@@ -9,6 +9,10 @@ use crate::{
 use rand::RngCore;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc, Mutex,
+};
 use std::time::Duration;
 
 #[cfg(windows)]
@@ -80,6 +84,8 @@ impl std::error::Error for NativeSessionError {}
 
 pub struct NativeSession {
     flow: NativeConnectFlow,
+    control: crate::SharedRtspControl,
+    next_cseq: crate::SharedCseq,
     feedback: FeedbackWorker,
     _ntp_timing: Option<NtpTimingResponder>,
     _ptp_timing: Option<PtpEngine>,
@@ -267,14 +273,15 @@ impl NativeSession {
         flow.ready()
             .map_err(|e| NativeSessionError::Flow(format!("{e:?}")))?;
 
-        // Native AirPlay 2 receivers expect POST /feedback roughly every 2 s.
-        // Transfer the live encrypted RTSP/HAP channel to one owner so CSeq
-        // and HAP nonces can never race across threads.
+        // Match source: one encrypted RTSP channel, one global CSeq,
+        // and a lock around each complete request/response exchange.
+        let control = Arc::new(Mutex::new(control));
+        let next_cseq = Arc::new(AtomicU32::new(4));
         let feedback = FeedbackWorker::start(
-            control,
+            Arc::clone(&control),
+            Arc::clone(&next_cseq),
             config.dacp_id.clone(),
             config.active_remote.clone(),
-            4,
         )
         .map_err(NativeSessionError::Feedback)?;
 
@@ -289,6 +296,8 @@ impl NativeSession {
 
         Ok(Self {
             flow,
+            control,
+            next_cseq,
             feedback,
             _ntp_timing: ntp_timing,
             _ptp_timing: ptp_timing,
@@ -306,6 +315,14 @@ impl NativeSession {
 
     pub fn is_ready(&self) -> bool {
         self.flow.phase() == NativePhase::Ready
+    }
+
+    pub fn control_channel(&self) -> crate::SharedRtspControl {
+        Arc::clone(&self.control)
+    }
+
+    pub fn next_control_cseq(&self) -> u32 {
+        self.next_cseq.load(Ordering::SeqCst)
     }
 
     #[cfg(windows)]
@@ -364,7 +381,7 @@ impl Drop for NativeSession {
         // Only after both threads are joined may timing/event resources drop.
         #[cfg(windows)]
         self.stop_windows_audio();
-        let _ = self.feedback.stop();
+        self.feedback.stop();
     }
 }
 
