@@ -21,6 +21,7 @@ pub mod ntp_session_setup;
 pub mod event_channel;
 pub mod record;
 pub mod stream_setup;
+pub mod media_transport;
 
 pub use ap2_info::{Ap2Info, Ap2InfoError, AudioFormatCapability, ALAC_44100_16_2};
 pub use catalog::{DeviceCatalog, DeviceRecord};
@@ -46,3 +47,4 @@ pub use ntp_session_setup::{build_ntp_session_plist, parse_event_port, setup_ntp
 pub use event_channel::{derive_event_keys, open_event_channel, EventChannel, EventChannelError};
 pub use record::{send_record, RecordConfig, RecordError};
 pub use stream_setup::{build_realtime_stream_plist, parse_stream_ports, setup_realtime_stream, RealtimeStreamSetupConfig, StreamPorts, StreamSetupError};
+pub use media_transport::{MediaTransport, MediaTransportError, MediaTransportPorts, RemoteMediaEndpoints};
