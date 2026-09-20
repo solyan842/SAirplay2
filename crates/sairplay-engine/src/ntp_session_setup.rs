@@ -214,13 +214,14 @@ mod tests {
 
             let plain = read_one_hap_frame(&mut socket, &mut cipher);
             let mut codec = crate::RtspCodec::default();
-            let req = String::from_utf8(plain.clone()).unwrap();
-
-            assert!(req.starts_with("SETUP rtsp://127.0.0.1/session RTSP/1.0\r\n"));
-            assert!(req.contains("CSeq: 4\r\n"));
-            assert!(req.contains("Content-Type: application/x-apple-binary-plist\r\n"));
 
             let header_end = plain.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let header = std::str::from_utf8(&plain[..header_end]).unwrap();
+
+            assert!(header.starts_with("SETUP rtsp://127.0.0.1/session RTSP/1.0\r\n"));
+            assert!(header.contains("CSeq: 4\r\n"));
+            assert!(header.contains("Content-Type: application/x-apple-binary-plist\r\n"));
+
             let body = &plain[header_end..];
             let value = Value::from_reader(Cursor::new(body)).unwrap();
             let dict = value.as_dictionary().unwrap();
