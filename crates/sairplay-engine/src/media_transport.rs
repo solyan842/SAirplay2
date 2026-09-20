@@ -81,6 +81,10 @@ impl MediaTransport {
         self.remote
     }
 
+    pub fn clone_control_socket(&self) -> io::Result<UdpSocket> {
+        self.control_socket.try_clone()
+    }
+
     pub fn send_data(&self, packet: &[u8]) -> Result<usize, MediaTransportError> {
         let remote = self.remote.ok_or(MediaTransportError::RemoteNotAttached)?;
         self.data_socket
