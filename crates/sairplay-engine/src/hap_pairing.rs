@@ -1,6 +1,7 @@
 use crate::{
     derive_control_keys, srp_client_compute, HapCryptoError, RtspCodec, RtspError, RtspResponse,
-    SrpError, Tlv8, Tlv8Error, TlvTag, HAP_TRANSIENT_FLAG, SRP_TRANSIENT_PIN,
+    EncryptedRtspChannel, SrpError, Tlv8, Tlv8Error, TlvTag, HAP_TRANSIENT_FLAG,
+    SRP_TRANSIENT_PIN,
 };
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -49,6 +50,11 @@ pub struct TransientPairingResult {
     pub session_key: [u8; 64],
 }
 
+pub struct TransientPairingSession {
+    pub pairing: TransientPairingResult,
+    pub channel: EncryptedRtspChannel,
+}
+
 pub struct TransientPairingClient {
     connect_timeout: Duration,
     exchange_timeout: Duration,
@@ -78,6 +84,15 @@ impl TransientPairingClient {
         port: u16,
         password: Option<&str>,
     ) -> Result<TransientPairingResult, PairingError> {
+        Ok(self.pair_channel(host, port, password)?.pairing)
+    }
+
+    pub fn pair_channel(
+        &self,
+        host: &str,
+        port: u16,
+        password: Option<&str>,
+    ) -> Result<TransientPairingSession, PairingError> {
         let peer = (host, port)
             .to_socket_addrs()
             .map_err(|_| PairingError::Resolve)?
@@ -103,15 +118,8 @@ impl TransientPairingClient {
         m1.insert_u8(TlvTag::Flags, HAP_TRANSIENT_FLAG);
 
         let m2_resp = exchange(
-            &mut stream,
-            &mut codec,
-            &mut pending,
-            1,
-            &self.user_agent,
-            "/pair-setup",
-            4,
-            &m1.encode(),
-            self.exchange_timeout,
+            &mut stream, &mut codec, &mut pending, 1, &self.user_agent,
+            "/pair-setup", 4, &m1.encode(), self.exchange_timeout,
         )?;
         let m2 = parse_pair_tlv(m2_resp)?;
         require_state(&m2, 0x02)?;
@@ -137,15 +145,8 @@ impl TransientPairingClient {
         m3.insert(TlvTag::Proof, srp.proof_m1.to_vec());
 
         let m4_resp = exchange(
-            &mut stream,
-            &mut codec,
-            &mut pending,
-            2,
-            &self.user_agent,
-            "/pair-setup",
-            4,
-            &m3.encode(),
-            self.exchange_timeout,
+            &mut stream, &mut codec, &mut pending, 2, &self.user_agent,
+            "/pair-setup", 4, &m3.encode(), self.exchange_timeout,
         )?;
         let m4 = parse_pair_tlv(m4_resp)?;
         require_state(&m4, 0x04)?;
@@ -161,14 +162,24 @@ impl TransientPairingClient {
         let mut audio_secret = [0u8; 32];
         audio_secret.copy_from_slice(&srp.session_key[..32]);
 
-        Ok(TransientPairingResult {
+        let pairing = TransientPairingResult {
             peer,
             write_key,
             read_key,
             audio_secret,
             session_key: srp.session_key,
-        })
+        };
+
+        let channel = EncryptedRtspChannel::new(
+            stream,
+            pairing.write_key,
+            pairing.read_key,
+            self.exchange_timeout,
+        );
+
+        Ok(TransientPairingSession { pairing, channel })
     }
+
 }
 
 fn parse_pair_tlv(response: RtspResponse) -> Result<Tlv8, PairingError> {
@@ -400,6 +411,101 @@ mod tests {
         assert_ne!(result.write_key,[0u8;32]);
         assert_ne!(result.read_key,[0u8;32]);
         assert_eq!(&result.audio_secret[..],&result.session_key[..32]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn paired_socket_handoffs_directly_to_encrypted_rtsp() {
+        let listener = TcpListener::bind(("127.0.0.1",0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let n = BigUint::parse_bytes(N_HEX.as_bytes(),16).unwrap();
+            let g = BigUint::from(5u8);
+            let salt = [0x24u8;16];
+            let inner = h(b"Pair-Setup:3939");
+            let mut xin = Vec::from(salt);
+            xin.extend_from_slice(&inner);
+            let x = BigUint::from_bytes_be(&h(&xin));
+            let v = g.modpow(&x,&n);
+            let k = BigUint::from_bytes_be(&h(&[pad(&n),pad(&g)].concat()));
+            let b = BigUint::from(0x1122334455667788u64);
+            let b_pub = ((&k*&v)+g.modpow(&b,&n))%&n;
+
+            let (cseq1, _) = read_request(&mut socket);
+            let mut m2=Tlv8::new();
+            m2.insert_u8(TlvTag::State,2);
+            m2.insert(TlvTag::Salt,salt.to_vec());
+            m2.insert(TlvTag::PublicKey,min(&b_pub));
+            send_tlv(&mut socket,cseq1,&m2);
+
+            let (cseq2, body3)=read_request(&mut socket);
+            let m3=Tlv8::decode(&body3).unwrap();
+            let a_bytes=m3.get(TlvTag::PublicKey).unwrap();
+            let a_pub=BigUint::from_bytes_be(a_bytes);
+            let u=BigUint::from_bytes_be(&h(&[pad(&a_pub),pad(&b_pub)].concat()));
+            let s=((&a_pub*v.modpow(&u,&n))%&n).modpow(&b,&n);
+            let session_key=h(&min(&s));
+
+            let hn=h(&min(&n));
+            let hg=h(&min(&g));
+            let hu=h(b"Pair-Setup");
+            let mut xor=[0u8;64];
+            for i in 0..64 { xor[i]=hn[i]^hg[i]; }
+            let mut m1in=Vec::new();
+            m1in.extend_from_slice(&xor);
+            m1in.extend_from_slice(&hu);
+            m1in.extend_from_slice(&salt);
+            m1in.extend_from_slice(a_bytes);
+            m1in.extend_from_slice(&min(&b_pub));
+            m1in.extend_from_slice(&session_key);
+            let proof=h(&m1in);
+            assert_eq!(m3.get(TlvTag::Proof).unwrap(), proof);
+
+            let mut hamkin=Vec::new();
+            hamkin.extend_from_slice(a_bytes);
+            hamkin.extend_from_slice(&proof);
+            hamkin.extend_from_slice(&session_key);
+            let hamk=h(&hamkin);
+            let mut m4=Tlv8::new();
+            m4.insert_u8(TlvTag::State,4);
+            m4.insert(TlvTag::Proof,hamk.to_vec());
+            send_tlv(&mut socket,cseq2,&m4);
+
+            let (write_key, read_key)=derive_control_keys(&session_key).unwrap();
+            let mut server_cipher=crate::HapControlCipher::new(read_key, write_key);
+
+            let mut carry=Vec::new();
+            let mut tmp=[0u8;4096];
+            let plain=loop {
+                let nread=socket.read(&mut tmp).unwrap();
+                carry.extend_from_slice(&tmp[..nread]);
+                if carry.len()<2 { continue; }
+                let plen=u16::from_le_bytes([carry[0],carry[1]]) as usize;
+                let flen=2+plen+16;
+                if carry.len()>=flen {
+                    break server_cipher.decrypt(&carry[..flen]).unwrap();
+                }
+            };
+            let text=String::from_utf8(plain).unwrap();
+            assert!(text.contains("CSeq: 3\r\n"));
+
+            let reply=b"RTSP/1.0 200 OK\r\nCSeq: 3\r\nContent-Length: 0\r\n\r\n";
+            let wire=server_cipher.encrypt(reply).unwrap();
+            socket.write_all(&wire).unwrap();
+        });
+
+        let mut session=TransientPairingClient::default()
+            .with_timeouts(Duration::from_secs(1),Duration::from_secs(3))
+            .pair_channel("127.0.0.1",addr.port(),None)
+            .expect("paired channel");
+
+        let req=b"POST /feedback RTSP/1.0\r\nCSeq: 3\r\nContent-Length: 0\r\n\r\n";
+        let resp=session.channel.exchange(req,3).expect("encrypted exchange");
+        assert_eq!(resp.status,200);
+        assert_eq!(resp.cseq(),Some(3));
+
         server.join().unwrap();
     }
 
