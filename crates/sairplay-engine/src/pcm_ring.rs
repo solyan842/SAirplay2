@@ -30,6 +30,10 @@ impl PcmRing {
             .collect()
     }
 
+    pub fn clear(&mut self) {
+        self.data.clear();
+    }
+
     pub fn len(&self) -> usize {
         self.data.len()
     }
@@ -56,5 +60,15 @@ mod tests {
         let mut ring = PcmRing::new(16);
         ring.push(&[1, 2, 3, 4]);
         assert_eq!(ring.pop_or_silence(8), vec![1,2,3,4,0,0,0,0]);
+    }
+
+    #[test]
+    fn warm_flush_discards_old_pcm_without_destroying_ring() {
+        let mut ring = PcmRing::new(16);
+        ring.push(&[1, 2, 3, 4]);
+        ring.clear();
+        assert!(ring.is_empty());
+        ring.push(&[9, 10]);
+        assert_eq!(ring.pop_or_silence(4), vec![9,10,0,0]);
     }
 }
