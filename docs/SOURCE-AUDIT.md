@@ -8,6 +8,15 @@ Primary reference pinned for this audit:
 
 Rule: when the primary source already defines native AirPlay 2 behavior, SAirplay2 ports that behavior to Rust/Windows without inventing a different protocol design. Platform substitutions are allowed only below the wire/lifecycle contract.
 
+
+## Verification snapshot
+
+- **Primary source:** music-assistant/airplay-cli @ `431c5c582eef9307c4e39c50a0ea65e970bc1128`.
+- **Code head verified:** `fae973329873ea818c99d376226fbcb0a93cd74b`.
+- **Windows CI:** run #310 / `35528932857` — Check PASS, 131 invariant tests PASS, GUI build PASS, artifact upload PASS.
+- **Artifact digest:** `sha256:5c480ece92988442b919193bfd1ca923a1078a8f9b298e684c8570bb52fc2ecc`.
+- **Hardware status:** pending fresh HomePod mini / AirPort Express test on this parity build. CI-PROVEN never means hardware-proven.
+
 ## Audit matrix
 
 | Area | Primary source | SAirplay2 at audit | Status / action |
@@ -17,20 +26,20 @@ Rule: when the primary source already defines native AirPlay 2 behavior, SAirpla
 | GET /info connection | Same TCP continues into HAP | Same TCP retained | MATCH |
 | GET /info CSeq | Main RTSP counter starts at 0 | CSeq 0 | MATCH |
 | RTSP User-Agent | `AirPlay/670.6.2` | Same | MATCH |
-| RTSP base headers | CSeq, User-Agent, DACP-ID, Active-Remote | Also emits Client-Instance | **DEVIATION: remove Client-Instance from native source path** |
+| RTSP base headers | CSeq, User-Agent, DACP-ID, Active-Remote | Native requests emit the same base set; Client-Instance removed | **MATCH · CI-PROVEN** |
 | /info capability parse | audioStream/bufferStream masks/extended tables | Implemented | MATCH for 16/44.1 realtime |
 | HAP transient pairing | transient M1/M3, fixed PIN unless password, same TCP | Implemented | MATCH current transient path |
 | Stored pair-verify | Supported by source | Not implemented | FEATURE GAP; not required for current transient HomePod test path |
 | Audio key | first 32 bytes of transient SRP session key | Same | MATCH |
 | Timing choice | feature bit 41 -> PTP; fallback NTP only if PTP unavailable | Same high-level decision | MATCH |
-| PTP bind | UDP 319/320, multicast membership/interface + unicast peer delivery | binds 319/320 but does not join multicast | **DEVIATION** |
-| PTP pre-SETPEERS delivery | peer list empty -> multicast fallback | sends unicast to receiver immediately | **DEVIATION** |
-| PTP Announce/Sync/Follow_Up | source-shaped gPTP majorSdoId=1 | Implemented minimal sender | PARTIAL |
+| PTP bind | UDP 319/320, multicast membership/interface + unicast peer delivery | Binds 319/320, joins 224.0.1.129, selects RTSP-local multicast egress interface | **MATCH · CI-PROVEN** |
+| PTP pre-SETPEERS delivery | peer list empty -> multicast fallback | Empty peer list uses 224.0.1.129; populated peers use source-style unicast delivery | **MATCH · CI-PROVEN** |
+| PTP Announce/Sync/Follow_Up | source-shaped gPTP majorSdoId=1 | Source-shaped gPTP majorSdoId=1, Announce 1s, Sync/FUP 125ms, Apple/802.1AS TLVs | **MATCH base sender · CI-PROVEN** |
 | PTP Delay/Pdelay replies | required | Implemented | MATCH basic wire path |
 | PTP Signaling grants | REQUEST_UNICAST -> GRANT | Implemented | MATCH basic wire path |
-| PTP BMCA / peer Announce processing | implemented; sender holds GM normally | not implemented | **GAP** |
-| HomePod OS27 follow-clock | conditional AudioAccessory standalone follow mode | not implemented / TXT not passed into session | **GAP; required only when source predicate matches** |
-| PTP settle | source observes peer/offset up to 400ms | fixed 400ms sleep | **DEVIATION** |
+| PTP BMCA / peer Announce processing | implemented; sender holds GM normally | Sender hold-GM behavior is preserved for the current one-receiver path; full generic BMCA diagnostics/election are not ported | **PARTIAL · not blocking current single-receiver realtime path** |
+| HomePod OS27 follow-clock | conditional AudioAccessory standalone follow mode | Exact model/igl/pgid/tsid/osvers/ov/srcvers/vs predicate; tracks receiver Announce + Sync/FUP, offset and dynamic ClockID/timebase | **MATCH source rule/path · CI-PROVEN; HARDWARE-PENDING** |
+| PTP settle | source observes peer/offset up to 400ms | Polls follow-clock decision/offset up to 400ms instead of blind sleep | **MATCH current follow path · CI-PROVEN** |
 | PTP Session SETUP plist | PTP protocol, IDs, group, timingPeerInfo/List | implemented | MATCH for GM path |
 | PTP identity | deviceID/macAddress/ClockID derived from DACP ID | same | MATCH |
 | NTP Session SETUP | deviceID, UUID, timingPort, timingProtocol=NTP | implemented | MATCH |
@@ -38,23 +47,23 @@ Rule: when the primary source already defines native AirPlay 2 behavior, SAirpla
 | RECORD order | RECORD before stream SETUP | same | MATCH |
 | Realtime Stream SETUP | type 96, ALAC, ports, latency fields, shk, spf=352 | same request fields | MATCH request |
 | Stream response ports | parse dataPort/controlPort by key | same | MATCH |
-| Stream response latency | parse latencyMin/latencyMax, clamp lead; arrival latency info | ignored | **DEVIATION** |
-| SETPEERS | after stream SETUP for PTP; bare plist [receiver, us] | absent | **CRITICAL DEVIATION** |
-| PTP peer list after SETPEERS | hand same peers to PTP engine and kick | absent | **CRITICAL DEVIATION** |
-| Main RTSP CSeq | /info=0, setup=1, RECORD=2, stream=3, SETPEERS=4, then feedback=5... | PTP currently feedback starts at 4 | **DEVIATION caused by missing SETPEERS** |
+| Stream response latency | parse latencyMin/latencyMax, clamp lead; arrival latency info | Parses both fields and clamps effective lead immediately after SETUP | **MATCH · CI-PROVEN** |
+| SETPEERS | after stream SETUP for PTP; bare plist [receiver, us] | Implemented immediately after Stream SETUP as bare plist `[receiver, us]` | **MATCH · CI-PROVEN** |
+| PTP peer list after SETPEERS | hand same peers to PTP engine and kick | Same `[receiver, us]` peers handed to engine; kick forces immediate timing emission | **MATCH · CI-PROVEN** |
+| Main RTSP CSeq | /info=0, setup=1, RECORD=2, stream=3, SETPEERS=4, then feedback=5... | PTP follows 0/1/2/3/4 then shared feedback/teardown counter; NTP omits SETPEERS and continues at 4 | **MATCH · CI-PROVEN** |
 | RTP SSRC | PTP=0, NTP=session_id | same | MATCH |
 | RTP header | PT 96, marker first packet | same | MATCH |
 | Realtime audio crypto | ChaCha20-Poly1305, seq nonce, AAD timestamp+SSRC, nonce suffix | same | MATCH |
 | NTP sync | 20-byte D4 | implemented | MATCH |
 | PTP realtime anchor | 28-byte D7, PTP ns + ClockID + frame geometry | implemented after anchor fix | MATCH for GM clock; follow-clock gap remains |
 | ALAC 16/44.1/352 | fixed realtime encoder | implemented | MATCH target format |
-| Delivery pacing window | latencyMax-250ms or default 1.75s; splice depth rules | absent | **DEVIATION** |
-| Initial fill spacing | >=1ms packet release spacing | absent | **DEVIATION** |
-| Retransmit history | 512 exact wire packets | absent | **DEVIATION** |
-| Retransmit request | read control UDP type 0x55 | absent | **DEVIATION** |
-| Retransmit response | type 0x56/D6 + original wire RTP | absent | **DEVIATION** |
-| /feedback keepalive | POST /feedback every ~2s | added | MATCH cadence after latest refactor |
-| Feedback timeout | 2s | added 2s | MATCH |
+| Delivery pacing window | latencyMax-250ms or default 1.75s; splice depth rules | Receiver window applied with source 250ms margin and shallow 600ms realtime splice depth | **MATCH current realtime target · CI-PROVEN** |
+| Initial fill spacing | >=1ms packet release spacing | 1ms minimum release spacing in the Windows producer | **MATCH · CI-PROVEN** |
+| Retransmit history | 512 exact wire packets | 512-slot ring stores the exact encrypted wire RTP only after successful local send | **MATCH · CI-PROVEN** |
+| Retransmit request | read control UDP type 0x55 | Dedicated control worker drains type 0x55 requests | **MATCH · CI-PROVEN** |
+| Retransmit response | type 0x56/D6 + original wire RTP | D6 wrapper echoes request sequence and returns original retained wire RTP | **MATCH · CI-PROVEN** |
+| /feedback keepalive | POST /feedback every ~2s | 2s cadence on shared encrypted RTSP channel | **MATCH · CI-PROVEN** |
+| Feedback timeout | 2s total budget including serialization lock | One 2s deadline covers lock acquisition + exchange; busy-lock expiry skips tick without consuming CSeq | **MATCH · CI-PROVEN** |
 | Feedback miss budget | 3 consecutive misses | added | MATCH basic policy |
 | RTSP serializer | one shared channel + lock + global CSeq | added in latest refactor | MATCH architecture |
 | Late feedback response carry | preserve stream/HAP nonce sequencing | channel preserves encrypted carry/pending stale CSeq | MATCH basic mechanism |
@@ -62,9 +71,9 @@ Rule: when the primary source already defines native AirPlay 2 behavior, SAirpla
 | Native volume | SET_PARAMETER text/parameters on shared RTSP | absent | FEATURE GAP |
 | Metadata | source supports native metadata/MRP | absent | FEATURE GAP; not base HomePod transport prerequisite |
 | Buffered type 103 | opt-in only in source | not implemented | OK for current realtime-only target |
-| Warm splice/flush lifecycle | source has persistent timeline behavior | partial standalone timeline components, not integrated into native live session | **GAP for later pause/seek/source-change acceptance tests** |
-| TEARDOWN | source sends clean native teardown | socket currently drops without native TEARDOWN | **DEVIATION** |
-| Feedback/retransmit shutdown ordering | workers stop before sockets/resources close | feedback ordering implemented; retransmit absent | PARTIAL |
+| Warm splice/flush lifecycle | source has persistent timeline behavior | Timeline invariants are implemented; Windows realtime producer now keeps the same wire alive with encoded silence through temporary source starvation. Explicit pause/seek command API is still not wired into GUI/native session | **PARTIAL · starvation/source-switch base path CI-PROVEN; explicit command path pending** |
+| TEARDOWN | source sends clean native teardown | Stops producer/workers, closes event channel, then serialized TEARDOWN with shared CSeq/deadline; read-timeout farewell is write-only 250ms | **MATCH · CI-PROVEN** |
+| Feedback/retransmit shutdown ordering | workers stop before sockets/resources close | Audio -> retransmit -> feedback -> event -> TEARDOWN; timing/control resources remain live through teardown | **MATCH current base lifecycle · CI-PROVEN** |
 
 ## Correction order
 
