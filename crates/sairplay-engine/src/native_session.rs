@@ -1,9 +1,10 @@
 use crate::{
     open_event_channel, prepare_realtime_media, send_record, setup_ntp_session,
     setup_ptp_session, start_ntp_timing_gate, Ap2PreflightClient, EventChannel,
-    MediaHandshakeConfig, NativeConnectFlow, NativePhase, NtpSessionSetupConfig,
-    NtpTimingResponder, PairingError, PreflightError, PtpEngine, PtpSessionSetupConfig,
-    RealtimeMediaSender, RecordConfig, RtpState, TransientPairingClient,
+    FeedbackWorker, MediaHandshakeConfig, NativeConnectFlow, NativePhase,
+    NtpSessionSetupConfig, NtpTimingResponder, PairingError, PreflightError, PtpEngine,
+    PtpSessionSetupConfig, RealtimeMediaSender, RecordConfig, RtpState,
+    TransientPairingClient,
 };
 use rand::RngCore;
 use std::fmt;
@@ -51,6 +52,7 @@ pub enum NativeSessionError {
     Record(String),
     Media(String),
     LocalAddress(std::io::Error),
+    Feedback(std::io::Error),
     #[cfg(windows)]
     Audio(WindowsAudioWorkerError),
 }
@@ -67,6 +69,7 @@ impl fmt::Display for NativeSessionError {
             Self::Record(e) => write!(f, "record failed: {e}"),
             Self::Media(e) => write!(f, "media setup failed: {e}"),
             Self::LocalAddress(e) => write!(f, "local address failed: {e}"),
+            Self::Feedback(e) => write!(f, "feedback worker failed: {e}"),
             #[cfg(windows)]
             Self::Audio(e) => write!(f, "Windows audio failed: {e}"),
         }
@@ -77,7 +80,7 @@ impl std::error::Error for NativeSessionError {}
 
 pub struct NativeSession {
     flow: NativeConnectFlow,
-    control: crate::EncryptedRtspChannel,
+    feedback: FeedbackWorker,
     _ntp_timing: Option<NtpTimingResponder>,
     _ptp_timing: Option<PtpEngine>,
     _event: EventChannel,
@@ -264,6 +267,17 @@ impl NativeSession {
         flow.ready()
             .map_err(|e| NativeSessionError::Flow(format!("{e:?}")))?;
 
+        // Native AirPlay 2 receivers expect POST /feedback roughly every 2 s.
+        // Transfer the live encrypted RTSP/HAP channel to one owner so CSeq
+        // and HAP nonces can never race across threads.
+        let feedback = FeedbackWorker::start(
+            control,
+            config.dacp_id.clone(),
+            config.active_remote.clone(),
+            4,
+        )
+        .map_err(NativeSessionError::Feedback)?;
+
         let ptp_clock_id = ptp_timing.as_ref().map(PtpEngine::clock_id);
         let ssrc = if ptp_clock_id.is_some() { 0 } else { session_id };
         let rtp = RtpState::new(sequence, rtp_timestamp, ssrc);
@@ -275,7 +289,7 @@ impl NativeSession {
 
         Ok(Self {
             flow,
-            control,
+            feedback,
             _ntp_timing: ntp_timing,
             _ptp_timing: ptp_timing,
             _event: event,
@@ -292,10 +306,6 @@ impl NativeSession {
 
     pub fn is_ready(&self) -> bool {
         self.flow.phase() == NativePhase::Ready
-    }
-
-    pub fn control_channel(&mut self) -> &mut crate::EncryptedRtspChannel {
-        &mut self.control
     }
 
     #[cfg(windows)]
@@ -332,6 +342,14 @@ impl NativeSession {
         self.audio_worker.as_ref().and_then(WindowsAudioWorker::last_error)
     }
 
+    pub fn feedback_running(&self) -> bool {
+        self.feedback.is_running()
+    }
+
+    pub fn feedback_error(&self) -> Option<String> {
+        self.feedback.last_error()
+    }
+
     #[cfg(windows)]
     pub fn stop_windows_audio(&mut self) {
         if let Some(mut worker) = self.audio_worker.take() {
@@ -342,10 +360,11 @@ impl NativeSession {
 
 impl Drop for NativeSession {
     fn drop(&mut self) {
-        // Stop the realtime producer first. Only after its thread is joined may
-        // timing/event/control resources be released by normal field drops.
+        // Stop the realtime producer first, then the RTSP keepalive worker.
+        // Only after both threads are joined may timing/event resources drop.
         #[cfg(windows)]
         self.stop_windows_audio();
+        let _ = self.feedback.stop();
     }
 }
 
