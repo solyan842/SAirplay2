@@ -4,7 +4,8 @@ use crate::{
     EventChannel, FeedbackWorker, MediaHandshakeConfig, NativeConnectFlow, NativePhase,
     NtpSessionSetupConfig, NtpTimingResponder, PairingError, PreflightError, PtpEngine,
     PtpSessionSetupConfig, RealtimeMediaSender, RecordConfig, RetransmitRing,
-    RetransmitWorker, RtpState, SetPeersConfig, TransientPairingClient, system_time_to_ntp,
+    RetransmitWorker, RtpState, SetPeersConfig, TransientPairingClient, VolumeSetResult,
+    set_native_volume, system_time_to_ntp,
 };
 use rand::RngCore;
 use std::fmt;
@@ -30,6 +31,7 @@ pub struct NativeSessionConfig {
     pub follow_receiver_clock: bool,
     pub apple_model: bool,
     pub receiver_name: String,
+    pub initial_volume: Option<u8>,
 }
 
 impl NativeSessionConfig {
@@ -45,6 +47,7 @@ impl NativeSessionConfig {
             follow_receiver_clock: false,
             apple_model: false,
             receiver_name: "SAirplay2 Receiver".into(),
+            initial_volume: None,
         }
     }
 }
@@ -61,6 +64,7 @@ pub enum NativeSessionError {
     Media(String),
     LocalAddress(std::io::Error),
     Feedback(std::io::Error),
+    Volume(String),
     #[cfg(windows)]
     Audio(WindowsAudioWorkerError),
 }
@@ -78,6 +82,7 @@ impl fmt::Display for NativeSessionError {
             Self::Media(e) => write!(f, "media setup failed: {e}"),
             Self::LocalAddress(e) => write!(f, "local address failed: {e}"),
             Self::Feedback(e) => write!(f, "feedback worker failed: {e}"),
+            Self::Volume(e) => write!(f, "volume setup failed: {e}"),
             #[cfg(windows)]
             Self::Audio(e) => write!(f, "Windows audio failed: {e}"),
         }
@@ -100,6 +105,7 @@ pub struct NativeSession {
     dacp_id: String,
     active_remote: String,
     lead_frames: u32,
+    initial_volume_result: Option<VolumeSetResult>,
     #[cfg(windows)]
     audio_worker: Option<WindowsAudioWorker>,
 }
@@ -321,6 +327,26 @@ impl NativeSession {
         // and a lock around each complete request/response exchange.
         let control = Arc::new(Mutex::new(control));
         let next_cseq = Arc::new(AtomicU32::new(next_control_cseq));
+
+        // Match source ordering: an explicitly requested initial volume is
+        // sent after native setup is complete but before the audio producer
+        // starts. No configured volume means no SET_PARAMETER at all.
+        let initial_volume_result = if let Some(volume) = config.initial_volume {
+            Some(
+                set_native_volume(
+                    &control,
+                    &next_cseq,
+                    &session_uri,
+                    &config.dacp_id,
+                    &config.active_remote,
+                    volume,
+                )
+                .map_err(|e| NativeSessionError::Volume(format!("{e:?}")))?,
+            )
+        } else {
+            None
+        };
+
         let feedback = FeedbackWorker::start(
             Arc::clone(&control),
             Arc::clone(&next_cseq),
@@ -405,6 +431,7 @@ impl NativeSession {
             dacp_id: config.dacp_id.clone(),
             active_remote: config.active_remote.clone(),
             lead_frames: effective_lead_frames,
+            initial_volume_result,
             #[cfg(windows)]
             audio_worker: None,
         })
@@ -458,6 +485,22 @@ impl NativeSession {
     #[cfg(windows)]
     pub fn audio_error(&self) -> Option<String> {
         self.audio_worker.as_ref().and_then(WindowsAudioWorker::last_error)
+    }
+
+    pub fn initial_volume_result(&self) -> Option<VolumeSetResult> {
+        self.initial_volume_result
+    }
+
+    pub fn set_volume(&self, percent: u8) -> Result<VolumeSetResult, NativeSessionError> {
+        set_native_volume(
+            &self.control,
+            &self.next_cseq,
+            &self.session_uri,
+            &self.dacp_id,
+            &self.active_remote,
+            percent,
+        )
+        .map_err(|e| NativeSessionError::Volume(format!("{e:?}")))
     }
 
     pub fn feedback_running(&self) -> bool {
