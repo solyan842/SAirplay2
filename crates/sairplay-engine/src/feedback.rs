@@ -57,7 +57,7 @@ impl FeedbackWorker {
                         user_agent: "AirPlay/670.6.2".into(),
                         dacp_id: dacp_id.clone(),
                         active_remote: active_remote.clone(),
-                        client_instance: Some(dacp_id.clone()),
+                        client_instance: None,
                         content_type: None,
                         body: Vec::new(),
                     };
