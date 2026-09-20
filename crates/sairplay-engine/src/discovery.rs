@@ -98,6 +98,46 @@ impl AirPlayTxt {
     pub fn supports_auth_setup(&self) -> bool {
         self.encryption_types.iter().any(|v| v == "4")
     }
+
+    pub fn follows_receiver_clock(&self) -> bool {
+        // Port of ap2_follow_receiver_clock() from the pinned primary source:
+        // standalone AudioAccessory group leader, no parent/stereo group, OS 27+.
+        let model = self
+            .fields
+            .get("model")
+            .or_else(|| self.fields.get("am"))
+            .map(String::as_str)
+            .unwrap_or("");
+        if !model.starts_with("AudioAccessory") {
+            return false;
+        }
+        if self.fields.get("igl").map(String::as_str) != Some("1") {
+            return false;
+        }
+        if self.fields.contains_key("pgid") || self.fields.contains_key("tsid") {
+            return false;
+        }
+
+        let os_major = self
+            .fields
+            .get("osvers")
+            .or_else(|| self.fields.get("ov"))
+            .and_then(|v| leading_version_major(v));
+        if let Some(major) = os_major {
+            return major >= 27;
+        }
+
+        self.fields
+            .get("srcvers")
+            .or_else(|| self.fields.get("vs"))
+            .and_then(|v| leading_version_major(v))
+            .is_some_and(|major| major >= 980)
+    }
+}
+
+fn leading_version_major(value: &str) -> Option<u32> {
+    let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() { None } else { digits.parse().ok() }
 }
 
 fn parse_feature_mask(value: &str) -> Result<u64, DiscoveryError> {
@@ -156,6 +196,46 @@ mod tests {
         assert!(txt.password_required);
         assert!(txt.supports_auth_setup());
         assert_eq!(txt.model.as_deref(), Some("AudioAccessory"));
+    }
+
+    #[test]
+    fn source_homepod_os27_follow_rule_is_exact() {
+        let standalone = AirPlayTxt::parse([
+            ("model", "AudioAccessory5,1"),
+            ("igl", "1"),
+            ("osvers", "27.0"),
+        ]).unwrap();
+        assert!(standalone.follows_receiver_clock());
+
+        let os26 = AirPlayTxt::parse([
+            ("model", "AudioAccessory5,1"),
+            ("igl", "1"),
+            ("osvers", "26.4"),
+        ]).unwrap();
+        assert!(!os26.follows_receiver_clock());
+
+        let grouped = AirPlayTxt::parse([
+            ("model", "AudioAccessory5,1"),
+            ("igl", "1"),
+            ("osvers", "27.0"),
+            ("pgid", "group"),
+        ]).unwrap();
+        assert!(!grouped.follows_receiver_clock());
+
+        let stereo = AirPlayTxt::parse([
+            ("model", "AudioAccessory5,1"),
+            ("igl", "1"),
+            ("osvers", "27.0"),
+            ("tsid", "pair"),
+        ]).unwrap();
+        assert!(!stereo.follows_receiver_clock());
+
+        let fallback = AirPlayTxt::parse([
+            ("model", "AudioAccessory5,1"),
+            ("igl", "1"),
+            ("srcvers", "980.1"),
+        ]).unwrap();
+        assert!(fallback.follows_receiver_clock());
     }
 
     #[test]
