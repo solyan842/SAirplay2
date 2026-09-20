@@ -64,6 +64,18 @@ impl Ap2PreflightClient {
         host: &str,
         port: u16,
     ) -> Result<PreflightResult, PreflightError> {
+        let (_stream, result) = self.open_info_connection(host, port)?;
+        Ok(result)
+    }
+
+    /// Opens the native control TCP socket and performs plaintext GET /info
+    /// without closing it. The returned stream is intended to continue into
+    /// HAP pairing and then encrypted RTSP on the same receiver connection.
+    pub fn open_info_connection(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<(TcpStream, PreflightResult), PreflightError> {
         let peer = (host, port)
             .to_socket_addrs()
             .map_err(|_| PreflightError::Resolve)?
@@ -103,11 +115,11 @@ impl Ap2PreflightClient {
                     return Err(PreflightError::Status(response.status));
                 }
                 let info = Ap2Info::parse(&response.body)?;
-                return Ok(PreflightResult {
+                return Ok((stream, PreflightResult {
                     peer,
                     response,
                     info,
-                });
+                }));
             }
 
             if Instant::now() >= deadline {
