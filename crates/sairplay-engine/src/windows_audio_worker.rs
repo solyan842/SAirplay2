@@ -103,8 +103,34 @@ impl WindowsAudioWorker {
                             }
                         }
 
-                        if frames == 0 {
-                            thread::sleep(Duration::from_millis(2));
+                        if frames == 0 && !chunker.has_packet() {
+                            let ntp = match system_time_to_ntp(SystemTime::now()) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(format!("NTP clock conversion failed: {error:?}"));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            };
+
+                            // Source splice/starvation contract: temporary PCM
+                            // absence never stops the wire. Consume any partial
+                            // tail once, pad the rest with encoded silence, and
+                            // keep advancing the same RTP/anchor timeline.
+                            if sender.can_accept_frames(ntp) {
+                                let packet = chunker.pop_packet_padded_silence();
+                                if let Err(error) = sender.send_pcm_352(&packet, ntp, lead_frames) {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(format!("silence keepalive send failed: {error:?}"));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            } else {
+                                thread::sleep(Duration::from_millis(1));
+                            }
                         }
                     }
                     Err(error) => {
