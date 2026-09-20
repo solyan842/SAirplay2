@@ -99,8 +99,20 @@ impl TransientPairingClient {
             .next()
             .ok_or(PairingError::Resolve)?;
 
-        let mut stream = TcpStream::connect_timeout(&peer, self.connect_timeout)
+        let stream = TcpStream::connect_timeout(&peer, self.connect_timeout)
             .map_err(PairingError::Connect)?;
+        self.pair_channel_on_stream(stream, peer, password)
+    }
+
+    /// Continue HAP transient pairing on an already-open control socket.
+    /// This is the native path used after plaintext GET /info so the socket
+    /// survives unchanged into encrypted RTSP.
+    pub fn pair_channel_on_stream(
+        &self,
+        mut stream: TcpStream,
+        peer: SocketAddr,
+        password: Option<&str>,
+    ) -> Result<TransientPairingSession, PairingError> {
         stream.set_nodelay(true).map_err(PairingError::Configure)?;
         stream
             .set_read_timeout(Some(Duration::from_millis(500)))
