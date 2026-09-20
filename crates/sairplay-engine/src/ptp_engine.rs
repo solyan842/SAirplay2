@@ -33,6 +33,7 @@ const TLV_GRANT_UNICAST: u16 = 0x0005;
 const OFFSET_SNAP_NS: i64 = 1_000_000;
 const OFFSET_EMA_DIV: i64 = 8;
 const FOLLOW_STALE_NS: u64 = 60_000_000_000;
+const EXCHANGE_GAP_NS: u64 = 3_000_000_000;
 
 #[derive(Debug)]
 pub enum PtpEngineError {
@@ -55,6 +56,22 @@ impl fmt::Display for PtpEngineError {
 
 impl std::error::Error for PtpEngineError {}
 
+#[derive(Debug, Default, Clone, Copy)]
+struct ExchangeState {
+    first_ns: u64,
+    third_ns: u64,
+    last_ns: u64,
+    count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtpExchange {
+    pub count: u32,
+    pub first_ms: u64,
+    pub last_ms: u64,
+    pub third_ms: u64,
+}
+
 #[derive(Debug, Default)]
 struct FollowClockState {
     enabled: bool,
@@ -65,6 +82,7 @@ struct FollowClockState {
     pending_sync_seq: Option<u16>,
     pending_sync_rx_ns: u64,
     pending_sync_corr_ns: i64,
+    exchange: ExchangeState,
 }
 
 #[derive(Clone, Debug)]
@@ -126,6 +144,25 @@ impl PtpClock {
 
     pub fn is_follow_locked(&self) -> bool {
         self.master_clock_id() != self.local_clock_id
+    }
+
+    pub fn exchange(&self) -> Option<PtpExchange> {
+        let now = now_unix_ns();
+        let follow = self.follow.lock().ok()?;
+        let ex = follow.exchange;
+        if ex.count == 0 || now.saturating_sub(ex.last_ns) > EXCHANGE_GAP_NS {
+            return None;
+        }
+        Some(PtpExchange {
+            count: ex.count,
+            first_ms: now.saturating_sub(ex.first_ns) / 1_000_000,
+            last_ms: now.saturating_sub(ex.last_ns) / 1_000_000,
+            third_ms: if ex.count >= 3 {
+                now.saturating_sub(ex.third_ns) / 1_000_000
+            } else {
+                0
+            },
+        })
     }
 }
 
@@ -241,6 +278,10 @@ impl PtpEngine {
 
     pub fn follow_locked(&self) -> bool {
         self.clock.is_follow_locked()
+    }
+
+    pub fn peer_exchange(&self) -> Option<PtpExchange> {
+        self.clock.exchange()
     }
 
     pub fn settle(&self, timeout: Duration) {
@@ -400,6 +441,7 @@ fn drain_socket(
                 }
                 MSG_SYNC => {
                     follow_sync(&buf[..n], rx_ns, false, follow_state);
+                    track_exchange(src_v4, rx_ns, follow_state);
                     continue;
                 }
                 MSG_FOLLOW_UP => {
@@ -412,10 +454,12 @@ fn drain_socket(
 
         match msg_type {
             MSG_DELAY_REQ => {
+                track_exchange(src_v4, rx_ns, follow_state);
                 let packet = build_delay_resp(&buf[..n], clock_id, rx_ns);
                 let _ = general.send_to(&packet, SocketAddr::new(src.ip(), GENERAL_PORT));
             }
             MSG_PDELAY_REQ => {
+                track_exchange(src_v4, rx_ns, follow_state);
                 let (resp, follow) = build_pdelay_resp_pair(&buf[..n], clock_id, rx_ns);
                 let _ = event.send_to(&resp, SocketAddr::new(src.ip(), EVENT_PORT));
                 let _ = general.send_to(&follow, SocketAddr::new(src.ip(), GENERAL_PORT));
@@ -426,6 +470,32 @@ fn drain_socket(
                 }
             }
             _ => {}
+        }
+    }
+}
+
+fn track_exchange(
+    src: Option<Ipv4Addr>,
+    rx_ns: u64,
+    state: &Arc<Mutex<FollowClockState>>,
+) {
+    let Some(src) = src else { return; };
+    if let Ok(mut f) = state.lock() {
+        if f.receiver != Some(src) {
+            return;
+        }
+        let ex = &mut f.exchange;
+        if ex.count == 0 || rx_ns.saturating_sub(ex.last_ns) > EXCHANGE_GAP_NS {
+            ex.first_ns = rx_ns;
+            ex.third_ns = 0;
+            ex.last_ns = rx_ns;
+            ex.count = 1;
+        } else {
+            ex.last_ns = rx_ns;
+            ex.count = ex.count.saturating_add(1);
+            if ex.count == 3 {
+                ex.third_ns = rx_ns;
+            }
         }
     }
 }
