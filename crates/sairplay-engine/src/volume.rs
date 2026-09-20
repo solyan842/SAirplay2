@@ -52,6 +52,44 @@ fn request(
     }
 }
 
+#[derive(Clone)]
+pub struct NativeVolumeControl {
+    control: SharedRtspControl,
+    next_cseq: SharedCseq,
+    session_uri: String,
+    dacp_id: String,
+    active_remote: String,
+}
+
+impl NativeVolumeControl {
+    pub(crate) fn new(
+        control: SharedRtspControl,
+        next_cseq: SharedCseq,
+        session_uri: String,
+        dacp_id: String,
+        active_remote: String,
+    ) -> Self {
+        Self {
+            control,
+            next_cseq,
+            session_uri,
+            dacp_id,
+            active_remote,
+        }
+    }
+
+    pub fn set(&self, percent: u8) -> Result<VolumeSetResult, VolumeError> {
+        set_native_volume(
+            &self.control,
+            &self.next_cseq,
+            &self.session_uri,
+            &self.dacp_id,
+            &self.active_remote,
+            percent,
+        )
+    }
+}
+
 pub fn set_native_volume(
     control: &SharedRtspControl,
     next_cseq: &SharedCseq,
