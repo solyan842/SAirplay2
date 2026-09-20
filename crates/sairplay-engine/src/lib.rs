@@ -1,3 +1,4 @@
+pub mod ap2_info;
 pub mod catalog;
 pub mod discovery;
 pub mod mdns_browser;
@@ -7,6 +8,7 @@ pub mod route;
 pub mod session;
 pub mod timeline;
 
+pub use ap2_info::{Ap2Info, Ap2InfoError, AudioFormatCapability, ALAC_44100_16_2};
 pub use catalog::{DeviceCatalog, DeviceRecord};
 pub use discovery::{AirPlayTxt, DiscoveryError};
 pub use mdns_browser::{DiscoveredService, DiscoveryEvent, MdnsBrowser, ServiceKind};
