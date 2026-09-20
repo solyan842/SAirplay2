@@ -1,6 +1,6 @@
 use crate::{
     open_event_channel, prepare_realtime_media, send_record, setup_ntp_session,
-    send_setpeers, setup_ptp_session, start_ntp_timing_gate, Ap2PreflightClient,
+    send_setpeers, send_teardown, setup_ptp_session, start_ntp_timing_gate, Ap2PreflightClient,
     EventChannel, FeedbackWorker, MediaHandshakeConfig, NativeConnectFlow, NativePhase,
     NtpSessionSetupConfig, NtpTimingResponder, PairingError, PreflightError, PtpEngine,
     PtpSessionSetupConfig, RealtimeMediaSender, RecordConfig, RetransmitRing,
@@ -90,8 +90,11 @@ pub struct NativeSession {
     retransmit: Option<RetransmitWorker>,
     _ntp_timing: Option<NtpTimingResponder>,
     _ptp_timing: Option<PtpEngine>,
-    _event: EventChannel,
+    event: Option<EventChannel>,
     sender: Option<RealtimeMediaSender>,
+    session_uri: String,
+    dacp_id: String,
+    active_remote: String,
     lead_frames: u32,
     #[cfg(windows)]
     audio_worker: Option<WindowsAudioWorker>,
@@ -338,6 +341,7 @@ impl NativeSession {
 
         // Realtime source always attempts the retransmit responder, but failure
         // is non-fatal: audio still runs, only packet repair is unavailable.
+        let latency_max = media.latency_max;
         let rtx_ring = RetransmitRing::new();
         let retransmit = media
             .transport
@@ -356,7 +360,7 @@ impl NativeSession {
         sender.configure_source_timeline(
             start_ntp,
             head_ts,
-            media.latency_max,
+            latency_max,
             effective_lead_frames,
         );
 
@@ -378,8 +382,11 @@ impl NativeSession {
             retransmit,
             _ntp_timing: ntp_timing,
             _ptp_timing: ptp_timing,
-            _event: event,
+            event: Some(event),
             sender: Some(sender),
+            session_uri: session_uri.clone(),
+            dacp_id: config.dacp_id.clone(),
+            active_remote: config.active_remote.clone(),
             lead_frames: effective_lead_frames,
             #[cfg(windows)]
             audio_worker: None,
@@ -462,6 +469,17 @@ impl Drop for NativeSession {
             worker.stop();
         }
         self.feedback.stop();
+
+        // Match upstream disconnect ordering: the reverse event channel is
+        // closed before the final RTSP TEARDOWN, while timing remains alive.
+        self.event.take();
+        let _ = send_teardown(
+            &self.control,
+            &self.next_cseq,
+            &self.session_uri,
+            &self.dacp_id,
+            &self.active_remote,
+        );
     }
 }
 
