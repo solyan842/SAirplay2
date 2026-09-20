@@ -76,10 +76,23 @@ impl SairplayApp {
                         ServiceKind::AirPlay => "AirPlay",
                         ServiceKind::Raop => "RAOP",
                     };
-                    self.log.push(format!(
-                        "mDNS {kind}: {} @ {}:{}",
-                        service.display_name, service.host, service.port
-                    ));
+                    if service.kind == ServiceKind::AirPlay {
+                        self.log.push(format!(
+                            "mDNS {kind}: {} @ {}:{} · model={} · features=0x{:016X} · PTP={} · buffered={}",
+                            service.display_name,
+                            service.host,
+                            service.port,
+                            service.txt.model.as_deref().unwrap_or("-"),
+                            service.txt.features,
+                            service.txt.supports_ptp(),
+                            service.txt.supports_buffered_audio(),
+                        ));
+                    } else {
+                        self.log.push(format!(
+                            "mDNS {kind}: {} @ {}:{}",
+                            service.display_name, service.host, service.port
+                        ));
+                    }
                     self.catalog.upsert(service);
                 }
                 DiscoveryEvent::Removed { kind, fullname } => {
@@ -201,7 +214,10 @@ impl SairplayApp {
         self.playback = PlaybackUiState::Connecting(name.clone());
         self.session = None;
         self.log.push(format!(
-            "{name}: preflight starting on {host}:{port}; Playing will wait for Ready + audio."
+            "{name}: preflight starting on {host}:{port} · model={} · features=0x{:016X} · PTP={} · Playing waits for Ready + audio.",
+            service.txt.model.as_deref().unwrap_or("-"),
+            service.txt.features,
+            service.txt.supports_ptp(),
         ));
 
         thread::Builder::new()
