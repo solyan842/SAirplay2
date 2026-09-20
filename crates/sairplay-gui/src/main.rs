@@ -1,7 +1,7 @@
 use eframe::egui;
 use sairplay_engine::{
     DeviceCatalog, DiscoveredService, DiscoveryEvent, MdnsBrowser, NativeSession,
-    NativeSessionConfig, Route, ServiceKind,
+    NativeSessionConfig, Route, ServiceKind, VolumeSetResult,
 };
 use std::net::IpAddr;
 use std::sync::mpsc::{self, Receiver};
@@ -25,6 +25,7 @@ struct SairplayApp {
     connect_rx: Option<Receiver<Result<NativeSession, String>>>,
     session: Option<NativeSession>,
     initial_volume_text: String,
+    volume_rx: Option<Receiver<Result<VolumeSetResult, String>>>,
 }
 
 impl Default for SairplayApp {
@@ -61,6 +62,7 @@ impl Default for SairplayApp {
             connect_rx: None,
             session: None,
             initial_volume_text: String::new(),
+            volume_rx: None,
         }
     }
 }
@@ -158,6 +160,62 @@ impl SairplayApp {
         }
     }
 
+    fn pump_volume_result(&mut self) {
+        let Some(rx) = &self.volume_rx else {
+            return;
+        };
+
+        match rx.try_recv() {
+            Ok(Ok(result)) => {
+                self.log.push(format!(
+                    "Receiver volume {}% = {:.2} dB · RTSP {}.",
+                    result.percent, result.db, result.status
+                ));
+                self.volume_rx = None;
+            }
+            Ok(Err(error)) => {
+                self.log.push(format!("Volume update failed: {error}"));
+                self.volume_rx = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.log.push("Volume worker ended unexpectedly.".into());
+                self.volume_rx = None;
+            }
+        }
+    }
+
+    fn apply_volume(&mut self) {
+        if self.volume_rx.is_some() {
+            return;
+        }
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let volume = match parse_volume_text(&self.initial_volume_text) {
+            Ok(Some(volume)) => volume,
+            Ok(None) => {
+                self.log.push("Enter receiver volume 0–100 before Apply Volume.".into());
+                return;
+            }
+            Err(error) => {
+                self.log.push(error);
+                return;
+            }
+        };
+
+        let control = session.volume_control();
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.volume_rx = Some(rx);
+        thread::Builder::new()
+            .name("sairplay-volume".into())
+            .spawn(move || {
+                let result = control.set(volume).map_err(|e| format!("{e:?}"));
+                let _ = tx.send(result);
+            })
+            .expect("failed to spawn volume worker");
+    }
+
     fn monitor_running_session(&mut self) {
         let Some(session) = self.session.as_ref() else {
             return;
@@ -223,20 +281,12 @@ impl SairplayApp {
         let name = device.display_name.clone();
         let port = service.port;
 
-        let initial_volume = {
-            let value = self.initial_volume_text.trim();
-            if value.is_empty() {
-                None
-            } else {
-                match value.parse::<u8>() {
-                    Ok(volume) if volume <= 100 => Some(volume),
-                    _ => {
-                        let message = "Initial receiver volume must be 0–100 or blank".to_string();
-                        self.log.push(message.clone());
-                        self.playback = PlaybackUiState::Error(message);
-                        return;
-                    }
-                }
+        let initial_volume = match parse_volume_text(&self.initial_volume_text) {
+            Ok(volume) => volume,
+            Err(message) => {
+                self.log.push(message.clone());
+                self.playback = PlaybackUiState::Error(message);
+                return;
             }
         };
 
@@ -308,6 +358,7 @@ impl eframe::App for SairplayApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_discovery();
         self.pump_connect_result();
+        self.pump_volume_result();
         self.monitor_running_session();
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -406,13 +457,25 @@ impl eframe::App for SairplayApp {
             ui.separator();
 
             ui.horizontal(|ui| {
-                ui.label("Initial receiver volume:");
+                ui.label("Receiver volume:");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.initial_volume_text)
                         .desired_width(52.0)
                         .hint_text("0–100"),
                 );
-                ui.label("blank = unchanged");
+                ui.label("blank = unchanged at Start");
+                let apply_enabled = self.session.is_some()
+                    && self.volume_rx.is_none()
+                    && !self.initial_volume_text.trim().is_empty();
+                if ui
+                    .add_enabled(apply_enabled, egui::Button::new("Apply Volume"))
+                    .clicked()
+                {
+                    self.apply_volume();
+                }
+                if self.volume_rx.is_some() {
+                    ui.spinner();
+                }
             });
             ui.add_space(6.0);
 
@@ -467,6 +530,17 @@ impl eframe::App for SairplayApp {
     }
 }
 
+fn parse_volume_text(value: &str) -> Result<Option<u8>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    match value.parse::<u8>() {
+        Ok(volume) if volume <= 100 => Ok(Some(volume)),
+        _ => Err("Receiver volume must be 0–100 or blank".into()),
+    }
+}
+
 fn preferred_service_address(service: &DiscoveredService) -> String {
     service
         .addresses
@@ -513,6 +587,16 @@ mod gui_tests {
             addresses: addresses.iter().map(|v| (*v).to_string()).collect(),
             txt: AirPlayTxt::default(),
         }
+    }
+
+    #[test]
+    fn volume_parser_preserves_source_zero_and_blank_semantics() {
+        assert_eq!(parse_volume_text("").unwrap(), None);
+        assert_eq!(parse_volume_text("0").unwrap(), Some(0));
+        assert_eq!(parse_volume_text("50").unwrap(), Some(50));
+        assert_eq!(parse_volume_text("100").unwrap(), Some(100));
+        assert!(parse_volume_text("101").is_err());
+        assert!(parse_volume_text("-1").is_err());
     }
 
     #[test]
