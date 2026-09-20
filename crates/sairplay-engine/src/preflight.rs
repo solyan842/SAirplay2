@@ -94,7 +94,8 @@ impl Ap2PreflightClient {
             .set_write_timeout(Some(self.exchange_timeout))
             .map_err(PreflightError::Configure)?;
 
-        let cseq = 1u32;
+        // Source-native client starts its RTSP counter at zero.
+        let cseq = 0u32;
         let request = RtspRequest::get_info(
             cseq,
             self.dacp_id.clone(),
@@ -190,13 +191,13 @@ mod tests {
             let n = socket.read(&mut req).unwrap();
             let req_text = String::from_utf8_lossy(&req[..n]);
             assert!(req_text.starts_with("GET /info RTSP/1.0\r\n"));
-            assert!(req_text.contains("CSeq: 1\r\n"));
+            assert!(req_text.contains("CSeq: 0\r\n"));
 
             let stale = response(99, b"stale");
             socket.write_all(&stale[..11]).unwrap();
             socket.write_all(&stale[11..]).unwrap();
 
-            let current = response(1, &info_body());
+            let current = response(0, &info_body());
             let split = current.len() / 2;
             socket.write_all(&current[..split]).unwrap();
             socket.write_all(&current[split..]).unwrap();
@@ -209,7 +210,7 @@ mod tests {
             .get_info("127.0.0.1", addr.port())
             .expect("preflight");
 
-        assert_eq!(result.response.cseq(), Some(1));
+        assert_eq!(result.response.cseq(), Some(0));
         assert!(result.info.realtime.known);
         assert!(result.info.realtime.extended);
         assert!(result.info.realtime.advertises(crate::ALAC_44100_16_2));
