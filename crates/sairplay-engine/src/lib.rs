@@ -26,6 +26,7 @@ pub mod media_handshake;
 pub mod rtp_packets;
 pub mod audio_packet;
 pub mod media_sender;
+pub mod pcm_chunker;
 pub mod alac_encoder;
 
 pub use ap2_info::{Ap2Info, Ap2InfoError, AudioFormatCapability, ALAC_44100_16_2};
@@ -58,3 +59,4 @@ pub use rtp_packets::{build_ntp_sync_packet, build_rtp_header, NtpSyncPacketArgs
 pub use audio_packet::{build_audio_nonce, build_encrypted_realtime_packet, AudioPacketError};
 pub use media_sender::{RealtimeMediaSender, MediaSendError, MediaSendResult};
 pub use alac_encoder::{encode_alac_16_stereo_352, AlacEncodeError, ALAC_PCM_BYTES_PER_FRAME, ALAC_PCM_PACKET_BYTES, ALAC_FRAMES_PER_PACKET};
+pub use pcm_chunker::{Pcm352Chunker, PCM352_PACKET_BYTES};
