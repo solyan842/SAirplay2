@@ -237,6 +237,22 @@ impl PtpEngine {
         self.clock.is_follow_locked()
     }
 
+    pub fn settle(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let follow_decided = self
+                .clock
+                .follow
+                .lock()
+                .ok()
+                .is_some_and(|f| !f.enabled || (f.clock_id.is_some() && f.offset_ns.is_some()));
+            if follow_decided {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     pub fn set_peers(&self, peers: &[IpAddr]) {
         if let Ok(mut slot) = self.peers.lock() {
             slot.clear();
