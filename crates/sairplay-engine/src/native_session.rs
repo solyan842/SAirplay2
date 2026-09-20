@@ -269,6 +269,19 @@ impl NativeSession {
         let media = prepare_realtime_media(&mut flow, &mut control, &media)
             .map_err(|e| NativeSessionError::Media(format!("{e:?}")))?;
 
+        // Upstream clamps the configured lead into the receiver-reported
+        // latency window immediately after Stream SETUP.
+        let requested_lead = config.lead_frames;
+        let min_frames = media.latency_min.unwrap_or(0);
+        let max_frames = media.latency_max.unwrap_or(requested_lead);
+        let effective_lead_frames = if requested_lead < min_frames {
+            min_frames
+        } else if requested_lead > max_frames {
+            max_frames
+        } else {
+            requested_lead
+        };
+
         // 6) PTP only: upstream sends SETPEERS as the next RTSP exchange,
         // then hands the exact same [receiver, us] list to the timing engine and
         // kicks timing immediately. NTP sessions skip this exchange.
@@ -323,7 +336,7 @@ impl NativeSession {
             _ptp_timing: ptp_timing,
             _event: event,
             sender: Some(sender),
-            lead_frames: config.lead_frames,
+            lead_frames: effective_lead_frames,
             #[cfg(windows)]
             audio_worker: None,
         })
