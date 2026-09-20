@@ -4,6 +4,7 @@ use crate::{
     NtpSyncPacketArgs, PtpSyncPacketArgs, RtpState,
     ALAC_PCM_PACKET_BYTES, FRAMES_PER_PACKET_44100,
 };
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub enum MediaSendError {
@@ -42,6 +43,10 @@ pub struct RealtimeMediaSender {
     timing: RealtimeTiming,
     ptp_anchor_wall0: Option<u64>,
     ptp_anchor_pos0: u32,
+    head_ts: u64,
+    pacing_window_frames: u64,
+    pace_last_release: Option<Instant>,
+    pacing_enabled: bool,
 }
 
 impl RealtimeMediaSender {
@@ -53,6 +58,10 @@ impl RealtimeMediaSender {
             timing: RealtimeTiming::Ntp,
             ptp_anchor_wall0: None,
             ptp_anchor_pos0: state.timestamp,
+            head_ts: state.timestamp as u64,
+            pacing_window_frames: 0,
+            pace_last_release: None,
+            pacing_enabled: false,
         }
     }
 
@@ -69,7 +78,82 @@ impl RealtimeMediaSender {
             timing: RealtimeTiming::Ptp { clock_id },
             ptp_anchor_wall0: None,
             ptp_anchor_pos0: state.timestamp,
+            head_ts: state.timestamp as u64,
+            pacing_window_frames: 0,
+            pace_last_release: None,
+            pacing_enabled: false,
         }
+    }
+
+    pub fn configure_source_timeline(
+        &mut self,
+        start_ntp: u64,
+        head_ts: u64,
+        latency_max: Option<u32>,
+        lead_frames: u32,
+    ) {
+        const PACING_MARGIN_FRAMES: u64 = 11_025; // 250 ms @ 44.1 kHz
+        const DEFAULT_BUFFER_WINDOW: u64 = 77_175; // (2000 - 250) ms
+        const SPLICE_DEPTH_FRAMES: u64 = 26_460; // 600 ms
+
+        let reported = latency_max
+            .map(|v| v as u64)
+            .filter(|v| *v > PACING_MARGIN_FRAMES);
+        let receiver_window = reported
+            .map(|v| v - PACING_MARGIN_FRAMES)
+            .unwrap_or(DEFAULT_BUFFER_WINDOW);
+
+        self.head_ts = head_ts;
+        self.pacing_window_frames = receiver_window.min(SPLICE_DEPTH_FRAMES);
+        self.pace_last_release = None;
+        self.pacing_enabled = true;
+
+        if matches!(self.timing, RealtimeTiming::Ptp { .. }) {
+            let lead_ns = frames_to_ns(lead_frames);
+            self.ptp_anchor_wall0 =
+                Some(ntp_fixed_to_unix_ns(start_ntp).saturating_sub(lead_ns));
+            self.ptp_anchor_pos0 = self.state.timestamp;
+        }
+    }
+
+    pub fn can_accept_frames(&mut self, now_ntp: u64) -> bool {
+        if !self.pacing_enabled {
+            return true;
+        }
+
+        let now_ts = ntp_to_frames(now_ntp, 44_100);
+        if now_ts.saturating_add(self.pacing_window_frames) < self.head_ts {
+            return false;
+        }
+
+        let now = Instant::now();
+        if let Some(last) = self.pace_last_release {
+            if now.duration_since(last) < Duration::from_micros(1_000) {
+                return false;
+            }
+        }
+        self.pace_last_release = Some(now);
+        true
+    }
+
+    pub fn prime_ptp_anchor(
+        &mut self,
+        ntp_time: u64,
+        lead_frames: u32,
+    ) -> Result<bool, MediaSendError> {
+        if !matches!(self.timing, RealtimeTiming::Ptp { .. }) {
+            return Ok(false);
+        }
+        self.send_sync_packet(ntp_time, lead_frames, true)?;
+        Ok(true)
+    }
+
+    pub fn head_ts(&self) -> u64 {
+        self.head_ts
+    }
+
+    pub fn pacing_window_frames(&self) -> u64 {
+        self.pacing_window_frames
     }
 
     pub fn state(&self) -> RtpState {
@@ -109,44 +193,7 @@ impl RealtimeMediaSender {
         let should_sync = self.state.first_packet || (!self.state.first_packet && self.state.sequence % 100 == 0);
 
         if should_sync {
-            match self.timing {
-                RealtimeTiming::Ntp => {
-                    let play_position = self.state.timestamp.saturating_sub(lead_frames);
-                    let sync = build_ntp_sync_packet(NtpSyncPacketArgs {
-                        first: self.state.first_packet,
-                        play_position,
-                        ntp_time,
-                        rtp_timestamp: self.state.timestamp,
-                    });
-                    self.transport.send_control(&sync)?;
-                }
-                RealtimeTiming::Ptp { clock_id } => {
-                    let wall_time_ns = ntp_fixed_to_unix_ns(ntp_time);
-                    let wall0 = *self.ptp_anchor_wall0.get_or_insert(wall_time_ns);
-                    if self.state.first_packet {
-                        self.ptp_anchor_pos0 = self.state.timestamp;
-                    }
-
-                    let wall_delta_ns = wall_time_ns as i128 - wall0 as i128;
-                    let lead_ns = (lead_frames as i128 * 1_000_000_000i128)
-                        / 44_100i128;
-                    let elapsed_ns = wall_delta_ns - lead_ns;
-                    let elapsed_frames = (elapsed_ns * 44_100i128) / 1_000_000_000i128;
-                    let play_pos = self.ptp_anchor_pos0.wrapping_add(elapsed_frames as u32);
-
-                    // Source/owntone realtime PTP anchor geometry.
-                    let frame_1 = play_pos.wrapping_add(11_035);
-                    let frame_2 = frame_1.wrapping_add(77_175);
-                    let sync = build_ptp_sync_packet(PtpSyncPacketArgs {
-                        first: self.state.first_packet,
-                        frame_1,
-                        wall_time_ns,
-                        frame_2,
-                        clock_id,
-                    });
-                    self.transport.send_control(&sync)?;
-                }
-            }
+            self.send_sync_packet(ntp_time, lead_frames, self.state.first_packet)?;
         }
 
         let sequence_sent = self.state.sequence;
@@ -155,6 +202,7 @@ impl RealtimeMediaSender {
         self.transport.send_data(&packet)?;
 
         self.state.advance(FRAMES_PER_PACKET_44100);
+        self.head_ts = self.head_ts.wrapping_add(FRAMES_PER_PACKET_44100 as u64);
 
         Ok(MediaSendResult {
             sequence_sent,
@@ -162,8 +210,64 @@ impl RealtimeMediaSender {
             sync_sent: should_sync,
         })
     }
+
+    fn send_sync_packet(
+        &mut self,
+        ntp_time: u64,
+        lead_frames: u32,
+        first: bool,
+    ) -> Result<(), MediaSendError> {
+        match self.timing {
+            RealtimeTiming::Ntp => {
+                let play_position = self.state.timestamp.saturating_sub(lead_frames);
+                let sync = build_ntp_sync_packet(NtpSyncPacketArgs {
+                    first,
+                    play_position,
+                    ntp_time,
+                    rtp_timestamp: self.state.timestamp,
+                });
+                self.transport.send_control(&sync)?;
+            }
+            RealtimeTiming::Ptp { clock_id } => {
+                let wall_time_ns = ntp_fixed_to_unix_ns(ntp_time);
+                let wall0 = *self.ptp_anchor_wall0.get_or_insert(wall_time_ns);
+                if first && self.ptp_anchor_wall0 == Some(wall_time_ns) {
+                    self.ptp_anchor_pos0 = self.state.timestamp;
+                }
+
+                let wall_delta_ns = wall_time_ns as i128 - wall0 as i128;
+                let lead_ns = frames_to_ns(lead_frames) as i128;
+                let elapsed_ns = wall_delta_ns - lead_ns;
+                let elapsed_frames = (elapsed_ns * 44_100i128) / 1_000_000_000i128;
+                let play_pos = self.ptp_anchor_pos0.wrapping_add(elapsed_frames as u32);
+
+                let frame_1 = play_pos.wrapping_add(11_035);
+                let frame_2 = frame_1.wrapping_add(77_175);
+                let sync = build_ptp_sync_packet(PtpSyncPacketArgs {
+                    first,
+                    frame_1,
+                    wall_time_ns,
+                    frame_2,
+                    clock_id,
+                });
+                self.transport.send_control(&sync)?;
+            }
+        }
+        Ok(())
+    }
 }
 
+
+fn frames_to_ns(frames: u32) -> u64 {
+    ((frames as u128 * 1_000_000_000u128) / 44_100u128) as u64
+}
+
+fn ntp_to_frames(ntp: u64, sample_rate: u64) -> u64 {
+    let sec = ntp >> 32;
+    let frac = ntp & 0xFFFF_FFFF;
+    sec.saturating_mul(sample_rate)
+        .saturating_add(((frac as u128 * sample_rate as u128) >> 32) as u64)
+}
 
 fn ntp_fixed_to_unix_ns(ntp: u64) -> u64 {
     const NTP_UNIX_EPOCH_DELTA: u64 = 2_208_988_800;
