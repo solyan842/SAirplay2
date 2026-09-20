@@ -5,6 +5,7 @@ pub mod mdns_browser;
 pub mod native_preflight;
 pub mod pcm_ring;
 pub mod route;
+pub mod rtsp;
 pub mod session;
 pub mod timeline;
 
@@ -15,5 +16,6 @@ pub use mdns_browser::{DiscoveredService, DiscoveryEvent, MdnsBrowser, ServiceKi
 pub use native_preflight::{NativeConnectError, NativeConnectFlow, NativePhase};
 pub use pcm_ring::PcmRing;
 pub use route::{ReceiverCapabilities, Route, RouteResolver};
+pub use rtsp::{RtspCodec, RtspError, RtspRequest, RtspResponse};
 pub use session::{EngineCommand, EngineEvent, EngineState, SessionCore};
 pub use timeline::{Boundary, SplicePlan, Timeline, TimelineError};
