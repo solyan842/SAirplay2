@@ -121,6 +121,23 @@ impl EncryptedRtspChannel {
         }
     }
 
+    pub fn write_only_with_timeout(
+        &mut self,
+        request: &[u8],
+        timeout: Duration,
+    ) -> Result<(), EncryptedRtspError> {
+        let wire = self.cipher.encrypt(request)?;
+        self.stream
+            .set_write_timeout(Some(timeout))
+            .map_err(EncryptedRtspError::Write)?;
+        let result = self
+            .stream
+            .write_all(&wire)
+            .map_err(EncryptedRtspError::Write);
+        let _ = self.stream.set_write_timeout(Some(self.exchange_timeout));
+        result
+    }
+
     pub fn pending_responses(&self) -> usize {
         self.pending.len()
     }
