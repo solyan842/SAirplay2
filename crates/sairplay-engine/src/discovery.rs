@@ -99,6 +99,18 @@ impl AirPlayTxt {
         self.encryption_types.iter().any(|v| v == "4")
     }
 
+    pub fn is_apple_model(&self) -> bool {
+        let model = self
+            .fields
+            .get("model")
+            .or_else(|| self.fields.get("am"))
+            .map(String::as_str)
+            .unwrap_or("");
+        ["AppleTV", "AudioAccessory", "iPhone", "iPad", "iPod", "Mac"]
+            .iter()
+            .any(|prefix| model.starts_with(prefix))
+    }
+
     pub fn follows_receiver_clock(&self) -> bool {
         // Port of ap2_follow_receiver_clock() from the pinned primary source:
         // standalone AudioAccessory group leader, no parent/stereo group, OS 27+.
