@@ -141,9 +141,10 @@ impl NativeSession {
             .port()
             .map_err(NativeSessionError::LocalAddress)?;
 
-        // Pairing uses CSeq 1/2. Encrypted control resumes at 3.
+        // Source keeps RTSP CSeq independent from the HAP pair-setup CSeqs:
+        // GET /info consumes RTSP CSeq 0, so encrypted control resumes at 1.
         let setup = NtpSessionSetupConfig {
-            cseq: 3,
+            cseq: 1,
             session_uri: session_uri.clone(),
             session_uuid,
             device_id: dacp_device_id(&config.dacp_id),
@@ -166,7 +167,7 @@ impl NativeSession {
 
         // 4) RECORD before realtime stream SETUP.
         let record = RecordConfig {
-            cseq: 4,
+            cseq: 2,
             session_uri: session_uri.clone(),
             dacp_id: config.dacp_id.clone(),
             active_remote: config.active_remote.clone(),
@@ -178,7 +179,7 @@ impl NativeSession {
         let media = MediaHandshakeConfig {
             bind_ip: local_addr.ip(),
             receiver_ip,
-            cseq: 5,
+            cseq: 3,
             session_uri,
             dacp_id: config.dacp_id.clone(),
             active_remote: config.active_remote.clone(),
