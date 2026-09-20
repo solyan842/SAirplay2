@@ -3,13 +3,14 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const EVENT_PORT: u16 = 319;
 const GENERAL_PORT: u16 = 320;
+const MCAST_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 1, 129);
 const HDR_LEN: usize = 34;
 
 const MSG_SYNC: u8 = 0x0;
@@ -54,14 +55,21 @@ pub struct PtpEngine {
     running: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     clock_id: u64,
+    peers: Arc<Mutex<Vec<Ipv4Addr>>>,
+    peer_kick: Arc<AtomicBool>,
 }
 
 impl PtpEngine {
     pub fn start(
         receiver_ip: IpAddr,
+        bind_ip: IpAddr,
         clock_id: u64,
     ) -> Result<Self, PtpEngineError> {
-        let receiver = match receiver_ip {
+        let _receiver = match receiver_ip {
+            IpAddr::V4(ip) => ip,
+            IpAddr::V6(_) => return Err(PtpEngineError::Ipv4Required),
+        };
+        let bind_interface = match bind_ip {
             IpAddr::V4(ip) => ip,
             IpAddr::V6(_) => return Err(PtpEngineError::Ipv4Required),
         };
@@ -78,16 +86,27 @@ impl PtpEngine {
 
         event.set_nonblocking(true).map_err(PtpEngineError::Configure)?;
         general.set_nonblocking(true).map_err(PtpEngineError::Configure)?;
-        event.set_multicast_ttl_v4(1).map_err(PtpEngineError::Configure)?;
-        general.set_multicast_ttl_v4(1).map_err(PtpEngineError::Configure)?;
+
+        // Match upstream ptp_open_socket(): multicast membership is best-effort,
+        // while bind failure itself is what triggers NTP fallback.
+        let _ = event.join_multicast_v4(&MCAST_ADDR, &bind_interface);
+        let _ = general.join_multicast_v4(&MCAST_ADDR, &bind_interface);
+        let _ = event.set_multicast_ttl_v4(1);
+        let _ = general.set_multicast_ttl_v4(1);
+        let _ = event.set_multicast_loop_v4(false);
+        let _ = general.set_multicast_loop_v4(false);
 
         let running = Arc::new(AtomicBool::new(true));
         let running_thread = Arc::clone(&running);
+        let peers = Arc::new(Mutex::new(Vec::<Ipv4Addr>::new()));
+        let peers_thread = Arc::clone(&peers);
+        let peer_kick = Arc::new(AtomicBool::new(false));
+        let kick_thread = Arc::clone(&peer_kick);
 
         let worker = thread::Builder::new()
             .name("sairplay-ptp".into())
             .spawn(move || {
-                run_ptp_loop(event, general, receiver, clock_id, running_thread);
+                run_ptp_loop(event, general, clock_id, running_thread, peers_thread, kick_thread);
             })
             .map_err(PtpEngineError::Spawn)?;
 
@@ -95,11 +114,27 @@ impl PtpEngine {
             running,
             worker: Some(worker),
             clock_id,
+            peers,
+            peer_kick,
         })
     }
 
     pub fn clock_id(&self) -> u64 {
         self.clock_id
+    }
+
+    pub fn set_peers(&self, peers: &[IpAddr]) {
+        if let Ok(mut slot) = self.peers.lock() {
+            slot.clear();
+            for peer in peers {
+                if let IpAddr::V4(ip) = peer {
+                    if !slot.contains(ip) {
+                        slot.push(*ip);
+                    }
+                }
+            }
+            self.peer_kick.store(!slot.is_empty(), Ordering::SeqCst);
+        }
     }
 
     pub fn stop(&mut self) {
@@ -119,9 +154,10 @@ impl Drop for PtpEngine {
 fn run_ptp_loop(
     event: UdpSocket,
     general: UdpSocket,
-    receiver: Ipv4Addr,
     clock_id: u64,
     running: Arc<AtomicBool>,
+    peers: Arc<Mutex<Vec<Ipv4Addr>>>,
+    peer_kick: Arc<AtomicBool>,
 ) {
     let mut sync_seq = 0u16;
     let mut announce_seq = 0u16;
@@ -132,23 +168,24 @@ fn run_ptp_loop(
 
     while running.load(Ordering::SeqCst) {
         let now = Instant::now();
+        let kick = peer_kick.swap(false, Ordering::SeqCst);
 
-        if now >= next_sync {
-            send_sync_pair(&event, &general, receiver, clock_id, sync_seq);
+        if kick || now >= next_sync {
+            send_sync_pair(&event, &general, &peers, clock_id, sync_seq);
             sync_seq = sync_seq.wrapping_add(1);
             next_sync = now + Duration::from_millis(125);
         }
 
-        if now >= next_announce {
+        if kick || now >= next_announce {
             let packet = build_announce(clock_id, announce_seq);
-            let _ = general.send_to(&packet, (receiver, GENERAL_PORT));
+            send_ptp(&general, GENERAL_PORT, &packet, &peers);
             announce_seq = announce_seq.wrapping_add(1);
             next_announce = now + Duration::from_secs(1);
         }
 
-        if now >= next_signaling {
+        if kick || now >= next_signaling {
             let packet = build_sender_signaling(clock_id, signaling_seq);
-            let _ = general.send_to(&packet, (receiver, GENERAL_PORT));
+            send_ptp(&general, GENERAL_PORT, &packet, &peers);
             signaling_seq = signaling_seq.wrapping_add(1);
             next_signaling = now + Duration::from_secs(1);
         }
@@ -156,6 +193,17 @@ fn run_ptp_loop(
         drain_socket(&event, &event, &general, clock_id);
         drain_socket(&general, &event, &general, clock_id);
         thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn send_ptp(socket: &UdpSocket, port: u16, packet: &[u8], peers: &Arc<Mutex<Vec<Ipv4Addr>>>) {
+    let snapshot = peers.lock().map(|p| p.clone()).unwrap_or_default();
+    if snapshot.is_empty() {
+        let _ = socket.send_to(packet, (MCAST_ADDR, port));
+    } else {
+        for peer in snapshot {
+            let _ = socket.send_to(packet, (peer, port));
+        }
     }
 }
 
@@ -271,7 +319,7 @@ fn build_announce(clock_id: u64, sequence: u16) -> Vec<u8> {
 fn send_sync_pair(
     event: &UdpSocket,
     general: &UdpSocket,
-    receiver: Ipv4Addr,
+    peers: &Arc<Mutex<Vec<Ipv4Addr>>>,
     clock_id: u64,
     sequence: u16,
 ) {
@@ -287,7 +335,7 @@ fn send_sync_pair(
         0,
         -3,
     );
-    let _ = event.send_to(&sync, (receiver, EVENT_PORT));
+    send_ptp(event, EVENT_PORT, &sync, peers);
 
     let egress = now_unix_ns();
     let flen = HDR_LEN + 10 + 32 + 20;
@@ -312,7 +360,7 @@ fn send_sync_pair(
     follow[o + 4..o + 10].copy_from_slice(&[0x00, 0x0D, 0x93, 0x00, 0x00, 0x04]);
     follow[o + 10..o + 18].copy_from_slice(&clock_id.to_be_bytes());
 
-    let _ = general.send_to(&follow, (receiver, GENERAL_PORT));
+    send_ptp(general, GENERAL_PORT, &follow, peers);
 }
 
 fn build_delay_resp(req: &[u8], clock_id: u64, rx_ns: u64) -> Vec<u8> {
