@@ -228,7 +228,7 @@ mod tests {
             let mut req = [0u8; 1024];
             let _ = socket.read(&mut req).unwrap();
             socket
-                .write_all(b"RTSP/1.0 401 Unauthorized\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n")
+                .write_all(b"RTSP/1.0 401 Unauthorized\r\nCSeq: 0\r\nContent-Length: 0\r\n\r\n")
                 .unwrap();
         });
 
