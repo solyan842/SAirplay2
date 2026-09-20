@@ -28,6 +28,7 @@ pub struct NativeSessionConfig {
     pub lead_frames: u32,
     pub supports_ptp: bool,
     pub follow_receiver_clock: bool,
+    pub apple_model: bool,
     pub receiver_name: String,
 }
 
@@ -42,6 +43,7 @@ impl NativeSessionConfig {
             lead_frames: 11_025,
             supports_ptp: false,
             follow_receiver_clock: false,
+            apple_model: false,
             receiver_name: "SAirplay2 Receiver".into(),
         }
     }
@@ -327,12 +329,20 @@ impl NativeSession {
         )
         .map_err(NativeSessionError::Feedback)?;
 
-        // START(0) source contract: choose the earliest feasible instant.
-        // Until clock-readiness parity below is connected, the local floor is
-        // the source's AP2_MIN_WARM_LEAD_MS = 250 ms.
+        // START(0) source contract: begin at the feasibility floor.
+        // Base floor is now + 250 ms. A live PTP receiver probe streak can
+        // raise it to the clock-servo readiness instant; Apple receivers use
+        // the source's observed fast-seat bound after the third exchange.
         let now_ntp = system_time_to_ntp(SystemTime::now())
             .map_err(|e| NativeSessionError::Timing(format!("{e:?}")))?;
-        let start_ntp = now_ntp.saturating_add(ms_to_ntp(250));
+        let mut floor_delay_ms = 250u64;
+        if let Some(engine) = ptp_timing.as_ref() {
+            if let Some(exchange) = engine.peer_exchange() {
+                let readiness = clock_ready_delay_ms(exchange, config.apple_model);
+                floor_delay_ms = floor_delay_ms.max(readiness);
+            }
+        }
+        let start_ntp = now_ntp.saturating_add(ms_to_ntp(floor_delay_ms));
         let head_ts = ntp_to_frames(start_ntp, 44_100);
 
         // Source native START derives the wire timeline from process identity:
@@ -490,6 +500,20 @@ impl Drop for NativeSession {
     }
 }
 
+fn clock_ready_delay_ms(exchange: crate::PtpExchange, apple_model: bool) -> u64 {
+    const CLOCK_LOCK_MS: u64 = 2300;
+    const CLOCK_SETTLE_MS: u64 = 250;
+    const CLOCK_SEAT_EXCHANGES: u32 = 3;
+
+    let full = CLOCK_LOCK_MS.saturating_sub(exchange.first_ms);
+    if apple_model && exchange.count >= CLOCK_SEAT_EXCHANGES {
+        let fast = CLOCK_SETTLE_MS.saturating_sub(exchange.third_ms);
+        full.min(fast)
+    } else {
+        full
+    }
+}
+
 fn ms_to_ntp(ms: u64) -> u64 {
     ((ms as u128) << 32).div_ceil(1000) as u64
 }
@@ -557,6 +581,27 @@ mod tests {
     use super::*;
     use rand::{rngs::StdRng, SeedableRng};
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn clock_readiness_matches_source_bounds() {
+        let ex = crate::PtpExchange {
+            count: 1,
+            first_ms: 900,
+            last_ms: 0,
+            third_ms: 0,
+        };
+        assert_eq!(clock_ready_delay_ms(ex, false), 1400);
+        assert_eq!(clock_ready_delay_ms(ex, true), 1400);
+
+        let apple = crate::PtpExchange {
+            count: 3,
+            first_ms: 1200,
+            last_ms: 0,
+            third_ms: 100,
+        };
+        assert_eq!(clock_ready_delay_ms(apple, true), 150);
+        assert_eq!(clock_ready_delay_ms(apple, false), 1100);
+    }
 
     #[test]
     fn session_uri_uses_source_shape_and_ipv6_brackets() {
