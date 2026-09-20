@@ -14,6 +14,7 @@ pub mod route;
 pub mod rtsp;
 pub mod session;
 pub mod timeline;
+pub mod timing_policy;
 
 pub use ap2_info::{Ap2Info, Ap2InfoError, AudioFormatCapability, ALAC_44100_16_2};
 pub use catalog::{DeviceCatalog, DeviceRecord};
@@ -31,3 +32,5 @@ pub use route::{ReceiverCapabilities, Route, RouteResolver};
 pub use rtsp::{RtspCodec, RtspError, RtspRequest, RtspResponse};
 pub use session::{EngineCommand, EngineEvent, EngineState, SessionCore};
 pub use timeline::{Boundary, SplicePlan, Timeline, TimelineError};
+
+pub use timing_policy::{TimingDecision, TimingMode, TimingPreference, TimingReadiness, TimingStartResult};
