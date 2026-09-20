@@ -208,6 +208,8 @@ impl SairplayApp {
         // unless a later UI explicitly supplies them.
         config.dacp_id = "A1B2C3D4E5F60708".into();
         config.active_remote = "123456789".into();
+        config.supports_ptp = service.txt.supports_ptp();
+        config.receiver_name = name.clone();
 
         let (tx, rx) = mpsc::sync_channel(1);
         self.connect_rx = Some(rx);
