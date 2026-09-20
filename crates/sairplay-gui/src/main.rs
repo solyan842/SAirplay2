@@ -1,8 +1,9 @@
 use eframe::egui;
 use sairplay_engine::{
-    DeviceCatalog, DiscoveryEvent, MdnsBrowser, NativeSession, NativeSessionConfig, Route,
-    ServiceKind,
+    DeviceCatalog, DiscoveredService, DiscoveryEvent, MdnsBrowser, NativeSession,
+    NativeSessionConfig, Route, ServiceKind,
 };
+use std::net::IpAddr;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
@@ -185,11 +186,7 @@ impl SairplayApp {
             return;
         };
 
-        let host = service
-            .addresses
-            .first()
-            .cloned()
-            .unwrap_or_else(|| service.host.clone());
+        let host = preferred_service_address(service);
         let name = device.display_name.clone();
         let port = service.port;
 
@@ -240,7 +237,7 @@ impl SairplayApp {
             PlaybackUiState::Idle => "Idle".into(),
             PlaybackUiState::Connecting(name) => format!("Preparing · {name}"),
             PlaybackUiState::Playing(name) => format!("Playing · {name}"),
-            PlaybackUiState::Error(error) => format!("Error · {error}"),
+            PlaybackUiState::Error(_) => "Error".into(),
         }
     }
 }
@@ -264,6 +261,23 @@ impl eframe::App for SairplayApp {
                 ui.strong(if self.discovery.is_some() { "Running" } else { "Unavailable" });
             });
 
+            if let PlaybackUiState::Error(error) = &self.playback {
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong("Last error:");
+                    if ui.button("Copy Error").clicked() {
+                        ui.ctx().copy_text(error.clone());
+                    }
+                });
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(error).monospace()
+                    )
+                    .selectable(true)
+                    .wrap(),
+                );
+            }
+
             ui.add_space(8.0);
             ui.heading("Receivers");
 
@@ -285,9 +299,10 @@ impl eframe::App for SairplayApp {
                         for device in &devices {
                             let route = device.route(false, false);
                             let address = device
-                                .addresses()
-                                .into_iter()
-                                .next()
+                                .airplay
+                                .as_ref()
+                                .map(preferred_service_address)
+                                .or_else(|| device.raop.as_ref().map(preferred_service_address))
                                 .unwrap_or_else(|| "-".into());
                             let services = match (device.airplay.is_some(), device.raop.is_some()) {
                                 (true, true) => "AirPlay + RAOP",
@@ -358,14 +373,85 @@ impl eframe::App for SairplayApp {
             );
 
             ui.separator();
-            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                for line in self.log.iter().rev().take(60).rev() {
-                    ui.monospace(line);
+            ui.horizontal(|ui| {
+                ui.strong("Log");
+                if ui.button("Copy Log").clicked() {
+                    ui.ctx().copy_text(self.log.join("\n"));
+                }
+            });
+            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                for line in self.log.iter().rev().take(80).rev() {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(line).monospace())
+                            .selectable(true)
+                            .wrap(),
+                    );
                 }
             });
         });
 
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+}
+
+fn preferred_service_address(service: &DiscoveredService) -> String {
+    service
+        .addresses
+        .iter()
+        .filter_map(|raw| raw.parse::<IpAddr>().ok().map(|ip| (address_rank(ip), raw)))
+        .min_by_key(|(rank, _)| *rank)
+        .and_then(|(rank, raw)| {
+            // Link-local/loopback addresses are not valid receiver targets for
+            // a normal LAN session. Let the mDNS hostname resolve instead.
+            (rank < 40).then(|| raw.clone())
+        })
+        .unwrap_or_else(|| service.host.trim_end_matches('.').to_string())
+}
+
+fn address_rank(ip: IpAddr) -> u8 {
+    match ip {
+        IpAddr::V4(ip) if ip.is_private() && !ip.is_link_local() => 0,
+        IpAddr::V4(ip)
+            if !ip.is_link_local() && !ip.is_loopback() && !ip.is_unspecified() =>
+        {
+            10
+        }
+        IpAddr::V6(ip)
+            if !ip.is_unicast_link_local() && !ip.is_loopback() && !ip.is_unspecified() =>
+        {
+            20
+        }
+        _ => 40,
+    }
+}
+
+#[cfg(test)]
+mod gui_tests {
+    use super::*;
+    use sairplay_engine::AirPlayTxt;
+
+    fn service(addresses: &[&str]) -> DiscoveredService {
+        DiscoveredService {
+            kind: ServiceKind::AirPlay,
+            fullname: "Test._airplay._tcp.local.".into(),
+            display_name: "Test".into(),
+            host: "Test.local.".into(),
+            port: 7000,
+            addresses: addresses.iter().map(|v| (*v).to_string()).collect(),
+            txt: AirPlayTxt::default(),
+        }
+    }
+
+    #[test]
+    fn lan_ipv4_beats_windows_link_local_address() {
+        let s = service(&["169.254.2.72", "192.168.88.72"]);
+        assert_eq!(preferred_service_address(&s), "192.168.88.72");
+    }
+
+    #[test]
+    fn hostname_is_used_when_only_link_local_addresses_exist() {
+        let s = service(&["169.254.2.72"]);
+        assert_eq!(preferred_service_address(&s), "Test.local");
     }
 }
 
