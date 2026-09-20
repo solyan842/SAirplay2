@@ -25,6 +25,7 @@ pub mod media_transport;
 pub mod media_handshake;
 pub mod rtp_packets;
 pub mod audio_packet;
+pub mod media_sender;
 
 pub use ap2_info::{Ap2Info, Ap2InfoError, AudioFormatCapability, ALAC_44100_16_2};
 pub use catalog::{DeviceCatalog, DeviceRecord};
@@ -54,3 +55,4 @@ pub use media_transport::{MediaTransport, MediaTransportError, MediaTransportPor
 pub use media_handshake::{prepare_realtime_media, MediaHandshakeConfig, MediaHandshakeError, MediaHandshakeResult};
 pub use rtp_packets::{build_ntp_sync_packet, build_rtp_header, NtpSyncPacketArgs, RtpState};
 pub use audio_packet::{build_audio_nonce, build_encrypted_realtime_packet, AudioPacketError};
+pub use media_sender::{RealtimeMediaSender, MediaSendError, MediaSendResult};
