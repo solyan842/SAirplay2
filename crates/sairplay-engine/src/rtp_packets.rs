@@ -71,8 +71,10 @@ pub fn build_ntp_sync_packet(args: NtpSyncPacketArgs) -> [u8; 20] {
     packet[2] = 0x00;
     packet[3] = 0x07;
     packet[4..8].copy_from_slice(&args.play_position.to_be_bytes());
-    packet[8..12].copy_from_slice(&(args.ntp_time >> 32).to_be_bytes()[4..8]);
-    packet[12..16].copy_from_slice(&(args.ntp_time as u32).to_be_bytes());
+    let ntp_seconds = (args.ntp_time >> 32) as u32;
+    let ntp_fraction = args.ntp_time as u32;
+    packet[8..12].copy_from_slice(&ntp_seconds.to_be_bytes());
+    packet[12..16].copy_from_slice(&ntp_fraction.to_be_bytes());
     packet[16..20].copy_from_slice(&args.rtp_timestamp.to_be_bytes());
     packet
 }
