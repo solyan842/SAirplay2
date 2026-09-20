@@ -1,9 +1,9 @@
 use crate::{
     open_event_channel, prepare_realtime_media, send_record, setup_ntp_session,
-    setup_ptp_session, start_ntp_timing_gate, Ap2PreflightClient, EventChannel,
-    FeedbackWorker, MediaHandshakeConfig, NativeConnectFlow, NativePhase,
+    send_setpeers, setup_ptp_session, start_ntp_timing_gate, Ap2PreflightClient,
+    EventChannel, FeedbackWorker, MediaHandshakeConfig, NativeConnectFlow, NativePhase,
     NtpSessionSetupConfig, NtpTimingResponder, PairingError, PreflightError, PtpEngine,
-    PtpSessionSetupConfig, RealtimeMediaSender, RecordConfig, RtpState,
+    PtpSessionSetupConfig, RealtimeMediaSender, RecordConfig, RtpState, SetPeersConfig,
     TransientPairingClient,
 };
 use rand::RngCore;
@@ -165,7 +165,7 @@ impl NativeSession {
         let event_port;
 
         if config.supports_ptp {
-            match PtpEngine::start(receiver_ip, clock_id) {
+            match PtpEngine::start(receiver_ip, local_addr.ip(), clock_id) {
                 Ok(engine) => {
                     // Match source settle window before publishing timingPeerInfo.
                     std::thread::sleep(Duration::from_millis(400));
@@ -260,7 +260,7 @@ impl NativeSession {
             bind_ip: local_addr.ip(),
             receiver_ip,
             cseq: 3,
-            session_uri,
+            session_uri: session_uri.clone(),
             dacp_id: config.dacp_id.clone(),
             active_remote: config.active_remote.clone(),
             audio_secret,
@@ -269,14 +269,34 @@ impl NativeSession {
         let media = prepare_realtime_media(&mut flow, &mut control, &media)
             .map_err(|e| NativeSessionError::Media(format!("{e:?}")))?;
 
-        // Only now is transport ready enough to allow audio capture.
+        // 6) PTP only: upstream sends SETPEERS as the next RTSP exchange,
+        // then hands the exact same [receiver, us] list to the timing engine and
+        // kicks timing immediately. NTP sessions skip this exchange.
+        let next_control_cseq = if let Some(engine) = ptp_timing.as_ref() {
+            let setpeers = SetPeersConfig {
+                cseq: 4,
+                session_uri: session_uri.clone(),
+                receiver_address: receiver_ip.to_string(),
+                local_address: local_addr.ip().to_string(),
+                dacp_id: config.dacp_id.clone(),
+                active_remote: config.active_remote.clone(),
+            };
+            send_setpeers(&mut control, &setpeers)
+                .map_err(|e| NativeSessionError::Media(format!("SETPEERS failed: {e:?}")))?;
+            engine.set_peers(&[receiver_ip, local_addr.ip()]);
+            5
+        } else {
+            4
+        };
+
+        // Only after Stream SETUP (+ SETPEERS for PTP) is the native transport Ready.
         flow.ready()
             .map_err(|e| NativeSessionError::Flow(format!("{e:?}")))?;
 
         // Match source: one encrypted RTSP channel, one global CSeq,
         // and a lock around each complete request/response exchange.
         let control = Arc::new(Mutex::new(control));
-        let next_cseq = Arc::new(AtomicU32::new(4));
+        let next_cseq = Arc::new(AtomicU32::new(next_control_cseq));
         let feedback = FeedbackWorker::start(
             Arc::clone(&control),
             Arc::clone(&next_cseq),
