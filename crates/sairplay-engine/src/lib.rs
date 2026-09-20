@@ -8,6 +8,7 @@ pub mod hap_pairing;
 pub mod hap_rtsp;
 pub mod mdns_browser;
 pub mod native_preflight;
+pub mod native_session;
 pub mod native_timing;
 pub mod pcm_ring;
 pub mod preflight;
@@ -68,3 +69,4 @@ pub use pcm_chunker::{Pcm352Chunker, PCM352_PACKET_BYTES};
 pub use wasapi_loopback::{WasapiLoopbackCapture, WasapiLoopbackError};
 #[cfg(windows)]
 pub use windows_audio_worker::{WindowsAudioWorker, WindowsAudioWorkerError};
+pub use native_session::{NativeSession, NativeSessionConfig, NativeSessionError};
