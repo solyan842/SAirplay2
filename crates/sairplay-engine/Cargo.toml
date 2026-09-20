@@ -7,3 +7,4 @@ authors.workspace = true
 
 [dependencies]
 mdns-sd = "0.21.3"
+plist = "=1.10.1"
