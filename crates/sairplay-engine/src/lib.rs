@@ -18,6 +18,8 @@ pub mod session;
 pub mod timeline;
 pub mod timing_policy;
 pub mod ntp_timing;
+pub mod ptp_engine;
+pub mod ptp_session_setup;
 pub mod ntp_session_setup;
 pub mod event_channel;
 pub mod record;
@@ -70,3 +72,5 @@ pub use wasapi_loopback::{WasapiLoopbackCapture, WasapiLoopbackError};
 #[cfg(windows)]
 pub use windows_audio_worker::{WindowsAudioWorker, WindowsAudioWorkerError};
 pub use native_session::{NativeSession, NativeSessionConfig, NativeSessionError};
+pub use ptp_engine::{PtpEngine, PtpEngineError};
+pub use ptp_session_setup::{build_ptp_session_plist, setup_ptp_session, PtpSessionSetupConfig, PtpSessionSetupError, PtpSessionSetupResult};
