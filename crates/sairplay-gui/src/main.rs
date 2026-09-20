@@ -24,6 +24,7 @@ struct SairplayApp {
     playback: PlaybackUiState,
     connect_rx: Option<Receiver<Result<NativeSession, String>>>,
     session: Option<NativeSession>,
+    initial_volume_text: String,
 }
 
 impl Default for SairplayApp {
@@ -59,6 +60,7 @@ impl Default for SairplayApp {
             playback: PlaybackUiState::Idle,
             connect_rx: None,
             session: None,
+            initial_volume_text: String::new(),
         }
     }
 }
@@ -120,6 +122,13 @@ impl SairplayApp {
                     PlaybackUiState::Connecting(name) => name.clone(),
                     _ => "receiver".into(),
                 };
+
+                if let Some(volume) = session.initial_volume_result() {
+                    self.log.push(format!(
+                        "{name}: receiver volume {}% = {:.2} dB · RTSP {}.",
+                        volume.percent, volume.db, volume.status
+                    ));
+                }
 
                 if session.is_ready() && session.audio_running() {
                     self.log.push(format!("{name}: transport Ready, Windows audio running."));
@@ -214,6 +223,23 @@ impl SairplayApp {
         let name = device.display_name.clone();
         let port = service.port;
 
+        let initial_volume = {
+            let value = self.initial_volume_text.trim();
+            if value.is_empty() {
+                None
+            } else {
+                match value.parse::<u8>() {
+                    Ok(volume) if volume <= 100 => Some(volume),
+                    _ => {
+                        let message = "Initial receiver volume must be 0–100 or blank".to_string();
+                        self.log.push(message.clone());
+                        self.playback = PlaybackUiState::Error(message);
+                        return;
+                    }
+                }
+            }
+        };
+
         let mut config = NativeSessionConfig::new(host.clone(), port);
         // Fixed app identity for the clean alpha path; credentials remain absent
         // unless a later UI explicitly supplies them.
@@ -223,17 +249,21 @@ impl SairplayApp {
         config.follow_receiver_clock = service.txt.follows_receiver_clock();
         config.apple_model = service.txt.is_apple_model();
         config.receiver_name = name.clone();
+        config.initial_volume = initial_volume;
 
         let (tx, rx) = mpsc::sync_channel(1);
         self.connect_rx = Some(rx);
         self.playback = PlaybackUiState::Connecting(name.clone());
         self.session = None;
         self.log.push(format!(
-            "{name}: preflight starting on {host}:{port} · model={} · features=0x{:016X} · PTP={} · follow-clock={} · Playing waits for Ready + audio.",
+            "{name}: preflight starting on {host}:{port} · model={} · features=0x{:016X} · PTP={} · follow-clock={} · initial-volume={} · Playing waits for Ready + audio.",
             service.txt.model.as_deref().unwrap_or("-"),
             service.txt.features,
             service.txt.supports_ptp(),
             service.txt.follows_receiver_clock(),
+            initial_volume
+                .map(|v| format!("{v}%"))
+                .unwrap_or_else(|| "unchanged".into()),
         ));
 
         thread::Builder::new()
@@ -374,6 +404,17 @@ impl eframe::App for SairplayApp {
 
             ui.add_space(12.0);
             ui.separator();
+
+            ui.horizontal(|ui| {
+                ui.label("Initial receiver volume:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.initial_volume_text)
+                        .desired_width(52.0)
+                        .hint_text("0–100"),
+                );
+                ui.label("blank = unchanged");
+            });
+            ui.add_space(6.0);
 
             ui.horizontal(|ui| {
                 let start_enabled = self.selected_fullname.is_some()
