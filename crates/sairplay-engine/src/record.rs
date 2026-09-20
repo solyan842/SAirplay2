@@ -41,7 +41,7 @@ pub fn send_record(
         user_agent: "AirPlay/670.6.2".into(),
         dacp_id: config.dacp_id.clone(),
         active_remote: config.active_remote.clone(),
-        client_instance: Some(config.dacp_id.clone()),
+        client_instance: None,
         content_type: None,
         body: Vec::new(),
     };
