@@ -74,7 +74,7 @@ impl WindowsAudioWorker {
             while running_thread.load(Ordering::SeqCst) {
                 match capture.drain_into(&mut chunker) {
                     Ok(frames) => {
-                        while let Some(packet) = chunker.pop_packet() {
+                        while chunker.has_packet() {
                             let ntp = match system_time_to_ntp(SystemTime::now()) {
                                 Ok(value) => value,
                                 Err(error) => {
@@ -86,6 +86,14 @@ impl WindowsAudioWorker {
                                 }
                             };
 
+                            // Match upstream ap2cl_accept_frames(): keep the PCM
+                            // queued until the source timeline's pacing gate opens.
+                            if !sender.can_accept_frames(ntp) {
+                                thread::sleep(Duration::from_millis(1));
+                                break;
+                            }
+
+                            let packet = chunker.pop_packet().expect("has_packet checked");
                             if let Err(error) = sender.send_pcm_352(&packet, ntp, lead_frames) {
                                 if let Ok(mut slot) = last_error_thread.lock() {
                                     *slot = Some(format!("media send failed: {error:?}"));
