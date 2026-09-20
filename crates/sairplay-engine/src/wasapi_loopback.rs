@@ -1,7 +1,6 @@
 use crate::Pcm352Chunker;
 use std::fmt;
 use std::ptr::null_mut;
-use windows::core::Interface;
 use windows::Win32::Media::Audio::{
     eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
     AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
@@ -44,6 +43,7 @@ impl ComGuard {
     fn enter() -> Result<Self, WasapiLoopbackError> {
         unsafe {
             CoInitializeEx(None, COINIT_MULTITHREADED)
+                .ok()
                 .map_err(|e| WasapiLoopbackError::Windows(format!("CoInitializeEx failed: {e}")))?;
         }
         Ok(Self { initialized: true })
