@@ -12,9 +12,9 @@ Rule: when the primary source already defines native AirPlay 2 behavior, SAirpla
 ## Verification snapshot
 
 - **Primary source:** music-assistant/airplay-cli @ `431c5c582eef9307c4e39c50a0ea65e970bc1128`.
-- **Code head verified:** `fae973329873ea818c99d376226fbcb0a93cd74b`.
-- **Windows CI:** run #310 / `35528932857` — Check PASS, 131 invariant tests PASS, GUI build PASS, artifact upload PASS.
-- **Artifact digest:** `sha256:5c480ece92988442b919193bfd1ca923a1078a8f9b298e684c8570bb52fc2ecc`.
+- **Code head verified:** `24aff961702661502bfe89e178f870adc6dabcd6`.
+- **Windows CI:** run #328 / `35530517923` — Check PASS, invariant tests PASS, GUI build PASS, artifact upload PASS.
+- **Artifact digest:** pending artifact metadata refresh for run #328.
 - **Hardware status:** pending fresh HomePod mini / AirPort Express test on this parity build. CI-PROVEN never means hardware-proven.
 
 ## Audit matrix
@@ -55,7 +55,7 @@ Rule: when the primary source already defines native AirPlay 2 behavior, SAirpla
 | RTP header | PT 96, marker first packet | same | MATCH |
 | Realtime audio crypto | ChaCha20-Poly1305, seq nonce, AAD timestamp+SSRC, nonce suffix | same | MATCH |
 | NTP sync | 20-byte D4 | implemented | MATCH |
-| PTP realtime anchor | 28-byte D7, PTP ns + ClockID + frame geometry | implemented after anchor fix | MATCH for GM clock; follow-clock gap remains |
+| PTP realtime anchor | 28-byte D7, PTP ns + ClockID + frame geometry | Frozen start line uses dynamic PTP master time/ClockID, including receiver-follow mode | **MATCH · CI-PROVEN; HARDWARE-PENDING** |
 | ALAC 16/44.1/352 | fixed realtime encoder | implemented | MATCH target format |
 | Delivery pacing window | latencyMax-250ms or default 1.75s; splice depth rules | Receiver window applied with source 250ms margin and shallow 600ms realtime splice depth | **MATCH current realtime target · CI-PROVEN** |
 | Initial fill spacing | >=1ms packet release spacing | 1ms minimum release spacing in the Windows producer | **MATCH · CI-PROVEN** |
@@ -68,7 +68,7 @@ Rule: when the primary source already defines native AirPlay 2 behavior, SAirpla
 | RTSP serializer | one shared channel + lock + global CSeq | added in latest refactor | MATCH architecture |
 | Late feedback response carry | preserve stream/HAP nonce sequencing | channel preserves encrypted carry/pending stale CSeq | MATCH basic mechanism |
 | MRP/event servicing | source services MRP when MRP exists | MRP not implemented | FEATURE GAP, not required for base audio |
-| Native volume | SET_PARAMETER text/parameters on shared RTSP | absent | FEATURE GAP |
+| Native volume | SET_PARAMETER text/parameters on shared RTSP | Exact libraop 0–100 mapping; initial volume is sent before audio start when explicitly configured; live Apply uses shared RTSP/CSeq on a non-UI worker | **MATCH · CI-PROVEN; HARDWARE-PENDING** |
 | Metadata | source supports native metadata/MRP | absent | FEATURE GAP; not base HomePod transport prerequisite |
 | Buffered type 103 | opt-in only in source | not implemented | OK for current realtime-only target |
 | Warm splice/flush lifecycle | source has persistent timeline behavior | Timeline invariants are implemented; Windows realtime producer now keeps the same wire alive with encoded silence through temporary source starvation. Explicit pause/seek command API is still not wired into GUI/native session | **PARTIAL · starvation/source-switch base path CI-PROVEN; explicit command path pending** |
