@@ -1,6 +1,8 @@
 use crate::StreamPorts;
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub enum MediaTransportError {
@@ -23,6 +25,12 @@ pub struct MediaTransportPorts {
 pub struct RemoteMediaEndpoints {
     pub data: SocketAddr,
     pub control: SocketAddr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatagramSendOutcome {
+    Sent(usize),
+    Dropped,
 }
 
 pub struct MediaTransport {
@@ -85,6 +93,36 @@ impl MediaTransport {
         self.control_socket.try_clone()
     }
 
+    pub fn send_data_deadline(
+        &self,
+        packet: &[u8],
+        timeout: Duration,
+    ) -> Result<DatagramSendOutcome, MediaTransportError> {
+        let remote = self.remote.ok_or(MediaTransportError::RemoteNotAttached)?;
+        send_datagram_deadline(
+            &self.data_socket,
+            packet,
+            remote.data,
+            timeout,
+            MediaTransportError::SendData,
+        )
+    }
+
+    pub fn send_control_deadline(
+        &self,
+        packet: &[u8],
+        timeout: Duration,
+    ) -> Result<DatagramSendOutcome, MediaTransportError> {
+        let remote = self.remote.ok_or(MediaTransportError::RemoteNotAttached)?;
+        send_datagram_deadline(
+            &self.control_socket,
+            packet,
+            remote.control,
+            timeout,
+            MediaTransportError::SendControl,
+        )
+    }
+
     pub fn send_data(&self, packet: &[u8]) -> Result<usize, MediaTransportError> {
         let remote = self.remote.ok_or(MediaTransportError::RemoteNotAttached)?;
         self.data_socket
@@ -97,6 +135,35 @@ impl MediaTransport {
         self.control_socket
             .send_to(packet, remote.control)
             .map_err(MediaTransportError::SendControl)
+    }
+}
+
+fn send_datagram_deadline(
+    socket: &UdpSocket,
+    packet: &[u8],
+    remote: SocketAddr,
+    timeout: Duration,
+    map_error: fn(io::Error) -> MediaTransportError,
+) -> Result<DatagramSendOutcome, MediaTransportError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match socket.send_to(packet, remote) {
+            Ok(n) => return Ok(DatagramSendOutcome::Sent(n)),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Ok(DatagramSendOutcome::Dropped);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(map_error(error)),
+        }
     }
 }
 
