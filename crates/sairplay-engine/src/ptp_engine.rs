@@ -1,0 +1,488 @@
+use std::fmt;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const EVENT_PORT: u16 = 319;
+const GENERAL_PORT: u16 = 320;
+const HDR_LEN: usize = 34;
+
+const MSG_SYNC: u8 = 0x0;
+const MSG_DELAY_REQ: u8 = 0x1;
+const MSG_PDELAY_REQ: u8 = 0x2;
+const MSG_PDELAY_RESP: u8 = 0x3;
+const MSG_FOLLOW_UP: u8 = 0x8;
+const MSG_DELAY_RESP: u8 = 0x9;
+const MSG_PDELAY_RESP_FUP: u8 = 0xA;
+const MSG_ANNOUNCE: u8 = 0xB;
+const MSG_SIGNALING: u8 = 0xC;
+
+const FLAG_TWO_STEP: u16 = 0x0200;
+const FLAG_UNICAST: u16 = 0x0400;
+const FLAG_PTP_TIMESCALE: u16 = 0x0008;
+
+const TLV_REQUEST_UNICAST: u16 = 0x0004;
+const TLV_GRANT_UNICAST: u16 = 0x0005;
+
+#[derive(Debug)]
+pub enum PtpEngineError {
+    Ipv4Required,
+    Bind { port: u16, source: io::Error },
+    Configure(io::Error),
+    Spawn(io::Error),
+}
+
+impl fmt::Display for PtpEngineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ipv4Required => write!(f, "PTP alpha engine currently requires IPv4"),
+            Self::Bind { port, source } => write!(f, "PTP UDP {port} bind failed: {source}"),
+            Self::Configure(e) => write!(f, "PTP socket configure failed: {e}"),
+            Self::Spawn(e) => write!(f, "PTP worker start failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for PtpEngineError {}
+
+pub struct PtpEngine {
+    running: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+    clock_id: u64,
+}
+
+impl PtpEngine {
+    pub fn start(
+        receiver_ip: IpAddr,
+        clock_id: u64,
+    ) -> Result<Self, PtpEngineError> {
+        let receiver = match receiver_ip {
+            IpAddr::V4(ip) => ip,
+            IpAddr::V6(_) => return Err(PtpEngineError::Ipv4Required),
+        };
+
+        let event = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, EVENT_PORT))
+            .map_err(|source| PtpEngineError::Bind { port: EVENT_PORT, source })?;
+        let general = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, GENERAL_PORT)) {
+            Ok(socket) => socket,
+            Err(source) => {
+                drop(event);
+                return Err(PtpEngineError::Bind { port: GENERAL_PORT, source });
+            }
+        };
+
+        event.set_nonblocking(true).map_err(PtpEngineError::Configure)?;
+        general.set_nonblocking(true).map_err(PtpEngineError::Configure)?;
+        event.set_multicast_ttl_v4(1).map_err(PtpEngineError::Configure)?;
+        general.set_multicast_ttl_v4(1).map_err(PtpEngineError::Configure)?;
+
+        let running = Arc::new(AtomicBool::new(true));
+        let running_thread = Arc::clone(&running);
+
+        let worker = thread::Builder::new()
+            .name("sairplay-ptp".into())
+            .spawn(move || {
+                run_ptp_loop(event, general, receiver, clock_id, running_thread);
+            })
+            .map_err(PtpEngineError::Spawn)?;
+
+        Ok(Self {
+            running,
+            worker: Some(worker),
+            clock_id,
+        })
+    }
+
+    pub fn clock_id(&self) -> u64 {
+        self.clock_id
+    }
+
+    pub fn stop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for PtpEngine {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn run_ptp_loop(
+    event: UdpSocket,
+    general: UdpSocket,
+    receiver: Ipv4Addr,
+    clock_id: u64,
+    running: Arc<AtomicBool>,
+) {
+    let mut sync_seq = 0u16;
+    let mut announce_seq = 0u16;
+    let mut signaling_seq = 0u16;
+    let mut next_sync = Instant::now();
+    let mut next_announce = Instant::now();
+    let mut next_signaling = Instant::now();
+
+    while running.load(Ordering::SeqCst) {
+        let now = Instant::now();
+
+        if now >= next_sync {
+            send_sync_pair(&event, &general, receiver, clock_id, sync_seq);
+            sync_seq = sync_seq.wrapping_add(1);
+            next_sync = now + Duration::from_millis(125);
+        }
+
+        if now >= next_announce {
+            let packet = build_announce(clock_id, announce_seq);
+            let _ = general.send_to(&packet, (receiver, GENERAL_PORT));
+            announce_seq = announce_seq.wrapping_add(1);
+            next_announce = now + Duration::from_secs(1);
+        }
+
+        if now >= next_signaling {
+            let packet = build_sender_signaling(clock_id, signaling_seq);
+            let _ = general.send_to(&packet, (receiver, GENERAL_PORT));
+            signaling_seq = signaling_seq.wrapping_add(1);
+            next_signaling = now + Duration::from_secs(1);
+        }
+
+        drain_socket(&event, &event, &general, clock_id);
+        drain_socket(&general, &event, &general, clock_id);
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn drain_socket(
+    socket: &UdpSocket,
+    event: &UdpSocket,
+    general: &UdpSocket,
+    clock_id: u64,
+) {
+    let mut buf = [0u8; 1536];
+    loop {
+        let (n, src) = match socket.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        };
+        if n < HDR_LEN {
+            continue;
+        }
+
+        let msg_type = buf[0] & 0x0F;
+        let rx_ns = now_unix_ns();
+
+        match msg_type {
+            MSG_DELAY_REQ => {
+                let packet = build_delay_resp(&buf[..n], clock_id, rx_ns);
+                let _ = general.send_to(&packet, SocketAddr::new(src.ip(), GENERAL_PORT));
+            }
+            MSG_PDELAY_REQ => {
+                let (resp, follow) = build_pdelay_resp_pair(&buf[..n], clock_id, rx_ns);
+                let _ = event.send_to(&resp, SocketAddr::new(src.ip(), EVENT_PORT));
+                let _ = general.send_to(&follow, SocketAddr::new(src.ip(), GENERAL_PORT));
+            }
+            MSG_SIGNALING => {
+                if let Some(packet) = build_signaling_grant(&buf[..n], clock_id) {
+                    let _ = general.send_to(&packet, SocketAddr::new(src.ip(), GENERAL_PORT));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn now_unix_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
+fn write_header(
+    out: &mut [u8],
+    msg_type: u8,
+    message_len: u16,
+    flags: u16,
+    clock_id: u64,
+    sequence: u16,
+    control: u8,
+    log_interval: i8,
+) {
+    out[..HDR_LEN].fill(0);
+    out[0] = 0x10 | (msg_type & 0x0F); // gPTP majorSdoId=1
+    out[1] = 0x02; // PTP v2
+    out[2..4].copy_from_slice(&message_len.to_be_bytes());
+    out[4] = 0; // domain
+    out[6..8].copy_from_slice(&flags.to_be_bytes());
+    out[20..28].copy_from_slice(&clock_id.to_be_bytes());
+    out[28..30].copy_from_slice(&0x8005u16.to_be_bytes());
+    out[30..32].copy_from_slice(&sequence.to_be_bytes());
+    out[32] = control;
+    out[33] = log_interval as u8;
+}
+
+fn write_timestamp(out: &mut [u8], ns: u64) {
+    let seconds = ns / 1_000_000_000;
+    let nanos = (ns % 1_000_000_000) as u32;
+    out[0] = (seconds >> 40) as u8;
+    out[1] = (seconds >> 32) as u8;
+    out[2] = (seconds >> 24) as u8;
+    out[3] = (seconds >> 16) as u8;
+    out[4] = (seconds >> 8) as u8;
+    out[5] = seconds as u8;
+    out[6..10].copy_from_slice(&nanos.to_be_bytes());
+}
+
+fn build_announce(clock_id: u64, sequence: u16) -> Vec<u8> {
+    let len = HDR_LEN + 30 + 12;
+    let mut out = vec![0u8; len];
+    write_header(
+        &mut out,
+        MSG_ANNOUNCE,
+        len as u16,
+        FLAG_UNICAST | FLAG_PTP_TIMESCALE,
+        clock_id,
+        sequence,
+        0,
+        0,
+    );
+    let b = &mut out[HDR_LEN..];
+    b[13] = 128;
+    b[14] = 6;
+    b[15] = 0x21;
+    b[16..18].copy_from_slice(&0x436Au16.to_be_bytes());
+    b[18] = 128;
+    b[19..27].copy_from_slice(&clock_id.to_be_bytes());
+    b[29] = 0x20;
+    b[30..32].copy_from_slice(&0x0008u16.to_be_bytes());
+    b[32..34].copy_from_slice(&8u16.to_be_bytes());
+    b[34..42].copy_from_slice(&clock_id.to_be_bytes());
+    out
+}
+
+fn send_sync_pair(
+    event: &UdpSocket,
+    general: &UdpSocket,
+    receiver: Ipv4Addr,
+    clock_id: u64,
+    sequence: u16,
+) {
+    let slen = HDR_LEN + 10;
+    let mut sync = vec![0u8; slen];
+    write_header(
+        &mut sync,
+        MSG_SYNC,
+        slen as u16,
+        FLAG_UNICAST | FLAG_PTP_TIMESCALE | FLAG_TWO_STEP,
+        clock_id,
+        sequence,
+        0,
+        -3,
+    );
+    let _ = event.send_to(&sync, (receiver, EVENT_PORT));
+
+    let egress = now_unix_ns();
+    let flen = HDR_LEN + 10 + 32 + 20;
+    let mut follow = vec![0u8; flen];
+    write_header(
+        &mut follow,
+        MSG_FOLLOW_UP,
+        flen as u16,
+        FLAG_UNICAST | FLAG_PTP_TIMESCALE,
+        clock_id,
+        sequence,
+        0,
+        -3,
+    );
+    write_timestamp(&mut follow[HDR_LEN..HDR_LEN + 10], egress);
+
+    let mut o = HDR_LEN + 10;
+    follow[o..o + 4].copy_from_slice(&[0x00, 0x03, 0x00, 0x1C]);
+    follow[o + 4..o + 10].copy_from_slice(&[0x00, 0x80, 0xC2, 0x00, 0x00, 0x01]);
+    o += 32;
+    follow[o..o + 4].copy_from_slice(&[0x00, 0x03, 0x00, 0x10]);
+    follow[o + 4..o + 10].copy_from_slice(&[0x00, 0x0D, 0x93, 0x00, 0x00, 0x04]);
+    follow[o + 10..o + 18].copy_from_slice(&clock_id.to_be_bytes());
+
+    let _ = general.send_to(&follow, (receiver, GENERAL_PORT));
+}
+
+fn build_delay_resp(req: &[u8], clock_id: u64, rx_ns: u64) -> Vec<u8> {
+    let len = HDR_LEN + 20;
+    let mut out = vec![0u8; len];
+    let sequence = u16::from_be_bytes([req[30], req[31]]);
+    write_header(
+        &mut out,
+        MSG_DELAY_RESP,
+        len as u16,
+        FLAG_UNICAST | FLAG_PTP_TIMESCALE | FLAG_TWO_STEP,
+        clock_id,
+        sequence,
+        0,
+        -3,
+    );
+    write_timestamp(&mut out[HDR_LEN..HDR_LEN + 10], rx_ns);
+    if req.len() >= 30 {
+        out[HDR_LEN + 10..HDR_LEN + 20].copy_from_slice(&req[20..30]);
+    }
+    out
+}
+
+fn build_pdelay_resp_pair(req: &[u8], clock_id: u64, rx_ns: u64) -> (Vec<u8>, Vec<u8>) {
+    let len = HDR_LEN + 20;
+    let sequence = u16::from_be_bytes([req[30], req[31]]);
+
+    let mut resp = vec![0u8; len];
+    write_header(
+        &mut resp,
+        MSG_PDELAY_RESP,
+        len as u16,
+        FLAG_UNICAST | FLAG_PTP_TIMESCALE | FLAG_TWO_STEP,
+        clock_id,
+        sequence,
+        0,
+        -3,
+    );
+    write_timestamp(&mut resp[HDR_LEN..HDR_LEN + 10], rx_ns);
+    if req.len() >= 30 {
+        resp[HDR_LEN + 10..HDR_LEN + 20].copy_from_slice(&req[20..30]);
+    }
+
+    let mut follow = vec![0u8; len];
+    write_header(
+        &mut follow,
+        MSG_PDELAY_RESP_FUP,
+        len as u16,
+        FLAG_UNICAST | FLAG_PTP_TIMESCALE,
+        clock_id,
+        sequence,
+        0,
+        -3,
+    );
+    write_timestamp(&mut follow[HDR_LEN..HDR_LEN + 10], now_unix_ns());
+    if req.len() >= 30 {
+        follow[HDR_LEN + 10..HDR_LEN + 20].copy_from_slice(&req[20..30]);
+    }
+
+    (resp, follow)
+}
+
+fn build_signaling_grant(req: &[u8], clock_id: u64) -> Option<Vec<u8>> {
+    if req.len() < HDR_LEN + 14 {
+        return None;
+    }
+    let mut offset = HDR_LEN + 10;
+    let mut grants = Vec::<[u8; 12]>::new();
+
+    while offset + 4 <= req.len() && grants.len() < 8 {
+        let tlv_type = u16::from_be_bytes([req[offset], req[offset + 1]]);
+        let tlv_len = u16::from_be_bytes([req[offset + 2], req[offset + 3]]) as usize;
+        if offset + 4 + tlv_len > req.len() {
+            break;
+        }
+
+        if tlv_type == TLV_REQUEST_UNICAST && tlv_len >= 6 {
+            let value = &req[offset + 4..offset + 4 + tlv_len];
+            let mut grant = [0u8; 12];
+            grant[0..2].copy_from_slice(&TLV_GRANT_UNICAST.to_be_bytes());
+            grant[2..4].copy_from_slice(&8u16.to_be_bytes());
+            grant[4] = value[0];
+            grant[5] = value[1];
+            let mut duration = u32::from_be_bytes([value[2], value[3], value[4], value[5]]);
+            if duration == 0 {
+                duration = 300;
+            }
+            grant[6..10].copy_from_slice(&duration.to_be_bytes());
+            grant[10] = 0;
+            grant[11] = 1;
+            grants.push(grant);
+        }
+
+        offset += 4 + tlv_len;
+    }
+
+    if grants.is_empty() {
+        return None;
+    }
+
+    let len = HDR_LEN + 10 + grants.len() * 12;
+    let mut out = vec![0u8; len];
+    let sequence = u16::from_be_bytes([req[30], req[31]]);
+    write_header(
+        &mut out,
+        MSG_SIGNALING,
+        len as u16,
+        FLAG_UNICAST,
+        clock_id,
+        sequence,
+        0x05,
+        0x7F,
+    );
+    out[HDR_LEN..HDR_LEN + 10].copy_from_slice(&req[20..30]);
+    let mut pos = HDR_LEN + 10;
+    for grant in grants {
+        out[pos..pos + 12].copy_from_slice(&grant);
+        pos += 12;
+    }
+    Some(out)
+}
+
+fn build_sender_signaling(clock_id: u64, sequence: u16) -> Vec<u8> {
+    let len = HDR_LEN + 10 + 26 + 36;
+    let mut out = vec![0u8; len];
+    write_header(
+        &mut out,
+        MSG_SIGNALING,
+        len as u16,
+        FLAG_UNICAST | FLAG_PTP_TIMESCALE,
+        clock_id,
+        sequence,
+        0x05,
+        -128,
+    );
+    let mut o = HDR_LEN + 10;
+    out[o..o + 4].copy_from_slice(&[0x00, 0x03, 0x00, 0x16]);
+    out[o + 4..o + 10].copy_from_slice(&[0x00, 0x0D, 0x93, 0x00, 0x00, 0x01]);
+    out[o + 10..o + 14].copy_from_slice(&[0x00, 0x00, 0x03, 0x01]);
+    o += 26;
+    out[o..o + 4].copy_from_slice(&[0x00, 0x03, 0x00, 0x20]);
+    out[o + 4..o + 10].copy_from_slice(&[0x00, 0x0D, 0x93, 0x00, 0x00, 0x05]);
+    out[o + 10..o + 14].copy_from_slice(&[0x00, 0x00, 0x03, 0x01]);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn announce_matches_source_shape() {
+        let p = build_announce(0x1122334455667788, 7);
+        assert_eq!(p.len(), 76);
+        assert_eq!(p[0], 0x1B);
+        assert_eq!(p[1], 0x02);
+        assert_eq!(u16::from_be_bytes([p[2], p[3]]), 76);
+        assert_eq!(&p[20..28], &0x1122334455667788u64.to_be_bytes());
+        assert_eq!(u16::from_be_bytes([p[30], p[31]]), 7);
+        assert_eq!(&p[68..76], &0x1122334455667788u64.to_be_bytes());
+    }
+
+    #[test]
+    fn delay_response_echoes_request_identity_and_sequence() {
+        let mut req = vec![0u8; 54];
+        req[20..30].copy_from_slice(&[1,2,3,4,5,6,7,8,0x80,0x05]);
+        req[30..32].copy_from_slice(&0x1234u16.to_be_bytes());
+        let p = build_delay_resp(&req, 9, 1_500_000_000);
+        assert_eq!(p[0], 0x19);
+        assert_eq!(u16::from_be_bytes([p[30], p[31]]), 0x1234);
+        assert_eq!(&p[HDR_LEN + 10..HDR_LEN + 20], &req[20..30]);
+    }
+}
