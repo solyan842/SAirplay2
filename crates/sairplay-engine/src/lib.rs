@@ -8,6 +8,7 @@ pub mod hap_pairing;
 pub mod hap_rtsp;
 pub mod mdns_browser;
 pub mod native_preflight;
+pub mod native_timing;
 pub mod pcm_ring;
 pub mod preflight;
 pub mod route;
@@ -36,3 +37,4 @@ pub use timeline::{Boundary, SplicePlan, Timeline, TimelineError};
 
 pub use timing_policy::{TimingDecision, TimingMode, TimingPreference, TimingReadiness, TimingStartResult};
 pub use ntp_timing::{build_timing_response, system_time_to_ntp, NtpTimingError, NtpTimingResponder};
+pub use native_timing::{start_ntp_timing_gate, NativeTimingGateError};
