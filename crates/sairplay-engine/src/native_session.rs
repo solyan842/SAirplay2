@@ -252,7 +252,22 @@ impl NativeSession {
     pub fn audio_error(&self) -> Option<String> {
         self.audio_worker.as_ref().and_then(WindowsAudioWorker::last_error)
     }
+
+    #[cfg(windows)]
+    pub fn stop_windows_audio(&mut self) {
+        if let Some(mut worker) = self.audio_worker.take() {
+            worker.stop();
+        }
+    }
 }
+
+impl Drop for NativeSession {
+    fn drop(&mut self) {
+        // Stop the realtime producer first. Only after its thread is joined may
+        // timing/event/control resources be released by normal field drops.
+        #[cfg(windows)]
+        self.stop_windows_audio();
+    }
 
 fn format_session_uri(local_ip: IpAddr, session_id: u32) -> String {
     match local_ip {
