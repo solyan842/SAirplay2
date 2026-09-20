@@ -1,27 +1,32 @@
 use crate::{EncryptedRtspChannel, RtspRequest};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
-const MAX_CONSECUTIVE_MISSES: u32 = 3;
+pub const FEEDBACK_INTERVAL: Duration = Duration::from_millis(2000);
+pub const FEEDBACK_TIMEOUT: Duration = Duration::from_millis(2000);
+pub const MAX_CONSECUTIVE_MISSES: u32 = 3;
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+pub type SharedRtspControl = Arc<Mutex<EncryptedRtspChannel>>;
+pub type SharedCseq = Arc<AtomicU32>;
 
 pub struct FeedbackWorker {
     stop: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
-    worker: Option<JoinHandle<EncryptedRtspChannel>>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl FeedbackWorker {
     pub fn start(
-        mut channel: EncryptedRtspChannel,
+        control: SharedRtspControl,
+        next_cseq: SharedCseq,
         dacp_id: String,
         active_remote: String,
-        first_cseq: u32,
     ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
@@ -34,15 +39,17 @@ impl FeedbackWorker {
         let worker = thread::Builder::new()
             .name("sairplay-feedback".into())
             .spawn(move || {
-                let mut cseq = first_cseq;
                 let mut misses = 0u32;
+                let mut next_tick = Instant::now() + FEEDBACK_INTERVAL;
 
                 while !stop_thread.load(Ordering::SeqCst) {
-                    thread::sleep(FEEDBACK_INTERVAL);
-                    if stop_thread.load(Ordering::SeqCst) {
-                        break;
+                    let now = Instant::now();
+                    if now < next_tick {
+                        thread::sleep((next_tick - now).min(STOP_POLL_INTERVAL));
+                        continue;
                     }
 
+                    let cseq = next_cseq.fetch_add(1, Ordering::SeqCst);
                     let request = RtspRequest {
                         method: "POST".into(),
                         uri: "/feedback".into(),
@@ -55,7 +62,23 @@ impl FeedbackWorker {
                         body: Vec::new(),
                     };
 
-                    match channel.exchange(&request.encode(), cseq) {
+                    // Mirrors source rtsp_lock: the complete encrypted request/response
+                    // exchange is serialized on one shared control channel.
+                    let result = match control.lock() {
+                        Ok(mut channel) => channel.exchange_with_timeout(
+                            &request.encode(),
+                            cseq,
+                            FEEDBACK_TIMEOUT,
+                        ),
+                        Err(_) => {
+                            if let Ok(mut slot) = error_thread.lock() {
+                                *slot = Some("RTSP control mutex poisoned".into());
+                            }
+                            break;
+                        }
+                    };
+
+                    match result {
                         Ok(response) if response.status == 200 => {
                             misses = 0;
                             if let Ok(mut slot) = error_thread.lock() {
@@ -81,14 +104,18 @@ impl FeedbackWorker {
                         }
                     }
 
-                    cseq = cseq.wrapping_add(1);
                     if misses >= MAX_CONSECUTIVE_MISSES {
                         break;
+                    }
+
+                    let after = Instant::now();
+                    next_tick += FEEDBACK_INTERVAL;
+                    if next_tick <= after {
+                        next_tick = after + FEEDBACK_INTERVAL;
                     }
                 }
 
                 running_thread.store(false, Ordering::SeqCst);
-                channel
             })?;
 
         Ok(Self {
@@ -107,17 +134,18 @@ impl FeedbackWorker {
         self.last_error.lock().ok().and_then(|slot| slot.clone())
     }
 
-    pub fn stop(&mut self) -> Option<EncryptedRtspChannel> {
+    pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        let channel = self.worker.take().and_then(|worker| worker.join().ok());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
         self.running.store(false, Ordering::SeqCst);
-        channel
     }
 }
 
 impl Drop for FeedbackWorker {
     fn drop(&mut self) {
-        let _ = self.stop();
+        self.stop();
     }
 }
 
@@ -134,7 +162,9 @@ mod tests {
         loop {
             let n = socket.read(&mut buf).unwrap();
             carry.extend_from_slice(&buf[..n]);
-            if carry.len() < 2 { continue; }
+            if carry.len() < 2 {
+                continue;
+            }
             let plen = u16::from_le_bytes([carry[0], carry[1]]) as usize;
             let total = 2 + plen + 16;
             if carry.len() >= total {
@@ -144,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn feedback_request_shape_is_post_empty_body_and_monotonic_cseq() {
+    fn feedback_request_matches_source_shape_and_shared_cseq() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let key = [0x44u8; 32];
@@ -153,6 +183,7 @@ mod tests {
             let (mut socket, _) = listener.accept().unwrap();
             socket.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
             let mut cipher = HapControlCipher::new(key, key);
+
             let plain = read_frame(&mut socket, &mut cipher);
             let text = String::from_utf8(plain).unwrap();
             assert!(text.starts_with("POST /feedback RTSP/1.0\r\n"));
@@ -166,10 +197,26 @@ mod tests {
 
         let stream = TcpStream::connect(addr).unwrap();
         stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
-        let channel = EncryptedRtspChannel::new(stream, key, key, Duration::from_secs(1));
-        let mut worker = FeedbackWorker::start(channel, "AABBCCDDEEFF0011".into(), "123".into(), 4).unwrap();
+        let control = Arc::new(Mutex::new(EncryptedRtspChannel::new(
+            stream,
+            key,
+            key,
+            Duration::from_secs(8),
+        )));
+        let cseq = Arc::new(AtomicU32::new(4));
+
+        let mut worker = FeedbackWorker::start(
+            Arc::clone(&control),
+            Arc::clone(&cseq),
+            "AABBCCDDEEFF0011".into(),
+            "123".into(),
+        )
+        .unwrap();
+
         thread::sleep(Duration::from_millis(2300));
-        let _ = worker.stop();
+        worker.stop();
+
+        assert_eq!(cseq.load(Ordering::SeqCst), 5);
         server.join().unwrap();
     }
 }
