@@ -58,6 +58,16 @@ impl SessionCore {
         Ok(EngineEvent::BoundaryAccepted(boundary))
     }
 
+    /// FLUSH is an input boundary, not a transport teardown.
+    /// Old PCM is discarded while the native wire timeline remains alive.
+    pub fn warm_flush(&mut self, boundary: Boundary) -> Result<EngineEvent, String> {
+        self.timeline
+            .warm_boundary(boundary)
+            .map_err(|e| format!("{e:?}"))?;
+        self.pcm.clear();
+        Ok(EngineEvent::BoundaryAccepted(boundary))
+    }
+
     pub fn packet_pcm(&mut self, stereo_samples: usize) -> Result<(u64, Vec<i16>), String> {
         let rtp = self
             .timeline
@@ -96,10 +106,26 @@ mod tests {
         let anchor = s.timeline.anchor();
 
         for _ in 0..100 {
-            s.warm_boundary(Boundary::NextTrack).unwrap();
+            s.pcm.push(&[1, 2, 3, 4]);
+            s.warm_flush(Boundary::NextTrack).unwrap();
+            assert!(s.pcm.is_empty());
             s.warm_boundary(Boundary::SourceChange).unwrap();
             assert_eq!(s.state, EngineState::Running);
             assert_eq!(s.timeline.anchor(), anchor);
         }
+    }
+
+    #[test]
+    fn warm_start_plans_splice_without_reanchoring_session() {
+        let mut s = SessionCore::new(Route::AirPlay2Native, 8192);
+        s.arm(0, 1_000_000_000).unwrap();
+        s.timeline.advance(44_100).unwrap();
+        let anchor = s.timeline.anchor();
+
+        let plan = s.timeline.plan_splice(3_000_000_000, 44_100, 250).unwrap();
+
+        assert_eq!(s.timeline.anchor(), anchor);
+        assert_eq!(plan.pad_frames, 44_100);
+        assert_eq!(s.state, EngineState::Running);
     }
 }
