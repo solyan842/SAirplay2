@@ -268,6 +268,7 @@ impl Drop for NativeSession {
         #[cfg(windows)]
         self.stop_windows_audio();
     }
+}
 
 fn format_session_uri(local_ip: IpAddr, session_id: u32) -> String {
     match local_ip {
