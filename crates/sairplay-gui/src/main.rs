@@ -162,6 +162,17 @@ impl SairplayApp {
             self.log.push("Audio worker stopped.".into());
             self.playback = PlaybackUiState::Error("Audio worker stopped".into());
             self.session = None;
+        } else if let Some(error) = session.feedback_error() {
+            self.log.push(format!("Feedback keepalive: {error}"));
+            if !session.feedback_running() {
+                self.playback = PlaybackUiState::Error(error);
+                self.session = None;
+            }
+        } else if !session.feedback_running() {
+            let error = "Feedback keepalive worker stopped".to_string();
+            self.log.push(error.clone());
+            self.playback = PlaybackUiState::Error(error);
+            self.session = None;
         }
     }
 
