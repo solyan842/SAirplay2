@@ -79,6 +79,29 @@ pub fn build_ntp_sync_packet(args: NtpSyncPacketArgs) -> [u8; 20] {
     packet
 }
 
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtpSyncPacketArgs {
+    pub first: bool,
+    pub frame_1: u32,
+    pub wall_time_ns: u64,
+    pub frame_2: u32,
+    pub clock_id: u64,
+}
+
+pub fn build_ptp_sync_packet(args: PtpSyncPacketArgs) -> [u8; 28] {
+    let mut packet = [0u8; 28];
+    packet[0] = if args.first { 0x90 } else { 0x80 };
+    packet[1] = 0xD7;
+    packet[2] = 0x00;
+    packet[3] = 0x06;
+    packet[4..8].copy_from_slice(&args.frame_1.to_be_bytes());
+    packet[8..16].copy_from_slice(&args.wall_time_ns.to_be_bytes());
+    packet[16..20].copy_from_slice(&args.frame_2.to_be_bytes());
+    packet[20..28].copy_from_slice(&args.clock_id.to_be_bytes());
+    packet
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +148,22 @@ mod tests {
         assert_eq!(&packet[8..12], &0x11223344u32.to_be_bytes());
         assert_eq!(&packet[12..16], &0x55667788u32.to_be_bytes());
         assert_eq!(&packet[16..20], &0x99AABBCCu32.to_be_bytes());
+    }
+
+    #[test]
+    fn ptp_sync_matches_source_layout() {
+        let packet = build_ptp_sync_packet(PtpSyncPacketArgs {
+            first: true,
+            frame_1: 0x01020304,
+            wall_time_ns: 0x1122334455667788,
+            frame_2: 0x99AABBCC,
+            clock_id: 0xA1B2C3D4E5F60708,
+        });
+        assert_eq!(&packet[0..4], &[0x90, 0xD7, 0x00, 0x06]);
+        assert_eq!(&packet[4..8], &0x01020304u32.to_be_bytes());
+        assert_eq!(&packet[8..16], &0x1122334455667788u64.to_be_bytes());
+        assert_eq!(&packet[16..20], &0x99AABBCCu32.to_be_bytes());
+        assert_eq!(&packet[20..28], &0xA1B2C3D4E5F60708u64.to_be_bytes());
     }
 
     #[test]
