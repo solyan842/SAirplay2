@@ -30,6 +30,13 @@ pub struct StreamPorts {
     pub control_port: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RealtimeStreamSetupResult {
+    pub ports: StreamPorts,
+    pub latency_min: Option<u32>,
+    pub latency_max: Option<u32>,
+}
+
 #[derive(Debug)]
 pub enum StreamSetupError {
     Flow(NativeConnectError),
@@ -88,7 +95,9 @@ pub fn build_realtime_stream_plist(
     Ok(out)
 }
 
-pub fn parse_stream_ports(body: &[u8]) -> Result<StreamPorts, StreamSetupError> {
+pub fn parse_stream_setup_response(
+    body: &[u8],
+) -> Result<RealtimeStreamSetupResult, StreamSetupError> {
     let value = Value::from_reader(Cursor::new(body))?;
     let root = value.as_dictionary().ok_or(StreamSetupError::InvalidRoot)?;
     let streams = root
@@ -116,10 +125,29 @@ pub fn parse_stream_ports(body: &[u8]) -> Result<StreamPorts, StreamSetupError> 
         return Err(StreamSetupError::InvalidControlPort);
     }
 
-    Ok(StreamPorts {
-        data_port: data as u16,
-        control_port: control as u16,
+    let latency_min = stream
+        .get("latencyMin")
+        .and_then(Value::as_unsigned_integer)
+        .filter(|v| *v > 0 && *v <= u32::MAX as u64)
+        .map(|v| v as u32);
+    let latency_max = stream
+        .get("latencyMax")
+        .and_then(Value::as_unsigned_integer)
+        .filter(|v| *v > 0 && *v <= u32::MAX as u64)
+        .map(|v| v as u32);
+
+    Ok(RealtimeStreamSetupResult {
+        ports: StreamPorts {
+            data_port: data as u16,
+            control_port: control as u16,
+        },
+        latency_min,
+        latency_max,
     })
+}
+
+pub fn parse_stream_ports(body: &[u8]) -> Result<RealtimeStreamSetupResult, StreamSetupError> {
+    Ok(parse_stream_setup_response(body)?.ports)
 }
 
 pub fn setup_realtime_stream(
@@ -156,10 +184,10 @@ pub fn setup_realtime_stream(
         return Err(StreamSetupError::Status(response.status));
     }
 
-    let ports = parse_stream_ports(&response.body)?;
+    let result = parse_stream_setup_response(&response.body)?;
 
     flow.stream_setup()?;
-    Ok(ports)
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -189,6 +217,8 @@ mod tests {
         // parser must use keys, never positional integer guessing.
         stream.insert("controlPort".into(), Value::Integer(control_port.into()));
         stream.insert("dataPort".into(), Value::Integer(data_port.into()));
+        stream.insert("latencyMin".into(), Value::Integer(22050u64.into()));
+        stream.insert("latencyMax".into(), Value::Integer(66150u64.into()));
         let mut root = Dictionary::new();
         root.insert("streams".into(), Value::Array(vec![Value::Dictionary(stream)]));
         let mut out = Vec::new();
@@ -247,6 +277,9 @@ mod tests {
     fn response_ports_are_parsed_by_key_not_position() {
         let ports = parse_stream_ports(&response_body(60000, 60001)).unwrap();
         assert_eq!(ports, StreamPorts { data_port: 60000, control_port: 60001 });
+        let parsed = parse_stream_setup_response(&response_body(60000, 60001)).unwrap();
+        assert_eq!(parsed.latency_min, Some(22050));
+        assert_eq!(parsed.latency_max, Some(66150));
     }
 
     #[test]
@@ -296,8 +329,8 @@ mod tests {
             stream_connection_id: 0x12345678,
         };
 
-        let ports = setup_realtime_stream(&mut flow, &mut channel, &config).unwrap();
-        assert_eq!(ports, StreamPorts { data_port: 61000, control_port: 61001 });
+        let result = setup_realtime_stream(&mut flow, &mut channel, &config).unwrap();
+        assert_eq!(result.ports, StreamPorts { data_port: 61000, control_port: 61001 });
         assert_eq!(flow.phase(), NativePhase::StreamSetup);
 
         server.join().unwrap();
