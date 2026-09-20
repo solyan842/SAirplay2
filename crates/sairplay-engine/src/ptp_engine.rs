@@ -582,7 +582,7 @@ fn send_sync_pair(
     let flen = HDR_LEN + 10 + 32 + 20;
     let mut follow_packet = vec![0u8; flen];
     write_header(
-        &mut follow,
+        &mut follow_packet,
         MSG_FOLLOW_UP,
         flen as u16,
         FLAG_UNICAST | FLAG_PTP_TIMESCALE,
@@ -656,7 +656,7 @@ fn build_pdelay_resp_pair(req: &[u8], clock_id: u64, rx_ns: u64) -> (Vec<u8>, Ve
         0,
         -3,
     );
-    write_timestamp(&mut follow_packet[HDR_LEN..HDR_LEN + 10], now_unix_ns());
+    write_timestamp(&mut follow[HDR_LEN..HDR_LEN + 10], now_unix_ns());
     if req.len() >= 30 {
         follow[HDR_LEN + 10..HDR_LEN + 20].copy_from_slice(&req[20..30]);
     }
