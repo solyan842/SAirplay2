@@ -1,10 +1,10 @@
 use crate::{
     build_encrypted_realtime_packet, build_ntp_sync_packet, build_ptp_sync_packet,
     encode_alac_16_stereo_352, AlacEncodeError, MediaTransport, MediaTransportError,
-    NtpSyncPacketArgs, PtpSyncPacketArgs, RetransmitRing, RtpState,
+    NtpSyncPacketArgs, PtpClock, PtpSyncPacketArgs, RetransmitRing, RtpState,
     ALAC_PCM_PACKET_BYTES, FRAMES_PER_PACKET_44100,
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]
 pub enum MediaSendError {
@@ -30,10 +30,10 @@ pub struct MediaSendResult {
     pub sync_sent: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum RealtimeTiming {
     Ntp,
-    Ptp { clock_id: u64 },
+    Ptp { clock: PtpClock },
 }
 
 pub struct RealtimeMediaSender {
@@ -77,7 +77,28 @@ impl RealtimeMediaSender {
             transport,
             state,
             audio_key,
-            timing: RealtimeTiming::Ptp { clock_id },
+            timing: RealtimeTiming::Ptp { clock: PtpClock::fixed(clock_id) },
+            ptp_anchor_wall0: None,
+            ptp_anchor_pos0: state.timestamp,
+            head_ts: state.timestamp as u64,
+            pacing_window_frames: 0,
+            pace_last_release: None,
+            pacing_enabled: false,
+            retransmit: None,
+        }
+    }
+
+    pub fn new_ptp_clock(
+        transport: MediaTransport,
+        state: RtpState,
+        audio_key: [u8; 32],
+        clock: PtpClock,
+    ) -> Self {
+        Self {
+            transport,
+            state,
+            audio_key,
+            timing: RealtimeTiming::Ptp { clock },
             ptp_anchor_wall0: None,
             ptp_anchor_pos0: state.timestamp,
             head_ts: state.timestamp as u64,
@@ -115,10 +136,14 @@ impl RealtimeMediaSender {
         self.pace_last_release = None;
         self.pacing_enabled = true;
 
-        if matches!(self.timing, RealtimeTiming::Ptp { .. }) {
+        if let RealtimeTiming::Ptp { clock } = &self.timing {
             let lead_ns = frames_to_ns(lead_frames);
-            self.ptp_anchor_wall0 =
-                Some(ntp_fixed_to_unix_ns(start_ntp).saturating_sub(lead_ns));
+            let local_now = system_unix_ns();
+            let master_now = clock.master_now_ns();
+            let start_local = ntp_fixed_to_unix_ns(start_ntp) as i128;
+            let master_shift = master_now as i128 - local_now as i128;
+            let wall0 = start_local + master_shift - lead_ns as i128;
+            self.ptp_anchor_wall0 = Some(wall0.max(0) as u64);
             self.ptp_anchor_pos0 = self.state.timestamp;
         }
     }
@@ -148,7 +173,7 @@ impl RealtimeMediaSender {
         ntp_time: u64,
         lead_frames: u32,
     ) -> Result<bool, MediaSendError> {
-        if !matches!(self.timing, RealtimeTiming::Ptp { .. }) {
+        if !matches!(&self.timing, RealtimeTiming::Ptp { .. }) {
             return Ok(false);
         }
         self.send_sync_packet(ntp_time, lead_frames, true)?;
@@ -227,7 +252,7 @@ impl RealtimeMediaSender {
         lead_frames: u32,
         first: bool,
     ) -> Result<(), MediaSendError> {
-        match self.timing {
+        match &self.timing {
             RealtimeTiming::Ntp => {
                 let play_position = self.state.timestamp.saturating_sub(lead_frames);
                 let sync = build_ntp_sync_packet(NtpSyncPacketArgs {
@@ -238,8 +263,9 @@ impl RealtimeMediaSender {
                 });
                 self.transport.send_control(&sync)?;
             }
-            RealtimeTiming::Ptp { clock_id } => {
-                let wall_time_ns = ntp_fixed_to_unix_ns(ntp_time);
+            RealtimeTiming::Ptp { clock } => {
+                let wall_time_ns = clock.master_now_ns();
+                let clock_id = clock.master_clock_id();
                 let wall0 = *self.ptp_anchor_wall0.get_or_insert(wall_time_ns);
                 if first && self.ptp_anchor_wall0 == Some(wall_time_ns) {
                     self.ptp_anchor_pos0 = self.state.timestamp;
@@ -267,6 +293,13 @@ impl RealtimeMediaSender {
     }
 }
 
+
+fn system_unix_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
 
 fn frames_to_ns(frames: u32) -> u64 {
     ((frames as u128 * 1_000_000_000u128) / 44_100u128) as u64
