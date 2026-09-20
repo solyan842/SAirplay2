@@ -282,6 +282,5 @@ mod tests {
         let (cn, _) = ctrl_rx.recv_from(&mut buf).unwrap();
         assert_eq!(cn, 20);
         assert_eq!(&buf[4..8], &0u32.to_be_bytes());
-    }}
-
+    }
 }
