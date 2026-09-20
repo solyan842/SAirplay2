@@ -1,6 +1,8 @@
 use crate::{EncryptedRtspError, RtspRequest, SharedCseq, SharedRtspControl};
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::sync::TryLockError;
+use std::thread;
+use std::time::{Duration, Instant};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_millis(2000);
 const FAREWELL_TIMEOUT: Duration = Duration::from_millis(250);
@@ -8,6 +10,7 @@ const FAREWELL_TIMEOUT: Duration = Duration::from_millis(250);
 #[derive(Debug)]
 pub enum TeardownError {
     Lock,
+    LockTimeout,
     Transport(EncryptedRtspError),
 }
 
@@ -37,11 +40,31 @@ pub fn send_teardown(
     dacp_id: &str,
     active_remote: &str,
 ) -> Result<(), TeardownError> {
+    let deadline = Instant::now() + CONTROL_TIMEOUT;
+    let mut channel = loop {
+        match control.try_lock() {
+            Ok(channel) => break channel,
+            Err(TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(TeardownError::LockTimeout);
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(TryLockError::Poisoned(_)) => return Err(TeardownError::Lock),
+        }
+    };
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(TeardownError::LockTimeout);
+    }
+
+    // Match source: CSeq advances only once the serialized request is
+    // actually about to start, after acquiring the control lock.
     let cseq = next_cseq.fetch_add(1, Ordering::SeqCst);
     let req = request(cseq, session_uri, dacp_id, active_remote).encode();
-    let mut channel = control.lock().map_err(|_| TeardownError::Lock)?;
 
-    match channel.exchange_with_timeout(&req, cseq, CONTROL_TIMEOUT) {
+    match channel.exchange_with_timeout(&req, cseq, remaining) {
         Ok(_) => Ok(()),
         Err(EncryptedRtspError::Timeout) => {
             // Match upstream farewell behavior: the read direction just failed,
