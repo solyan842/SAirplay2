@@ -29,6 +29,9 @@ const FLAG_PTP_TIMESCALE: u16 = 0x0008;
 
 const TLV_REQUEST_UNICAST: u16 = 0x0004;
 const TLV_GRANT_UNICAST: u16 = 0x0005;
+const OFFSET_SNAP_NS: i64 = 1_000_000;
+const OFFSET_EMA_DIV: i64 = 8;
+const FOLLOW_STALE_NS: u64 = 60_000_000_000;
 
 #[derive(Debug)]
 pub enum PtpEngineError {
@@ -51,12 +54,87 @@ impl fmt::Display for PtpEngineError {
 
 impl std::error::Error for PtpEngineError {}
 
+#[derive(Debug, Default)]
+struct FollowClockState {
+    enabled: bool,
+    receiver: Option<Ipv4Addr>,
+    clock_id: Option<u64>,
+    offset_ns: Option<i64>,
+    last_ns: u64,
+    pending_sync_seq: Option<u16>,
+    pending_sync_rx_ns: u64,
+    pending_sync_corr_ns: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PtpClock {
+    local_clock_id: u64,
+    follow: Arc<Mutex<FollowClockState>>,
+}
+
+impl PtpClock {
+    pub fn fixed(clock_id: u64) -> Self {
+        Self {
+            local_clock_id: clock_id,
+            follow: Arc::new(Mutex::new(FollowClockState::default())),
+        }
+    }
+
+    pub fn master_clock_id(&self) -> u64 {
+        let now = now_unix_ns();
+        if let Ok(mut follow) = self.follow.lock() {
+            if follow.enabled
+                && follow.clock_id.is_some()
+                && follow.offset_ns.is_some()
+                && now.saturating_sub(follow.last_ns) <= FOLLOW_STALE_NS
+            {
+                return follow.clock_id.unwrap();
+            }
+            if follow.enabled && now.saturating_sub(follow.last_ns) > FOLLOW_STALE_NS {
+                follow.clock_id = None;
+                follow.offset_ns = None;
+                follow.pending_sync_seq = None;
+            }
+        }
+        self.local_clock_id
+    }
+
+    pub fn master_now_ns(&self) -> u64 {
+        let local = now_unix_ns();
+        if let Ok(mut follow) = self.follow.lock() {
+            if follow.enabled
+                && follow.clock_id.is_some()
+                && follow.offset_ns.is_some()
+                && local.saturating_sub(follow.last_ns) <= FOLLOW_STALE_NS
+            {
+                let offset = follow.offset_ns.unwrap();
+                return if offset >= 0 {
+                    local.saturating_add(offset as u64)
+                } else {
+                    local.saturating_sub(offset.unsigned_abs())
+                };
+            }
+            if follow.enabled && local.saturating_sub(follow.last_ns) > FOLLOW_STALE_NS {
+                follow.clock_id = None;
+                follow.offset_ns = None;
+                follow.pending_sync_seq = None;
+            }
+        }
+        local
+    }
+
+    pub fn is_follow_locked(&self) -> bool {
+        self.master_clock_id() != self.local_clock_id
+    }
+}
+
 pub struct PtpEngine {
     running: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     clock_id: u64,
     peers: Arc<Mutex<Vec<Ipv4Addr>>>,
     peer_kick: Arc<AtomicBool>,
+    clock: PtpClock,
 }
 
 impl PtpEngine {
@@ -64,6 +142,7 @@ impl PtpEngine {
         receiver_ip: IpAddr,
         bind_ip: IpAddr,
         clock_id: u64,
+        follow_receiver_clock: bool,
     ) -> Result<Self, PtpEngineError> {
         let _receiver = match receiver_ip {
             IpAddr::V4(ip) => ip,
@@ -102,11 +181,29 @@ impl PtpEngine {
         let peers_thread = Arc::clone(&peers);
         let peer_kick = Arc::new(AtomicBool::new(false));
         let kick_thread = Arc::clone(&peer_kick);
+        let follow = Arc::new(Mutex::new(FollowClockState {
+            enabled: follow_receiver_clock,
+            receiver: Some(_receiver),
+            ..FollowClockState::default()
+        }));
+        let follow_thread = Arc::clone(&follow);
+        let clock = PtpClock {
+            local_clock_id: clock_id,
+            follow,
+        };
 
         let worker = thread::Builder::new()
             .name("sairplay-ptp".into())
             .spawn(move || {
-                run_ptp_loop(event, general, clock_id, running_thread, peers_thread, kick_thread);
+                run_ptp_loop(
+                    event,
+                    general,
+                    clock_id,
+                    running_thread,
+                    peers_thread,
+                    kick_thread,
+                    follow_thread,
+                );
             })
             .map_err(PtpEngineError::Spawn)?;
 
@@ -116,11 +213,28 @@ impl PtpEngine {
             clock_id,
             peers,
             peer_kick,
+            clock,
         })
     }
 
     pub fn clock_id(&self) -> u64 {
         self.clock_id
+    }
+
+    pub fn master_clock_id(&self) -> u64 {
+        self.clock.master_clock_id()
+    }
+
+    pub fn master_now_ns(&self) -> u64 {
+        self.clock.master_now_ns()
+    }
+
+    pub fn clock_handle(&self) -> PtpClock {
+        self.clock.clone()
+    }
+
+    pub fn follow_locked(&self) -> bool {
+        self.clock.is_follow_locked()
     }
 
     pub fn set_peers(&self, peers: &[IpAddr]) {
@@ -158,6 +272,7 @@ fn run_ptp_loop(
     running: Arc<AtomicBool>,
     peers: Arc<Mutex<Vec<Ipv4Addr>>>,
     peer_kick: Arc<AtomicBool>,
+    follow: Arc<Mutex<FollowClockState>>,
 ) {
     let mut sync_seq = 0u16;
     let mut announce_seq = 0u16;
@@ -171,33 +286,45 @@ fn run_ptp_loop(
         let kick = peer_kick.swap(false, Ordering::SeqCst);
 
         if kick || now >= next_sync {
-            send_sync_pair(&event, &general, &peers, clock_id, sync_seq);
+            send_sync_pair(&event, &general, &peers, &follow, clock_id, sync_seq);
             sync_seq = sync_seq.wrapping_add(1);
             next_sync = now + Duration::from_millis(125);
         }
 
         if kick || now >= next_announce {
             let packet = build_announce(clock_id, announce_seq);
-            send_ptp(&general, GENERAL_PORT, &packet, &peers);
+            send_ptp(&general, GENERAL_PORT, &packet, &peers, &follow);
             announce_seq = announce_seq.wrapping_add(1);
             next_announce = now + Duration::from_secs(1);
         }
 
         if kick || now >= next_signaling {
             let packet = build_sender_signaling(clock_id, signaling_seq);
-            send_ptp(&general, GENERAL_PORT, &packet, &peers);
+            send_ptp(&general, GENERAL_PORT, &packet, &peers, &follow);
             signaling_seq = signaling_seq.wrapping_add(1);
             next_signaling = now + Duration::from_secs(1);
         }
 
-        drain_socket(&event, &event, &general, clock_id);
-        drain_socket(&general, &event, &general, clock_id);
+        drain_socket(&event, &event, &general, clock_id, &follow);
+        drain_socket(&general, &event, &general, clock_id, &follow);
         thread::sleep(Duration::from_millis(2));
     }
 }
 
-fn send_ptp(socket: &UdpSocket, port: u16, packet: &[u8], peers: &Arc<Mutex<Vec<Ipv4Addr>>>) {
-    let snapshot = peers.lock().map(|p| p.clone()).unwrap_or_default();
+fn send_ptp(
+    socket: &UdpSocket,
+    port: u16,
+    packet: &[u8],
+    peers: &Arc<Mutex<Vec<Ipv4Addr>>>,
+    follow: &Arc<Mutex<FollowClockState>>,
+) {
+    let followed = follow.lock().ok().and_then(|f| {
+        if f.enabled { f.receiver } else { None }
+    });
+    let snapshot = peers
+        .lock()
+        .map(|p| p.iter().copied().filter(|ip| Some(*ip) != followed).collect())
+        .unwrap_or_default();
     if snapshot.is_empty() {
         let _ = socket.send_to(packet, (MCAST_ADDR, port));
     } else {
@@ -212,6 +339,7 @@ fn drain_socket(
     event: &UdpSocket,
     general: &UdpSocket,
     clock_id: u64,
+    follow_state: &Arc<Mutex<FollowClockState>>,
 ) {
     let mut buf = [0u8; 1536];
     loop {
@@ -226,6 +354,39 @@ fn drain_socket(
 
         let msg_type = buf[0] & 0x0F;
         let rx_ns = now_unix_ns();
+
+        if n >= 28 {
+            let src_clock = u64::from_be_bytes(buf[20..28].try_into().unwrap());
+            if src_clock == clock_id {
+                continue;
+            }
+        }
+
+        let src_v4 = match src.ip() {
+            IpAddr::V4(ip) => Some(ip),
+            IpAddr::V6(_) => None,
+        };
+        let followed = follow_state.lock().ok().is_some_and(|f| {
+            f.enabled && f.receiver == src_v4
+        });
+
+        if followed {
+            match msg_type {
+                MSG_ANNOUNCE => {
+                    follow_announce(&buf[..n], rx_ns, follow_state);
+                    continue;
+                }
+                MSG_SYNC => {
+                    follow_sync(&buf[..n], rx_ns, false, follow_state);
+                    continue;
+                }
+                MSG_FOLLOW_UP => {
+                    follow_sync(&buf[..n], rx_ns, true, follow_state);
+                    continue;
+                }
+                _ => {}
+            }
+        }
 
         match msg_type {
             MSG_DELAY_REQ => {
@@ -243,6 +404,85 @@ fn drain_socket(
                 }
             }
             _ => {}
+        }
+    }
+}
+
+fn read_ptp_timestamp(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 10 { return None; }
+    let sec = ((bytes[0] as u64) << 40)
+        | ((bytes[1] as u64) << 32)
+        | ((bytes[2] as u64) << 24)
+        | ((bytes[3] as u64) << 16)
+        | ((bytes[4] as u64) << 8)
+        | bytes[5] as u64;
+    let ns = u32::from_be_bytes(bytes[6..10].try_into().ok()?) as u64;
+    Some(sec.saturating_mul(1_000_000_000).saturating_add(ns))
+}
+
+fn correction_ns(packet: &[u8]) -> i64 {
+    if packet.len() < 16 { return 0; }
+    let raw = u64::from_be_bytes(packet[8..16].try_into().unwrap()) as i64;
+    raw / 65_536
+}
+
+fn fold_follow_offset(state: &mut FollowClockState, raw: i64) {
+    match state.offset_ns {
+        None => state.offset_ns = Some(raw),
+        Some(old) => {
+            let delta = raw - old;
+            state.offset_ns = Some(if delta.abs() > OFFSET_SNAP_NS {
+                raw
+            } else {
+                old + delta / OFFSET_EMA_DIV
+            });
+        }
+    }
+}
+
+fn follow_announce(packet: &[u8], rx_ns: u64, state: &Arc<Mutex<FollowClockState>>) {
+    if packet.len() < HDR_LEN + 30 { return; }
+    let body = &packet[HDR_LEN..];
+    let clock_id = u64::from_be_bytes(body[19..27].try_into().unwrap());
+    if let Ok(mut f) = state.lock() {
+        if f.clock_id.is_some() && f.clock_id != Some(clock_id) {
+            f.offset_ns = None;
+            f.pending_sync_seq = None;
+        }
+        f.clock_id = Some(clock_id);
+        f.last_ns = rx_ns;
+    }
+}
+
+fn follow_sync(
+    packet: &[u8],
+    rx_ns: u64,
+    follow_up: bool,
+    state: &Arc<Mutex<FollowClockState>>,
+) {
+    if packet.len() < HDR_LEN + 10 { return; }
+    let flags = u16::from_be_bytes([packet[6], packet[7]]);
+    let seq = u16::from_be_bytes([packet[30], packet[31]]);
+    let corr = correction_ns(packet);
+    let Some(t1) = read_ptp_timestamp(&packet[HDR_LEN..HDR_LEN + 10]) else { return; };
+
+    if let Ok(mut f) = state.lock() {
+        f.last_ns = rx_ns;
+        if !follow_up {
+            if flags & FLAG_TWO_STEP != 0 {
+                f.pending_sync_seq = Some(seq);
+                f.pending_sync_rx_ns = rx_ns;
+                f.pending_sync_corr_ns = corr;
+            } else {
+                fold_follow_offset(&mut f, t1 as i64 + corr - rx_ns as i64);
+            }
+        } else if f.pending_sync_seq == Some(seq) {
+            let sample = t1 as i64
+                + f.pending_sync_corr_ns
+                + corr
+                - f.pending_sync_rx_ns as i64;
+            f.pending_sync_seq = None;
+            fold_follow_offset(&mut f, sample);
         }
     }
 }
@@ -320,6 +560,7 @@ fn send_sync_pair(
     event: &UdpSocket,
     general: &UdpSocket,
     peers: &Arc<Mutex<Vec<Ipv4Addr>>>,
+    follow: &Arc<Mutex<FollowClockState>>,
     clock_id: u64,
     sequence: u16,
 ) {
@@ -335,11 +576,11 @@ fn send_sync_pair(
         0,
         -3,
     );
-    send_ptp(event, EVENT_PORT, &sync, peers);
+    send_ptp(event, EVENT_PORT, &sync, peers, follow);
 
     let egress = now_unix_ns();
     let flen = HDR_LEN + 10 + 32 + 20;
-    let mut follow = vec![0u8; flen];
+    let mut follow_packet = vec![0u8; flen];
     write_header(
         &mut follow,
         MSG_FOLLOW_UP,
@@ -350,17 +591,17 @@ fn send_sync_pair(
         0,
         -3,
     );
-    write_timestamp(&mut follow[HDR_LEN..HDR_LEN + 10], egress);
+    write_timestamp(&mut follow_packet[HDR_LEN..HDR_LEN + 10], egress);
 
     let mut o = HDR_LEN + 10;
-    follow[o..o + 4].copy_from_slice(&[0x00, 0x03, 0x00, 0x1C]);
-    follow[o + 4..o + 10].copy_from_slice(&[0x00, 0x80, 0xC2, 0x00, 0x00, 0x01]);
+    follow_packet[o..o + 4].copy_from_slice(&[0x00, 0x03, 0x00, 0x1C]);
+    follow_packet[o + 4..o + 10].copy_from_slice(&[0x00, 0x80, 0xC2, 0x00, 0x00, 0x01]);
     o += 32;
-    follow[o..o + 4].copy_from_slice(&[0x00, 0x03, 0x00, 0x10]);
-    follow[o + 4..o + 10].copy_from_slice(&[0x00, 0x0D, 0x93, 0x00, 0x00, 0x04]);
-    follow[o + 10..o + 18].copy_from_slice(&clock_id.to_be_bytes());
+    follow_packet[o..o + 4].copy_from_slice(&[0x00, 0x03, 0x00, 0x10]);
+    follow_packet[o + 4..o + 10].copy_from_slice(&[0x00, 0x0D, 0x93, 0x00, 0x00, 0x04]);
+    follow_packet[o + 10..o + 18].copy_from_slice(&clock_id.to_be_bytes());
 
-    send_ptp(general, GENERAL_PORT, &follow, peers);
+    send_ptp(general, GENERAL_PORT, &follow_packet, peers, follow);
 }
 
 fn build_delay_resp(req: &[u8], clock_id: u64, rx_ns: u64) -> Vec<u8> {
@@ -415,7 +656,7 @@ fn build_pdelay_resp_pair(req: &[u8], clock_id: u64, rx_ns: u64) -> (Vec<u8>, Ve
         0,
         -3,
     );
-    write_timestamp(&mut follow[HDR_LEN..HDR_LEN + 10], now_unix_ns());
+    write_timestamp(&mut follow_packet[HDR_LEN..HDR_LEN + 10], now_unix_ns());
     if req.len() >= 30 {
         follow[HDR_LEN + 10..HDR_LEN + 20].copy_from_slice(&req[20..30]);
     }
