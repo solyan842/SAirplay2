@@ -4,8 +4,8 @@ use crate::{
     EventChannel, FeedbackWorker, MediaHandshakeConfig, NativeConnectFlow, NativePhase,
     NtpSessionSetupConfig, NtpTimingResponder, PairingError, PreflightError, PtpEngine,
     PtpSessionSetupConfig, RealtimeMediaSender, RecordConfig, RetransmitRing,
-    RetransmitWorker, RtpState, SetPeersConfig, TransientPairingClient, VolumeSetResult,
-    set_native_volume, system_time_to_ntp,
+    NativeVolumeControl, RetransmitWorker, RtpState, SetPeersConfig, TransientPairingClient,
+    VolumeSetResult, set_native_volume, system_time_to_ntp,
 };
 use rand::RngCore;
 use std::fmt;
@@ -489,6 +489,16 @@ impl NativeSession {
 
     pub fn initial_volume_result(&self) -> Option<VolumeSetResult> {
         self.initial_volume_result
+    }
+
+    pub fn volume_control(&self) -> NativeVolumeControl {
+        NativeVolumeControl::new(
+            Arc::clone(&self.control),
+            Arc::clone(&self.next_cseq),
+            self.session_uri.clone(),
+            self.dacp_id.clone(),
+            self.active_remote.clone(),
+        )
     }
 
     pub fn set_volume(&self, percent: u8) -> Result<VolumeSetResult, NativeSessionError> {
