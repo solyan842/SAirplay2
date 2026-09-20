@@ -33,6 +33,7 @@ pub mod audio_packet;
 pub mod media_sender;
 pub mod retransmit;
 pub mod teardown;
+pub mod volume;
 pub mod pcm_chunker;
 #[cfg(windows)]
 pub mod wasapi_loopback;
@@ -73,6 +74,7 @@ pub use audio_packet::{build_audio_nonce, build_encrypted_realtime_packet, Audio
 pub use media_sender::{RealtimeMediaSender, MediaSendError, MediaSendResult};
 pub use retransmit::{RetransmitRing, RetransmitWorker, RTX_RING_SLOTS};
 pub use teardown::{send_teardown, TeardownError};
+pub use volume::{set_native_volume, volume_percent_to_db, VolumeError, VolumeSetResult};
 pub use alac_encoder::{encode_alac_16_stereo_352, AlacEncodeError, ALAC_PCM_BYTES_PER_FRAME, ALAC_PCM_PACKET_BYTES, ALAC_FRAMES_PER_PACKET};
 pub use pcm_chunker::{Pcm352Chunker, PCM352_PACKET_BYTES};
 #[cfg(windows)]
