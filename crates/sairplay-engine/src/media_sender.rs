@@ -1,12 +1,14 @@
 use crate::{
-    build_encrypted_realtime_packet, build_ntp_sync_packet, MediaTransport, MediaTransportError,
-    NtpSyncPacketArgs, RtpState, FRAMES_PER_PACKET_44100,
+    build_encrypted_realtime_packet, build_ntp_sync_packet, encode_alac_16_stereo_352,
+    AlacEncodeError, MediaTransport, MediaTransportError, NtpSyncPacketArgs, RtpState,
+    ALAC_PCM_PACKET_BYTES, FRAMES_PER_PACKET_44100,
 };
 
 #[derive(Debug)]
 pub enum MediaSendError {
     Transport(MediaTransportError),
     Packet(crate::AudioPacketError),
+    Alac(AlacEncodeError),
 }
 
 impl From<MediaTransportError> for MediaSendError {
@@ -14,6 +16,9 @@ impl From<MediaTransportError> for MediaSendError {
 }
 impl From<crate::AudioPacketError> for MediaSendError {
     fn from(value: crate::AudioPacketError) -> Self { Self::Packet(value) }
+}
+impl From<AlacEncodeError> for MediaSendError {
+    fn from(value: AlacEncodeError) -> Self { Self::Alac(value) }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +51,26 @@ impl RealtimeMediaSender {
 
     pub fn transport(&self) -> &MediaTransport {
         &self.transport
+    }
+
+    pub fn send_pcm_352(
+        &mut self,
+        pcm_le_stereo: &[u8],
+        ntp_time: u64,
+        lead_frames: u32,
+    ) -> Result<MediaSendResult, MediaSendError> {
+        if pcm_le_stereo.len() != ALAC_PCM_PACKET_BYTES {
+            return Err(MediaSendError::Alac(if pcm_le_stereo.len() % 4 != 0 {
+                AlacEncodeError::MisalignedPcm
+            } else if pcm_le_stereo.len() > ALAC_PCM_PACKET_BYTES {
+                AlacEncodeError::TooManyFrames
+            } else {
+                AlacEncodeError::Empty
+            }));
+        }
+
+        let alac = encode_alac_16_stereo_352(pcm_le_stereo)?;
+        self.send_alac_payload(&alac, ntp_time, lead_frames)
     }
 
     pub fn send_alac_payload(
@@ -105,6 +130,47 @@ mod tests {
             },
         );
         transport
+    }
+
+    #[test]
+    fn pcm_pipeline_encodes_encrypts_sends_and_advances() {
+        let data_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ctrl_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        data_rx.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        ctrl_rx.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+
+        let transport = transport_to(&data_rx, &ctrl_rx);
+        let state = RtpState::new(0x0102, 50_000, 0x10203040);
+        let mut sender = RealtimeMediaSender::new(transport, state, [0x55u8; 32]);
+
+        let pcm = vec![0u8; ALAC_PCM_PACKET_BYTES];
+        let result = sender.send_pcm_352(&pcm, 0x0102030405060708, 11_025).unwrap();
+
+        assert!(result.sync_sent);
+        assert_eq!(result.sequence_sent, 0x0102);
+        assert_eq!(result.timestamp_sent, 50_000);
+
+        let mut buf = [0u8; 4096];
+        let (cn, _) = ctrl_rx.recv_from(&mut buf).unwrap();
+        assert_eq!(cn, 20);
+
+        let (dn, _) = data_rx.recv_from(&mut buf).unwrap();
+        assert!(dn > 12 + 16 + 8);
+        assert_eq!(&buf[..12], &state.header());
+        assert_eq!(sender.state().timestamp, 50_352);
+    }
+
+    #[test]
+    fn pcm_pipeline_rejects_partial_chunk() {
+        let data_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ctrl_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let transport = transport_to(&data_rx, &ctrl_rx);
+        let state = RtpState::new(1, 0, 1);
+        let mut sender = RealtimeMediaSender::new(transport, state, [0x11u8; 32]);
+
+        let err = sender.send_pcm_352(&vec![0u8; ALAC_PCM_PACKET_BYTES - 4], 0, 0);
+        assert!(matches!(err, Err(MediaSendError::Alac(_))));
+        assert_eq!(sender.state(), state);
     }
 
     #[test]
