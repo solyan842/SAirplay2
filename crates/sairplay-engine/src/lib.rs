@@ -1,6 +1,7 @@
 pub mod ap2_info;
 pub mod catalog;
 pub mod discovery;
+pub mod hap_tlv8;
 pub mod mdns_browser;
 pub mod native_preflight;
 pub mod pcm_ring;
@@ -13,6 +14,7 @@ pub mod timeline;
 pub use ap2_info::{Ap2Info, Ap2InfoError, AudioFormatCapability, ALAC_44100_16_2};
 pub use catalog::{DeviceCatalog, DeviceRecord};
 pub use discovery::{AirPlayTxt, DiscoveryError};
+pub use hap_tlv8::{Tlv8, Tlv8Error, TlvTag};
 pub use mdns_browser::{DiscoveredService, DiscoveryEvent, MdnsBrowser, ServiceKind};
 pub use native_preflight::{NativeConnectError, NativeConnectFlow, NativePhase};
 pub use pcm_ring::PcmRing;
