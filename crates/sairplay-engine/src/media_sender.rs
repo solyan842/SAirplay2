@@ -1,7 +1,7 @@
 use crate::{
     build_encrypted_realtime_packet, build_ntp_sync_packet, build_ptp_sync_packet,
     encode_alac_16_stereo_352, AlacEncodeError, MediaTransport, MediaTransportError,
-    NtpSyncPacketArgs, PtpSyncPacketArgs, RtpState,
+    NtpSyncPacketArgs, PtpSyncPacketArgs, RetransmitRing, RtpState,
     ALAC_PCM_PACKET_BYTES, FRAMES_PER_PACKET_44100,
 };
 use std::time::{Duration, Instant};
@@ -47,6 +47,7 @@ pub struct RealtimeMediaSender {
     pacing_window_frames: u64,
     pace_last_release: Option<Instant>,
     pacing_enabled: bool,
+    retransmit: Option<RetransmitRing>,
 }
 
 impl RealtimeMediaSender {
@@ -62,6 +63,7 @@ impl RealtimeMediaSender {
             pacing_window_frames: 0,
             pace_last_release: None,
             pacing_enabled: false,
+            retransmit: None,
         }
     }
 
@@ -82,7 +84,12 @@ impl RealtimeMediaSender {
             pacing_window_frames: 0,
             pace_last_release: None,
             pacing_enabled: false,
+            retransmit: None,
         }
+    }
+
+    pub fn set_retransmit_ring(&mut self, ring: RetransmitRing) {
+        self.retransmit = Some(ring);
     }
 
     pub fn configure_source_timeline(
@@ -200,6 +207,9 @@ impl RealtimeMediaSender {
         let timestamp_sent = self.state.timestamp;
         let packet = build_encrypted_realtime_packet(&self.state, alac_payload, &self.audio_key)?;
         self.transport.send_data(&packet)?;
+        if let Some(ring) = &self.retransmit {
+            ring.store(sequence_sent, &packet);
+        }
 
         self.state.advance(FRAMES_PER_PACKET_44100);
         self.head_ts = self.head_ts.wrapping_add(FRAMES_PER_PACKET_44100 as u64);
