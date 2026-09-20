@@ -1,9 +1,9 @@
 use crate::{
     open_event_channel, prepare_realtime_media, send_record, setup_ntp_session,
-    start_ntp_timing_gate, Ap2PreflightClient, EventChannel, MediaHandshakeConfig,
-    NativeConnectFlow, NativePhase, NtpSessionSetupConfig, NtpTimingResponder,
-    PairingError, PreflightError, RealtimeMediaSender, RecordConfig, RtpState,
-    TransientPairingClient,
+    setup_ptp_session, start_ntp_timing_gate, Ap2PreflightClient, EventChannel,
+    MediaHandshakeConfig, NativeConnectFlow, NativePhase, NtpSessionSetupConfig,
+    NtpTimingResponder, PairingError, PreflightError, PtpEngine, PtpSessionSetupConfig,
+    RealtimeMediaSender, RecordConfig, RtpState, TransientPairingClient,
 };
 use rand::RngCore;
 use std::fmt;
@@ -21,6 +21,8 @@ pub struct NativeSessionConfig {
     pub dacp_id: String,
     pub active_remote: String,
     pub lead_frames: u32,
+    pub supports_ptp: bool,
+    pub receiver_name: String,
 }
 
 impl NativeSessionConfig {
@@ -32,6 +34,8 @@ impl NativeSessionConfig {
             dacp_id: "A1B2C3D4E5F60708".into(),
             active_remote: "123456789".into(),
             lead_frames: 11_025,
+            supports_ptp: false,
+            receiver_name: "SAirplay2 Receiver".into(),
         }
     }
 }
@@ -74,7 +78,8 @@ impl std::error::Error for NativeSessionError {}
 pub struct NativeSession {
     flow: NativeConnectFlow,
     control: crate::EncryptedRtspChannel,
-    _timing: NtpTimingResponder,
+    _ntp_timing: Option<NtpTimingResponder>,
+    _ptp_timing: Option<PtpEngine>,
     _event: EventChannel,
     sender: Option<RealtimeMediaSender>,
     lead_frames: u32,
@@ -134,32 +139,98 @@ impl NativeSession {
         let session_uri = format_session_uri(local_addr.ip(), session_id);
 
         // 2) Timing must be live before encrypted Session SETUP.
-        let timing_bind = SocketAddr::new(local_addr.ip(), 0);
-        let timing = start_ntp_timing_gate(&mut flow, timing_bind)
-            .map_err(|e| NativeSessionError::Timing(format!("{e:?}")))?;
-        let timing_port = timing
-            .port()
-            .map_err(NativeSessionError::LocalAddress)?;
+        // Receivers advertising SupportsPTP use the native gPTP path first;
+        // only an actual 319/320 start failure falls back to the NTP responder.
+        let clock_id = dacp_clock_id(&config.dacp_id).ok_or_else(|| {
+            NativeSessionError::Timing("DACP ID cannot form an 8-byte PTP clock id".into())
+        })?;
+        let device_id = dacp_device_id(&config.dacp_id).ok_or_else(|| {
+            NativeSessionError::Timing("DACP ID cannot form deviceID".into())
+        })?;
+        let mac_address = dacp_mac_address(&config.dacp_id).ok_or_else(|| {
+            NativeSessionError::Timing("DACP ID cannot form macAddress".into())
+        })?;
 
-        // Source keeps RTSP CSeq independent from the HAP pair-setup CSeqs:
-        // GET /info consumes RTSP CSeq 0, so encrypted control resumes at 1.
-        let setup = NtpSessionSetupConfig {
-            cseq: 1,
-            session_uri: session_uri.clone(),
-            session_uuid,
-            device_id: dacp_device_id(&config.dacp_id),
-            timing_port,
-            dacp_id: config.dacp_id.clone(),
-            active_remote: config.active_remote.clone(),
-        };
-        let setup_result = setup_ntp_session(&mut flow, &mut control, &setup)
-            .map_err(|e| NativeSessionError::SessionSetup(format!("{e:?}")))?;
+        let mut ntp_timing = None;
+        let mut ptp_timing = None;
+        let event_port;
+
+        if config.supports_ptp {
+            match PtpEngine::start(receiver_ip, clock_id) {
+                Ok(engine) => {
+                    // Match source settle window before publishing timingPeerInfo.
+                    std::thread::sleep(Duration::from_millis(400));
+                    flow.timing_ready()
+                        .map_err(|e| NativeSessionError::Flow(format!("{e:?}")))?;
+
+                    let setup = PtpSessionSetupConfig {
+                        cseq: 1,
+                        session_uri: session_uri.clone(),
+                        session_uuid: session_uuid.clone(),
+                        group_uuid: random_uuid_upper(&mut rng),
+                        peer_uuid: random_uuid_upper(&mut rng),
+                        device_id,
+                        mac_address,
+                        name: config.receiver_name.clone(),
+                        local_address: local_addr.ip().to_string(),
+                        clock_id: engine.clock_id(),
+                        dacp_id: config.dacp_id.clone(),
+                        active_remote: config.active_remote.clone(),
+                    };
+                    let result = setup_ptp_session(&mut flow, &mut control, &setup)
+                        .map_err(|e| NativeSessionError::SessionSetup(format!("{e:?}")))?;
+                    event_port = result.event_port;
+                    ptp_timing = Some(engine);
+                }
+                Err(_) => {
+                    let timing_bind = SocketAddr::new(local_addr.ip(), 0);
+                    let timing = start_ntp_timing_gate(&mut flow, timing_bind)
+                        .map_err(|e| NativeSessionError::Timing(format!("{e:?}")))?;
+                    let timing_port = timing
+                        .port()
+                        .map_err(NativeSessionError::LocalAddress)?;
+                    let setup = NtpSessionSetupConfig {
+                        cseq: 1,
+                        session_uri: session_uri.clone(),
+                        session_uuid: session_uuid.clone(),
+                        device_id: Some(device_id),
+                        timing_port,
+                        dacp_id: config.dacp_id.clone(),
+                        active_remote: config.active_remote.clone(),
+                    };
+                    let result = setup_ntp_session(&mut flow, &mut control, &setup)
+                        .map_err(|e| NativeSessionError::SessionSetup(format!("{e:?}")))?;
+                    event_port = result.event_port;
+                    ntp_timing = Some(timing);
+                }
+            }
+        } else {
+            let timing_bind = SocketAddr::new(local_addr.ip(), 0);
+            let timing = start_ntp_timing_gate(&mut flow, timing_bind)
+                .map_err(|e| NativeSessionError::Timing(format!("{e:?}")))?;
+            let timing_port = timing
+                .port()
+                .map_err(NativeSessionError::LocalAddress)?;
+            let setup = NtpSessionSetupConfig {
+                cseq: 1,
+                session_uri: session_uri.clone(),
+                session_uuid: session_uuid.clone(),
+                device_id: Some(device_id),
+                timing_port,
+                dacp_id: config.dacp_id.clone(),
+                active_remote: config.active_remote.clone(),
+            };
+            let result = setup_ntp_session(&mut flow, &mut control, &setup)
+                .map_err(|e| NativeSessionError::SessionSetup(format!("{e:?}")))?;
+            event_port = result.event_port;
+            ntp_timing = Some(timing);
+        }
 
         // 3) Keep-open reverse event TCP.
         let event = open_event_channel(
             &mut flow,
             receiver_ip,
-            setup_result.event_port,
+            event_port,
             &audio_secret,
             Duration::from_secs(3),
         )
@@ -193,13 +264,15 @@ impl NativeSession {
         flow.ready()
             .map_err(|e| NativeSessionError::Flow(format!("{e:?}")))?;
 
-        let rtp = RtpState::new(sequence, rtp_timestamp, session_id);
+        let ssrc = if ptp_timing.is_some() { 0 } else { session_id };
+        let rtp = RtpState::new(sequence, rtp_timestamp, ssrc);
         let sender = RealtimeMediaSender::new(media.transport, rtp, audio_secret);
 
         Ok(Self {
             flow,
             control,
-            _timing: timing,
+            _ntp_timing: ntp_timing,
+            _ptp_timing: ptp_timing,
             _event: event,
             sender: Some(sender),
             lead_frames: config.lead_frames,
@@ -288,6 +361,28 @@ fn dacp_device_id(dacp_id: &str) -> Option<String> {
         .map(|i| &compact[i * 2..i * 2 + 2])
         .collect::<Vec<_>>();
     Some(bytes.join(":").to_ascii_uppercase())
+}
+
+fn dacp_clock_id(dacp_id: &str) -> Option<u64> {
+    let compact: String = dacp_id.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if compact.len() != 16 {
+        return None;
+    }
+    u64::from_str_radix(&compact, 16).ok()
+}
+
+fn dacp_mac_address(dacp_id: &str) -> Option<String> {
+    let compact: String = dacp_id.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if compact.len() != 16 {
+        return None;
+    }
+    Some(
+        (0..6)
+            .map(|i| &compact[i * 2..i * 2 + 2])
+            .collect::<Vec<_>>()
+            .join(":")
+            .to_ascii_uppercase(),
+    )
 }
 
 fn random_uuid_upper(rng: &mut impl RngCore) -> String {
