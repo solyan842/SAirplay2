@@ -30,9 +30,15 @@ impl RtpState {
     }
 
     pub fn advance(&mut self, frames: u32) {
+        self.advance_with_marker_clear(frames, true);
+    }
+
+    pub fn advance_with_marker_clear(&mut self, frames: u32, clear_first: bool) {
         self.sequence = self.sequence.wrapping_add(1);
         self.timestamp = self.timestamp.wrapping_add(frames);
-        self.first_packet = false;
+        if clear_first {
+            self.first_packet = false;
+        }
     }
 }
 
