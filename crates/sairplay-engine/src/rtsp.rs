@@ -127,7 +127,10 @@ impl RtspCodec {
             let mut lines = header_text.split("\r\n");
             let status_line = lines.next().ok_or(RtspError::InvalidStatusLine)?;
             let mut parts = status_line.splitn(3, ' ');
-            let version = parts.next().ok_or(RtspError::InvalidStatusLine)?;
+            let version = parts
+                .next()
+                .ok_or(RtspError::InvalidStatusLine)?
+                .to_string();
             let status = parts
                 .next()
                 .ok_or(RtspError::InvalidStatusLine)?
@@ -171,7 +174,7 @@ impl RtspCodec {
             self.carry.drain(..message_len);
 
             out.push(RtspResponse {
-                version: version.to_string(),
+                version,
                 status,
                 reason,
                 headers,
