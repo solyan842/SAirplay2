@@ -146,7 +146,7 @@ pub fn setup_realtime_stream(
         user_agent: "AirPlay/670.6.2".into(),
         dacp_id: config.dacp_id.clone(),
         active_remote: config.active_remote.clone(),
-        client_instance: Some(config.dacp_id.clone()),
+        client_instance: None,
         content_type: Some("application/x-apple-binary-plist".into()),
         body,
     };
