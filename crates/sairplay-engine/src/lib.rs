@@ -80,5 +80,5 @@ pub use wasapi_loopback::{WasapiLoopbackCapture, WasapiLoopbackError};
 #[cfg(windows)]
 pub use windows_audio_worker::{WindowsAudioWorker, WindowsAudioWorkerError};
 pub use native_session::{NativeSession, NativeSessionConfig, NativeSessionError};
-pub use ptp_engine::{PtpClock, PtpEngine, PtpEngineError};
+pub use ptp_engine::{PtpClock, PtpEngine, PtpEngineError, PtpExchange};
 pub use ptp_session_setup::{build_ptp_session_plist, setup_ptp_session, PtpSessionSetupConfig, PtpSessionSetupError, PtpSessionSetupResult};
