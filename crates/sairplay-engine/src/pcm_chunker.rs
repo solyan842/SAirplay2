@@ -20,6 +20,17 @@ impl Pcm352Chunker {
         self.pending.extend(pcm_le_stereo_16.iter().copied());
     }
 
+    pub fn pop_packet_padded_silence(&mut self) -> [u8; PCM352_PACKET_BYTES] {
+        let mut out = [0u8; PCM352_PACKET_BYTES];
+        for byte in &mut out {
+            match self.pending.pop_front() {
+                Some(value) => *byte = value,
+                None => break,
+            }
+        }
+        out
+    }
+
     pub fn pop_packet(&mut self) -> Option<[u8; PCM352_PACKET_BYTES]> {
         if self.pending.len() < PCM352_PACKET_BYTES {
             return None;
@@ -57,6 +68,16 @@ mod tests {
         let out = c.pop_packet().unwrap();
         assert!(out[..1000].iter().all(|b| *b == 0x11));
         assert!(out[1000..].iter().all(|b| *b == 0x22));
+        assert_eq!(c.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn starvation_consumes_partial_tail_then_pads_silence() {
+        let mut c = Pcm352Chunker::new();
+        c.push(&vec![0x55; 1000]);
+        let out = c.pop_packet_padded_silence();
+        assert!(out[..1000].iter().all(|b| *b == 0x55));
+        assert!(out[1000..].iter().all(|b| *b == 0));
         assert_eq!(c.pending_bytes(), 0);
     }
 
