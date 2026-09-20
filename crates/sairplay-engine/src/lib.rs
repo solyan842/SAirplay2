@@ -8,4 +8,4 @@ pub use discovery::{AirPlayTxt, DiscoveryError};
 pub use pcm_ring::PcmRing;
 pub use route::{ReceiverCapabilities, Route, RouteResolver};
 pub use session::{EngineCommand, EngineEvent, EngineState, SessionCore};
-pub use timeline::{Boundary, Timeline, TimelineError};
+pub use timeline::{Boundary, SplicePlan, Timeline, TimelineError};
