@@ -20,7 +20,7 @@ impl RtspRequest {
             method: "GET".into(),
             uri: "/info".into(),
             cseq,
-            user_agent: "AirPlay/550.10".into(),
+            user_agent: "AirPlay/670.6.2".into(),
             client_instance: Some(dacp_id.clone()),
             dacp_id,
             active_remote: active_remote.into(),
@@ -232,7 +232,7 @@ mod tests {
 
         assert!(encoded.starts_with("GET /info RTSP/1.0\r\n"));
         assert!(encoded.contains("CSeq: 1\r\n"));
-        assert!(encoded.contains("User-Agent: AirPlay/550.10\r\n"));
+        assert!(encoded.contains("User-Agent: AirPlay/670.6.2\r\n"));
         assert!(encoded.contains("DACP-ID: AABBCCDDEEFF0011\r\n"));
         assert!(encoded.contains("Active-Remote: 123456789\r\n"));
         assert!(encoded.contains("Client-Instance: AABBCCDDEEFF0011\r\n"));
