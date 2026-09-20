@@ -18,7 +18,7 @@ pub use ap2_info::{Ap2Info, Ap2InfoError, AudioFormatCapability, ALAC_44100_16_2
 pub use catalog::{DeviceCatalog, DeviceRecord};
 pub use discovery::{AirPlayTxt, DiscoveryError};
 pub use hap_crypto::{derive_control_keys, HapControlCipher, HapCryptoError};
-pub use hap_tlv8::{Tlv8, Tlv8Error, TlvTag};
+pub use hap_tlv8::{Tlv8, Tlv8Error, TlvTag, HAP_TRANSIENT_FLAG};
 pub use hap_srp::{srp_client_compute, SrpClientResult, SrpError, SRP_TRANSIENT_PIN};
 pub use hap_pairing::{PairingError, TransientPairingClient, TransientPairingResult};
 pub use mdns_browser::{DiscoveredService, DiscoveryEvent, MdnsBrowser, ServiceKind};
