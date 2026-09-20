@@ -32,7 +32,6 @@ pub struct RealtimeMediaSender {
     transport: MediaTransport,
     state: RtpState,
     audio_key: [u8; 32],
-    packets_since_sync: u16,
 }
 
 impl RealtimeMediaSender {
@@ -41,7 +40,6 @@ impl RealtimeMediaSender {
             transport,
             state,
             audio_key,
-            packets_since_sync: 0,
         }
     }
 
@@ -79,10 +77,10 @@ impl RealtimeMediaSender {
         ntp_time: u64,
         lead_frames: u32,
     ) -> Result<MediaSendResult, MediaSendError> {
-        let should_sync = self.state.first_packet || self.packets_since_sync >= 100;
+        let should_sync = self.state.first_packet || (!self.state.first_packet && self.state.sequence % 100 == 0);
 
         if should_sync {
-            let play_position = self.state.timestamp.wrapping_sub(lead_frames);
+            let play_position = self.state.timestamp.saturating_sub(lead_frames);
             let sync = build_ntp_sync_packet(NtpSyncPacketArgs {
                 first: self.state.first_packet,
                 play_position,
@@ -98,12 +96,6 @@ impl RealtimeMediaSender {
         self.transport.send_data(&packet)?;
 
         self.state.advance(FRAMES_PER_PACKET_44100);
-
-        if should_sync {
-            self.packets_since_sync = 0;
-        } else {
-            self.packets_since_sync = self.packets_since_sync.wrapping_add(1);
-        }
 
         Ok(MediaSendResult {
             sequence_sent,
@@ -204,7 +196,7 @@ mod tests {
         assert_eq!(&buf[..4], &[0x90, 0xD4, 0x00, 0x07]);
         assert_eq!(
             &buf[4..8],
-            &100_000u32.wrapping_sub(11_025).to_be_bytes()
+            &100_000u32.saturating_sub(11_025).to_be_bytes()
         );
         assert_eq!(&buf[16..20], &100_000u32.to_be_bytes());
 
@@ -245,30 +237,51 @@ mod tests {
     }
 
     #[test]
-    fn sync_repeats_after_100_intervening_packets() {
+    fn periodic_sync_follows_sequence_modulo_100_like_source() {
         let data_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let ctrl_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         data_rx.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         ctrl_rx.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
 
         let transport = transport_to(&data_rx, &ctrl_rx);
-        let state = RtpState::new(10, 0, 0x12345678);
+        // First packet seq=98 -> initial sync, then seq=99 no sync, seq=100 sync.
+        let state = RtpState::new(98, 50_000, 0x12345678);
         let mut sender = RealtimeMediaSender::new(transport, state, [0x11u8; 32]);
-        let mut buf = [0u8; 2048];
+        let mut buf = [0u8; 4096];
 
-        sender.send_alac_payload(b"x", 1, 0).unwrap();
+        let first = sender.send_alac_payload(b"x", 1, 0).unwrap();
+        assert!(first.sync_sent);
         let _ = ctrl_rx.recv_from(&mut buf).unwrap();
         let _ = data_rx.recv_from(&mut buf).unwrap();
 
-        for _ in 0..100 {
-            sender.send_alac_payload(b"x", 1, 0).unwrap();
-            let _ = data_rx.recv_from(&mut buf).unwrap();
-        }
+        let second = sender.send_alac_payload(b"x", 1, 0).unwrap();
+        assert!(!second.sync_sent);
+        let _ = data_rx.recv_from(&mut buf).unwrap();
 
-        let repeated = sender.send_alac_payload(b"x", 1, 0).unwrap();
-        assert!(repeated.sync_sent);
+        let third = sender.send_alac_payload(b"x", 1, 0).unwrap();
+        assert!(third.sync_sent);
         let (cn, _) = ctrl_rx.recv_from(&mut buf).unwrap();
         assert_eq!(cn, 20);
         assert_eq!(&buf[..2], &[0x80, 0xD4]);
+        let _ = data_rx.recv_from(&mut buf).unwrap();
     }
+
+    #[test]
+    fn sync_play_position_saturates_at_zero_when_latency_exceeds_timestamp() {
+        let data_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ctrl_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        ctrl_rx.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+
+        let transport = transport_to(&data_rx, &ctrl_rx);
+        let state = RtpState::new(1, 1_000, 0x12345678);
+        let mut sender = RealtimeMediaSender::new(transport, state, [0x11u8; 32]);
+
+        sender.send_alac_payload(b"x", 1, 11_025).unwrap();
+
+        let mut buf = [0u8; 64];
+        let (cn, _) = ctrl_rx.recv_from(&mut buf).unwrap();
+        assert_eq!(cn, 20);
+        assert_eq!(&buf[4..8], &0u32.to_be_bytes());
+    }}
+
 }
