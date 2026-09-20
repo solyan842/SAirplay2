@@ -1,0 +1,15 @@
+[workspace]
+members = [
+  "crates/sairplay-engine",
+  "crates/sairplay-gui",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["SolYan"]
+
+[workspace.dependencies]
+crossbeam-channel = "0.5"
