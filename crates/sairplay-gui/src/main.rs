@@ -221,6 +221,7 @@ impl SairplayApp {
         config.active_remote = "123456789".into();
         config.supports_ptp = service.txt.supports_ptp();
         config.follow_receiver_clock = service.txt.follows_receiver_clock();
+        config.apple_model = service.txt.is_apple_model();
         config.receiver_name = name.clone();
 
         let (tx, rx) = mpsc::sync_channel(1);
