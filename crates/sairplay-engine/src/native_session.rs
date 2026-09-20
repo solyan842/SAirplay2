@@ -177,7 +177,7 @@ impl NativeSession {
             ) {
                 Ok(engine) => {
                     // Match source settle window before publishing timingPeerInfo.
-                    std::thread::sleep(Duration::from_millis(400));
+                    engine.settle(Duration::from_millis(400));
                     flow.timing_ready()
                         .map_err(|e| NativeSessionError::Flow(format!("{e:?}")))?;
 
