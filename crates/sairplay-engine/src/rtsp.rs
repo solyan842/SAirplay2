@@ -235,7 +235,7 @@ mod tests {
         assert!(encoded.contains("User-Agent: AirPlay/670.6.2\r\n"));
         assert!(encoded.contains("DACP-ID: AABBCCDDEEFF0011\r\n"));
         assert!(encoded.contains("Active-Remote: 123456789\r\n"));
-        assert!(encoded.contains("Client-Instance: AABBCCDDEEFF0011\r\n"));
+        assert!(!encoded.contains("Client-Instance:"));
         assert!(encoded.ends_with("Content-Length: 0\r\n\r\n"));
     }
 
