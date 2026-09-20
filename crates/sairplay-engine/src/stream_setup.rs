@@ -146,7 +146,7 @@ pub fn parse_stream_setup_response(
     })
 }
 
-pub fn parse_stream_ports(body: &[u8]) -> Result<RealtimeStreamSetupResult, StreamSetupError> {
+pub fn parse_stream_ports(body: &[u8]) -> Result<StreamPorts, StreamSetupError> {
     Ok(parse_stream_setup_response(body)?.ports)
 }
 
@@ -154,7 +154,7 @@ pub fn setup_realtime_stream(
     flow: &mut NativeConnectFlow,
     channel: &mut EncryptedRtspChannel,
     config: &RealtimeStreamSetupConfig,
-) -> Result<StreamPorts, StreamSetupError> {
+) -> Result<RealtimeStreamSetupResult, StreamSetupError> {
     if flow.phase() != crate::NativePhase::Recorded {
         flow.stream_setup()?;
         unreachable!("stream_setup succeeds only from Recorded");
