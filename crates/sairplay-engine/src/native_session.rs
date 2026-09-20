@@ -3,8 +3,8 @@ use crate::{
     send_setpeers, setup_ptp_session, start_ntp_timing_gate, Ap2PreflightClient,
     EventChannel, FeedbackWorker, MediaHandshakeConfig, NativeConnectFlow, NativePhase,
     NtpSessionSetupConfig, NtpTimingResponder, PairingError, PreflightError, PtpEngine,
-    PtpSessionSetupConfig, RealtimeMediaSender, RecordConfig, RtpState, SetPeersConfig,
-    TransientPairingClient,
+    PtpSessionSetupConfig, RealtimeMediaSender, RecordConfig, RetransmitRing,
+    RetransmitWorker, RtpState, SetPeersConfig, TransientPairingClient, system_time_to_ntp,
 };
 use rand::RngCore;
 use std::fmt;
@@ -13,7 +13,7 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc, Mutex,
 };
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 #[cfg(windows)]
 use crate::{WindowsAudioWorker, WindowsAudioWorkerError};
@@ -87,6 +87,7 @@ pub struct NativeSession {
     control: crate::SharedRtspControl,
     next_cseq: crate::SharedCseq,
     feedback: FeedbackWorker,
+    retransmit: Option<RetransmitWorker>,
     _ntp_timing: Option<NtpTimingResponder>,
     _ptp_timing: Option<PtpEngine>,
     _event: EventChannel,
@@ -142,8 +143,6 @@ impl NativeSession {
         // session URL and realtime streamConnectionID/SSRC for NTP.
         let mut rng = rand::thread_rng();
         let session_id = rng.next_u32();
-        let sequence = rng.next_u32() as u16;
-        let rtp_timestamp = rng.next_u32();
         let session_uuid = random_uuid_upper(&mut rng);
         let session_uri = format_session_uri(local_addr.ip(), session_id);
 
@@ -318,20 +317,65 @@ impl NativeSession {
         )
         .map_err(NativeSessionError::Feedback)?;
 
+        // START(0) source contract: choose the earliest feasible instant.
+        // Until clock-readiness parity below is connected, the local floor is
+        // the source's AP2_MIN_WARM_LEAD_MS = 250 ms.
+        let now_ntp = system_time_to_ntp(SystemTime::now())
+            .map_err(|e| NativeSessionError::Timing(format!("{e:?}")))?;
+        let start_ntp = now_ntp.saturating_add(ms_to_ntp(250));
+        let head_ts = ntp_to_frames(start_ntp, 44_100);
+
+        // Source native START derives the wire timeline from process identity:
+        // head_ts remains pure wall-clock scheduling; RTP adds this offset.
+        let pid = std::process::id();
+        let rtp_offset = pid.wrapping_mul(2_654_435_761u32) & 0x0FFF_FF00u32;
+        let sequence = pid.wrapping_mul(40_503u32) as u16;
+        let rtp_timestamp = (head_ts as u32).wrapping_add(rtp_offset);
+
         let ptp_clock_id = ptp_timing.as_ref().map(PtpEngine::clock_id);
         let ssrc = if ptp_clock_id.is_some() { 0 } else { session_id };
         let rtp = RtpState::new(sequence, rtp_timestamp, ssrc);
-        let sender = if let Some(clock_id) = ptp_clock_id {
+
+        // Realtime source always attempts the retransmit responder, but failure
+        // is non-fatal: audio still runs, only packet repair is unavailable.
+        let rtx_ring = RetransmitRing::new();
+        let retransmit = media
+            .transport
+            .clone_control_socket()
+            .ok()
+            .and_then(|socket| RetransmitWorker::start(socket, rtx_ring.clone()).ok());
+
+        let mut sender = if let Some(clock_id) = ptp_clock_id {
             RealtimeMediaSender::new_ptp(media.transport, rtp, audio_secret, clock_id)
         } else {
             RealtimeMediaSender::new(media.transport, rtp, audio_secret)
         };
+        if retransmit.is_some() {
+            sender.set_retransmit_ring(rtx_ring);
+        }
+        sender.configure_source_timeline(
+            start_ntp,
+            head_ts,
+            media.latency_max,
+            effective_lead_frames,
+        );
+
+        // Source announces the PTP timeline immediately at START, before the
+        // first audio packet; the first packet announces it once more.
+        if ptp_clock_id.is_some() {
+            let anchor_now = system_time_to_ntp(SystemTime::now())
+                .map_err(|e| NativeSessionError::Timing(format!("{e:?}")))?;
+            sender
+                .prime_ptp_anchor(anchor_now, effective_lead_frames)
+                .map_err(|e| NativeSessionError::Media(format!("initial PTP anchor failed: {e:?}")))?;
+        }
 
         Ok(Self {
             flow,
             control,
             next_cseq,
             feedback,
+            retransmit,
             _ntp_timing: ntp_timing,
             _ptp_timing: ptp_timing,
             _event: event,
@@ -414,8 +458,22 @@ impl Drop for NativeSession {
         // Only after both threads are joined may timing/event resources drop.
         #[cfg(windows)]
         self.stop_windows_audio();
+        if let Some(worker) = self.retransmit.as_mut() {
+            worker.stop();
+        }
         self.feedback.stop();
     }
+}
+
+fn ms_to_ntp(ms: u64) -> u64 {
+    ((ms as u128) << 32).div_ceil(1000) as u64
+}
+
+fn ntp_to_frames(ntp: u64, sample_rate: u64) -> u64 {
+    let sec = ntp >> 32;
+    let frac = ntp & 0xFFFF_FFFF;
+    sec.saturating_mul(sample_rate)
+        .saturating_add(((frac as u128 * sample_rate as u128) >> 32) as u64)
 }
 
 fn format_session_uri(local_ip: IpAddr, session_id: u32) -> String {
