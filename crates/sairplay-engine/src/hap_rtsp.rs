@@ -51,10 +51,19 @@ impl EncryptedRtspChannel {
         request: &[u8],
         expected_cseq: u32,
     ) -> Result<RtspResponse, EncryptedRtspError> {
+        self.exchange_with_timeout(request, expected_cseq, self.exchange_timeout)
+    }
+
+    pub fn exchange_with_timeout(
+        &mut self,
+        request: &[u8],
+        expected_cseq: u32,
+        timeout: Duration,
+    ) -> Result<RtspResponse, EncryptedRtspError> {
         let wire = self.cipher.encrypt(request)?;
         self.stream.write_all(&wire).map_err(EncryptedRtspError::Write)?;
 
-        let deadline = Instant::now() + self.exchange_timeout;
+        let deadline = Instant::now() + timeout;
         let mut buf = [0u8; 4096];
 
         loop {
