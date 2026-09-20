@@ -1,7 +1,8 @@
 use crate::{
     build_encrypted_realtime_packet, build_ntp_sync_packet, build_ptp_sync_packet,
-    encode_alac_16_stereo_352, AlacEncodeError, MediaTransport, MediaTransportError,
-    NtpSyncPacketArgs, PtpClock, PtpSyncPacketArgs, RetransmitRing, RtpState,
+    encode_alac_16_stereo_352, AlacEncodeError, DatagramSendOutcome, MediaTransport,
+    MediaTransportError, NtpSyncPacketArgs, PtpClock, PtpSyncPacketArgs,
+    RetransmitRing, RtpState,
     ALAC_PCM_PACKET_BYTES, FRAMES_PER_PACKET_44100,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -176,8 +177,7 @@ impl RealtimeMediaSender {
         if !matches!(&self.timing, RealtimeTiming::Ptp { .. }) {
             return Ok(false);
         }
-        self.send_sync_packet(ntp_time, lead_frames, true)?;
-        Ok(true)
+        self.send_sync_packet(ntp_time, lead_frames, true)
     }
 
     pub fn head_ts(&self) -> u64 {
@@ -224,25 +224,41 @@ impl RealtimeMediaSender {
     ) -> Result<MediaSendResult, MediaSendError> {
         let should_sync = self.state.first_packet || (!self.state.first_packet && self.state.sequence % 100 == 0);
 
-        if should_sync {
-            self.send_sync_packet(ntp_time, lead_frames, self.state.first_packet)?;
-        }
+        let sync_delivered = if should_sync {
+            self.send_sync_packet(ntp_time, lead_frames, self.state.first_packet)?
+        } else {
+            true
+        };
 
         let sequence_sent = self.state.sequence;
         let timestamp_sent = self.state.timestamp;
         let packet = build_encrypted_realtime_packet(&self.state, alac_payload, &self.audio_key)?;
-        self.transport.send_data(&packet)?;
-        if let Some(ring) = &self.retransmit {
-            ring.store(sequence_sent, &packet);
-        }
+        let audio_delivered = match self
+            .transport
+            .send_data_deadline(&packet, Duration::from_millis(20))?
+        {
+            DatagramSendOutcome::Sent(_) => {
+                if let Some(ring) = &self.retransmit {
+                    ring.store(sequence_sent, &packet);
+                }
+                true
+            }
+            DatagramSendOutcome::Dropped => false,
+        };
 
-        self.state.advance(FRAMES_PER_PACKET_44100);
+        // Upstream advances the media timeline even on a transient local UDP
+        // drop; retrying an old timestamp late is worse than exposing a gap.
+        // Keep the restart marker armed until both first sync and first audio
+        // were accepted by the local socket.
+        let clear_first = audio_delivered && sync_delivered;
+        self.state
+            .advance_with_marker_clear(FRAMES_PER_PACKET_44100, clear_first);
         self.head_ts = self.head_ts.wrapping_add(FRAMES_PER_PACKET_44100 as u64);
 
         Ok(MediaSendResult {
             sequence_sent,
             timestamp_sent,
-            sync_sent: should_sync,
+            sync_sent: should_sync && sync_delivered,
         })
     }
 
@@ -251,8 +267,8 @@ impl RealtimeMediaSender {
         ntp_time: u64,
         lead_frames: u32,
         first: bool,
-    ) -> Result<(), MediaSendError> {
-        match &self.timing {
+    ) -> Result<bool, MediaSendError> {
+        let delivered = match &self.timing {
             RealtimeTiming::Ntp => {
                 let play_position = self.state.timestamp.saturating_sub(lead_frames);
                 let sync = build_ntp_sync_packet(NtpSyncPacketArgs {
@@ -261,7 +277,11 @@ impl RealtimeMediaSender {
                     ntp_time,
                     rtp_timestamp: self.state.timestamp,
                 });
-                self.transport.send_control(&sync)?;
+                matches!(
+                    self.transport
+                        .send_control_deadline(&sync, Duration::from_millis(20))?,
+                    DatagramSendOutcome::Sent(_)
+                )
             }
             RealtimeTiming::Ptp { clock } => {
                 let wall_time_ns = clock.master_now_ns();
@@ -286,10 +306,14 @@ impl RealtimeMediaSender {
                     frame_2,
                     clock_id,
                 });
-                self.transport.send_control(&sync)?;
+                matches!(
+                    self.transport
+                        .send_control_deadline(&sync, Duration::from_millis(20))?,
+                    DatagramSendOutcome::Sent(_)
+                )
             }
-        }
-        Ok(())
+        };
+        Ok(delivered)
     }
 }
 
