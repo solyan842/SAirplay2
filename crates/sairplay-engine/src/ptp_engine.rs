@@ -343,7 +343,7 @@ fn send_ptp(
     let followed = follow.lock().ok().and_then(|f| {
         if f.enabled { f.receiver } else { None }
     });
-    let snapshot = peers
+    let snapshot: Vec<Ipv4Addr> = peers
         .lock()
         .map(|p| p.iter().copied().filter(|ip| Some(*ip) != followed).collect())
         .unwrap_or_default();
