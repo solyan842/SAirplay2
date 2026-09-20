@@ -1,6 +1,7 @@
 use crate::{
-    build_encrypted_realtime_packet, build_ntp_sync_packet, encode_alac_16_stereo_352,
-    AlacEncodeError, MediaTransport, MediaTransportError, NtpSyncPacketArgs, RtpState,
+    build_encrypted_realtime_packet, build_ntp_sync_packet, build_ptp_sync_packet,
+    encode_alac_16_stereo_352, AlacEncodeError, MediaTransport, MediaTransportError,
+    NtpSyncPacketArgs, PtpSyncPacketArgs, RtpState,
     ALAC_PCM_PACKET_BYTES, FRAMES_PER_PACKET_44100,
 };
 
@@ -28,10 +29,19 @@ pub struct MediaSendResult {
     pub sync_sent: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RealtimeTiming {
+    Ntp,
+    Ptp { clock_id: u64 },
+}
+
 pub struct RealtimeMediaSender {
     transport: MediaTransport,
     state: RtpState,
     audio_key: [u8; 32],
+    timing: RealtimeTiming,
+    ptp_anchor_wall0: Option<u64>,
+    ptp_anchor_pos0: u32,
 }
 
 impl RealtimeMediaSender {
@@ -40,6 +50,25 @@ impl RealtimeMediaSender {
             transport,
             state,
             audio_key,
+            timing: RealtimeTiming::Ntp,
+            ptp_anchor_wall0: None,
+            ptp_anchor_pos0: state.timestamp,
+        }
+    }
+
+    pub fn new_ptp(
+        transport: MediaTransport,
+        state: RtpState,
+        audio_key: [u8; 32],
+        clock_id: u64,
+    ) -> Self {
+        Self {
+            transport,
+            state,
+            audio_key,
+            timing: RealtimeTiming::Ptp { clock_id },
+            ptp_anchor_wall0: None,
+            ptp_anchor_pos0: state.timestamp,
         }
     }
 
@@ -80,14 +109,44 @@ impl RealtimeMediaSender {
         let should_sync = self.state.first_packet || (!self.state.first_packet && self.state.sequence % 100 == 0);
 
         if should_sync {
-            let play_position = self.state.timestamp.saturating_sub(lead_frames);
-            let sync = build_ntp_sync_packet(NtpSyncPacketArgs {
-                first: self.state.first_packet,
-                play_position,
-                ntp_time,
-                rtp_timestamp: self.state.timestamp,
-            });
-            self.transport.send_control(&sync)?;
+            match self.timing {
+                RealtimeTiming::Ntp => {
+                    let play_position = self.state.timestamp.saturating_sub(lead_frames);
+                    let sync = build_ntp_sync_packet(NtpSyncPacketArgs {
+                        first: self.state.first_packet,
+                        play_position,
+                        ntp_time,
+                        rtp_timestamp: self.state.timestamp,
+                    });
+                    self.transport.send_control(&sync)?;
+                }
+                RealtimeTiming::Ptp { clock_id } => {
+                    let wall_time_ns = ntp_fixed_to_unix_ns(ntp_time);
+                    let wall0 = *self.ptp_anchor_wall0.get_or_insert(wall_time_ns);
+                    if self.state.first_packet {
+                        self.ptp_anchor_pos0 = self.state.timestamp;
+                    }
+
+                    let wall_delta_ns = wall_time_ns as i128 - wall0 as i128;
+                    let lead_ns = (lead_frames as i128 * 1_000_000_000i128)
+                        / 44_100i128;
+                    let elapsed_ns = wall_delta_ns - lead_ns;
+                    let elapsed_frames = (elapsed_ns * 44_100i128) / 1_000_000_000i128;
+                    let play_pos = self.ptp_anchor_pos0.wrapping_add(elapsed_frames as u32);
+
+                    // Source/owntone realtime PTP anchor geometry.
+                    let frame_1 = play_pos.wrapping_add(11_035);
+                    let frame_2 = frame_1.wrapping_add(77_175);
+                    let sync = build_ptp_sync_packet(PtpSyncPacketArgs {
+                        first: self.state.first_packet,
+                        frame_1,
+                        wall_time_ns,
+                        frame_2,
+                        clock_id,
+                    });
+                    self.transport.send_control(&sync)?;
+                }
+            }
         }
 
         let sequence_sent = self.state.sequence;
@@ -103,6 +162,17 @@ impl RealtimeMediaSender {
             sync_sent: should_sync,
         })
     }
+}
+
+
+fn ntp_fixed_to_unix_ns(ntp: u64) -> u64 {
+    const NTP_UNIX_EPOCH_DELTA: u64 = 2_208_988_800;
+    let sec = ntp >> 32;
+    let frac = ntp & 0xFFFF_FFFF;
+    let unix_sec = sec.saturating_sub(NTP_UNIX_EPOCH_DELTA);
+    unix_sec
+        .saturating_mul(1_000_000_000)
+        .saturating_add((frac.saturating_mul(1_000_000_000)) >> 32)
 }
 
 #[cfg(test)]
@@ -150,6 +220,33 @@ mod tests {
         assert!(dn > 12 + 16 + 8);
         assert_eq!(&buf[..12], &state.header());
         assert_eq!(sender.state().timestamp, 50_352);
+    }
+
+    #[test]
+    fn ptp_sender_emits_d7_anchor_before_rtp() {
+        let data_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ctrl_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        data_rx.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        ctrl_rx.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+
+        let transport = transport_to(&data_rx, &ctrl_rx);
+        let state = RtpState::new(7, 100_000, 0);
+        let mut sender = RealtimeMediaSender::new_ptp(
+            transport,
+            state,
+            [0x55u8; 32],
+            0xA1B2C3D4E5F60708,
+        );
+
+        let ntp = ((2_208_988_800u64 + 100) << 32);
+        sender.send_alac_payload(b"x", ntp, 11_025).unwrap();
+
+        let mut buf = [0u8; 128];
+        let (cn, _) = ctrl_rx.recv_from(&mut buf).unwrap();
+        assert_eq!(cn, 28);
+        assert_eq!(&buf[..4], &[0x90, 0xD7, 0x00, 0x06]);
+        assert_eq!(&buf[20..28], &0xA1B2C3D4E5F60708u64.to_be_bytes());
+        let _ = data_rx.recv_from(&mut buf).unwrap();
     }
 
     #[test]
