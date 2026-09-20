@@ -191,7 +191,7 @@ impl NativeSession {
                         mac_address,
                         name: config.receiver_name.clone(),
                         local_address: local_addr.ip().to_string(),
-                        clock_id: engine.clock_id(),
+                        clock_id: engine.master_clock_id(),
                         dacp_id: config.dacp_id.clone(),
                         active_remote: config.active_remote.clone(),
                     };
@@ -342,8 +342,8 @@ impl NativeSession {
         let sequence = pid.wrapping_mul(40_503u32) as u16;
         let rtp_timestamp = (head_ts as u32).wrapping_add(rtp_offset);
 
-        let ptp_clock_id = ptp_timing.as_ref().map(PtpEngine::clock_id);
-        let ssrc = if ptp_clock_id.is_some() { 0 } else { session_id };
+        let ptp_clock = ptp_timing.as_ref().map(PtpEngine::clock_handle);
+        let ssrc = if ptp_clock.is_some() { 0 } else { session_id };
         let rtp = RtpState::new(sequence, rtp_timestamp, ssrc);
 
         // Realtime source always attempts the retransmit responder, but failure
@@ -356,8 +356,8 @@ impl NativeSession {
             .ok()
             .and_then(|socket| RetransmitWorker::start(socket, rtx_ring.clone()).ok());
 
-        let mut sender = if let Some(clock_id) = ptp_clock_id {
-            RealtimeMediaSender::new_ptp(media.transport, rtp, audio_secret, clock_id)
+        let mut sender = if let Some(clock) = ptp_clock.clone() {
+            RealtimeMediaSender::new_ptp_clock(media.transport, rtp, audio_secret, clock)
         } else {
             RealtimeMediaSender::new(media.transport, rtp, audio_secret)
         };
@@ -373,7 +373,7 @@ impl NativeSession {
 
         // Source announces the PTP timeline immediately at START, before the
         // first audio packet; the first packet announces it once more.
-        if ptp_clock_id.is_some() {
+        if ptp_clock.is_some() {
             let anchor_now = system_time_to_ntp(SystemTime::now())
                 .map_err(|e| NativeSessionError::Timing(format!("{e:?}")))?;
             sender
