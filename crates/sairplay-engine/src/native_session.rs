@@ -264,9 +264,14 @@ impl NativeSession {
         flow.ready()
             .map_err(|e| NativeSessionError::Flow(format!("{e:?}")))?;
 
-        let ssrc = if ptp_timing.is_some() { 0 } else { session_id };
+        let ptp_clock_id = ptp_timing.as_ref().map(PtpEngine::clock_id);
+        let ssrc = if ptp_clock_id.is_some() { 0 } else { session_id };
         let rtp = RtpState::new(sequence, rtp_timestamp, ssrc);
-        let sender = RealtimeMediaSender::new(media.transport, rtp, audio_secret);
+        let sender = if let Some(clock_id) = ptp_clock_id {
+            RealtimeMediaSender::new_ptp(media.transport, rtp, audio_secret, clock_id)
+        } else {
+            RealtimeMediaSender::new(media.transport, rtp, audio_secret)
+        };
 
         Ok(Self {
             flow,
