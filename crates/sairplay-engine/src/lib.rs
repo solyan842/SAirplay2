@@ -29,6 +29,8 @@ pub mod media_sender;
 pub mod pcm_chunker;
 #[cfg(windows)]
 pub mod wasapi_loopback;
+#[cfg(windows)]
+pub mod windows_audio_worker;
 pub mod alac_encoder;
 
 pub use ap2_info::{Ap2Info, Ap2InfoError, AudioFormatCapability, ALAC_44100_16_2};
@@ -64,3 +66,5 @@ pub use alac_encoder::{encode_alac_16_stereo_352, AlacEncodeError, ALAC_PCM_BYTE
 pub use pcm_chunker::{Pcm352Chunker, PCM352_PACKET_BYTES};
 #[cfg(windows)]
 pub use wasapi_loopback::{WasapiLoopbackCapture, WasapiLoopbackError};
+#[cfg(windows)]
+pub use windows_audio_worker::{WindowsAudioWorker, WindowsAudioWorkerError};
