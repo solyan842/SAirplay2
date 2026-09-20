@@ -297,7 +297,7 @@ mod tests {
             buf.extend_from_slice(&tmp[..n]);
             if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                 let header_end = end + 4;
-                let header = String::from_utf8_lossy(&buf[..end]);
+                let header = String::from_utf8_lossy(&buf[..end]).into_owned();
                 let len = header.lines()
                     .find_map(|l| l.strip_prefix("Content-Length: "))
                     .unwrap().parse::<usize>().unwrap();
