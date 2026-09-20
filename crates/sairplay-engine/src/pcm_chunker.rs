@@ -12,6 +12,8 @@ impl Pcm352Chunker {
 
     pub fn pending_bytes(&self) -> usize { self.pending.len() }
 
+    pub fn has_packet(&self) -> bool { self.pending.len() >= PCM352_PACKET_BYTES }
+
     pub fn clear(&mut self) { self.pending.clear(); }
 
     pub fn push(&mut self, pcm_le_stereo_16: &[u8]) {
