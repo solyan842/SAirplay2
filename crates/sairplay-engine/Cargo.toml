@@ -6,5 +6,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+sha2 = "0.10.9"
+hkdf = "0.12.4"
+chacha20poly1305 = "0.10.1"
 mdns-sd = "0.21.3"
 plist = "=1.10.1"
