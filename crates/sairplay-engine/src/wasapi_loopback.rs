@@ -64,9 +64,10 @@ impl Drop for ComGuard {
 /// convert the endpoint mix to the exact SAirplay2 baseline:
 /// PCM signed 16-bit, stereo, 44.1 kHz.
 pub struct WasapiLoopbackCapture {
-    _com: ComGuard,
     audio_client: IAudioClient,
     capture_client: IAudioCaptureClient,
+    // Must be dropped after COM interfaces so CoUninitialize runs last.
+    _com: ComGuard,
 }
 
 impl WasapiLoopbackCapture {
@@ -132,9 +133,9 @@ impl WasapiLoopbackCapture {
                 )))?;
 
             Ok(Self {
-                _com: com,
                 audio_client,
                 capture_client,
+                _com: com,
             })
         }
     }
