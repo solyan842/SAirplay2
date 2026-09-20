@@ -220,6 +220,7 @@ impl SairplayApp {
         config.dacp_id = "A1B2C3D4E5F60708".into();
         config.active_remote = "123456789".into();
         config.supports_ptp = service.txt.supports_ptp();
+        config.follow_receiver_clock = service.txt.follows_receiver_clock();
         config.receiver_name = name.clone();
 
         let (tx, rx) = mpsc::sync_channel(1);
@@ -227,10 +228,11 @@ impl SairplayApp {
         self.playback = PlaybackUiState::Connecting(name.clone());
         self.session = None;
         self.log.push(format!(
-            "{name}: preflight starting on {host}:{port} · model={} · features=0x{:016X} · PTP={} · Playing waits for Ready + audio.",
+            "{name}: preflight starting on {host}:{port} · model={} · features=0x{:016X} · PTP={} · follow-clock={} · Playing waits for Ready + audio.",
             service.txt.model.as_deref().unwrap_or("-"),
             service.txt.features,
             service.txt.supports_ptp(),
+            service.txt.follows_receiver_clock(),
         ));
 
         thread::Builder::new()
