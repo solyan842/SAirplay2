@@ -1,3 +1,4 @@
+use socket2::SockRef;
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -170,6 +171,11 @@ impl PtpEngine {
         // while bind failure itself is what triggers NTP fallback.
         let _ = event.join_multicast_v4(&MCAST_ADDR, &bind_interface);
         let _ = general.join_multicast_v4(&MCAST_ADDR, &bind_interface);
+        // Upstream sets both membership interface and multicast egress
+        // interface. std::net exposes only the former, so use the socket API
+        // for the exact IP_MULTICAST_IF behavior.
+        let _ = SockRef::from(&event).set_multicast_if_v4(&bind_interface);
+        let _ = SockRef::from(&general).set_multicast_if_v4(&bind_interface);
         let _ = event.set_multicast_ttl_v4(1);
         let _ = general.set_multicast_ttl_v4(1);
         let _ = event.set_multicast_loop_v4(false);
