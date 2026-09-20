@@ -23,6 +23,7 @@ pub mod record;
 pub mod stream_setup;
 pub mod media_transport;
 pub mod media_handshake;
+pub mod rtp_packets;
 
 pub use ap2_info::{Ap2Info, Ap2InfoError, AudioFormatCapability, ALAC_44100_16_2};
 pub use catalog::{DeviceCatalog, DeviceRecord};
@@ -50,3 +51,4 @@ pub use record::{send_record, RecordConfig, RecordError};
 pub use stream_setup::{build_realtime_stream_plist, parse_stream_ports, setup_realtime_stream, RealtimeStreamSetupConfig, StreamPorts, StreamSetupError};
 pub use media_transport::{MediaTransport, MediaTransportError, MediaTransportPorts, RemoteMediaEndpoints};
 pub use media_handshake::{prepare_realtime_media, MediaHandshakeConfig, MediaHandshakeError, MediaHandshakeResult};
+pub use rtp_packets::{build_ntp_sync_packet, build_rtp_header, NtpSyncPacketArgs, RtpState};
