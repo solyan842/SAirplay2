@@ -32,6 +32,8 @@ impl From<StreamSetupError> for MediaHandshakeError {
 pub struct MediaHandshakeResult {
     pub transport: MediaTransport,
     pub remote_ports: StreamPorts,
+    pub latency_min: Option<u32>,
+    pub latency_max: Option<u32>,
 }
 
 pub fn prepare_realtime_media(
@@ -54,7 +56,8 @@ pub fn prepare_realtime_media(
         audio_secret: config.audio_secret,
         stream_connection_id: config.stream_connection_id,
     };
-    let remote_ports = setup_realtime_stream(flow, channel, &setup)?;
+    let setup_result = setup_realtime_stream(flow, channel, &setup)?;
+    let remote_ports = setup_result.ports;
 
     // 3) Only after a valid SETUP response attach the receiver endpoints.
     transport.attach_remote(config.receiver_ip, remote_ports);
@@ -62,6 +65,8 @@ pub fn prepare_realtime_media(
     Ok(MediaHandshakeResult {
         transport,
         remote_ports,
+        latency_min: setup_result.latency_min,
+        latency_max: setup_result.latency_max,
     })
 }
 
