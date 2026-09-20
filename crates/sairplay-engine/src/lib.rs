@@ -63,7 +63,7 @@ pub use event_channel::{derive_event_keys, open_event_channel, EventChannel, Eve
 pub use feedback::{FeedbackWorker, SharedCseq, SharedRtspControl};
 pub use setpeers::{build_setpeers_plist, send_setpeers, SetPeersConfig, SetPeersError};
 pub use record::{send_record, RecordConfig, RecordError};
-pub use stream_setup::{build_realtime_stream_plist, parse_stream_ports, setup_realtime_stream, RealtimeStreamSetupConfig, StreamPorts, StreamSetupError};
+pub use stream_setup::{build_realtime_stream_plist, parse_stream_ports, parse_stream_setup_response, setup_realtime_stream, RealtimeStreamSetupConfig, RealtimeStreamSetupResult, StreamPorts, StreamSetupError};
 pub use media_transport::{MediaTransport, MediaTransportError, MediaTransportPorts, RemoteMediaEndpoints};
 pub use media_handshake::{prepare_realtime_media, MediaHandshakeConfig, MediaHandshakeError, MediaHandshakeResult};
 pub use rtp_packets::{build_ntp_sync_packet, build_ptp_sync_packet, build_rtp_header, NtpSyncPacketArgs, PtpSyncPacketArgs, RtpState, FRAMES_PER_PACKET_44100};
