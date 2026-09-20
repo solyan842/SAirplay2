@@ -27,6 +27,7 @@ pub struct NativeSessionConfig {
     pub active_remote: String,
     pub lead_frames: u32,
     pub supports_ptp: bool,
+    pub follow_receiver_clock: bool,
     pub receiver_name: String,
 }
 
@@ -40,6 +41,7 @@ impl NativeSessionConfig {
             active_remote: "123456789".into(),
             lead_frames: 11_025,
             supports_ptp: false,
+            follow_receiver_clock: false,
             receiver_name: "SAirplay2 Receiver".into(),
         }
     }
@@ -167,7 +169,12 @@ impl NativeSession {
         let event_port;
 
         if config.supports_ptp {
-            match PtpEngine::start(receiver_ip, local_addr.ip(), clock_id) {
+            match PtpEngine::start(
+                receiver_ip,
+                local_addr.ip(),
+                clock_id,
+                config.follow_receiver_clock,
+            ) {
                 Ok(engine) => {
                     // Match source settle window before publishing timingPeerInfo.
                     std::thread::sleep(Duration::from_millis(400));
