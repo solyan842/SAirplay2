@@ -54,65 +54,68 @@ impl FeedbackWorker {
                     // whole budget, this tick is SKIPPED: no CSeq/nonce is
                     // consumed and it is not a receiver miss.
                     let deadline = Instant::now() + FEEDBACK_TIMEOUT;
-                    let mut channel = loop {
-                        match control.try_lock() {
-                            Ok(channel) => break Some(channel),
-                            Err(TryLockError::WouldBlock) => {
-                                if stop_thread.load(Ordering::SeqCst) {
-                                    break None;
+                    let result_and_cseq = {
+                        let mut channel = loop {
+                            match control.try_lock() {
+                                Ok(channel) => break Some(channel),
+                                Err(TryLockError::WouldBlock) => {
+                                    if stop_thread.load(Ordering::SeqCst) {
+                                        break None;
+                                    }
+                                    if Instant::now() >= deadline {
+                                        break None;
+                                    }
+                                    thread::sleep(Duration::from_millis(5));
                                 }
-                                if Instant::now() >= deadline {
-                                    break None;
+                                Err(TryLockError::Poisoned(_)) => {
+                                    if let Ok(mut slot) = error_thread.lock() {
+                                        *slot = Some("RTSP control mutex poisoned".into());
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
                                 }
-                                thread::sleep(Duration::from_millis(5));
                             }
-                            Err(TryLockError::Poisoned(_)) => {
-                                if let Ok(mut slot) = error_thread.lock() {
-                                    *slot = Some("RTSP control mutex poisoned".into());
-                                }
-                                running_thread.store(false, Ordering::SeqCst);
-                                return;
-                            }
+                        };
+
+                        if stop_thread.load(Ordering::SeqCst) {
+                            break;
                         }
+
+                        let Some(ref mut channel) = channel else {
+                            // Busy control path: source calls this a skipped tick.
+                            next_tick = Instant::now() + FEEDBACK_INTERVAL;
+                            continue;
+                        };
+
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            next_tick = Instant::now() + FEEDBACK_INTERVAL;
+                            continue;
+                        }
+
+                        // CSeq advances only once the request is actually starting.
+                        let cseq = next_cseq.fetch_add(1, Ordering::SeqCst);
+                        let request = RtspRequest {
+                            method: "POST".into(),
+                            uri: "/feedback".into(),
+                            cseq,
+                            user_agent: "AirPlay/670.6.2".into(),
+                            dacp_id: dacp_id.clone(),
+                            active_remote: active_remote.clone(),
+                            client_instance: None,
+                            content_type: None,
+                            body: Vec::new(),
+                        };
+
+                        let result = channel.exchange_with_timeout(
+                            &request.encode(),
+                            cseq,
+                            remaining,
+                        );
+                        (result, cseq)
                     };
 
-                    if stop_thread.load(Ordering::SeqCst) {
-                        break;
-                    }
-
-                    let Some(ref mut channel) = channel else {
-                        // Busy control path: source calls this a skipped tick.
-                        next_tick = Instant::now() + FEEDBACK_INTERVAL;
-                        continue;
-                    };
-
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        next_tick = Instant::now() + FEEDBACK_INTERVAL;
-                        continue;
-                    }
-
-                    // CSeq advances only once the request is actually starting.
-                    let cseq = next_cseq.fetch_add(1, Ordering::SeqCst);
-                    let request = RtspRequest {
-                        method: "POST".into(),
-                        uri: "/feedback".into(),
-                        cseq,
-                        user_agent: "AirPlay/670.6.2".into(),
-                        dacp_id: dacp_id.clone(),
-                        active_remote: active_remote.clone(),
-                        client_instance: None,
-                        content_type: None,
-                        body: Vec::new(),
-                    };
-
-                    let result = channel.exchange_with_timeout(
-                        &request.encode(),
-                        cseq,
-                        remaining,
-                    );
-                    drop(channel);
-
+                    let (result, cseq) = result_and_cseq;
                     match result {
                         Ok(response) if response.status == 200 => {
                             misses = 0;
