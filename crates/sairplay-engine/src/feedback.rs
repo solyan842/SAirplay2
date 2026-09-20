@@ -1,7 +1,7 @@
 use crate::{EncryptedRtspChannel, RtspRequest};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, TryLockError,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -49,6 +49,50 @@ impl FeedbackWorker {
                         continue;
                     }
 
+                    // Source uses one total 2 s budget for lock acquisition +
+                    // request/response. If the serialization lock consumes the
+                    // whole budget, this tick is SKIPPED: no CSeq/nonce is
+                    // consumed and it is not a receiver miss.
+                    let deadline = Instant::now() + FEEDBACK_TIMEOUT;
+                    let mut channel = loop {
+                        match control.try_lock() {
+                            Ok(channel) => break Some(channel),
+                            Err(TryLockError::WouldBlock) => {
+                                if stop_thread.load(Ordering::SeqCst) {
+                                    break None;
+                                }
+                                if Instant::now() >= deadline {
+                                    break None;
+                                }
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(TryLockError::Poisoned(_)) => {
+                                if let Ok(mut slot) = error_thread.lock() {
+                                    *slot = Some("RTSP control mutex poisoned".into());
+                                }
+                                running_thread.store(false, Ordering::SeqCst);
+                                return;
+                            }
+                        }
+                    };
+
+                    if stop_thread.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    let Some(ref mut channel) = channel else {
+                        // Busy control path: source calls this a skipped tick.
+                        next_tick = Instant::now() + FEEDBACK_INTERVAL;
+                        continue;
+                    };
+
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        next_tick = Instant::now() + FEEDBACK_INTERVAL;
+                        continue;
+                    }
+
+                    // CSeq advances only once the request is actually starting.
                     let cseq = next_cseq.fetch_add(1, Ordering::SeqCst);
                     let request = RtspRequest {
                         method: "POST".into(),
@@ -62,21 +106,12 @@ impl FeedbackWorker {
                         body: Vec::new(),
                     };
 
-                    // Mirrors source rtsp_lock: the complete encrypted request/response
-                    // exchange is serialized on one shared control channel.
-                    let result = match control.lock() {
-                        Ok(mut channel) => channel.exchange_with_timeout(
-                            &request.encode(),
-                            cseq,
-                            FEEDBACK_TIMEOUT,
-                        ),
-                        Err(_) => {
-                            if let Ok(mut slot) = error_thread.lock() {
-                                *slot = Some("RTSP control mutex poisoned".into());
-                            }
-                            break;
-                        }
-                    };
+                    let result = channel.exchange_with_timeout(
+                        &request.encode(),
+                        cseq,
+                        remaining,
+                    );
+                    drop(channel);
 
                     match result {
                         Ok(response) if response.status == 200 => {
