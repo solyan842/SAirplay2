@@ -21,7 +21,7 @@ impl RtspRequest {
             uri: "/info".into(),
             cseq,
             user_agent: "AirPlay/670.6.2".into(),
-            client_instance: Some(dacp_id.clone()),
+            client_instance: None,
             dacp_id,
             active_remote: active_remote.into(),
             content_type: None,
