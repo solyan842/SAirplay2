@@ -22,6 +22,7 @@ pub mod ptp_engine;
 pub mod ptp_session_setup;
 pub mod ntp_session_setup;
 pub mod event_channel;
+pub mod feedback;
 pub mod record;
 pub mod stream_setup;
 pub mod media_transport;
@@ -58,6 +59,7 @@ pub use ntp_timing::{build_timing_response, system_time_to_ntp, NtpTimingError, 
 pub use native_timing::{start_ntp_timing_gate, NativeTimingGateError};
 pub use ntp_session_setup::{build_ntp_session_plist, parse_event_port, setup_ntp_session, NtpSessionSetupConfig, NtpSessionSetupError, NtpSessionSetupResult};
 pub use event_channel::{derive_event_keys, open_event_channel, EventChannel, EventChannelError};
+pub use feedback::FeedbackWorker;
 pub use record::{send_record, RecordConfig, RecordError};
 pub use stream_setup::{build_realtime_stream_plist, parse_stream_ports, setup_realtime_stream, RealtimeStreamSetupConfig, StreamPorts, StreamSetupError};
 pub use media_transport::{MediaTransport, MediaTransportError, MediaTransportPorts, RemoteMediaEndpoints};
