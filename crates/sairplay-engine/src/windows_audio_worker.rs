@@ -115,6 +115,7 @@ impl WindowsAudioWorker {
                             );
                         }
                         let frames = report.frames;
+                        let content_frames = report.content_frames;
                         captured_frames_total = captured_frames_total.saturating_add(frames as u64);
 
                         // Before the first START, upstream has no live wire feed.
@@ -206,9 +207,11 @@ impl WindowsAudioWorker {
                                     }
                                 }
                             }
-                        } else if frames > 0 {
-                            // New PCM arrived but not enough for a complete packet;
-                            // this is normal producer cadence, not starvation.
+                        } else if content_frames > 0 {
+                            // New non-silent PCM arrived but not enough for a
+                            // complete packet; this is normal producer cadence,
+                            // not starvation. WASAPI SILENT packets are excluded
+                            // from the content queue and must not reset this gate.
                             input_starved_since = None;
                             silence_keepalive = false;
                         } else {
