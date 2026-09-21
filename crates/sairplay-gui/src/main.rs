@@ -434,13 +434,415 @@ impl SairplayApp {
         self.last_rtx = (0, 0, 0);
     }
 
-    fn status_text(&self) -> String {
+    fn header_status(&self) -> (&'static str, &'static str, egui::Color32) {
         match &self.playback {
-            PlaybackUiState::Idle => "Idle".into(),
-            PlaybackUiState::Connecting(name) => format!("Preparing · {name}"),
-            PlaybackUiState::Playing(name) => format!("Playing · {name}"),
-            PlaybackUiState::Error(_) => "Error".into(),
+            PlaybackUiState::Idle => (
+                self.t("Sẵn sàng", "Ready"),
+                self.t("Đang chờ phát nhạc...", "Waiting for playback..."),
+                egui::Color32::from_rgb(18, 185, 91),
+            ),
+            PlaybackUiState::Connecting(_) => (
+                self.t("Đang kết nối", "Connecting"),
+                self.t("Đang chuẩn bị thiết bị...", "Preparing receiver..."),
+                egui::Color32::from_rgb(241, 158, 0),
+            ),
+            PlaybackUiState::Playing(_) => (
+                self.t("Đang chạy", "Running"),
+                self.t("Đang truyền âm thanh qua AirPlay", "Streaming via AirPlay"),
+                egui::Color32::from_rgb(18, 185, 91),
+            ),
+            PlaybackUiState::Error(_) => (
+                self.t("Lỗi kết nối", "Connection Error"),
+                self.t("Xem Log để kiểm tra", "Open Log for details"),
+                egui::Color32::from_rgb(229, 57, 68),
+            ),
         }
+    }
+
+    fn device_status(&self, device: &DeviceRecord, stereo_pair: bool) -> (&'static str, egui::Color32) {
+        let selected = device
+            .airplay
+            .as_ref()
+            .is_some_and(|s| self.selected_fullname.as_deref() == Some(s.fullname.as_str()));
+
+        match &self.playback {
+            PlaybackUiState::Connecting(name) if name == &device.display_name => (
+                self.t("Đang kết nối", "Connecting"),
+                egui::Color32::from_rgb(241, 158, 0),
+            ),
+            PlaybackUiState::Playing(name) if name == &device.display_name => (
+                self.t("Đang chạy", "Running"),
+                egui::Color32::from_rgb(18, 185, 91),
+            ),
+            PlaybackUiState::Error(_) if selected => (
+                self.t("Lỗi kết nối", "Connection Error"),
+                egui::Color32::from_rgb(229, 57, 68),
+            ),
+            _ if device.route(false, false) == Route::AirPlay2Native => {
+                if stereo_pair {
+                    (self.t("Sẵn sàng", "Ready"), egui::Color32::from_rgb(18, 185, 91))
+                } else {
+                    (self.t("Đang chờ", "Waiting"), egui::Color32::from_rgb(241, 158, 0))
+                }
+            }
+            _ => (
+                self.t("Chờ", "Standby"),
+                egui::Color32::from_rgb(104, 124, 154),
+            ),
+        }
+    }
+
+    fn render_device_row(&mut self, ui: &mut egui::Ui, device: &DeviceRecord, stereo_pair: bool) {
+        let route = device.route(false, false);
+        let fullname = device.airplay.as_ref().map(|s| s.fullname.clone());
+        let selected = fullname
+            .as_deref()
+            .is_some_and(|name| self.selected_fullname.as_deref() == Some(name));
+        let selectable = route == Route::AirPlay2Native
+            && fullname.is_some()
+            && !matches!(self.playback, PlaybackUiState::Connecting(_));
+
+        let address = device
+            .airplay
+            .as_ref()
+            .map(preferred_service_address)
+            .or_else(|| device.raop.as_ref().map(preferred_service_address))
+            .unwrap_or_else(|| "-".into());
+
+        let artwork = classify_device_artwork(device);
+        let (status, status_color) = self.device_status(device, stereo_pair);
+
+        egui::Frame::new()
+            .fill(if selected {
+                egui::Color32::from_rgb(240, 248, 255)
+            } else {
+                egui::Color32::WHITE
+            })
+            .stroke(egui::Stroke::new(
+                if selected { 1.4 } else { 1.0 },
+                if selected {
+                    egui::Color32::from_rgb(165, 211, 255)
+                } else {
+                    egui::Color32::from_rgb(223, 232, 243)
+                },
+            ))
+            .corner_radius(egui::CornerRadius::same(12))
+            .inner_margin(egui::Margin::symmetric(12, 9))
+            .show(ui, |ui| {
+                ui.set_min_height(72.0);
+                ui.horizontal(|ui| {
+                    let response = ui.add_enabled(
+                        selectable,
+                        egui::RadioButton::new(selected, ""),
+                    );
+                    if response.clicked() {
+                        self.selected_fullname = fullname.clone();
+                        if matches!(self.playback, PlaybackUiState::Error(_)) {
+                            self.playback = PlaybackUiState::Idle;
+                        }
+                    }
+
+                    ui.add_space(2.0);
+                    draw_device_art(ui, artwork, stereo_pair, egui::vec2(86.0, 54.0));
+                    ui.add_space(6.0);
+
+                    ui.vertical(|ui| {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(&device.display_name)
+                                .size(16.0)
+                                .strong()
+                                .color(egui::Color32::from_rgb(20, 31, 51)),
+                        );
+                        ui.label(
+                            egui::RichText::new(address)
+                                .size(13.5)
+                                .color(egui::Color32::from_rgb(70, 106, 165)),
+                        );
+                    });
+
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            draw_status_badge(ui, status, status_color);
+                        },
+                    );
+                });
+            });
+
+        ui.add_space(7.0);
+    }
+
+    fn render_device_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        title: &'static str,
+        devices: &[DeviceRecord],
+        stereo_pair: bool,
+    ) {
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(252, 254, 255))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(210, 225, 242)))
+            .corner_radius(egui::CornerRadius::same(14))
+            .inner_margin(egui::Margin::same(12))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    draw_small_airplay_mark(ui);
+                    ui.label(
+                        egui::RichText::new(title)
+                            .size(22.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(13, 28, 54)),
+                    );
+
+                    if !stereo_pair {
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let label = self.t("MultiRoom", "MultiRoom");
+                                let toggle = ui.selectable_label(
+                                    self.multiroom_enabled,
+                                    egui::RichText::new(format!("○  {label}")).size(15.0),
+                                );
+                                if toggle.clicked() {
+                                    self.multiroom_enabled = !self.multiroom_enabled;
+                                    self.log.push(format!(
+                                        "MultiRoom GUI mode {}. Transport wiring is intentionally unchanged.",
+                                        if self.multiroom_enabled { "enabled" } else { "disabled" }
+                                    ));
+                                }
+                                toggle.on_hover_text(self.t(
+                                    "Giao diện MultiRoom đã chuẩn bị; transport sẽ nối sau khi đường phát đơn ổn định.",
+                                    "MultiRoom UI is prepared; transport wiring follows after single-room playback is stable.",
+                                ));
+                            },
+                        );
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                egui::ScrollArea::vertical()
+                    .id_salt(if stereo_pair { "pair_scroll" } else { "receiver_scroll" })
+                    .max_height(345.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if devices.is_empty() {
+                            ui.add_space(20.0);
+                            ui.vertical_centered(|ui| {
+                                let text = if stereo_pair {
+                                    self.t(
+                                        "Chưa phát hiện Stereo Pair HomePod",
+                                        "No HomePod stereo pair detected",
+                                    )
+                                } else {
+                                    self.t(
+                                        "Đang quét thiết bị AirPlay...",
+                                        "Scanning AirPlay receivers...",
+                                    )
+                                };
+                                ui.label(
+                                    egui::RichText::new(text)
+                                        .size(14.0)
+                                        .color(egui::Color32::from_rgb(113, 130, 154)),
+                                );
+                            });
+                        } else {
+                            for device in devices {
+                                self.render_device_row(ui, device, stereo_pair);
+                            }
+                        }
+                    });
+            });
+    }
+
+    fn render_controls(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .fill(egui::Color32::WHITE)
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(210, 225, 242)))
+            .corner_radius(egui::CornerRadius::same(13))
+            .inner_margin(egui::Margin::symmetric(16, 10))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("◖))")
+                            .size(23.0)
+                            .color(egui::Color32::from_rgb(67, 92, 131)),
+                    );
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(self.t("Âm lượng Receiver", "Receiver Volume"))
+                                .size(14.0)
+                                .color(egui::Color32::from_rgb(38, 52, 75)),
+                        );
+                        let mut volume = parse_volume_text(&self.initial_volume_text)
+                            .ok()
+                            .flatten()
+                            .unwrap_or(50);
+                        let response = ui.add_sized(
+                            [280.0, 22.0],
+                            egui::Slider::new(&mut volume, 0..=100)
+                                .show_value(true)
+                                .suffix("%"),
+                        );
+                        if response.changed() {
+                            self.initial_volume_text = volume.to_string();
+                            self.apply_volume_value(volume);
+                        }
+                    });
+
+                    if self.volume_rx.is_some() {
+                        ui.spinner();
+                    }
+
+                    ui.separator();
+
+                    let start_enabled = self.selected_fullname.is_some()
+                        && !self.multiroom_enabled
+                        && matches!(self.playback, PlaybackUiState::Idle | PlaybackUiState::Error(_));
+                    let start_text = format!("▶  {}", self.t("Bắt đầu", "Start"));
+                    if ui
+                        .add_enabled(
+                            start_enabled,
+                            egui::Button::new(
+                                egui::RichText::new(start_text)
+                                    .size(16.0)
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(egui::Color32::from_rgb(15, 128, 247))
+                            .min_size(egui::vec2(160.0, 44.0)),
+                        )
+                        .clicked()
+                    {
+                        self.start_selected();
+                    }
+
+                    let stop_enabled = self.session.is_some();
+                    let stop_text = format!("■  {}", self.t("Dừng", "Stop"));
+                    if ui
+                        .add_enabled(
+                            stop_enabled,
+                            egui::Button::new(egui::RichText::new(stop_text).size(16.0))
+                                .min_size(egui::vec2(140.0, 44.0)),
+                        )
+                        .clicked()
+                    {
+                        self.stop_playback();
+                    }
+
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(self.t(
+                                "Kết nối qua AirPlay 2",
+                                "Connect via AirPlay 2",
+                            ))
+                            .size(15.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(22, 38, 65)),
+                        );
+                        let detail = if self.multiroom_enabled {
+                            self.t(
+                                "MultiRoom · giao diện đã sẵn sàng",
+                                "MultiRoom · UI prepared",
+                            )
+                        } else {
+                            self.t("Sẵn sàng truyền · ALAC", "Ready to stream · ALAC")
+                        };
+                        ui.label(
+                            egui::RichText::new(detail)
+                                .size(13.0)
+                                .color(egui::Color32::from_rgb(82, 113, 162)),
+                        );
+                    });
+                });
+            });
+    }
+
+    fn render_trial_row(&mut self, ui: &mut egui::Ui) {
+        let text = self.t("Dùng thử · còn 3 ngày", "Trial · 3 days left");
+        let activate = self.t("Nhấn để kích hoạt", "Click to activate");
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(248, 252, 255))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(211, 226, 244)))
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(14, 7))
+            .show(ui, |ui| {
+                let response = ui
+                    .horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("⌕")
+                                .size(18.0)
+                                .color(egui::Color32::from_rgb(10, 120, 246)),
+                        );
+                        ui.label(egui::RichText::new(text).strong().size(14.0));
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(activate)
+                                .size(14.0)
+                                .color(egui::Color32::from_rgb(71, 106, 160)),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new("›")
+                                        .size(24.0)
+                                        .color(egui::Color32::from_rgb(55, 93, 151)),
+                                );
+                            },
+                        );
+                    })
+                    .response
+                    .interact(egui::Sense::click());
+                if response.clicked() {
+                    self.activation_open = true;
+                }
+            });
+    }
+
+    fn render_activation_window(&mut self, ctx: &egui::Context) {
+        if !self.activation_open {
+            return;
+        }
+        let title = self.t("Kích hoạt S-Airplay2", "Activate S-Airplay2");
+        let key_label = self.t("Mã kích hoạt", "Activation key");
+        let note = self.t(
+            "Giao diện kích hoạt đã sẵn sàng. Cơ chế bản quyền thật sẽ được nối ở bước sau.",
+            "Activation UI is ready. The licensing backend will be connected in a later step.",
+        );
+        let close_label = self.t("Đóng", "Close");
+
+        let mut open = self.activation_open;
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(430.0)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(note).size(13.5));
+                ui.add_space(10.0);
+                ui.label(key_label);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.activation_key)
+                        .hint_text("XXXX-XXXX-XXXX-XXXX")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.add_enabled(
+                        false,
+                        egui::Button::new(self.t("Kích hoạt", "Activate"))
+                            .min_size(egui::vec2(120.0, 34.0)),
+                    );
+                    if ui.button(close_label).clicked() {
+                        self.activation_open = false;
+                    }
+                });
+            });
+        self.activation_open &= open;
     }
 }
 
@@ -451,22 +853,37 @@ impl eframe::App for SairplayApp {
         self.pump_volume_result();
         self.monitor_running_session();
 
+        let mut visuals = egui::Visuals::light();
+        visuals.panel_fill = egui::Color32::from_rgb(244, 249, 255);
+        visuals.window_fill = egui::Color32::WHITE;
+        visuals.extreme_bg_color = egui::Color32::from_rgb(238, 245, 253);
+        visuals.selection.bg_fill = egui::Color32::from_rgb(31, 139, 255);
+        visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+        ctx.set_visuals(visuals);
+
         egui::TopBottomPanel::bottom("app_footer")
-            .exact_height(30.0)
+            .exact_height(31.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(egui::Color32::WHITE)
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(218, 229, 242),
+                    ))
+                    .inner_margin(egui::Margin::symmetric(16, 5)),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::Hyperlink::from_label_and_url(
-                            egui::RichText::new("SolYan").small(),
-                            "https://www.youtube.com/@SolYan-Music",
-                        )
-                        .open_in_new_tab(true),
+                    ui.label(
+                        egui::RichText::new("@2026 SolYan S-Airplay2")
+                            .small()
+                            .color(egui::Color32::from_rgb(73, 91, 122)),
                     );
                     ui.label(egui::RichText::new("·").small());
                     ui.add(
                         egui::Hyperlink::from_label_and_url(
-                            egui::RichText::new("yansign842@gmail.com").small(),
-                            "https://mail.google.com/mail/?view=cm&fs=1&to=yansign842@gmail.com",
+                            egui::RichText::new("Website").small().underline(),
+                            "https://youtube.com/@solyan-music",
                         )
                         .open_in_new_tab(true),
                     );
@@ -475,8 +892,8 @@ impl eframe::App for SairplayApp {
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
                             if ui
-                                .link(egui::RichText::new("Log").small())
-                                .on_hover_text("Copy full log")
+                                .link(egui::RichText::new("Log").small().underline())
+                                .on_hover_text(self.t("Sao chép toàn bộ Log", "Copy full log"))
                                 .clicked()
                             {
                                 ui.ctx().copy_text(self.log.join("\n"));
@@ -486,154 +903,405 @@ impl eframe::App for SairplayApp {
                 });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("SAirplay2");
-            ui.label("Native AirPlay 2 · Windows system audio · 16-bit / 44.1 kHz");
-            ui.separator();
-
-            ui.horizontal(|ui| {
-                ui.label("Status:");
-                ui.strong(self.status_text());
-                ui.separator();
-                ui.label("Discovery:");
-                ui.strong(if self.discovery.is_some() { "Running" } else { "Unavailable" });
-            });
-
-            if let PlaybackUiState::Error(error) = &self.playback {
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.strong("Last error:");
-                    if ui.button("Copy Error").clicked() {
-                        ui.ctx().copy_text(error.clone());
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(244, 249, 255))
+                    .inner_margin(egui::Margin::same(18)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let logo = draw_app_logo(ui, egui::vec2(86.0, 86.0));
+                    if logo
+                        .on_hover_text(self.t(
+                            "Nhấn để quét lại thiết bị",
+                            "Click to scan devices again",
+                        ))
+                        .clicked()
+                    {
+                        self.rescan_devices();
                     }
-                });
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(error).monospace()
-                    )
-                    .selectable(true)
-                    .wrap(),
-                );
-            }
 
-            ui.add_space(8.0);
-            ui.heading("Receivers");
-
-            let devices = self.catalog.devices().to_vec();
-            if devices.is_empty() {
-                ui.label("Scanning _airplay._tcp.local. and _raop._tcp.local. ...");
-            } else {
-                egui::Grid::new("receivers_grid")
-                    .striped(true)
-                    .min_col_width(105.0)
-                    .show(ui, |ui| {
-                        ui.strong("");
-                        ui.strong("Device");
-                        ui.strong("Route");
-                        ui.strong("Address");
-                        ui.strong("Services");
-                        ui.end_row();
-
-                        for device in &devices {
-                            let route = device.route(false, false);
-                            let address = device
-                                .airplay
-                                .as_ref()
-                                .map(preferred_service_address)
-                                .or_else(|| device.raop.as_ref().map(preferred_service_address))
-                                .unwrap_or_else(|| "-".into());
-                            let services = match (device.airplay.is_some(), device.raop.is_some()) {
-                                (true, true) => "AirPlay + RAOP",
-                                (true, false) => "AirPlay",
-                                (false, true) => "RAOP",
-                                (false, false) => "-",
-                            };
-
-                            let fullname = device
-                                .airplay
-                                .as_ref()
-                                .map(|service| service.fullname.clone());
-                            let selected = fullname
-                                .as_deref()
-                                .is_some_and(|name| self.selected_fullname.as_deref() == Some(name));
-
-                            let selectable = route == Route::AirPlay2Native && fullname.is_some();
-                            let radio = ui.add_enabled(
-                                selectable && !matches!(self.playback, PlaybackUiState::Connecting(_)),
-                                egui::RadioButton::new(selected, ""),
-                            );
-                            if radio.clicked() {
-                                self.selected_fullname = fullname;
-                                if matches!(self.playback, PlaybackUiState::Error(_)) {
-                                    self.playback = PlaybackUiState::Idle;
-                                }
-                            }
-
-                            ui.label(&device.display_name);
-                            ui.monospace(format!("{route:?}"));
-                            ui.monospace(address);
-                            ui.label(services);
-                            ui.end_row();
-                        }
+                    ui.add_space(10.0);
+                    ui.vertical(|ui| {
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("SAirplay2")
+                                .size(35.0)
+                                .strong()
+                                .color(egui::Color32::from_rgb(7, 19, 52)),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "Native AirPlay — Apple's lossless wireless audio transport using ALAC",
+                            )
+                            .size(15.5)
+                            .color(egui::Color32::from_rgb(79, 105, 154)),
+                        );
                     });
-            }
 
-            ui.add_space(12.0);
-            ui.separator();
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.vertical(|ui| {
+                                let vi_fill = if self.language == UiLanguage::Vi {
+                                    egui::Color32::from_rgb(245, 249, 255)
+                                } else {
+                                    egui::Color32::WHITE
+                                };
+                                let en_fill = if self.language == UiLanguage::En {
+                                    egui::Color32::from_rgb(18, 126, 246)
+                                } else {
+                                    egui::Color32::from_rgb(238, 244, 251)
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("VI")
+                                                .strong()
+                                                .color(egui::Color32::from_rgb(24, 46, 86)),
+                                        )
+                                        .fill(vi_fill)
+                                        .min_size(egui::vec2(54.0, 34.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.language = UiLanguage::Vi;
+                                }
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("EN")
+                                                .strong()
+                                                .color(if self.language == UiLanguage::En {
+                                                    egui::Color32::WHITE
+                                                } else {
+                                                    egui::Color32::from_rgb(24, 46, 86)
+                                                }),
+                                        )
+                                        .fill(en_fill)
+                                        .min_size(egui::vec2(54.0, 34.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.language = UiLanguage::En;
+                                }
+                            });
 
-            ui.horizontal(|ui| {
-                ui.label("Receiver volume:");
-                let mut volume = parse_volume_text(&self.initial_volume_text)
-                    .ok()
-                    .flatten()
-                    .unwrap_or(50);
-                let response = ui.add(
-                    egui::Slider::new(&mut volume, 0..=100)
-                        .show_value(true)
-                        .suffix("%"),
-                );
-                if response.changed() {
-                    self.initial_volume_text = volume.to_string();
-                    self.apply_volume_value(volume);
-                }
-                if self.volume_rx.is_some() {
-                    ui.spinner();
-                }
+                            ui.add_space(12.0);
+                            let (status, detail, color) = self.header_status();
+                            egui::Frame::new()
+                                .fill(egui::Color32::WHITE)
+                                .stroke(egui::Stroke::new(
+                                    1.0,
+                                    egui::Color32::from_rgb(211, 226, 243),
+                                ))
+                                .corner_radius(egui::CornerRadius::same(28))
+                                .inner_margin(egui::Margin::symmetric(16, 10))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.painter().circle_filled(
+                                            ui.cursor().min + egui::vec2(8.0, 16.0),
+                                            7.0,
+                                            color,
+                                        );
+                                        ui.add_space(20.0);
+                                        ui.vertical(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(status)
+                                                    .size(15.5)
+                                                    .strong()
+                                                    .color(egui::Color32::from_rgb(18, 29, 49)),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(detail)
+                                                    .size(12.0)
+                                                    .color(egui::Color32::from_rgb(79, 105, 154)),
+                                            );
+                                        });
+                                    });
+                                });
+                        },
+                    );
+                });
+
+                ui.add_space(12.0);
+
+                let all_devices = self.catalog.devices().to_vec();
+                let receivers: Vec<DeviceRecord> = all_devices
+                    .iter()
+                    .filter(|device| !is_homepod_stereo_pair(device))
+                    .cloned()
+                    .collect();
+                let stereo_pairs: Vec<DeviceRecord> = all_devices
+                    .iter()
+                    .filter(|device| is_homepod_stereo_pair(device))
+                    .cloned()
+                    .collect();
+
+                ui.columns(2, |columns| {
+                    self.render_device_panel(
+                        &mut columns[0],
+                        self.t("Receivers", "Receivers"),
+                        &receivers,
+                        false,
+                    );
+                    self.render_device_panel(
+                        &mut columns[1],
+                        self.t("Stereo Pair HomePod", "Stereo Pair HomePod"),
+                        &stereo_pairs,
+                        true,
+                    );
+                });
+
+                ui.add_space(10.0);
+                self.render_controls(ui);
+                ui.add_space(8.0);
+                self.render_trial_row(ui);
             });
-            ui.add_space(6.0);
 
-            ui.horizontal(|ui| {
-                let start_enabled = self.selected_fullname.is_some()
-                    && matches!(self.playback, PlaybackUiState::Idle | PlaybackUiState::Error(_));
-                if ui
-                    .add_enabled(start_enabled, egui::Button::new("Start"))
-                    .clicked()
-                {
-                    self.start_selected();
-                }
-
-                let stop_enabled = self.session.is_some();
-                if ui
-                    .add_enabled(stop_enabled, egui::Button::new("Stop"))
-                    .clicked()
-                {
-                    self.stop_playback();
-                }
-
-                if matches!(self.playback, PlaybackUiState::Connecting(_)) {
-                    ui.spinner();
-                    ui.label("Checking receiver, pairing, timing and media transport...");
-                }
-            });
-
-            ui.add_space(6.0);
-            ui.label(
-                "Playing is shown only after native transport is Ready and Windows audio capture has started.",
-            );
-
-        });
-
+        self.render_activation_window(ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+}
+
+fn is_homepod_stereo_pair(device: &DeviceRecord) -> bool {
+    let Some(service) = device.airplay.as_ref() else {
+        return false;
+    };
+    let model = service.txt.model.as_deref().unwrap_or("");
+    model.starts_with("AudioAccessory") && service.txt.fields.contains_key("tsid")
+}
+
+fn classify_device_artwork(device: &DeviceRecord) -> DeviceArtwork {
+    let model = device
+        .airplay
+        .as_ref()
+        .and_then(|s| s.txt.model.as_deref())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let name = device.display_name.to_ascii_lowercase();
+
+    if model.starts_with("airport") || name.contains("airport") {
+        DeviceArtwork::AirportExpress
+    } else if model.starts_with("audioaccessory") || name.contains("homepod") {
+        if name.contains("black")
+            || name.contains("space gray")
+            || name.contains("space grey")
+            || name.contains("đen")
+        {
+            DeviceArtwork::HomePodDark
+        } else {
+            DeviceArtwork::HomePodLight
+        }
+    } else if model.starts_with("mac") || name.contains("macbook") || name.contains("mac ") {
+        DeviceArtwork::MacBook
+    } else {
+        DeviceArtwork::MusicServer
+    }
+}
+
+fn draw_app_logo(ui: &mut egui::Ui, size: egui::Vec2) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(18),
+        egui::Color32::from_rgb(18, 132, 248),
+    );
+
+    let center = rect.center() + egui::vec2(0.0, 3.0);
+    painter.circle_stroke(
+        center,
+        26.0,
+        egui::Stroke::new(4.0, egui::Color32::WHITE),
+    );
+    painter.circle_stroke(
+        center,
+        17.0,
+        egui::Stroke::new(3.0, egui::Color32::WHITE),
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 8.0, center.y + 5.0),
+            egui::pos2(rect.right() - 8.0, rect.bottom() - 7.0),
+        ),
+        egui::CornerRadius::ZERO,
+        egui::Color32::from_rgb(18, 132, 248),
+    );
+    painter.line_segment(
+        [
+            egui::pos2(center.x, center.y - 24.0),
+            egui::pos2(center.x, center.y + 20.0),
+        ],
+        egui::Stroke::new(3.2, egui::Color32::WHITE),
+    );
+    painter.circle_filled(
+        egui::pos2(center.x, center.y + 19.0),
+        5.0,
+        egui::Color32::WHITE,
+    );
+    response
+}
+
+fn draw_small_airplay_mark(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.circle_filled(
+        rect.center(),
+        17.0,
+        egui::Color32::from_rgb(236, 246, 255),
+    );
+    painter.circle_stroke(
+        rect.center(),
+        9.0,
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(15, 126, 245)),
+    );
+    painter.circle_filled(
+        rect.center() + egui::vec2(0.0, 6.0),
+        3.0,
+        egui::Color32::from_rgb(15, 126, 245),
+    );
+}
+
+fn draw_status_badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    let bg = egui::Color32::from_rgba_unmultiplied(
+        color.r(),
+        color.g(),
+        color.b(),
+        28,
+    );
+    egui::Frame::new()
+        .fill(bg)
+        .corner_radius(egui::CornerRadius::same(18))
+        .inner_margin(egui::Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (dot_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot_rect.center(), 5.0, color);
+                ui.label(egui::RichText::new(text).size(13.5).color(color));
+            });
+        });
+}
+
+fn draw_device_art(
+    ui: &mut egui::Ui,
+    artwork: DeviceArtwork,
+    stereo_pair: bool,
+    size: egui::Vec2,
+) {
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    match artwork {
+        DeviceArtwork::AirportExpress => {
+            let body = egui::Rect::from_center_size(
+                rect.center() + egui::vec2(0.0, 2.0),
+                egui::vec2(58.0, 32.0),
+            );
+            painter.rect_filled(
+                body.translate(egui::vec2(0.0, 3.0)),
+                egui::CornerRadius::same(8),
+                egui::Color32::from_rgb(205, 213, 222),
+            );
+            painter.rect_filled(
+                body,
+                egui::CornerRadius::same(8),
+                egui::Color32::from_rgb(246, 247, 248),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(body.center().x - 7.0, body.top() + 6.0),
+                    egui::pos2(body.center().x + 7.0, body.top() + 6.0),
+                ],
+                egui::Stroke::new(1.2, egui::Color32::from_rgb(211, 216, 222)),
+            );
+        }
+        DeviceArtwork::HomePodLight | DeviceArtwork::HomePodDark => {
+            let dark = artwork == DeviceArtwork::HomePodDark;
+            let fill = if dark {
+                egui::Color32::from_rgb(36, 38, 43)
+            } else {
+                egui::Color32::from_rgb(225, 228, 232)
+            };
+            let top = if dark {
+                egui::Color32::from_rgb(72, 75, 83)
+            } else {
+                egui::Color32::from_rgb(248, 249, 250)
+            };
+
+            if stereo_pair {
+                let c1 = rect.center() + egui::vec2(-17.0, 1.0);
+                let c2 = rect.center() + egui::vec2(17.0, 1.0);
+                painter.circle_filled(c1, 22.0, fill);
+                painter.circle_filled(
+                    c2,
+                    22.0,
+                    if dark {
+                        egui::Color32::from_rgb(42, 44, 49)
+                    } else {
+                        egui::Color32::from_rgb(218, 222, 227)
+                    },
+                );
+                painter.circle_filled(c1 + egui::vec2(0.0, -12.0), 8.0, top);
+                painter.circle_filled(c2 + egui::vec2(0.0, -12.0), 8.0, top);
+            } else {
+                painter.circle_filled(rect.center(), 23.0, fill);
+                painter.circle_filled(rect.center() + egui::vec2(0.0, -13.0), 8.0, top);
+            }
+        }
+        DeviceArtwork::MacBook => {
+            let screen = egui::Rect::from_center_size(
+                rect.center() + egui::vec2(0.0, -4.0),
+                egui::vec2(58.0, 36.0),
+            );
+            painter.rect_filled(
+                screen,
+                egui::CornerRadius::same(3),
+                egui::Color32::from_rgb(43, 48, 61),
+            );
+            painter.rect_filled(
+                screen.shrink(3.0),
+                egui::CornerRadius::same(2),
+                egui::Color32::from_rgb(35, 96, 181),
+            );
+            let base_y = screen.bottom() + 4.0;
+            painter.line_segment(
+                [
+                    egui::pos2(screen.left() - 5.0, base_y),
+                    egui::pos2(screen.right() + 5.0, base_y),
+                ],
+                egui::Stroke::new(4.0, egui::Color32::from_rgb(139, 147, 159)),
+            );
+        }
+        DeviceArtwork::MusicServer => {
+            let body = egui::Rect::from_center_size(rect.center(), egui::vec2(66.0, 30.0));
+            painter.rect_filled(
+                body,
+                egui::CornerRadius::same(3),
+                egui::Color32::from_rgb(164, 169, 175),
+            );
+            let display = egui::Rect::from_center_size(
+                body.center(),
+                egui::vec2(18.0, 10.0),
+            );
+            painter.rect_filled(
+                display,
+                egui::CornerRadius::same(2),
+                egui::Color32::from_rgb(24, 39, 45),
+            );
+            painter.circle_filled(
+                egui::pos2(body.right() - 9.0, body.center().y),
+                3.0,
+                egui::Color32::from_rgb(71, 78, 86),
+            );
+            painter.circle_filled(
+                egui::pos2(body.left() + 9.0, body.center().y),
+                3.0,
+                egui::Color32::from_rgb(71, 78, 86),
+            );
+        }
     }
 }
 
