@@ -400,6 +400,41 @@ impl eframe::App for SairplayApp {
         self.pump_volume_result();
         self.monitor_running_session();
 
+        egui::TopBottomPanel::bottom("app_footer")
+            .exact_height(30.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Hyperlink::from_label_and_url(
+                            egui::RichText::new("SolYan").small(),
+                            "https://www.youtube.com/@SolYan-Music",
+                        )
+                        .open_in_new_tab(true),
+                    );
+                    ui.label(egui::RichText::new("·").small());
+                    ui.add(
+                        egui::Hyperlink::from_label_and_url(
+                            egui::RichText::new("yansign842@gmail.com").small(),
+                            "https://mail.google.com/mail/?view=cm&fs=1&to=yansign842@gmail.com",
+                        )
+                        .open_in_new_tab(true),
+                    );
+
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui
+                                .link(egui::RichText::new("Log").small())
+                                .on_hover_text("Copy full log")
+                                .clicked()
+                            {
+                                ui.ctx().copy_text(self.log.join("\n"));
+                            }
+                        },
+                    );
+                });
+            });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("SAirplay2");
             ui.label("Native AirPlay 2 · Windows system audio · 16-bit / 44.1 kHz");
@@ -545,22 +580,6 @@ impl eframe::App for SairplayApp {
                 "Playing is shown only after native transport is Ready and Windows audio capture has started.",
             );
 
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.strong("Log");
-                if ui.button("Copy Log").clicked() {
-                    ui.ctx().copy_text(self.log.join("\n"));
-                }
-            });
-            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                for line in self.log.iter().rev().take(80).rev() {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(line).monospace())
-                            .selectable(true)
-                            .wrap(),
-                    );
-                }
-            });
         });
 
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -653,8 +672,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("SAirplay2")
-            .with_inner_size([980.0, 680.0])
-            .with_min_inner_size([820.0, 560.0]),
+            .with_inner_size([980.0, 500.0])
+            .with_min_inner_size([820.0, 440.0]),
         ..Default::default()
     };
 
