@@ -94,6 +94,8 @@ impl WindowsAudioWorker {
             let mut nonzero_gap_started: Option<std::time::Instant> = None;
             let mut nonzero_gap_reported = false;
             let mut resume_packet_pending = false;
+            let mut inferred_idle = false;
+            let mut idle_keepalive_reported = false;
 
             while running_thread.load(Ordering::SeqCst) {
                 match capture.drain_into(&mut chunker) {
@@ -141,6 +143,11 @@ impl WindowsAudioWorker {
                                         resume_packet_pending = true;
                                     }
                                 }
+                                if inferred_idle {
+                                    inferred_idle = false;
+                                    idle_keepalive_reported = false;
+                                    input_starved_since = None;
+                                }
                                 nonzero_gap_reported = false;
                             } else {
                                 let gap_started = nonzero_gap_started
@@ -158,6 +165,9 @@ impl WindowsAudioWorker {
                                             sender.timeline_reanchors()
                                         ));
                                     }
+                                    inferred_idle = true;
+                                    idle_keepalive_reported = false;
+                                    input_starved_since = None;
                                     nonzero_gap_reported = true;
                                 }
                             }
@@ -235,10 +245,14 @@ impl WindowsAudioWorker {
                             }
                         };
 
-                        // Source delivery-stall guard runs while content is
-                        // still queued. It only pads once the wire head is
-                        // actually behind wall clock.
-                        if chunker.has_packet() {
+                        // A sustained all-zero Windows loopback interval is
+                        // the local equivalent of source PAUSED/EOF/track-gap:
+                        // keep the splice line hot and do not re-anchor it.
+                        // This is intentionally gated on actual PCM content
+                        // (first_nonzero), not on a single empty WASAPI poll.
+                        if inferred_idle {
+                            input_starved_since = None;
+                        } else if chunker.has_packet() {
                             input_starved_since = None;
                             if let Some(added) = sender.recover_delivery_gap(recovery_ntp, lead_frames) {
                                 let startup_window = startup_started
@@ -281,10 +295,51 @@ impl WindowsAudioWorker {
                                         ));
                                     }
                                 }
-                                // Mirror successive 250 ms zero-reads: a still-dry
-                                // source can be checked again after another full
-                                // starvation interval, never on each 1 ms poll.
                                 input_starved_since = Some(std::time::Instant::now());
+                            }
+                        }
+
+                        // Upstream keeps an already-started splice timeline
+                        // bitstream-continuous with encoded silence while
+                        // PAUSED/EOF/idle. Windows loopback has no command pipe,
+                        // so inferred_idle supplies only that missing state.
+                        if inferred_idle && !chunker.has_packet() {
+                            let ntp = match system_time_to_ntp(SystemTime::now()) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(format!("NTP clock conversion failed: {error:?}"));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            };
+                            if sender.can_accept_frames(ntp) {
+                                let silence = [0u8; crate::PCM352_PACKET_BYTES];
+                                match sender.send_pcm_352(&silence, ntp, lead_frames) {
+                                    Ok(result) => {
+                                        if !idle_keepalive_reported {
+                                            if let Ok(mut events) = startup_events_thread.lock() {
+                                                events.push(format!(
+                                                    "Transition: inferred idle keepalive active · seq={} ts={} audio_sent={} · pending_bytes={} · pad_debt={}.",
+                                                    result.sequence_sent,
+                                                    result.timestamp_sent,
+                                                    result.audio_delivered,
+                                                    chunker.pending_bytes(),
+                                                    sender.splice_pad_frames()
+                                                ));
+                                            }
+                                            idle_keepalive_reported = true;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        if let Ok(mut slot) = last_error_thread.lock() {
+                                            *slot = Some(format!("idle silence keepalive failed: {error:?}"));
+                                        }
+                                        running_thread.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+                                }
                             }
                         }
 
