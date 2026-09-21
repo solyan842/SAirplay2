@@ -578,7 +578,7 @@ impl SairplayApp {
                 Ok(decoded) => {
                     let rgba = decoded.to_rgba8();
                     let size = [rgba.width() as usize, rgba.height() as usize];
-                    if size != [160, 100] {
+                    if size != [256, 256] {
                         self.log.push(format!(
                             "Device artwork {} has unexpected size {}x{}.",
                             device_artwork_name(artwork),
@@ -731,7 +731,7 @@ impl SairplayApp {
                             ui,
                             artwork,
                             stereo_pair,
-                            egui::vec2(68.0, 42.5),
+                            egui::vec2(54.0, 54.0),
                             artwork_texture.as_ref(),
                         );
                     },
@@ -1923,55 +1923,55 @@ fn device_artwork_name(artwork: DeviceArtwork) -> &'static str {
 fn device_artwork_bytes(artwork: DeviceArtwork) -> &'static [u8] {
     match artwork {
         DeviceArtwork::HomePodMiniWhite => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_mini_white.png"))
+            include_bytes!("../assets/devices/homepod_mini_white.png")
         }
         DeviceArtwork::HomePodMiniBlack => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_mini_black.png"))
+            include_bytes!("../assets/devices/homepod_mini_black.png")
         }
         DeviceArtwork::HomePodWhite => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_white.png"))
+            include_bytes!("../assets/devices/homepod_white.png")
         }
         DeviceArtwork::HomePodBlack => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_black.png"))
+            include_bytes!("../assets/devices/homepod_black.png")
         }
         DeviceArtwork::HomePodMiniPairWhite => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_mini_pair_white.png"))
+            include_bytes!("../assets/devices/homepod_mini_pair_white.png")
         }
         DeviceArtwork::HomePodMiniPairBlack => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_mini_pair_black.png"))
+            include_bytes!("../assets/devices/homepod_mini_pair_black.png")
         }
         DeviceArtwork::HomePodMiniPairMixed => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_mini_pair_mixed.png"))
+            include_bytes!("../assets/devices/homepod_mini_pair_mixed.png")
         }
         DeviceArtwork::HomePodPairWhite => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_pair_white.png"))
+            include_bytes!("../assets/devices/homepod_pair_white.png")
         }
         DeviceArtwork::HomePodPairBlack => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_pair_black.png"))
+            include_bytes!("../assets/devices/homepod_pair_black.png")
         }
         DeviceArtwork::HomePodPairMixed => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_pair_mixed.png"))
+            include_bytes!("../assets/devices/homepod_pair_mixed.png")
         }
         DeviceArtwork::MacBook => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/macbook.png"))
+            include_bytes!("../assets/devices/macbook.png")
         }
         DeviceArtwork::MacMini => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/mac_mini.png"))
+            include_bytes!("../assets/devices/mac_mini.png")
         }
         DeviceArtwork::MusicServer => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/music_server.png"))
+            include_bytes!("../assets/devices/music_server.png")
         }
         DeviceArtwork::AirportExpress => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/airport_express.png"))
+            include_bytes!("../assets/devices/airport_express.png")
         }
         DeviceArtwork::Tv => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/tv.png"))
+            include_bytes!("../assets/devices/tv.png")
         }
         DeviceArtwork::AppleTv => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/apple_tv.png"))
+            include_bytes!("../assets/devices/apple_tv.png")
         }
         DeviceArtwork::AirplaySpeakers => {
-            include_bytes!(concat!(env!("OUT_DIR"), "/airplay_speakers.png"))
+            include_bytes!("../assets/devices/airplay_speakers.png")
         }
     }
 }
@@ -2196,7 +2196,7 @@ fn draw_device_art(
 
     let target = egui::Rect::from_center_size(
         rect.center() + egui::vec2(0.0, if response.hovered() { -1.0 } else { 0.0 }),
-        egui::vec2(size.x.min(68.0), size.x.min(68.0) * 0.625),
+        egui::vec2(size.x.min(54.0), size.y.min(54.0)),
     );
 
     if response.hovered() {
@@ -2278,7 +2278,7 @@ mod gui_tests {
                 .unwrap_or_else(|err| panic!("{} failed to decode: {err}", device_artwork_name(artwork)));
             assert_eq!(
                 (decoded.width(), decoded.height()),
-                (160, 100),
+                (256, 256),
                 "{} has wrong dimensions",
                 device_artwork_name(artwork),
             );
