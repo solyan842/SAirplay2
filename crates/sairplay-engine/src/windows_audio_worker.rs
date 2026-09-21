@@ -96,6 +96,7 @@ impl WindowsAudioWorker {
             let mut resume_packet_pending = false;
             let mut inferred_idle = false;
             let mut idle_keepalive_reported = false;
+            let mut transition_epoch: u64 = 0;
 
             while running_thread.load(Ordering::SeqCst) {
                 match capture.drain_into(&mut chunker) {
@@ -144,6 +145,33 @@ impl WindowsAudioWorker {
                                     }
                                 }
                                 if inferred_idle {
+                                    if let Ok(now_ntp) = system_time_to_ntp(SystemTime::now()) {
+                                        let state = sender.state();
+                                        let head_delta = sender.timeline_head_delta_frames(now_ntp);
+                                        let head_delta_ms =
+                                            head_delta as f64 * 1000.0 / 44_100.0;
+                                        if let Ok(mut events) = startup_events_thread.lock() {
+                                            events.push(format!(
+                                                "Transition: boundary #{} resume · head_delta_frames={} ({:.1} ms) · seq={} ts={} · pending_bytes={} · pad_debt={} · reanchors={}.",
+                                                transition_epoch,
+                                                head_delta,
+                                                head_delta_ms,
+                                                state.sequence,
+                                                state.timestamp,
+                                                chunker.pending_bytes(),
+                                                sender.splice_pad_frames(),
+                                                sender.timeline_reanchors()
+                                            ));
+                                            if head_delta <= 0 {
+                                                events.push(format!(
+                                                    "Diagnostic: warm boundary #{} resumed on a lapsed timeline · head_delta_frames={} ({:.1} ms).",
+                                                    transition_epoch,
+                                                    head_delta,
+                                                    head_delta_ms
+                                                ));
+                                            }
+                                        }
+                                    }
                                     inferred_idle = false;
                                     idle_keepalive_reported = false;
                                     input_starved_since = None;
@@ -168,6 +196,42 @@ impl WindowsAudioWorker {
                                     inferred_idle = true;
                                     idle_keepalive_reported = false;
                                     input_starved_since = None;
+                                    transition_epoch = transition_epoch.saturating_add(1);
+                                    if let Ok(now_ntp) = system_time_to_ntp(SystemTime::now()) {
+                                        let state = sender.state();
+                                        let head_delta = sender.timeline_head_delta_frames(now_ntp);
+                                        let head_delta_ms =
+                                            head_delta as f64 * 1000.0 / 44_100.0;
+                                        if let Ok(mut events) = startup_events_thread.lock() {
+                                            events.push(format!(
+                                                "Transition: boundary #{} inferred · head_delta_frames={} ({:.1} ms) · seq={} ts={} · pending_bytes={} ({} frames) · pad_debt={} · reanchors={}.",
+                                                transition_epoch,
+                                                head_delta,
+                                                head_delta_ms,
+                                                state.sequence,
+                                                state.timestamp,
+                                                chunker.pending_bytes(),
+                                                chunker.pending_bytes() / 4,
+                                                sender.splice_pad_frames(),
+                                                sender.timeline_reanchors()
+                                            ));
+                                            if head_delta <= 0 {
+                                                events.push(format!(
+                                                    "Diagnostic: warm boundary #{} entered with a lapsed timeline · head_delta_frames={} ({:.1} ms).",
+                                                    transition_epoch,
+                                                    head_delta,
+                                                    head_delta_ms
+                                                ));
+                                            }
+                                            if chunker.pending_bytes() >= crate::PCM352_PACKET_BYTES {
+                                                events.push(format!(
+                                                    "Diagnostic: warm boundary #{} retains at least one complete PCM packet · pending_bytes={}.",
+                                                    transition_epoch,
+                                                    chunker.pending_bytes()
+                                                ));
+                                            }
+                                        }
+                                    }
                                     nonzero_gap_reported = true;
                                 }
                             }
@@ -414,7 +478,8 @@ impl WindowsAudioWorker {
                                     if resume_packet_pending {
                                         if let Ok(mut events) = startup_events_thread.lock() {
                                             events.push(format!(
-                                                "Transition: first outbound after PCM resume · seq={} ts={} marker={} sync_sent={} audio_sent={} pad_before={} · pending_after={}.",
+                                                "Transition: first outbound after PCM resume · boundary={} · seq={} ts={} marker={} sync_sent={} audio_sent={} pad_before={} · pending_after={}.",
+                                                transition_epoch,
                                                 result.sequence_sent,
                                                 result.timestamp_sent,
                                                 result.first_marker,
