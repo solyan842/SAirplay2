@@ -5,7 +5,7 @@ use crate::{
     NtpSessionSetupConfig, NtpTimingResponder, PairingError, PreflightError, PtpEngine,
     PtpSessionSetupConfig, RealtimeMediaSender, RecordConfig, RetransmitRing,
     NativeVolumeControl, RetransmitStats, RetransmitWorker, RtpState, SetPeersConfig, TransientPairingClient,
-    VolumeSetResult, set_native_volume, system_time_to_ntp,
+    VolumeSetResult, set_native_volume,
 };
 use rand::RngCore;
 use std::fmt;
@@ -14,7 +14,7 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc, Mutex,
 };
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 #[cfg(windows)]
 use crate::{WindowsAudioWorker, WindowsAudioWorkerError};
@@ -107,6 +107,7 @@ pub struct NativeSession {
     lead_frames: u32,
     latency_max: Option<u32>,
     rtp_offset: u32,
+    cold_start_delay_ms: u64,
     initial_volume_result: Option<VolumeSetResult>,
     #[cfg(windows)]
     audio_worker: Option<WindowsAudioWorker>,
@@ -357,6 +358,16 @@ impl NativeSession {
         )
         .map_err(NativeSessionError::Feedback)?;
 
+        // Preserve the source clock-readiness floor; only the absolute START
+        // instant is deferred until PCM is actually buffered.
+        let mut cold_start_delay_ms = 250u64;
+        if let Some(engine) = ptp_timing.as_ref() {
+            if let Some(exchange) = engine.peer_exchange() {
+                let readiness = clock_ready_delay_ms(exchange, config.apple_model);
+                cold_start_delay_ms = cold_start_delay_ms.max(readiness);
+            }
+        }
+
         // Cold START is intentionally deferred until the Windows capture path
         // has one complete transport packet buffered. Upstream's caller gates
         // START on audio-present; sending/anchoring before that creates a
@@ -404,6 +415,7 @@ impl NativeSession {
             lead_frames: effective_lead_frames,
             latency_max,
             rtp_offset,
+            cold_start_delay_ms,
             initial_volume_result,
             #[cfg(windows)]
             audio_worker: None,
@@ -446,6 +458,7 @@ impl NativeSession {
             self.lead_frames,
             self.latency_max,
             self.rtp_offset,
+            self.cold_start_delay_ms,
         ) {
             Ok(worker) => {
                 self.audio_worker = Some(worker);
