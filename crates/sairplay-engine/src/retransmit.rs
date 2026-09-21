@@ -1,7 +1,7 @@
 use std::io;
 use std::net::UdpSocket;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
@@ -51,9 +51,19 @@ impl Default for RetransmitRing {
     fn default() -> Self { Self::new() }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetransmitStats {
+    pub requested: u64,
+    pub answered: u64,
+    pub expired: u64,
+}
+
 pub struct RetransmitWorker {
     stop: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
+    requested: Arc<AtomicU64>,
+    answered: Arc<AtomicU64>,
+    expired: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -65,6 +75,12 @@ impl RetransmitWorker {
         let running = Arc::new(AtomicBool::new(true));
         let stop_thread = Arc::clone(&stop);
         let running_thread = Arc::clone(&running);
+        let requested = Arc::new(AtomicU64::new(0));
+        let answered = Arc::new(AtomicU64::new(0));
+        let expired = Arc::new(AtomicU64::new(0));
+        let requested_thread = Arc::clone(&requested);
+        let answered_thread = Arc::clone(&answered);
+        let expired_thread = Arc::clone(&expired);
 
         let worker = thread::Builder::new()
             .name("sairplay-rtx".into())
@@ -95,9 +111,11 @@ impl RetransmitWorker {
                             (requested as usize).min(RTX_RING_SLOTS)
                         };
 
+                        requested_thread.fetch_add(count as u64, Ordering::SeqCst);
                         for k in 0..count {
                             let seq = first.wrapping_add(k as u16);
                             let Some(packet) = ring.lookup(seq) else {
+                                expired_thread.fetch_add(1, Ordering::SeqCst);
                                 continue;
                             };
                             let mut out = Vec::with_capacity(4 + packet.len());
@@ -108,7 +126,9 @@ impl RetransmitWorker {
                                 req_seq as u8,
                             ]);
                             out.extend_from_slice(&packet);
-                            let _ = socket.send_to(&out, from);
+                            if socket.send_to(&out, from).is_ok() {
+                                answered_thread.fetch_add(1, Ordering::SeqCst);
+                            }
                         }
                     }
 
@@ -122,12 +142,23 @@ impl RetransmitWorker {
         Ok(Self {
             stop,
             running,
+            requested,
+            answered,
+            expired,
             worker: Some(worker),
         })
     }
 
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
+    }
+
+    pub fn stats(&self) -> RetransmitStats {
+        RetransmitStats {
+            requested: self.requested.load(Ordering::SeqCst),
+            answered: self.answered.load(Ordering::SeqCst),
+            expired: self.expired.load(Ordering::SeqCst),
+        }
     }
 
     pub fn stop(&mut self) {
