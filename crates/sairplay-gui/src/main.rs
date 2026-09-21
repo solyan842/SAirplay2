@@ -227,6 +227,9 @@ impl SairplayApp {
 
         let audio_discontinuities = session.audio_discontinuities();
         let rtx = session.retransmit_stats();
+        for event in session.drain_startup_events() {
+            self.log.push(event);
+        }
 
         if audio_discontinuities > self.last_audio_discontinuities {
             let at_frame = session.audio_last_discontinuity_frame();
