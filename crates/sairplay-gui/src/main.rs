@@ -26,11 +26,23 @@ enum UiLanguage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeviceArtwork {
-    AirportExpress,
-    HomePodLight,
-    HomePodDark,
+    HomePodMiniWhite,
+    HomePodMiniBlack,
+    HomePodWhite,
+    HomePodBlack,
+    HomePodMiniPairWhite,
+    HomePodMiniPairBlack,
+    HomePodMiniPairMixed,
+    HomePodPairWhite,
+    HomePodPairBlack,
+    HomePodPairMixed,
     MacBook,
+    MacMini,
     MusicServer,
+    AirportExpress,
+    Tv,
+    AppleTv,
+    AirplaySpeakers,
 }
 
 struct UiTheme;
@@ -1436,40 +1448,167 @@ fn build_homepod_stereo_pairs(devices: &[DeviceRecord]) -> Vec<DeviceRecord> {
             .cloned()
             .unwrap_or_else(|| "HomePod Stereo Pair".to_owned());
 
+        let pair_art = classify_homepod_pair_artwork(&distinct);
+
         let mut pair = representative.clone();
         pair.display_name = pair_name;
+        if let Some(service) = pair.airplay.as_mut() {
+            service
+                .txt
+                .fields
+                .insert("sairplay-pair-art".to_owned(), pair_art.to_owned());
+        }
         pairs.push(pair);
     }
 
     pairs
 }
 
-fn classify_device_artwork(device: &DeviceRecord) -> DeviceArtwork {
-    let model = device
+fn device_model(device: &DeviceRecord) -> String {
+    device
         .airplay
         .as_ref()
-        .and_then(|s| s.txt.model.as_deref())
+        .and_then(|service| service.txt.model.as_deref())
+        .or_else(|| {
+            device
+                .raop
+                .as_ref()
+                .and_then(|service| service.txt.model.as_deref())
+        })
         .unwrap_or("")
-        .to_ascii_lowercase();
+        .to_ascii_lowercase()
+}
+
+fn device_color_is_dark(device: &DeviceRecord) -> bool {
+    let name = device.display_name.to_ascii_lowercase();
+    let model = device_model(device);
+    [
+        "black", "space gray", "space grey", "midnight", "đen", "den",
+        "dark", "graphite",
+    ]
+    .iter()
+    .any(|needle| name.contains(needle) || model.contains(needle))
+}
+
+fn homepod_is_mini(device: &DeviceRecord) -> bool {
+    let model = device_model(device);
+    let name = device.display_name.to_ascii_lowercase();
+    model.starts_with("audioaccessory5,") || name.contains("homepod mini")
+}
+
+fn classify_homepod_pair_artwork(members: &[&DeviceRecord]) -> &'static str {
+    let mini = members.iter().all(|device| homepod_is_mini(device));
+    let dark_count = members
+        .iter()
+        .filter(|device| device_color_is_dark(device))
+        .count();
+
+    match (mini, dark_count) {
+        (true, 0) => "mini-white",
+        (true, n) if n == members.len() => "mini-black",
+        (true, _) => "mini-mixed",
+        (false, 0) => "homepod-white",
+        (false, n) if n == members.len() => "homepod-black",
+        (false, _) => "homepod-mixed",
+    }
+}
+
+fn classify_device_artwork(device: &DeviceRecord) -> DeviceArtwork {
+    if let Some(tag) = device
+        .airplay
+        .as_ref()
+        .and_then(|service| service.txt.fields.get("sairplay-pair-art"))
+        .map(String::as_str)
+    {
+        return match tag {
+            "mini-white" => DeviceArtwork::HomePodMiniPairWhite,
+            "mini-black" => DeviceArtwork::HomePodMiniPairBlack,
+            "mini-mixed" => DeviceArtwork::HomePodMiniPairMixed,
+            "homepod-white" => DeviceArtwork::HomePodPairWhite,
+            "homepod-black" => DeviceArtwork::HomePodPairBlack,
+            "homepod-mixed" => DeviceArtwork::HomePodPairMixed,
+            _ => DeviceArtwork::HomePodPairMixed,
+        };
+    }
+
+    let model = device_model(device);
     let name = device.display_name.to_ascii_lowercase();
 
     if model.starts_with("airport") || name.contains("airport") {
         DeviceArtwork::AirportExpress
     } else if model.starts_with("audioaccessory") || name.contains("homepod") {
-        if name.contains("black")
-            || name.contains("space gray")
-            || name.contains("space grey")
-            || name.contains("đen")
-        {
-            DeviceArtwork::HomePodDark
-        } else {
-            DeviceArtwork::HomePodLight
+        match (homepod_is_mini(device), device_color_is_dark(device)) {
+            (true, true) => DeviceArtwork::HomePodMiniBlack,
+            (true, false) => DeviceArtwork::HomePodMiniWhite,
+            (false, true) => DeviceArtwork::HomePodBlack,
+            (false, false) => DeviceArtwork::HomePodWhite,
         }
-    } else if model.starts_with("mac") || name.contains("macbook") || name.contains("mac ") {
+    } else if model.starts_with("appletv") || name.contains("apple tv") || name.contains("appletv") {
+        DeviceArtwork::AppleTv
+    } else if name.contains("mac mini") || model.contains("macmini") {
+        DeviceArtwork::MacMini
+    } else if model.starts_with("mac") || name.contains("macbook") || name.contains("mac book") {
         DeviceArtwork::MacBook
+    } else if name.contains("television")
+        || name.contains("smart tv")
+        || name.contains(" tivi")
+        || name.starts_with("tivi")
+        || name.contains("bravia")
+        || name.contains("project")
+        || model.contains("television")
+    {
+        DeviceArtwork::Tv
+    } else if [
+        "speaker", "loa", "sonos", "bose", "bluesound", "naim",
+        "denon", "marantz", "bowers", "devialet",
+    ]
+    .iter()
+    .any(|needle| name.contains(needle) || model.contains(needle))
+    {
+        DeviceArtwork::AirplaySpeakers
+    } else if name.contains("server")
+        || name.contains("streamer")
+        || name.contains("music server")
+        || model.contains("server")
+    {
+        DeviceArtwork::MusicServer
     } else {
+        // User-approved fallback for an unknown AirPlay receiver.
         DeviceArtwork::MusicServer
     }
+}
+
+fn device_sprite_cell(artwork: DeviceArtwork) -> usize {
+    match artwork {
+        DeviceArtwork::HomePodMiniWhite => 0,
+        DeviceArtwork::HomePodMiniBlack => 1,
+        DeviceArtwork::HomePodWhite => 2,
+        DeviceArtwork::HomePodBlack => 3,
+        DeviceArtwork::HomePodMiniPairWhite => 4,
+        DeviceArtwork::HomePodMiniPairBlack => 5,
+        DeviceArtwork::HomePodMiniPairMixed => 6,
+        DeviceArtwork::MacBook => 7,
+        DeviceArtwork::MacMini => 8,
+        DeviceArtwork::MusicServer => 9,
+        DeviceArtwork::AirportExpress => 10,
+        DeviceArtwork::Tv => 11,
+        DeviceArtwork::HomePodPairWhite => 12,
+        DeviceArtwork::HomePodPairBlack => 13,
+        DeviceArtwork::HomePodPairMixed => 14,
+        DeviceArtwork::AppleTv => 15,
+        DeviceArtwork::AirplaySpeakers => 16,
+    }
+}
+
+fn sprite_uv(cell: usize) -> egui::Rect {
+    const COLS: f32 = 5.0;
+    const ROWS: f32 = 4.0;
+    let col = (cell % 5) as f32;
+    let row = (cell / 5) as f32;
+    egui::Rect::from_min_max(
+        egui::pos2(col / COLS, row / ROWS),
+        egui::pos2((col + 1.0) / COLS, (row + 1.0) / ROWS),
+    )
 }
 
 fn draw_app_logo(ui: &mut egui::Ui, size: egui::Vec2) -> egui::Response {
@@ -1561,90 +1700,32 @@ fn draw_status_badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
 fn draw_device_art(
     ui: &mut egui::Ui,
     artwork: DeviceArtwork,
-    stereo_pair: bool,
+    _stereo_pair: bool,
     size: egui::Vec2,
 ) {
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
-    let painter = ui.painter_at(rect);
 
-    let card = egui::Rect::from_center_size(
+    // All approved artwork was normalized into the same 64x40 sprite cell.
+    // Keep aspect ratio exactly 8:5 so product proportions never stretch.
+    let target = egui::Rect::from_center_size(
         rect.center() + egui::vec2(0.0, if response.hovered() { -1.0 } else { 0.0 }),
-        egui::vec2(size.x.min(58.0), size.y.min(40.0)),
+        egui::vec2(size.x.min(72.0), size.x.min(72.0) * 0.625),
     );
 
-    painter.rect_filled(
-        card.translate(egui::vec2(0.0, 2.0)),
-        egui::CornerRadius::same(10),
-        egui::Color32::from_black_alpha(if response.hovered() { 18 } else { 12 }),
-    );
-    painter.rect_filled(
-        card,
-        egui::CornerRadius::same(10),
-        if response.hovered() {
-            egui::Color32::from_rgb(247, 251, 255)
-        } else {
-            egui::Color32::from_rgb(250, 252, 255)
-        },
-    );
-    painter.rect_stroke(
-        card,
-        egui::CornerRadius::same(10),
-        egui::Stroke::new(
-            1.0,
-            if response.hovered() { UiTheme::border_hover() } else { UiTheme::border() },
-        ),
-        egui::StrokeKind::Inside,
-    );
-
-    let (source, tint) = match artwork {
-        DeviceArtwork::AirportExpress => (
-            egui::include_image!("../assets/mingcute_router_modem_filled.svg"),
-            egui::Color32::from_rgb(104, 119, 140),
-        ),
-        DeviceArtwork::HomePodLight => (
-            egui::include_image!("../assets/mingcute_homepod_mini_filled.svg"),
-            egui::Color32::from_rgb(138, 149, 166),
-        ),
-        DeviceArtwork::HomePodDark => (
-            egui::include_image!("../assets/mingcute_homepod_mini_filled.svg"),
-            egui::Color32::from_rgb(49, 56, 67),
-        ),
-        DeviceArtwork::MacBook => (
-            egui::include_image!("../assets/mingcute_laptop_filled.svg"),
-            egui::Color32::from_rgb(84, 101, 126),
-        ),
-        DeviceArtwork::MusicServer => (
-            egui::include_image!("../assets/fluent_server_24_filled.svg"),
-            egui::Color32::from_rgb(93, 108, 128),
-        ),
-    };
-
-    if stereo_pair && matches!(artwork, DeviceArtwork::HomePodLight | DeviceArtwork::HomePodDark) {
-        let icon_size = egui::vec2(22.0, 22.0);
-        let left = egui::Rect::from_center_size(card.center() + egui::vec2(-11.0, 0.0), icon_size);
-        let right = egui::Rect::from_center_size(card.center() + egui::vec2(11.0, 0.0), icon_size);
-
-        ui.put(
-            left,
-            egui::Image::new(source.clone())
-                .fit_to_exact_size(left.size())
-                .tint(tint),
-        );
-        ui.put(
-            right,
-            egui::Image::new(source)
-                .fit_to_exact_size(right.size())
-                .tint(tint),
-        );
-    } else {
-        let icon_rect = egui::Rect::from_center_size(card.center(), egui::vec2(29.0, 29.0));
-        ui.put(
-            icon_rect,
-            egui::Image::new(source)
-                .fit_to_exact_size(icon_rect.size())
-                .tint(tint),
+    if response.hovered() {
+        ui.painter().rect_filled(
+            target.expand(3.0),
+            egui::CornerRadius::same(10),
+            egui::Color32::from_rgba_unmultiplied(22, 119, 255, 12),
         );
     }
+
+    ui.put(
+        target,
+        egui::Image::new(egui::include_image!("../assets/device_icons_sprite.png"))
+            .uv(sprite_uv(device_sprite_cell(artwork)))
+            .fit_to_exact_size(target.size()),
+    );
 }
 
 fn parse_volume_text(value: &str) -> Result<Option<u8>, String> {
