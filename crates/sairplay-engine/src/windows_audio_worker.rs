@@ -122,9 +122,12 @@ impl WindowsAudioWorker {
                         let frames = report.frames;
                         captured_frames_total = captured_frames_total.saturating_add(frames as u64);
 
-                        // Transition diagnostics only: distinguish a real PCM
-                        // return from ordinary WASAPI packet cadence. This does
-                        // not alter queued PCM or sender behavior.
+                        // Windows has no explicit player FLUSH/START command pipe,
+                        // so a sustained all-zero interval is our local boundary
+                        // signal. Once it crosses 250 ms, mirror the SOURCE local
+                        // half of ap2_session_flush(): discard queued pre-boundary
+                        // PCM and old splice-pad debt, but never FLUSH/reset the
+                        // receiver, RTP sequence/timestamp, crypto or anchor line.
                         if cold_armed {
                             if report.first_nonzero_frame_offset.is_some() {
                                 if let Some(gap_started) = nonzero_gap_started.take() {
@@ -197,6 +200,11 @@ impl WindowsAudioWorker {
                                     idle_keepalive_reported = false;
                                     input_starved_since = None;
                                     transition_epoch = transition_epoch.saturating_add(1);
+
+                                    let pending_before = chunker.pending_bytes();
+                                    let pending_nonzero_before = chunker.pending_nonzero_bytes();
+                                    let pad_before = sender.splice_pad_frames();
+
                                     if let Ok(now_ntp) = system_time_to_ntp(SystemTime::now()) {
                                         let state = sender.state();
                                         let head_delta = sender.timeline_head_delta_frames(now_ntp);
@@ -204,15 +212,16 @@ impl WindowsAudioWorker {
                                             head_delta as f64 * 1000.0 / 44_100.0;
                                         if let Ok(mut events) = startup_events_thread.lock() {
                                             events.push(format!(
-                                                "Transition: boundary #{} inferred · head_delta_frames={} ({:.1} ms) · seq={} ts={} · pending_bytes={} ({} frames) · pad_debt={} · reanchors={}.",
+                                                "Transition: boundary #{} inferred · head_delta_frames={} ({:.1} ms) · seq={} ts={} · pending_bytes={} ({} frames) · pending_nonzero_bytes={} · pad_debt={} · reanchors={}.",
                                                 transition_epoch,
                                                 head_delta,
                                                 head_delta_ms,
                                                 state.sequence,
                                                 state.timestamp,
-                                                chunker.pending_bytes(),
-                                                chunker.pending_bytes() / 4,
-                                                sender.splice_pad_frames(),
+                                                pending_before,
+                                                pending_before / 4,
+                                                pending_nonzero_before,
+                                                pad_before,
                                                 sender.timeline_reanchors()
                                             ));
                                             if head_delta <= 0 {
@@ -223,14 +232,32 @@ impl WindowsAudioWorker {
                                                     head_delta_ms
                                                 ));
                                             }
-                                            if chunker.pending_bytes() >= crate::PCM352_PACKET_BYTES {
+                                            if pending_nonzero_before != 0 {
                                                 events.push(format!(
-                                                    "Diagnostic: warm boundary #{} retains at least one complete PCM packet · pending_bytes={}.",
+                                                    "Diagnostic: warm boundary #{} contained stale nonzero PCM · bytes={} nonzero_bytes={}.",
                                                     transition_epoch,
-                                                    chunker.pending_bytes()
+                                                    pending_before,
+                                                    pending_nonzero_before
                                                 ));
                                             }
                                         }
+                                    }
+
+                                    // SOURCE-PARITY local warm FLUSH:
+                                    // ap2_session_flush() resets the sender-side ring
+                                    // while ap2cl_flush() on the splice path leaves the
+                                    // receiver queue and immutable wire line untouched.
+                                    chunker.clear();
+                                    sender.begin_warm_splice_boundary();
+
+                                    if let Ok(mut events) = startup_events_thread.lock() {
+                                        events.push(format!(
+                                            "Transition: boundary #{} local FLUSH · discarded_bytes={} · stale_nonzero_bytes={} · dropped_pad_frames={} · seq/timestamp/anchor preserved.",
+                                            transition_epoch,
+                                            pending_before,
+                                            pending_nonzero_before,
+                                            pad_before
+                                        ));
                                     }
                                     nonzero_gap_reported = true;
                                 }
