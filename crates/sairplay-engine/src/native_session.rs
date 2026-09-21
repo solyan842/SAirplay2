@@ -495,6 +495,20 @@ impl NativeSession {
             .unwrap_or(0)
     }
 
+    #[cfg(windows)]
+    pub fn audio_last_discontinuity_frame(&self) -> Option<u64> {
+        self.audio_worker
+            .as_ref()
+            .and_then(WindowsAudioWorker::last_discontinuity_frame)
+    }
+
+    #[cfg(windows)]
+    pub fn audio_first_non_silent_frame(&self) -> Option<u64> {
+        self.audio_worker
+            .as_ref()
+            .and_then(WindowsAudioWorker::first_non_silent_frame)
+    }
+
     pub fn retransmit_stats(&self) -> RetransmitStats {
         self.retransmit
             .as_ref()
