@@ -66,8 +66,14 @@ impl Drop for ComGuard {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WasapiDrainReport {
     pub frames: usize,
+    pub packets: usize,
     pub discontinuities: u64,
     pub discontinuity_frame_offset: Option<u64>,
+    pub discontinuity_discarded_bytes: usize,
+    pub discontinuity_discarded_nonzero_bytes: usize,
+    pub discontinuity_packet_frames: Option<u32>,
+    pub discontinuity_packet_silent: Option<bool>,
+    pub discontinuity_packet_nonzero: Option<bool>,
     pub first_non_silent_frame_offset: Option<u64>,
     pub first_nonzero_frame_offset: Option<u64>,
 }
@@ -180,23 +186,43 @@ impl WasapiLoopbackCapture {
                         "GetBuffer failed: {e}"
                     )))?;
 
-                if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32) != 0 {
-                    // Diagnostic only: Microsoft defines this flag as either a
-                    // stream-state transition or a timing glitch. Record where
-                    // it occurred without modifying PCM or sender behavior.
+                let discontinuity =
+                    (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32) != 0;
+                let silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0;
+
+                if discontinuity {
+                    // Microsoft defines DATA_DISCONTINUITY as a capture glitch
+                    // or stream transition: this packet is not position-
+                    // continuous with the preceding packet. Never concatenate a
+                    // partial PCM packet from the old capture epoch with this
+                    // new epoch, because that creates an artificial waveform
+                    // edge before ALAC encoding. Cut only the local PCM queue;
+                    // AirPlay RTP/anchor/crypto state lives above this layer and
+                    // remains untouched.
                     report.discontinuities = report.discontinuities.saturating_add(1);
                     if report.discontinuity_frame_offset.is_none() {
                         report.discontinuity_frame_offset = Some(drained_before);
                     }
+                    let pending = chunker.pending_bytes();
+                    let pending_nonzero = chunker.pending_nonzero_bytes();
+                    report.discontinuity_discarded_bytes =
+                        report.discontinuity_discarded_bytes.saturating_add(pending);
+                    report.discontinuity_discarded_nonzero_bytes =
+                        report.discontinuity_discarded_nonzero_bytes.saturating_add(pending_nonzero);
+                    chunker.clear();
+                    report.discontinuity_packet_frames = Some(frames);
+                    report.discontinuity_packet_silent = Some(silent);
                 }
 
-                let silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0;
                 if !silent && report.first_non_silent_frame_offset.is_none() {
                     report.first_non_silent_frame_offset = Some(drained_before);
                 }
 
                 let byte_len = frames as usize * BLOCK_ALIGN as usize;
                 if silent {
+                    if discontinuity {
+                        report.discontinuity_packet_nonzero = Some(false);
+                    }
                     chunker.push(&vec![0u8; byte_len]);
                 } else {
                     if data.is_null() && byte_len != 0 {
@@ -204,6 +230,10 @@ impl WasapiLoopbackCapture {
                         return Err(WasapiLoopbackError::InvalidBuffer);
                     }
                     let bytes = std::slice::from_raw_parts(data as *const u8, byte_len);
+                    let packet_has_nonzero = bytes.iter().any(|byte| *byte != 0);
+                    if discontinuity {
+                        report.discontinuity_packet_nonzero = Some(packet_has_nonzero);
+                    }
                     if report.first_nonzero_frame_offset.is_none() {
                         for (frame_index, frame) in bytes.chunks_exact(BLOCK_ALIGN as usize).enumerate() {
                             if frame.iter().any(|byte| *byte != 0) {
@@ -223,6 +253,7 @@ impl WasapiLoopbackCapture {
                     )))?;
 
                 report.frames = report.frames.saturating_add(frames as usize);
+                report.packets = report.packets.saturating_add(1);
                 drained_before = drained_before.saturating_add(frames as u64);
             }
         }
