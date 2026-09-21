@@ -69,6 +69,7 @@ pub struct WasapiDrainReport {
     pub discontinuities: u64,
     pub discontinuity_frame_offset: Option<u64>,
     pub first_non_silent_frame_offset: Option<u64>,
+    pub first_nonzero_frame_offset: Option<u64>,
 }
 
 pub struct WasapiLoopbackCapture {
@@ -203,6 +204,15 @@ impl WasapiLoopbackCapture {
                         return Err(WasapiLoopbackError::InvalidBuffer);
                     }
                     let bytes = std::slice::from_raw_parts(data as *const u8, byte_len);
+                    if report.first_nonzero_frame_offset.is_none() {
+                        for (frame_index, frame) in bytes.chunks_exact(BLOCK_ALIGN as usize).enumerate() {
+                            if frame.iter().any(|byte| *byte != 0) {
+                                report.first_nonzero_frame_offset =
+                                    Some(drained_before.saturating_add(frame_index as u64));
+                                break;
+                            }
+                        }
+                    }
                     chunker.push(bytes);
                 }
 
