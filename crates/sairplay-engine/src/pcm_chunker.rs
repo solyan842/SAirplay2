@@ -31,6 +31,24 @@ impl Pcm352Chunker {
         out
     }
 
+    pub fn pop_packet_with_silence_prefix(
+        &mut self,
+        pad_frames: u32,
+    ) -> Option<[u8; PCM352_PACKET_BYTES]> {
+        let pad_frames = pad_frames.min(352) as usize;
+        let pad_bytes = pad_frames * 4;
+        let want = PCM352_PACKET_BYTES - pad_bytes;
+        if self.pending.len() < want {
+            return None;
+        }
+
+        let mut out = [0u8; PCM352_PACKET_BYTES];
+        for byte in &mut out[pad_bytes..] {
+            *byte = self.pending.pop_front().expect("length checked");
+        }
+        Some(out)
+    }
+
     pub fn pop_packet(&mut self) -> Option<[u8; PCM352_PACKET_BYTES]> {
         if self.pending.len() < PCM352_PACKET_BYTES {
             return None;
@@ -69,6 +87,17 @@ mod tests {
         assert!(out[..1000].iter().all(|b| *b == 0x11));
         assert!(out[1000..].iter().all(|b| *b == 0x22));
         assert_eq!(c.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn splice_pad_is_sample_exact_and_preserves_unused_real_pcm() {
+        let mut c = Pcm352Chunker::new();
+        c.push(&vec![0x66; PCM352_PACKET_BYTES]);
+
+        let out = c.pop_packet_with_silence_prefix(100).unwrap();
+        assert!(out[..400].iter().all(|b| *b == 0));
+        assert!(out[400..].iter().all(|b| *b == 0x66));
+        assert_eq!(c.pending_bytes(), 400);
     }
 
     #[test]
