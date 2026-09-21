@@ -229,9 +229,18 @@ impl SairplayApp {
         let rtx = session.retransmit_stats();
 
         if audio_discontinuities > self.last_audio_discontinuities {
+            let at_frame = session.audio_last_discontinuity_frame();
+            let first_audio = session.audio_first_non_silent_frame();
+            let at_ms = at_frame.map(|f| (f as f64 * 1000.0 / 44_100.0));
+            let first_audio_ms = first_audio.map(|f| (f as f64 * 1000.0 / 44_100.0));
             self.log.push(format!(
-                "Diagnostic: WASAPI discontinuity count {} -> {}.",
-                self.last_audio_discontinuities, audio_discontinuities
+                "Diagnostic: WASAPI discontinuity count {} -> {} · at-frame={:?} (~{:.1?} ms) · first-non-silent={:?} (~{:.1?} ms).",
+                self.last_audio_discontinuities,
+                audio_discontinuities,
+                at_frame,
+                at_ms,
+                first_audio,
+                first_audio_ms,
             ));
             self.last_audio_discontinuities = audio_discontinuities;
         }
