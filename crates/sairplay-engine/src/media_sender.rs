@@ -49,6 +49,9 @@ pub struct RealtimeMediaSender {
     pace_last_release: Option<Instant>,
     pacing_enabled: bool,
     retransmit: Option<RetransmitRing>,
+    splice_pad_frames: u32,
+    timeline_reanchors: u64,
+    reanchor_shifted_frames: u64,
 }
 
 impl RealtimeMediaSender {
@@ -65,6 +68,9 @@ impl RealtimeMediaSender {
             pace_last_release: None,
             pacing_enabled: false,
             retransmit: None,
+            splice_pad_frames: 0,
+            timeline_reanchors: 0,
+            reanchor_shifted_frames: 0,
         }
     }
 
@@ -86,6 +92,9 @@ impl RealtimeMediaSender {
             pace_last_release: None,
             pacing_enabled: false,
             retransmit: None,
+            splice_pad_frames: 0,
+            timeline_reanchors: 0,
+            reanchor_shifted_frames: 0,
         }
     }
 
@@ -107,6 +116,9 @@ impl RealtimeMediaSender {
             pace_last_release: None,
             pacing_enabled: false,
             retransmit: None,
+            splice_pad_frames: 0,
+            timeline_reanchors: 0,
+            reanchor_shifted_frames: 0,
         }
     }
 
@@ -147,6 +159,61 @@ impl RealtimeMediaSender {
             self.ptp_anchor_wall0 = Some(wall0.max(0) as u64);
             self.ptp_anchor_pos0 = self.state.timestamp;
         }
+    }
+
+    fn splice_pad_to_lead(
+        &mut self,
+        now_ts: u64,
+        lapse_ts: u64,
+        lead_frames: u32,
+    ) -> Option<u32> {
+        let recovery_lead = (lead_frames as u64).min(self.pacing_window_frames);
+        let effective_head = self.head_ts.saturating_add(self.splice_pad_frames as u64);
+        if effective_head > lapse_ts {
+            return None;
+        }
+        let target = now_ts.saturating_add(recovery_lead);
+        if target <= effective_head {
+            return None;
+        }
+
+        let pad = target - effective_head;
+        let pad_u32 = pad.min(u32::MAX as u64) as u32;
+        self.splice_pad_frames = self.splice_pad_frames.saturating_add(pad_u32);
+        self.timeline_reanchors = self.timeline_reanchors.saturating_add(1);
+        self.reanchor_shifted_frames = self.reanchor_shifted_frames.saturating_add(pad);
+        Some(pad_u32)
+    }
+
+    pub fn recover_input_gap(&mut self, now_ntp: u64, lead_frames: u32) -> Option<u32> {
+        let now_ts = ntp_to_frames(now_ntp, 44_100);
+        let floor = 11_025u64; // source: AP2_MIN_WARM_LEAD_MS = 250 ms
+        self.splice_pad_to_lead(
+            now_ts,
+            now_ts.saturating_add(floor),
+            lead_frames,
+        )
+    }
+
+    pub fn recover_delivery_gap(&mut self, now_ntp: u64, lead_frames: u32) -> Option<u32> {
+        let now_ts = ntp_to_frames(now_ntp, 44_100);
+        self.splice_pad_to_lead(now_ts, now_ts, lead_frames)
+    }
+
+    pub fn splice_pad_frames(&self) -> u32 {
+        self.splice_pad_frames
+    }
+
+    pub fn consume_splice_pad(&mut self, frames: u32) {
+        self.splice_pad_frames = self.splice_pad_frames.saturating_sub(frames);
+    }
+
+    pub fn timeline_reanchors(&self) -> u64 {
+        self.timeline_reanchors
+    }
+
+    pub fn reanchor_shifted_frames(&self) -> u64 {
+        self.reanchor_shifted_frames
     }
 
     pub fn can_accept_frames(&mut self, now_ntp: u64) -> bool {
@@ -418,6 +485,41 @@ mod tests {
         assert_eq!(&buf[..4], &[0x90, 0xD7, 0x00, 0x06]);
         assert_eq!(&buf[20..28], &0xA1B2C3D4E5F60708u64.to_be_bytes());
         let _ = data_rx.recv_from(&mut buf).unwrap();
+    }
+
+    #[test]
+    fn starvation_recovery_adds_only_the_missing_silence_debt() {
+        let data_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ctrl_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let transport = transport_to(&data_rx, &ctrl_rx);
+        let state = RtpState::new(1, 0, 1);
+        let mut sender = RealtimeMediaSender::new(transport, state, [0x11u8; 32]);
+
+        let now = ((2_208_988_800u64 + 10) << 32);
+        let now_ts = ntp_to_frames(now, 44_100);
+        sender.configure_source_timeline(now, now_ts + 5_000, Some(66_150), 11_025);
+
+        let added = sender.recover_input_gap(now, 11_025).unwrap();
+        assert_eq!(added, 6_025);
+        assert_eq!(sender.splice_pad_frames(), 6_025);
+
+        // A second call sees the effective head already recovered and must
+        // not stack another shift.
+        assert_eq!(sender.recover_input_gap(now, 11_025), None);
+    }
+
+    #[test]
+    fn delivery_recovery_does_not_pad_a_head_still_ahead_of_now() {
+        let data_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ctrl_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let transport = transport_to(&data_rx, &ctrl_rx);
+        let state = RtpState::new(1, 0, 1);
+        let mut sender = RealtimeMediaSender::new(transport, state, [0x11u8; 32]);
+
+        let now = ((2_208_988_800u64 + 10) << 32);
+        let now_ts = ntp_to_frames(now, 44_100);
+        sender.configure_source_timeline(now, now_ts + 1, Some(66_150), 11_025);
+        assert_eq!(sender.recover_delivery_gap(now, 11_025), None);
     }
 
     #[test]
