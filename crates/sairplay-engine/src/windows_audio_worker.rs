@@ -91,7 +91,9 @@ impl WindowsAudioWorker {
             let mut startup_packet_index: u32 = 0;
             let mut startup_started: Option<std::time::Instant> = None;
             let mut input_starved_since: Option<std::time::Instant> = None;
-            let mut silence_keepalive = false;
+            let mut nonzero_gap_started: Option<std::time::Instant> = None;
+            let mut nonzero_gap_reported = false;
+            let mut resume_packet_pending = false;
 
             while running_thread.load(Ordering::SeqCst) {
                 match capture.drain_into(&mut chunker) {
@@ -115,8 +117,51 @@ impl WindowsAudioWorker {
                             );
                         }
                         let frames = report.frames;
-                        let content_frames = report.content_frames;
                         captured_frames_total = captured_frames_total.saturating_add(frames as u64);
+
+                        // Transition diagnostics only: distinguish a real PCM
+                        // return from ordinary WASAPI packet cadence. This does
+                        // not alter queued PCM or sender behavior.
+                        if cold_armed {
+                            if report.first_nonzero_frame_offset.is_some() {
+                                if let Some(gap_started) = nonzero_gap_started.take() {
+                                    let gap_ms = gap_started.elapsed().as_millis();
+                                    if gap_ms >= 100 {
+                                        if let Ok(mut events) = startup_events_thread.lock() {
+                                            events.push(format!(
+                                                "Transition: nonzero PCM resumed after {} ms · wasapi_frames={} · discontinuities={} · pending_bytes={} · pad_debt={} · reanchors={}.",
+                                                gap_ms,
+                                                frames,
+                                                report.discontinuities,
+                                                chunker.pending_bytes(),
+                                                sender.splice_pad_frames(),
+                                                sender.timeline_reanchors()
+                                            ));
+                                        }
+                                        resume_packet_pending = true;
+                                    }
+                                }
+                                nonzero_gap_reported = false;
+                            } else {
+                                let gap_started = nonzero_gap_started
+                                    .get_or_insert_with(std::time::Instant::now);
+                                if !nonzero_gap_reported
+                                    && gap_started.elapsed() >= Duration::from_millis(250)
+                                {
+                                    if let Ok(mut events) = startup_events_thread.lock() {
+                                        events.push(format!(
+                                            "Transition: no nonzero PCM for >=250 ms · wasapi_frames={} · engine_non_silent={} · pending_bytes={} · pad_debt={} · reanchors={}.",
+                                            frames,
+                                            report.first_non_silent_frame_offset.is_some(),
+                                            chunker.pending_bytes(),
+                                            sender.splice_pad_frames(),
+                                            sender.timeline_reanchors()
+                                        ));
+                                    }
+                                    nonzero_gap_reported = true;
+                                }
+                            }
+                        }
 
                         // Before the first START, upstream has no live wire feed.
                         // Shared-mode WASAPI may still emit engine SILENT buffers
@@ -195,56 +240,51 @@ impl WindowsAudioWorker {
                         // actually behind wall clock.
                         if chunker.has_packet() {
                             input_starved_since = None;
-                            silence_keepalive = false;
                             if let Some(added) = sender.recover_delivery_gap(recovery_ntp, lead_frames) {
-                                if startup_started.map(|t| t.elapsed() <= Duration::from_secs(3)).unwrap_or(false) {
+                                let startup_window = startup_started
+                                    .map(|t| t.elapsed() <= Duration::from_secs(3))
+                                    .unwrap_or(false);
+                                if startup_window || nonzero_gap_started.is_some() || resume_packet_pending {
                                     if let Ok(mut events) = startup_events_thread.lock() {
                                         events.push(format!(
-                                            "Startup: delivery-gap recovery added {} silence frames · total_pad={}.",
+                                            "{}: delivery-gap recovery added {} silence frames · total_pad={} · pending_bytes={}.",
+                                            if startup_window { "Startup" } else { "Transition" },
                                             added,
-                                            sender.splice_pad_frames()
+                                            sender.splice_pad_frames(),
+                                            chunker.pending_bytes()
                                         ));
                                     }
                                 }
                             }
-                        } else if content_frames > 0 {
-                            // New non-silent PCM arrived but not enough for a
-                            // complete packet; this is normal producer cadence,
-                            // not starvation. WASAPI SILENT packets are excluded
-                            // from the content queue and must not reset this gate.
+                        } else if frames > 0 {
+                            // New PCM arrived but not enough for a complete packet;
+                            // this is normal producer cadence, not starvation.
                             input_starved_since = None;
-                            silence_keepalive = false;
                         } else {
-                            // Match upstream's 250 ms blocking zero-read boundary.
-                            // Once an already-started splice line has genuinely gone
-                            // dry, keep the wire hot with ordinary encoded silence
-                            // instead of accumulating a large unsent silence debt.
+                            // Upstream blocks ap2_session_read(..., 250) and only
+                            // enters starvation recovery after that full timeout.
+                            // WASAPI polling returns ordinary empty drains every
+                            // ~1 ms, so never treat a single empty poll as a gap.
                             let started = input_starved_since.get_or_insert_with(std::time::Instant::now);
                             if started.elapsed() >= Duration::from_millis(250) {
-                                silence_keepalive = true;
-                            }
-                        }
-
-                        if silence_keepalive && !chunker.has_packet() {
-                            let ntp = match system_time_to_ntp(SystemTime::now()) {
-                                Ok(value) => value,
-                                Err(error) => {
-                                    if let Ok(mut slot) = last_error_thread.lock() {
-                                        *slot = Some(format!("NTP clock conversion failed: {error:?}"));
+                                if let Some(added) = sender.recover_input_gap(recovery_ntp, lead_frames) {
+                                    let startup_window = startup_started
+                                        .map(|t| t.elapsed() <= Duration::from_secs(3))
+                                        .unwrap_or(false);
+                                    if let Ok(mut events) = startup_events_thread.lock() {
+                                        events.push(format!(
+                                            "{}: input-gap recovery after >=250 ms added {} silence frames · total_pad={} · pending_bytes={}.",
+                                            if startup_window { "Startup" } else { "Transition" },
+                                            added,
+                                            sender.splice_pad_frames(),
+                                            chunker.pending_bytes()
+                                        ));
                                     }
-                                    running_thread.store(false, Ordering::SeqCst);
-                                    return;
                                 }
-                            };
-                            if sender.can_accept_frames(ntp) {
-                                let silence = [0u8; crate::ALAC_PCM_PACKET_BYTES];
-                                if let Err(error) = sender.send_pcm_352(&silence, ntp, lead_frames) {
-                                    if let Ok(mut slot) = last_error_thread.lock() {
-                                        *slot = Some(format!("silence keepalive failed: {error:?}"));
-                                    }
-                                    running_thread.store(false, Ordering::SeqCst);
-                                    return;
-                                }
+                                // Mirror successive 250 ms zero-reads: a still-dry
+                                // source can be checked again after another full
+                                // starvation interval, never on each 1 ms poll.
+                                input_starved_since = Some(std::time::Instant::now());
                             }
                         }
 
@@ -281,6 +321,21 @@ impl WindowsAudioWorker {
                             match sender.send_pcm_352(&packet, ntp, lead_frames) {
                                 Ok(result) => {
                                     startup_packet_index = startup_packet_index.saturating_add(1);
+                                    if resume_packet_pending {
+                                        if let Ok(mut events) = startup_events_thread.lock() {
+                                            events.push(format!(
+                                                "Transition: first outbound after PCM resume · seq={} ts={} marker={} sync_sent={} audio_sent={} pad_before={} · pending_after={}.",
+                                                result.sequence_sent,
+                                                result.timestamp_sent,
+                                                result.first_marker,
+                                                result.sync_sent,
+                                                result.audio_delivered,
+                                                pad_now,
+                                                chunker.pending_bytes()
+                                            ));
+                                        }
+                                        resume_packet_pending = false;
+                                    }
                                     if startup_started.map(|t| t.elapsed() <= Duration::from_secs(3)).unwrap_or(false)
                                         && (startup_packet_index <= 10 || result.sync_sent || !result.audio_delivered)
                                     {
