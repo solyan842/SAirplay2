@@ -533,7 +533,7 @@ impl SairplayApp {
                 if stereo_pair {
                     (self.t("Sẵn sàng", "Ready"), egui::Color32::from_rgb(18, 185, 91))
                 } else {
-                    (self.t("Đang chờ", "Waiting"), egui::Color32::from_rgb(241, 158, 0))
+                    (self.t("Đang chờ", "Waiting"), egui::Color32::from_rgb(245, 128, 32))
                 }
             }
             _ => (
@@ -758,11 +758,27 @@ impl SairplayApp {
                                 .unwrap_or(50);
 
                             ui.horizontal(|ui| {
-                                let response = ui.add_sized(
-                                    [145.0, 18.0],
-                                    egui::Slider::new(&mut volume, 0..=100)
-                                        .show_value(false),
-                                );
+                                let response = ui
+                                    .scope(|ui| {
+                                        let visuals = &mut ui.style_mut().visuals;
+                                        visuals.selection.bg_fill = UiTheme::blue();
+                                        visuals.widgets.inactive.bg_fill = UiTheme::blue();
+                                        visuals.widgets.inactive.bg_stroke =
+                                            egui::Stroke::new(1.0, UiTheme::blue());
+                                        visuals.widgets.hovered.bg_fill = UiTheme::blue_hover();
+                                        visuals.widgets.hovered.bg_stroke =
+                                            egui::Stroke::new(1.0, UiTheme::blue_hover());
+                                        visuals.widgets.active.bg_fill = UiTheme::blue_pressed();
+                                        visuals.widgets.active.bg_stroke =
+                                            egui::Stroke::new(1.0, UiTheme::blue_pressed());
+
+                                        ui.add_sized(
+                                            [145.0, 18.0],
+                                            egui::Slider::new(&mut volume, 0..=100)
+                                                .show_value(false),
+                                        )
+                                    })
+                                    .inner;
                                 if response.changed() {
                                     self.initial_volume_text = volume.to_string();
                                     self.apply_volume_value(volume);
@@ -1192,7 +1208,10 @@ impl eframe::App for SairplayApp {
 }
 
 fn draw_lang_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(42.0, 28.0), egui::Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(42.0, 28.0), egui::Sense::click());
+    let button_rect = rect.shrink(1.0);
+
     let fill = if selected {
         if response.is_pointer_button_down_on() {
             UiTheme::blue_pressed()
@@ -1202,30 +1221,41 @@ fn draw_lang_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Res
             UiTheme::blue()
         }
     } else if response.is_pointer_button_down_on() {
-        egui::Color32::from_rgb(222, 235, 249)
+        egui::Color32::from_rgb(239, 247, 255)
     } else if response.hovered() {
-        egui::Color32::from_rgb(235, 246, 255)
+        egui::Color32::from_rgb(247, 251, 255)
     } else {
-        egui::Color32::from_rgb(238, 244, 251)
+        egui::Color32::WHITE
     };
 
-    ui.painter().rect_filled(rect, egui::CornerRadius::same(9), fill);
+    let stroke = if selected {
+        egui::Stroke::new(1.0, fill)
+    } else if response.hovered() {
+        egui::Stroke::new(1.0, UiTheme::border_hover())
+    } else {
+        egui::Stroke::new(1.0, UiTheme::border())
+    };
+
+    ui.painter()
+        .rect_filled(button_rect, egui::CornerRadius::same(10), fill);
     ui.painter().rect_stroke(
-        rect,
-        egui::CornerRadius::same(9),
-        egui::Stroke::new(
-            1.0,
-            if selected { fill } else if response.hovered() { UiTheme::border_hover() } else { UiTheme::border() },
-        ),
+        button_rect,
+        egui::CornerRadius::same(10),
+        stroke,
         egui::StrokeKind::Inside,
     );
     ui.painter().text(
-        rect.center(),
+        button_rect.center(),
         egui::Align2::CENTER_CENTER,
         label,
         egui::FontId::proportional(12.0),
-        if selected { egui::Color32::WHITE } else { UiTheme::text() },
+        if selected {
+            egui::Color32::WHITE
+        } else {
+            UiTheme::text()
+        },
     );
+
     response
 }
 
