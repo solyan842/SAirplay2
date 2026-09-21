@@ -121,6 +121,7 @@ struct SairplayApp {
     last_feedback_error: Option<String>,
     show_multiroom_info: bool,
     show_pair_info: bool,
+    device_sprite: Option<egui::TextureHandle>,
 }
 
 impl Default for SairplayApp {
@@ -168,6 +169,7 @@ impl Default for SairplayApp {
             last_feedback_error: None,
             show_multiroom_info: false,
             show_pair_info: false,
+            device_sprite: None,
         }
     }
 }
@@ -562,6 +564,29 @@ impl SairplayApp {
         }
     }
 
+    fn ensure_device_sprite(&mut self, ctx: &egui::Context) {
+        if self.device_sprite.is_some() {
+            return;
+        }
+
+        const BYTES: &[u8] = include_bytes!("../assets/device_icons_sprite.png");
+        match image::load_from_memory(BYTES) {
+            Ok(decoded) => {
+                let rgba = decoded.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                self.device_sprite = Some(ctx.load_texture(
+                    "sairplay-device-icons",
+                    color,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+            Err(err) => {
+                self.log.push(format!("Device artwork decode failed: {err}"));
+            }
+        }
+    }
+
     fn device_status(&self, device: &DeviceRecord, stereo_pair: bool) -> (&'static str, StatusTone) {
         let selected = device
             .airplay
@@ -592,7 +617,13 @@ impl SairplayApp {
         }
     }
 
-    fn render_device_row(&mut self, ui: &mut egui::Ui, device: &DeviceRecord, stereo_pair: bool) {
+    fn render_device_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        device: &DeviceRecord,
+        stereo_pair: bool,
+        sprite: Option<&egui::TextureHandle>,
+    ) {
         const ROW_H: f32 = 64.0;
         const SELECTOR_W: f32 = 24.0;
         const ART_W: f32 = 70.0;
@@ -672,7 +703,13 @@ impl SairplayApp {
                     egui::vec2(ART_W, 44.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
-                        draw_device_art(ui, artwork, stereo_pair, egui::vec2(68.0, 42.5));
+                        draw_device_art(
+                            ui,
+                            artwork,
+                            stereo_pair,
+                            egui::vec2(68.0, 42.5),
+                            sprite,
+                        );
                     },
                 );
 
@@ -882,8 +919,14 @@ impl SairplayApp {
                                     },
                                 );
                             } else {
+                                let sprite = self.device_sprite.clone();
                                 for device in devices {
-                                    self.render_device_row(ui, device, stereo_pair);
+                                    self.render_device_row(
+                                        ui,
+                                        device,
+                                        stereo_pair,
+                                        sprite.as_ref(),
+                                    );
                                 }
                             }
                         });
@@ -1177,6 +1220,7 @@ impl eframe::App for SairplayApp {
         self.pump_connect_result();
         self.pump_volume_result();
         self.monitor_running_session();
+        self.ensure_device_sprite(ctx);
 
         let mut visuals = egui::Visuals::light();
         visuals.panel_fill = UiTheme::bg();
@@ -2063,14 +2107,13 @@ fn draw_device_art(
     artwork: DeviceArtwork,
     _stereo_pair: bool,
     size: egui::Vec2,
+    sprite: Option<&egui::TextureHandle>,
 ) {
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
 
-    // All approved artwork was normalized into the same 64x40 sprite cell.
-    // Keep aspect ratio exactly 8:5 so product proportions never stretch.
     let target = egui::Rect::from_center_size(
         rect.center() + egui::vec2(0.0, if response.hovered() { -1.0 } else { 0.0 }),
-        egui::vec2(size.x.min(72.0), size.x.min(72.0) * 0.625),
+        egui::vec2(size.x.min(68.0), size.x.min(68.0) * 0.625),
     );
 
     if response.hovered() {
@@ -2081,12 +2124,20 @@ fn draw_device_art(
         );
     }
 
-    ui.put(
-        target,
-        egui::Image::new(egui::include_image!("../assets/device_icons_sprite.png"))
-            .uv(sprite_uv(device_sprite_cell(artwork)))
-            .fit_to_exact_size(target.size()),
-    );
+    if let Some(texture) = sprite {
+        ui.put(
+            target,
+            egui::Image::new((texture.id(), target.size()))
+                .uv(sprite_uv(device_sprite_cell(artwork))),
+        );
+    } else {
+        // Neutral placeholder only while the embedded PNG is being decoded.
+        ui.painter().circle_stroke(
+            target.center(),
+            10.0,
+            egui::Stroke::new(1.4, UiTheme::border_hover()),
+        );
+    }
 }
 
 fn parse_volume_text(value: &str) -> Result<Option<u8>, String> {
