@@ -1,7 +1,7 @@
 use crate::{
     build_encrypted_realtime_packet, build_ntp_sync_packet, build_ptp_sync_packet,
     encode_alac_16_stereo_352, AlacEncodeError, DatagramSendOutcome, MediaTransport,
-    MediaTransportError, NtpSyncPacketArgs, PtpClock, PtpSyncPacketArgs,
+    MediaTransportError, NtpSyncPacketArgs, PtpClock, PtpExchange, PtpSyncPacketArgs,
     RetransmitRing, RtpState,
     ALAC_PCM_PACKET_BYTES, FRAMES_PER_PACKET_44100,
 };
@@ -306,6 +306,16 @@ impl RealtimeMediaSender {
 
     pub fn state(&self) -> RtpState {
         self.state
+    }
+
+    /// Receiver PTP probe streak (Delay_Req/Pdelay_Req) observed by the timing
+    /// engine. Diagnostic only: mirrors the upstream clock-readiness evidence
+    /// without changing media/timeline behavior.
+    pub fn ptp_probe_exchange(&self) -> Option<PtpExchange> {
+        match &self.timing {
+            RealtimeTiming::Ptp { clock } => clock.exchange(),
+            RealtimeTiming::Ntp => None,
+        }
     }
 
     pub fn transport(&self) -> &MediaTransport {
