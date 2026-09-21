@@ -138,6 +138,21 @@ impl MediaTransport {
     }
 }
 
+fn is_transient_send_pressure(error: &io::Error) -> bool {
+    // Windows WSAENOBUFS (10055): the local transport buffer/queue is
+    // temporarily full. Upstream realtime behavior treats local UDP send
+    // pressure as a dropped packet after the bounded send budget rather than
+    // killing the media session; the RTP timeline still advances and the
+    // receiver can request retransmit for retained packets.
+    #[cfg(windows)]
+    {
+        if error.raw_os_error() == Some(10055) {
+            return true;
+        }
+    }
+    false
+}
+
 fn send_datagram_deadline(
     socket: &UdpSocket,
     packet: &[u8],
@@ -155,7 +170,7 @@ fn send_datagram_deadline(
                     io::ErrorKind::WouldBlock
                         | io::ErrorKind::TimedOut
                         | io::ErrorKind::Interrupted
-                ) =>
+                ) || is_transient_send_pressure(&error) =>
             {
                 if Instant::now() >= deadline {
                     return Ok(DatagramSendOutcome::Dropped);
