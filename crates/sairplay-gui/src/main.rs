@@ -1454,8 +1454,8 @@ fn install_windows_ui_font(ctx: &egui::Context) {
     #[cfg(windows)]
     {
         let candidates = [
-            r"C:\\Windows\\Fonts\\segoeui.ttf",
-            r"C:\\Windows\\Fonts\\arial.ttf",
+            r"C:\Windows\Fonts\segoeui.ttf",
+            r"C:\Windows\Fonts\arial.ttf",
         ];
 
         for path in candidates {
