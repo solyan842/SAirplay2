@@ -1014,12 +1014,15 @@ impl eframe::App for SairplayApp {
                         egui::Layout::top_down(egui::Align::Center),
                         |ui| {
                             egui::Frame::new()
-                                .fill(egui::Color32::WHITE)
-                                .stroke(egui::Stroke::new(
-                                    1.0,
-                                    egui::Color32::from_rgb(211, 226, 243),
-                                ))
+                                .fill(UiTheme::surface())
+                                .stroke(egui::Stroke::new(1.0, UiTheme::border()))
                                 .corner_radius(egui::CornerRadius::same(24))
+                                .shadow(egui::epaint::Shadow {
+                                    offset: [0, 2],
+                                    blur: 10,
+                                    spread: 0,
+                                    color: egui::Color32::from_black_alpha(16),
+                                })
                                 .inner_margin(egui::Margin::symmetric(12, 9))
                                 .show(ui, |ui| {
                                     ui.set_min_width(176.0);
@@ -1053,54 +1056,11 @@ impl eframe::App for SairplayApp {
                         egui::vec2(46.0, 70.0),
                         egui::Layout::top_down(egui::Align::Center),
                         |ui| {
-                            let vi_selected = self.language == UiLanguage::Vi;
-                            let en_selected = self.language == UiLanguage::En;
-
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new("VI")
-                                            .size(12.0)
-                                            .strong()
-                                            .color(if vi_selected {
-                                                egui::Color32::WHITE
-                                            } else {
-                                                egui::Color32::from_rgb(24, 46, 86)
-                                            }),
-                                    )
-                                    .fill(if vi_selected {
-                                        egui::Color32::from_rgb(18, 126, 246)
-                                    } else {
-                                        egui::Color32::from_rgb(238, 244, 251)
-                                    })
-                                    .min_size(egui::vec2(42.0, 28.0)),
-                                )
-                                .clicked()
-                            {
+                            if draw_lang_button(ui, "VI", self.language == UiLanguage::Vi).clicked() {
                                 self.language = UiLanguage::Vi;
                             }
-
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new("EN")
-                                            .size(12.0)
-                                            .strong()
-                                            .color(if en_selected {
-                                                egui::Color32::WHITE
-                                            } else {
-                                                egui::Color32::from_rgb(24, 46, 86)
-                                            }),
-                                    )
-                                    .fill(if en_selected {
-                                        egui::Color32::from_rgb(18, 126, 246)
-                                    } else {
-                                        egui::Color32::from_rgb(238, 244, 251)
-                                    })
-                                    .min_size(egui::vec2(42.0, 28.0)),
-                                )
-                                .clicked()
-                            {
+                            ui.add_space(4.0);
+                            if draw_lang_button(ui, "EN", self.language == UiLanguage::En).clicked() {
                                 self.language = UiLanguage::En;
                             }
                         },
@@ -1146,6 +1106,44 @@ impl eframe::App for SairplayApp {
         self.render_activation_window(ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
+}
+
+fn draw_lang_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(42.0, 28.0), egui::Sense::click());
+    let fill = if selected {
+        if response.is_pointer_button_down_on() {
+            UiTheme::blue_pressed()
+        } else if response.hovered() {
+            UiTheme::blue_hover()
+        } else {
+            UiTheme::blue()
+        }
+    } else if response.is_pointer_button_down_on() {
+        egui::Color32::from_rgb(222, 235, 249)
+    } else if response.hovered() {
+        egui::Color32::from_rgb(235, 246, 255)
+    } else {
+        egui::Color32::from_rgb(238, 244, 251)
+    };
+
+    ui.painter().rect_filled(rect, egui::CornerRadius::same(9), fill);
+    ui.painter().rect_stroke(
+        rect,
+        egui::CornerRadius::same(9),
+        egui::Stroke::new(
+            1.0,
+            if selected { fill } else if response.hovered() { UiTheme::border_hover() } else { UiTheme::border() },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(12.0),
+        if selected { egui::Color32::WHITE } else { UiTheme::text() },
+    );
+    response
 }
 
 fn draw_action_button(
@@ -1326,23 +1324,28 @@ fn draw_app_logo(ui: &mut egui::Ui, size: egui::Vec2) -> egui::Response {
 }
 
 fn draw_small_airplay_mark(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.circle_filled(
-        rect.center(),
-        17.0,
-        egui::Color32::from_rgb(236, 246, 255),
+    let bg = if response.hovered() {
+        egui::Color32::from_rgb(225, 242, 255)
+    } else {
+        egui::Color32::from_rgb(236, 246, 255)
+    };
+    painter.circle_filled(rect.center(), 16.0, bg);
+
+    let c = UiTheme::blue();
+    let center = rect.center();
+    painter.circle_stroke(center + egui::vec2(0.0, -1.0), 9.0, egui::Stroke::new(1.8, c));
+    painter.circle_stroke(center + egui::vec2(0.0, -1.0), 5.5, egui::Stroke::new(1.6, c));
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 6.0, center.y + 2.0),
+            egui::pos2(rect.right() - 6.0, rect.bottom() - 4.0),
+        ),
+        egui::CornerRadius::same(0),
+        bg,
     );
-    painter.circle_stroke(
-        rect.center(),
-        9.0,
-        egui::Stroke::new(2.0, egui::Color32::from_rgb(15, 126, 245)),
-    );
-    painter.circle_filled(
-        rect.center() + egui::vec2(0.0, 6.0),
-        3.0,
-        egui::Color32::from_rgb(15, 126, 245),
-    );
+    painter.circle_filled(center + egui::vec2(0.0, 7.0), 2.7, c);
 }
 
 fn draw_status_badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
@@ -1372,115 +1375,171 @@ fn draw_device_art(
     stereo_pair: bool,
     size: egui::Vec2,
 ) {
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
+    let lift = if response.hovered() { -1.0 } else { 0.0 };
 
     match artwork {
         DeviceArtwork::AirportExpress => {
-            let body = egui::Rect::from_center_size(
-                rect.center() + egui::vec2(0.0, 2.0),
-                egui::vec2(58.0, 32.0),
+            let shadow = egui::Rect::from_center_size(
+                rect.center() + egui::vec2(0.0, 7.0),
+                egui::vec2(46.0, 10.0),
             );
-            painter.rect_filled(
-                body.translate(egui::vec2(0.0, 3.0)),
-                egui::CornerRadius::same(8),
-                egui::Color32::from_rgb(205, 213, 222),
+            painter.ellipse_filled(
+                shadow.center(),
+                egui::vec2(shadow.width() / 2.0, shadow.height() / 2.0),
+                egui::Color32::from_black_alpha(18),
+            );
+
+            let body = egui::Rect::from_center_size(
+                rect.center() + egui::vec2(0.0, lift),
+                egui::vec2(44.0, 34.0),
             );
             painter.rect_filled(
                 body,
                 egui::CornerRadius::same(8),
-                egui::Color32::from_rgb(246, 247, 248),
+                egui::Color32::from_rgb(247, 248, 250),
             );
-            painter.line_segment(
-                [
-                    egui::pos2(body.center().x - 7.0, body.top() + 6.0),
-                    egui::pos2(body.center().x + 7.0, body.top() + 6.0),
-                ],
-                egui::Stroke::new(1.2, egui::Color32::from_rgb(211, 216, 222)),
+            painter.rect_stroke(
+                body,
+                egui::CornerRadius::same(8),
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(214, 219, 226)),
+                egui::StrokeKind::Inside,
+            );
+            painter.circle_stroke(
+                body.center(),
+                6.5,
+                egui::Stroke::new(1.3, egui::Color32::from_rgb(181, 187, 195)),
+            );
+            painter.circle_filled(
+                egui::pos2(body.right() - 7.0, body.bottom() - 6.0),
+                1.7,
+                egui::Color32::from_rgb(113, 186, 120),
             );
         }
         DeviceArtwork::HomePodLight | DeviceArtwork::HomePodDark => {
             let dark = artwork == DeviceArtwork::HomePodDark;
-            let fill = if dark {
-                egui::Color32::from_rgb(36, 38, 43)
+            let body = if dark {
+                egui::Color32::from_rgb(49, 51, 56)
             } else {
-                egui::Color32::from_rgb(225, 228, 232)
+                egui::Color32::from_rgb(224, 227, 231)
             };
             let top = if dark {
-                egui::Color32::from_rgb(72, 75, 83)
+                egui::Color32::from_rgb(92, 96, 106)
             } else {
-                egui::Color32::from_rgb(248, 249, 250)
+                egui::Color32::from_rgb(248, 249, 251)
+            };
+            let mesh = if dark {
+                egui::Color32::from_rgb(75, 78, 84)
+            } else {
+                egui::Color32::from_rgb(200, 205, 212)
+            };
+
+            let draw_one = |p: &egui::Painter, center: egui::Pos2, scale: f32| {
+                let r = egui::Rect::from_center_size(
+                    center + egui::vec2(0.0, lift),
+                    egui::vec2(27.0 * scale, 37.0 * scale),
+                );
+                p.rect_filled(r, egui::CornerRadius::same((10.0 * scale) as u8), body);
+                p.ellipse_filled(
+                    egui::pos2(r.center().x, r.top() + 5.0 * scale),
+                    egui::vec2(9.5 * scale, 3.7 * scale),
+                    top,
+                );
+                for n in 0..4 {
+                    let y = r.top() + 11.0 * scale + n as f32 * 5.0 * scale;
+                    p.line_segment(
+                        [
+                            egui::pos2(r.left() + 5.0 * scale, y),
+                            egui::pos2(r.right() - 5.0 * scale, y),
+                        ],
+                        egui::Stroke::new(0.6, mesh),
+                    );
+                }
+                p.ellipse_filled(
+                    egui::pos2(r.center().x, r.bottom() + 2.5 * scale),
+                    egui::vec2(12.0 * scale, 2.5 * scale),
+                    egui::Color32::from_black_alpha(18),
+                );
             };
 
             if stereo_pair {
-                let c1 = rect.center() + egui::vec2(-17.0, 1.0);
-                let c2 = rect.center() + egui::vec2(17.0, 1.0);
-                painter.circle_filled(c1, 22.0, fill);
-                painter.circle_filled(
-                    c2,
-                    22.0,
-                    if dark {
-                        egui::Color32::from_rgb(42, 44, 49)
-                    } else {
-                        egui::Color32::from_rgb(218, 222, 227)
-                    },
-                );
-                painter.circle_filled(c1 + egui::vec2(0.0, -12.0), 8.0, top);
-                painter.circle_filled(c2 + egui::vec2(0.0, -12.0), 8.0, top);
+                draw_one(&painter, rect.center() + egui::vec2(-15.0, 0.0), 0.9);
+                draw_one(&painter, rect.center() + egui::vec2(15.0, 0.0), 0.9);
             } else {
-                painter.circle_filled(rect.center(), 23.0, fill);
-                painter.circle_filled(rect.center() + egui::vec2(0.0, -13.0), 8.0, top);
+                draw_one(&painter, rect.center(), 1.0);
             }
         }
         DeviceArtwork::MacBook => {
             let screen = egui::Rect::from_center_size(
-                rect.center() + egui::vec2(0.0, -4.0),
-                egui::vec2(58.0, 36.0),
+                rect.center() + egui::vec2(0.0, -4.0 + lift),
+                egui::vec2(48.0, 31.0),
             );
             painter.rect_filled(
                 screen,
                 egui::CornerRadius::same(3),
-                egui::Color32::from_rgb(43, 48, 61),
+                egui::Color32::from_rgb(62, 68, 78),
             );
             painter.rect_filled(
-                screen.shrink(3.0),
+                screen.shrink(2.5),
                 egui::CornerRadius::same(2),
-                egui::Color32::from_rgb(35, 96, 181),
+                egui::Color32::from_rgb(36, 91, 169),
+            );
+            painter.circle_filled(
+                egui::pos2(screen.center().x, screen.top() + 2.0),
+                1.0,
+                egui::Color32::from_rgb(124, 132, 145),
             );
             let base_y = screen.bottom() + 4.0;
             painter.line_segment(
                 [
-                    egui::pos2(screen.left() - 5.0, base_y),
-                    egui::pos2(screen.right() + 5.0, base_y),
+                    egui::pos2(screen.left() - 6.0, base_y),
+                    egui::pos2(screen.right() + 6.0, base_y),
                 ],
-                egui::Stroke::new(4.0, egui::Color32::from_rgb(139, 147, 159)),
+                egui::Stroke::new(4.0, egui::Color32::from_rgb(150, 157, 166)),
             );
         }
         DeviceArtwork::MusicServer => {
-            let body = egui::Rect::from_center_size(rect.center(), egui::vec2(66.0, 30.0));
+            let body = egui::Rect::from_center_size(
+                rect.center() + egui::vec2(0.0, lift),
+                egui::vec2(55.0, 28.0),
+            );
             painter.rect_filled(
                 body,
                 egui::CornerRadius::same(3),
-                egui::Color32::from_rgb(164, 169, 175),
+                egui::Color32::from_rgb(168, 174, 182),
+            );
+            painter.rect_stroke(
+                body,
+                egui::CornerRadius::same(3),
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(138, 145, 154)),
+                egui::StrokeKind::Inside,
             );
             let display = egui::Rect::from_center_size(
                 body.center(),
-                egui::vec2(18.0, 10.0),
+                egui::vec2(18.0, 9.0),
             );
             painter.rect_filled(
                 display,
                 egui::CornerRadius::same(2),
-                egui::Color32::from_rgb(24, 39, 45),
+                egui::Color32::from_rgb(24, 38, 45),
             );
             painter.circle_filled(
-                egui::pos2(body.right() - 9.0, body.center().y),
+                egui::pos2(body.right() - 8.0, body.center().y),
                 3.0,
                 egui::Color32::from_rgb(71, 78, 86),
             );
-            painter.circle_filled(
-                egui::pos2(body.left() + 9.0, body.center().y),
-                3.0,
-                egui::Color32::from_rgb(71, 78, 86),
+            painter.circle_stroke(
+                egui::pos2(body.left() + 8.0, body.center().y),
+                3.3,
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(94, 101, 109)),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(body.left() + 19.0, body.top() + 7.0),
+                    egui::pos2(body.left() + 19.0, body.bottom() - 7.0),
+                ],
+                egui::Stroke::new(0.8, egui::Color32::from_rgb(134, 141, 149)),
             );
         }
     }
