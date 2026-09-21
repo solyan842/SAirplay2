@@ -233,6 +233,13 @@ impl RealtimeMediaSender {
         self.splice_pad_frames
     }
 
+    /// Source-equivalent local half of a warm splice FLUSH. The receiver
+    /// queue, RTP sequence, RTP timestamp and immutable anchor line stay
+    /// untouched; only pad debt from the superseded content epoch is dropped.
+    pub fn begin_warm_splice_boundary(&mut self) {
+        self.splice_pad_frames = 0;
+    }
+
     pub fn consume_splice_pad(&mut self, frames: u32) {
         self.splice_pad_frames = self.splice_pad_frames.saturating_sub(frames);
     }
@@ -475,6 +482,73 @@ mod tests {
             },
         );
         transport
+    }
+
+    #[test]
+    fn warm_boundary_keeps_wire_timeline_and_drops_only_old_pad_debt() {
+        let data_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ctrl_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let transport = transport_to(&data_rx, &ctrl_rx);
+        let state = RtpState::new(0xFFFE, 0xFFFF_F000, 0);
+        let mut sender = RealtimeMediaSender::new(transport, state, [0u8; 32]);
+        sender.head_ts = 9_876_543_210;
+        sender.splice_pad_frames = 12_345;
+        sender.timeline_reanchors = 7;
+        sender.reanchor_shifted_frames = 88_000;
+
+        let before_state = sender.state();
+        let before_head = sender.head_ts();
+        let before_reanchors = sender.timeline_reanchors();
+        let before_shift = sender.reanchor_shifted_frames();
+
+        sender.begin_warm_splice_boundary();
+
+        assert_eq!(sender.splice_pad_frames(), 0);
+        assert_eq!(sender.state(), before_state);
+        assert_eq!(sender.head_ts(), before_head);
+        assert_eq!(sender.timeline_reanchors(), before_reanchors);
+        assert_eq!(sender.reanchor_shifted_frames(), before_shift);
+    }
+
+    #[test]
+    fn long_run_wire_timeline_survives_sequence_and_timestamp_wraps() {
+        let data_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ctrl_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let transport = transport_to(&data_rx, &ctrl_rx);
+
+        let initial_head = 123_456_789u64;
+        let wire_offset = 0x00AB_CD00u32;
+        let initial_rtp = (initial_head as u32).wrapping_add(wire_offset);
+        let initial_seq = 65_000u16;
+        let state = RtpState::new(initial_seq, initial_rtp, 0);
+        let mut sender = RealtimeMediaSender::new(transport, state, [0u8; 32]);
+        sender.head_ts = initial_head;
+        sender.state.first_packet = false;
+
+        // 12.5M packets is ~27.7 hours at 44.1 kHz / 352 fpp. This crosses
+        // the 16-bit sequence space many times and the 32-bit RTP timestamp
+        // at least once without touching sockets or wall time.
+        const PACKETS: u64 = 12_500_000;
+        for i in 0..PACKETS {
+            sender.state.advance(FRAMES_PER_PACKET_44100);
+            sender.head_ts = sender
+                .head_ts
+                .wrapping_add(FRAMES_PER_PACKET_44100 as u64);
+
+            if i % 100_000 == 0 || i + 1 == PACKETS {
+                assert_eq!(
+                    sender.state.timestamp,
+                    (sender.head_ts as u32).wrapping_add(wire_offset)
+                );
+                let sent = i + 1;
+                assert_eq!(
+                    sender.state.sequence,
+                    initial_seq.wrapping_add(sent as u16)
+                );
+            }
+        }
+
+        assert!(sender.head_ts > initial_head + u32::MAX as u64);
     }
 
     #[test]
