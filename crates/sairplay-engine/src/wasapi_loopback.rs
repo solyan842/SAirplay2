@@ -67,6 +67,8 @@ impl Drop for ComGuard {
 pub struct WasapiDrainReport {
     pub frames: usize,
     pub discontinuities: u64,
+    pub discontinuity_frame_offset: Option<u64>,
+    pub first_non_silent_frame_offset: Option<u64>,
 }
 
 pub struct WasapiLoopbackCapture {
@@ -153,6 +155,7 @@ impl WasapiLoopbackCapture {
         chunker: &mut Pcm352Chunker,
     ) -> Result<WasapiDrainReport, WasapiLoopbackError> {
         let mut report = WasapiDrainReport::default();
+        let mut drained_before = 0u64;
 
         unsafe {
             loop {
@@ -177,14 +180,22 @@ impl WasapiLoopbackCapture {
                     )))?;
 
                 if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32) != 0 {
-                    // Diagnostic only: Microsoft defines this flag as a capture
-                    // glitch indicator. Do not alter PCM/timing here until a
-                    // hardware click is correlated with the counter.
+                    // Diagnostic only: Microsoft defines this flag as either a
+                    // stream-state transition or a timing glitch. Record where
+                    // it occurred without modifying PCM or sender behavior.
                     report.discontinuities = report.discontinuities.saturating_add(1);
+                    if report.discontinuity_frame_offset.is_none() {
+                        report.discontinuity_frame_offset = Some(drained_before);
+                    }
+                }
+
+                let silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0;
+                if !silent && report.first_non_silent_frame_offset.is_none() {
+                    report.first_non_silent_frame_offset = Some(drained_before);
                 }
 
                 let byte_len = frames as usize * BLOCK_ALIGN as usize;
-                if (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 {
+                if silent {
                     chunker.push(&vec![0u8; byte_len]);
                 } else {
                     if data.is_null() && byte_len != 0 {
@@ -202,6 +213,7 @@ impl WasapiLoopbackCapture {
                     )))?;
 
                 report.frames = report.frames.saturating_add(frames as usize);
+                drained_before = drained_before.saturating_add(frames as u64);
             }
         }
 
