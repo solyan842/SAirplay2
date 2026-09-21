@@ -2,7 +2,7 @@
 
 use eframe::egui;
 use sairplay_engine::{
-    DeviceCatalog, DiscoveredService, DiscoveryEvent, MdnsBrowser, NativeSession,
+    DeviceCatalog, DeviceRecord, DiscoveredService, DiscoveryEvent, MdnsBrowser, NativeSession,
     NativeSessionConfig, Route, ServiceKind, VolumeSetResult,
 };
 use std::net::IpAddr;
@@ -15,6 +15,21 @@ enum PlaybackUiState {
     Connecting(String),
     Playing(String),
     Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiLanguage {
+    Vi,
+    En,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceArtwork {
+    AirportExpress,
+    HomePodLight,
+    HomePodDark,
+    MacBook,
+    MusicServer,
 }
 
 struct SairplayApp {
@@ -31,6 +46,10 @@ struct SairplayApp {
     pending_volume: Option<u8>,
     last_audio_discontinuities: u64,
     last_rtx: (u64, u64, u64),
+    language: UiLanguage,
+    multiroom_enabled: bool,
+    activation_open: bool,
+    activation_key: String,
 }
 
 impl Default for SairplayApp {
@@ -71,6 +90,10 @@ impl Default for SairplayApp {
             pending_volume: None,
             last_audio_discontinuities: 0,
             last_rtx: (0, 0, 0),
+            language: UiLanguage::Vi,
+            multiroom_enabled: false,
+            activation_open: false,
+            activation_key: String::new(),
         }
     }
 }
@@ -118,6 +141,32 @@ impl SairplayApp {
                     self.log.push(format!("mDNS error: {err}"));
                 }
             }
+        }
+    }
+
+    fn rescan_devices(&mut self) {
+        self.discovery.take();
+        self.discovery_rx = None;
+        self.catalog = DeviceCatalog::default();
+        self.selected_fullname = None;
+        self.log.push("Manual rescan requested from app logo.".into());
+
+        match MdnsBrowser::start() {
+            Ok((browser, rx)) => {
+                self.discovery = Some(browser);
+                self.discovery_rx = Some(rx);
+                self.log.push("Scanning AirPlay receivers...".into());
+            }
+            Err(err) => {
+                self.log.push(format!("mDNS discovery unavailable: {err}"));
+            }
+        }
+    }
+
+    fn t(&self, vi: &'static str, en: &'static str) -> &'static str {
+        match self.language {
+            UiLanguage::Vi => vi,
+            UiLanguage::En => en,
         }
     }
 
