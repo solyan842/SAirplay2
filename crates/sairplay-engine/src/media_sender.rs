@@ -245,6 +245,19 @@ impl RealtimeMediaSender {
         self.reanchor_shifted_frames
     }
 
+    /// Signed distance from the effective delivery head to the current wall
+    /// frame clock. Positive means the immutable splice line is still ahead
+    /// (hot); zero/negative means the line has lapsed and any real content
+    /// sent without recovery would carry a past timestamp.
+    pub fn timeline_head_delta_frames(&self, now_ntp: u64) -> i64 {
+        let now_ts = ntp_to_frames(now_ntp, 44_100);
+        let effective_head = self
+            .head_ts
+            .saturating_add(self.splice_pad_frames as u64);
+        let delta = effective_head as i128 - now_ts as i128;
+        delta.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+    }
+
     pub fn can_accept_frames(&mut self, now_ntp: u64) -> bool {
         if !self.pacing_enabled {
             return true;
@@ -462,6 +475,25 @@ mod tests {
             },
         );
         transport
+    }
+
+    #[test]
+    fn timeline_head_delta_reports_hot_and_lapsed_lines() {
+        let data_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ctrl_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let transport = transport_to(&data_rx, &ctrl_rx);
+        let state = RtpState::new(1, 1_000, 0);
+        let mut sender = RealtimeMediaSender::new(transport, state, [0u8; 32]);
+
+        let start_ntp = ((10u64) << 32);
+        let head_ts = ntp_to_frames(start_ntp, 44_100);
+        sender.configure_source_timeline(start_ntp, head_ts, Some(88_200), 11_025);
+
+        assert_eq!(sender.timeline_head_delta_frames(start_ntp), 0);
+        let earlier = start_ntp.saturating_sub((1u64 << 32) / 10);
+        assert!(sender.timeline_head_delta_frames(earlier) > 0);
+        let later = start_ntp.saturating_add((1u64 << 32) / 10);
+        assert!(sender.timeline_head_delta_frames(later) < 0);
     }
 
     #[test]
