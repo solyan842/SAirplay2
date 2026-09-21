@@ -64,7 +64,7 @@ impl Default for SairplayApp {
             playback: PlaybackUiState::Idle,
             connect_rx: None,
             session: None,
-            initial_volume_text: "35".into(),
+            initial_volume_text: "50".into(),
             volume_rx: None,
             pending_volume: None,
             last_audio_discontinuities: 0,
@@ -500,7 +500,7 @@ impl eframe::App for SairplayApp {
                 let mut volume = parse_volume_text(&self.initial_volume_text)
                     .ok()
                     .flatten()
-                    .unwrap_or(35);
+                    .unwrap_or(50);
                 let response = ui.add(
                     egui::Slider::new(&mut volume, 0..=100)
                         .show_value(true)
