@@ -29,6 +29,8 @@ pub struct MediaSendResult {
     pub sequence_sent: u16,
     pub timestamp_sent: u32,
     pub sync_sent: bool,
+    pub audio_delivered: bool,
+    pub first_marker: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -326,6 +328,7 @@ impl RealtimeMediaSender {
 
         let sequence_sent = self.state.sequence;
         let timestamp_sent = self.state.timestamp;
+        let first_marker = self.state.first_packet;
         let packet = build_encrypted_realtime_packet(&self.state, alac_payload, &self.audio_key)?;
         let audio_delivered = match self
             .transport
@@ -353,6 +356,8 @@ impl RealtimeMediaSender {
             sequence_sent,
             timestamp_sent,
             sync_sent: should_sync && sync_delivered,
+            audio_delivered,
+            first_marker,
         })
     }
 
