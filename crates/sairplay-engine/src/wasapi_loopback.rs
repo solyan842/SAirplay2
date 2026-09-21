@@ -3,7 +3,7 @@ use std::fmt;
 use std::ptr::null_mut;
 use windows::Win32::Media::Audio::{
     eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
-    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
     AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, WAVEFORMATEX,
     WAVE_FORMAT_PCM,
 };
@@ -63,6 +63,12 @@ impl Drop for ComGuard {
 /// The stream is opened in shared mode and asks the Windows audio engine to
 /// convert the endpoint mix to the exact SAirplay2 baseline:
 /// PCM signed 16-bit, stereo, 44.1 kHz.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WasapiDrainReport {
+    pub frames: usize,
+    pub discontinuities: u64,
+}
+
 pub struct WasapiLoopbackCapture {
     audio_client: IAudioClient,
     capture_client: IAudioCaptureClient,
@@ -145,8 +151,8 @@ impl WasapiLoopbackCapture {
     pub fn drain_into(
         &self,
         chunker: &mut Pcm352Chunker,
-    ) -> Result<usize, WasapiLoopbackError> {
-        let mut total_frames = 0usize;
+    ) -> Result<WasapiDrainReport, WasapiLoopbackError> {
+        let mut report = WasapiDrainReport::default();
 
         unsafe {
             loop {
@@ -170,6 +176,13 @@ impl WasapiLoopbackCapture {
                         "GetBuffer failed: {e}"
                     )))?;
 
+                if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32) != 0 {
+                    // Diagnostic only: Microsoft defines this flag as a capture
+                    // glitch indicator. Do not alter PCM/timing here until a
+                    // hardware click is correlated with the counter.
+                    report.discontinuities = report.discontinuities.saturating_add(1);
+                }
+
                 let byte_len = frames as usize * BLOCK_ALIGN as usize;
                 if (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 {
                     chunker.push(&vec![0u8; byte_len]);
@@ -188,11 +201,11 @@ impl WasapiLoopbackCapture {
                         "ReleaseBuffer failed: {e}"
                     )))?;
 
-                total_frames += frames as usize;
+                report.frames = report.frames.saturating_add(frames as usize);
             }
         }
 
-        Ok(total_frames)
+        Ok(report)
     }
 }
 
