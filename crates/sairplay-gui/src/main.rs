@@ -840,7 +840,7 @@ impl SairplayApp {
                                             info.rect,
                                             self.t(
                                                 "Chọn cặp HomePod đã ghép nối trong ứng dụng Nhà (Home) của Apple để phát âm thanh stereo đồng bộ.",
-                                                "Select a HomePod pair already configured in Apple's Home app to play synchronized stereo audio.",
+                                                "Select a HomePod pair already configured in Apple's Home app for synchronized stereo playback.",
                                             ),
                                         );
                                     }
@@ -869,7 +869,7 @@ impl SairplayApp {
                                             info.rect,
                                             self.t(
                                                 "Khi bật chế độ này, bạn có thể chọn nhiều thiết bị trong danh sách để phát âm thanh đồng thời.",
-                                                "When this mode is enabled, you can select multiple devices from the list to play audio simultaneously.",
+                                                "When this mode is enabled, you can select multiple devices in the list to play audio simultaneously.",
                                             ),
                                         );
                                     }
