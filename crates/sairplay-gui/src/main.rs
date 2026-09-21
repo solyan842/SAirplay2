@@ -885,27 +885,8 @@ impl SairplayApp {
                                     .unwrap_or(50);
 
                                 ui.horizontal(|ui| {
-                                    let response = ui
-                                        .scope(|ui| {
-                                            let visuals = &mut ui.style_mut().visuals;
-                                            visuals.selection.bg_fill = UiTheme::blue();
-                                            visuals.widgets.inactive.bg_fill = UiTheme::blue();
-                                            visuals.widgets.inactive.bg_stroke =
-                                                egui::Stroke::new(1.0, UiTheme::blue());
-                                            visuals.widgets.hovered.bg_fill = UiTheme::blue_hover();
-                                            visuals.widgets.hovered.bg_stroke =
-                                                egui::Stroke::new(1.0, UiTheme::blue_hover());
-                                            visuals.widgets.active.bg_fill = UiTheme::blue_pressed();
-                                            visuals.widgets.active.bg_stroke =
-                                                egui::Stroke::new(1.0, UiTheme::blue_pressed());
-
-                                            ui.add_sized(
-                                                [140.0, 18.0],
-                                                egui::Slider::new(&mut volume, 0..=100)
-                                                    .show_value(false),
-                                            )
-                                        })
-                                        .inner;
+                                    let response =
+                                        draw_volume_slider(ui, &mut volume, egui::vec2(140.0, 18.0));
 
                                     if response.changed() {
                                         self.initial_volume_text = volume.to_string();
@@ -1008,6 +989,8 @@ impl SairplayApp {
                         egui::vec2(CARD_INNER_W, CARD_INNER_H),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
+                            draw_airplay_wave_icon(ui, egui::vec2(34.0, 34.0));
+                            ui.add_space(9.0);
                             ui.vertical(|ui| {
                                 ui.label(
                                     egui::RichText::new(self.t(
@@ -1045,18 +1028,18 @@ impl SairplayApp {
         let activate = self.t("Nhấn để kích hoạt", "Click to activate");
 
         let (rect, response) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), 36.0),
+            egui::vec2(ui.available_width(), 34.0),
             egui::Sense::click(),
         );
         let fill = if response.hovered() {
-            egui::Color32::from_rgb(242, 249, 255)
+            egui::Color32::from_rgb(244, 250, 255)
         } else {
-            egui::Color32::from_rgb(248, 252, 255)
+            egui::Color32::from_rgb(249, 252, 255)
         };
-        ui.painter().rect_filled(rect, egui::CornerRadius::same(10), fill);
+        ui.painter().rect_filled(rect, egui::CornerRadius::same(11), fill);
         ui.painter().rect_stroke(
             rect,
-            egui::CornerRadius::same(10),
+            egui::CornerRadius::same(11),
             egui::Stroke::new(
                 1.0,
                 if response.hovered() { UiTheme::border_hover() } else { UiTheme::border() },
@@ -1064,37 +1047,35 @@ impl SairplayApp {
             egui::StrokeKind::Inside,
         );
 
-        let icon_center = egui::pos2(rect.left() + 20.0, rect.center().y);
-        ui.painter().circle_stroke(
-            icon_center,
-            7.0,
-            egui::Stroke::new(1.7, UiTheme::blue()),
-        );
-        ui.painter().line_segment(
-            [icon_center + egui::vec2(5.0, 5.0), icon_center + egui::vec2(10.0, 10.0)],
-            egui::Stroke::new(1.7, UiTheme::blue()),
-        );
+        draw_key_icon_at(ui, egui::pos2(rect.left() + 20.0, rect.center().y));
 
         ui.painter().text(
-            egui::pos2(rect.left() + 39.0, rect.center().y),
+            egui::pos2(rect.left() + 40.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
             text,
-            egui::FontId::proportional(12.5),
+            egui::FontId::proportional(12.3),
             UiTheme::text(),
         );
-        ui.painter().text(
-            egui::pos2(rect.left() + 175.0, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            activate,
-            egui::FontId::proportional(12.0),
-            UiTheme::text_soft(),
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.left() + 164.0, rect.center().y - 7.0),
+                egui::pos2(rect.left() + 164.0, rect.center().y + 7.0),
+            ],
+            egui::Stroke::new(1.0, UiTheme::border()),
         );
         ui.painter().text(
-            egui::pos2(rect.right() - 18.0, rect.center().y),
+            egui::pos2(rect.left() + 177.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            activate,
+            egui::FontId::proportional(11.8),
+            if response.hovered() { UiTheme::blue() } else { UiTheme::text_soft() },
+        );
+        ui.painter().text(
+            egui::pos2(rect.right() - 16.0, rect.center().y),
             egui::Align2::CENTER_CENTER,
             "›",
-            egui::FontId::proportional(22.0),
-            UiTheme::text_soft(),
+            egui::FontId::proportional(21.0),
+            if response.hovered() { UiTheme::blue() } else { UiTheme::text_soft() },
         );
 
         if response.clicked() {
@@ -1345,6 +1326,79 @@ impl eframe::App for SairplayApp {
         self.render_activation_window(ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
+}
+
+fn draw_volume_slider(ui: &mut egui::Ui, value: &mut u8, size: egui::Vec2) -> egui::Response {
+    let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    let rail = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), 5.0));
+
+    if (response.clicked() || response.dragged()) && response.interact_pointer_pos().is_some() {
+        let pointer = response.interact_pointer_pos().unwrap();
+        let fraction = ((pointer.x - rail.left()) / rail.width()).clamp(0.0, 1.0);
+        let next = (fraction * 100.0).round() as u8;
+        if next != *value {
+            *value = next;
+            response.mark_changed();
+        }
+    }
+
+    let fraction = *value as f32 / 100.0;
+    let thumb_x = egui::lerp(rail.left()..=rail.right(), fraction);
+    let active = egui::Rect::from_min_max(
+        rail.left_top(),
+        egui::pos2(thumb_x, rail.bottom()),
+    );
+
+    ui.painter().rect_filled(
+        rail,
+        egui::CornerRadius::same(3),
+        egui::Color32::from_rgb(220, 229, 242),
+    );
+    ui.painter().rect_filled(
+        active,
+        egui::CornerRadius::same(3),
+        UiTheme::blue(),
+    );
+
+    let thumb = egui::pos2(thumb_x, rail.center().y);
+    let thumb_fill = if response.is_pointer_button_down_on() {
+        UiTheme::blue_pressed()
+    } else if response.hovered() {
+        UiTheme::blue_hover()
+    } else {
+        UiTheme::blue()
+    };
+    ui.painter().circle_filled(thumb, 7.0, egui::Color32::WHITE);
+    ui.painter().circle_filled(thumb, 5.5, thumb_fill);
+    response
+}
+
+fn draw_airplay_wave_icon(ui: &mut egui::Ui, size: egui::Vec2) {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let color = if response.hovered() { UiTheme::blue_hover() } else { UiTheme::blue() };
+    let center = rect.center();
+    let heights = [10.0, 18.0, 26.0, 32.0, 26.0, 18.0, 10.0];
+    for (i, h) in heights.iter().enumerate() {
+        let x = center.x + (i as f32 - 3.0) * 4.0;
+        ui.painter().line_segment(
+            [egui::pos2(x, center.y - h / 2.0), egui::pos2(x, center.y + h / 2.0)],
+            egui::Stroke::new(2.3, color),
+        );
+    }
+}
+
+fn draw_key_icon_at(ui: &mut egui::Ui, center: egui::Pos2) {
+    let color = UiTheme::blue();
+    let ring_center = center + egui::vec2(-3.0, -1.0);
+    ui.painter().circle_stroke(ring_center, 5.0, egui::Stroke::new(1.7, color));
+    ui.painter().line_segment(
+        [ring_center + egui::vec2(3.7, 3.7), center + egui::vec2(7.0, 7.0)],
+        egui::Stroke::new(1.7, color),
+    );
+    ui.painter().line_segment(
+        [center + egui::vec2(4.0, 4.0), center + egui::vec2(7.0, 1.0)],
+        egui::Stroke::new(1.7, color),
+    );
 }
 
 fn draw_lang_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
