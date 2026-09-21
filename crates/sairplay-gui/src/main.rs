@@ -1389,6 +1389,43 @@ mod gui_tests {
         let s = service(&["169.254.2.72"]);
         assert_eq!(preferred_service_address(&s), "Test.local");
     }
+
+    #[test]
+    fn homepod_tsid_is_listed_as_stereo_pair() {
+        let txt = AirPlayTxt::parse([
+            ("model", "AudioAccessory5,1"),
+            ("tsid", "stereo-group-1"),
+            ("features", (1u64 << 38).to_string().as_str()),
+        ])
+        .unwrap();
+        let device = DeviceRecord {
+            display_name: "Living Room".into(),
+            airplay: Some(DiscoveredService {
+                kind: ServiceKind::AirPlay,
+                fullname: "Living Room._airplay._tcp.local.".into(),
+                display_name: "Living Room".into(),
+                host: "living-room.local.".into(),
+                port: 7000,
+                addresses: vec!["192.168.1.30".into()],
+                txt,
+            }),
+            raop: None,
+        };
+        assert!(is_homepod_stereo_pair(&device));
+    }
+
+    #[test]
+    fn unknown_model_uses_music_server_fallback_artwork() {
+        let device = DeviceRecord {
+            display_name: "Unknown Receiver".into(),
+            airplay: Some(service(&["192.168.1.44"])),
+            raop: None,
+        };
+        assert_eq!(
+            classify_device_artwork(&device),
+            DeviceArtwork::MusicServer
+        );
+    }
 }
 
 fn main() -> eframe::Result<()> {
