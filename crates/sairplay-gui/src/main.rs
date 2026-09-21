@@ -119,6 +119,8 @@ struct SairplayApp {
     activation_open: bool,
     activation_key: String,
     last_feedback_error: Option<String>,
+    show_multiroom_info: bool,
+    show_pair_info: bool,
 }
 
 impl Default for SairplayApp {
@@ -164,6 +166,8 @@ impl Default for SairplayApp {
             activation_open: false,
             activation_key: String::new(),
             last_feedback_error: None,
+            show_multiroom_info: false,
+            show_pair_info: false,
         }
     }
 }
@@ -748,28 +752,69 @@ impl SairplayApp {
                         ui.add_space(5.0);
                         ui.label(
                             egui::RichText::new(title)
-                                .size(19.0)
+                                .size(if stereo_pair { 16.5 } else { 19.0 })
                                 .strong()
                                 .color(UiTheme::text()),
                         );
 
-                        if !stereo_pair {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    draw_info_mark(ui);
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let info = draw_info_button(ui);
+                                if info.clicked() {
+                                    if stereo_pair {
+                                        self.show_pair_info = !self.show_pair_info;
+                                        self.show_multiroom_info = false;
+                                    } else {
+                                        self.show_multiroom_info = !self.show_multiroom_info;
+                                        self.show_pair_info = false;
+                                    }
+                                }
+
+                                if stereo_pair {
+                                    if self.show_pair_info {
+                                        draw_info_popover(
+                                            ui.ctx(),
+                                            "pair_info_popover",
+                                            info.rect,
+                                            self.t(
+                                                "Chọn một cặp HomePod đã được ghép nối trước trong ứng dụng Nhà (Home) của Apple để phát âm thanh đồng bộ ở chế độ stereo.",
+                                                "Select a HomePod stereo pair that has already been configured in Apple's Home app for synchronized stereo playback.",
+                                            ),
+                                        );
+                                    }
+                                } else {
                                     ui.add_space(5.0);
-                                    let label = self.t("MultiRoom", "MultiRoom");
-                                    if draw_multiroom_toggle(ui, label, self.multiroom_enabled).clicked() {
+                                    let label =
+                                        self.t("Phát nhạc liên phòng", "Multi-room playback");
+                                    if draw_multiroom_toggle(
+                                        ui,
+                                        label,
+                                        self.multiroom_enabled,
+                                    )
+                                    .clicked()
+                                    {
                                         self.multiroom_enabled = !self.multiroom_enabled;
                                         self.log.push(format!(
                                             "MultiRoom GUI mode {}. Transport wiring is intentionally unchanged.",
                                             if self.multiroom_enabled { "enabled" } else { "disabled" }
                                         ));
                                     }
-                                },
-                            );
-                        }
+
+                                    if self.show_multiroom_info {
+                                        draw_info_popover(
+                                            ui.ctx(),
+                                            "multiroom_info_popover",
+                                            info.rect,
+                                            self.t(
+                                                "Khi bật chế độ này, bạn có thể chọn nhiều thiết bị trong bảng Thiết Bị để phát âm thanh đồng thời trên các thiết bị đã chọn.",
+                                                "When this mode is enabled, you can select multiple devices in the Devices panel and play audio simultaneously on the selected devices.",
+                                            ),
+                                        );
+                                    }
+                                }
+                            },
+                        );
                     },
                 );
 
@@ -820,7 +865,7 @@ impl SairplayApp {
                                         ui.add_space(48.0);
                                         let text = if stereo_pair {
                                             self.t(
-                                                "Chưa phát hiện Stereo Pair HomePod",
+                                                "Chưa phát hiện cặp HomePod đã ghép nối",
                                                 "No HomePod stereo pair detected",
                                             )
                                         } else {
@@ -873,7 +918,7 @@ impl SairplayApp {
 
                             ui.vertical(|ui| {
                                 ui.label(
-                                    egui::RichText::new(self.t("Âm lượng Receiver", "Receiver Volume"))
+                                    egui::RichText::new(self.t("Âm lượng", "Volume"))
                                         .size(12.0)
                                         .strong()
                                         .color(UiTheme::text()),
@@ -1287,8 +1332,9 @@ impl eframe::App for SairplayApp {
                 let receivers: Vec<DeviceRecord> = all_devices.clone();
                 let stereo_pairs = build_homepod_stereo_pairs(&all_devices);
 
-                let receivers_title = self.t("Receivers", "Receivers");
-                let pairs_title = self.t("Stereo Pair HomePod", "Stereo Pair HomePod");
+                let receivers_title = self.t("Thiết Bị", "Devices");
+                let pairs_title =
+                    self.t("Cặp loa HomePod đã ghép nối", "HomePod Stereo Pairs");
                 ui.columns(2, |columns| {
                     self.render_device_panel(
                         &mut columns[0],
@@ -1892,8 +1938,9 @@ fn draw_selector(ui: &mut egui::Ui, selected: bool, enabled: bool) -> egui::Resp
 }
 
 fn draw_multiroom_toggle(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+    let width = if label.chars().count() > 12 { 158.0 } else { 126.0 };
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(100.0, 26.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::click());
     let circle = egui::pos2(rect.left() + 12.0, rect.center().y);
 
     ui.painter().circle_stroke(
@@ -1923,16 +1970,27 @@ fn draw_multiroom_toggle(ui: &mut egui::Ui, label: &str, selected: bool) -> egui
     response
 }
 
-fn draw_info_mark(ui: &mut egui::Ui) {
+fn draw_info_button(ui: &mut egui::Ui) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
-    let color = if response.hovered() {
+        ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+    let color = if response.is_pointer_button_down_on() {
+        UiTheme::blue_pressed()
+    } else if response.hovered() {
         UiTheme::blue()
     } else {
         egui::Color32::from_rgb(120, 150, 194)
     };
+
+    if response.hovered() {
+        ui.painter().circle_filled(
+            rect.center(),
+            10.0,
+            egui::Color32::from_rgba_unmultiplied(22, 119, 255, 18),
+        );
+    }
+
     ui.painter()
-        .circle_stroke(rect.center(), 8.0, egui::Stroke::new(1.3, color));
+        .circle_stroke(rect.center(), 8.0, egui::Stroke::new(1.4, color));
     ui.painter().text(
         rect.center() + egui::vec2(0.0, 0.4),
         egui::Align2::CENTER_CENTER,
@@ -1940,6 +1998,45 @@ fn draw_info_mark(ui: &mut egui::Ui) {
         egui::FontId::proportional(11.0),
         color,
     );
+    response
+}
+
+fn draw_info_popover(
+    ctx: &egui::Context,
+    id: &'static str,
+    anchor: egui::Rect,
+    text: &str,
+) {
+    let width = 350.0;
+    let screen = ctx.screen_rect();
+    let mut x = anchor.right() - width;
+    x = x.clamp(screen.left() + 10.0, (screen.right() - width - 10.0).max(screen.left() + 10.0));
+    let pos = egui::pos2(x, anchor.bottom() + 7.0);
+
+    egui::Area::new(egui::Id::new(id))
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(253, 254, 255))
+                .stroke(egui::Stroke::new(1.0, UiTheme::border()))
+                .corner_radius(egui::CornerRadius::same(11))
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 4],
+                    blur: 16,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(22),
+                })
+                .inner_margin(egui::Margin::symmetric(12, 9))
+                .show(ui, |ui| {
+                    ui.set_width(width - 24.0);
+                    ui.label(
+                        egui::RichText::new(text)
+                            .size(11.8)
+                            .color(UiTheme::text()),
+                    );
+                });
+        });
 }
 
 fn draw_status_badge(ui: &mut egui::Ui, text: &str, tone: StatusTone) {
