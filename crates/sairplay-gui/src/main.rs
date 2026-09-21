@@ -1385,9 +1385,9 @@ fn draw_device_art(
                 rect.center() + egui::vec2(0.0, 7.0),
                 egui::vec2(46.0, 10.0),
             );
-            painter.ellipse_filled(
-                shadow.center(),
-                egui::vec2(shadow.width() / 2.0, shadow.height() / 2.0),
+            painter.rect_filled(
+                shadow,
+                egui::CornerRadius::same(5),
                 egui::Color32::from_black_alpha(18),
             );
 
@@ -1441,9 +1441,9 @@ fn draw_device_art(
                     egui::vec2(27.0 * scale, 37.0 * scale),
                 );
                 p.rect_filled(r, egui::CornerRadius::same((10.0 * scale) as u8), body);
-                p.ellipse_filled(
+                p.circle_filled(
                     egui::pos2(r.center().x, r.top() + 5.0 * scale),
-                    egui::vec2(9.5 * scale, 3.7 * scale),
+                    5.0 * scale,
                     top,
                 );
                 for n in 0..4 {
@@ -1456,9 +1456,12 @@ fn draw_device_art(
                         egui::Stroke::new(0.6, mesh),
                     );
                 }
-                p.ellipse_filled(
-                    egui::pos2(r.center().x, r.bottom() + 2.5 * scale),
-                    egui::vec2(12.0 * scale, 2.5 * scale),
+                p.rect_filled(
+                    egui::Rect::from_center_size(
+                        egui::pos2(r.center().x, r.bottom() + 2.5 * scale),
+                        egui::vec2(24.0 * scale, 4.0 * scale),
+                    ),
+                    egui::CornerRadius::same(2),
                     egui::Color32::from_black_alpha(18),
                 );
             };
