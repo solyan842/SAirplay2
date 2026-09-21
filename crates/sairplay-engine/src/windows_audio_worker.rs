@@ -36,6 +36,7 @@ pub struct WindowsAudioWorker {
     discontinuities: Arc<AtomicU64>,
     last_discontinuity_frame: Arc<AtomicU64>,
     first_non_silent_frame: Arc<AtomicU64>,
+    startup_events: Arc<Mutex<Vec<String>>>,
 }
 
 impl WindowsAudioWorker {
@@ -61,6 +62,8 @@ impl WindowsAudioWorker {
         let last_discontinuity_frame_thread = Arc::clone(&last_discontinuity_frame);
         let first_non_silent_frame = Arc::new(AtomicU64::new(u64::MAX));
         let first_non_silent_frame_thread = Arc::clone(&first_non_silent_frame);
+        let startup_events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let startup_events_thread = Arc::clone(&startup_events);
 
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
@@ -85,6 +88,8 @@ impl WindowsAudioWorker {
             let mut captured_frames_total = 0u64;
             let mut source_present = false;
             let mut cold_armed = false;
+            let mut startup_packet_index: u32 = 0;
+            let mut startup_started: Option<std::time::Instant> = None;
 
             while running_thread.load(Ordering::SeqCst) {
                 match capture.drain_into(&mut chunker) {
@@ -160,6 +165,15 @@ impl WindowsAudioWorker {
                                 return;
                             }
                             cold_armed = true;
+                            startup_started = Some(std::time::Instant::now());
+                            if let Ok(mut events) = startup_events_thread.lock() {
+                                events.push(format!(
+                                    "Startup: cold START armed · delay={} ms · lead_frames={} · pending_bytes={}.",
+                                    cold_start_delay_ms,
+                                    lead_frames,
+                                    chunker.pending_bytes()
+                                ));
+                            }
                         }
 
                         let recovery_ntp = match system_time_to_ntp(SystemTime::now()) {
@@ -177,12 +191,32 @@ impl WindowsAudioWorker {
                         // still queued. It only pads once the wire head is
                         // actually behind wall clock.
                         if chunker.has_packet() {
-                            let _ = sender.recover_delivery_gap(recovery_ntp, lead_frames);
+                            if let Some(added) = sender.recover_delivery_gap(recovery_ntp, lead_frames) {
+                                if startup_started.map(|t| t.elapsed() <= Duration::from_secs(3)).unwrap_or(false) {
+                                    if let Ok(mut events) = startup_events_thread.lock() {
+                                        events.push(format!(
+                                            "Startup: delivery-gap recovery added {} silence frames · total_pad={}.",
+                                            added,
+                                            sender.splice_pad_frames()
+                                        ));
+                                    }
+                                }
+                            }
                         } else if frames == 0 {
                             // Source starvation guard is anticipatory: when
                             // input is dry it starts padding as the effective
                             // head enters the 250 ms minimum-lead floor.
-                            let _ = sender.recover_input_gap(recovery_ntp, lead_frames);
+                            if let Some(added) = sender.recover_input_gap(recovery_ntp, lead_frames) {
+                                if startup_started.map(|t| t.elapsed() <= Duration::from_secs(3)).unwrap_or(false) {
+                                    if let Ok(mut events) = startup_events_thread.lock() {
+                                        events.push(format!(
+                                            "Startup: input-gap recovery added {} silence frames · total_pad={}.",
+                                            added,
+                                            sender.splice_pad_frames()
+                                        ));
+                                    }
+                                }
+                            }
                         }
 
                         loop {
@@ -215,12 +249,33 @@ impl WindowsAudioWorker {
                             let packet = chunker
                                 .pop_packet_with_silence_prefix(pad_now)
                                 .expect("required real-byte count checked");
-                            if let Err(error) = sender.send_pcm_352(&packet, ntp, lead_frames) {
-                                if let Ok(mut slot) = last_error_thread.lock() {
-                                    *slot = Some(format!("media send failed: {error:?}"));
+                            match sender.send_pcm_352(&packet, ntp, lead_frames) {
+                                Ok(result) => {
+                                    startup_packet_index = startup_packet_index.saturating_add(1);
+                                    if startup_started.map(|t| t.elapsed() <= Duration::from_secs(3)).unwrap_or(false)
+                                        && (startup_packet_index <= 10 || result.sync_sent || !result.audio_delivered)
+                                    {
+                                        if let Ok(mut events) = startup_events_thread.lock() {
+                                            events.push(format!(
+                                                "Startup: RTP #{} seq={} ts={} marker={} sync_sent={} audio_sent={} pad_before={}.",
+                                                startup_packet_index,
+                                                result.sequence_sent,
+                                                result.timestamp_sent,
+                                                result.first_marker,
+                                                result.sync_sent,
+                                                result.audio_delivered,
+                                                pad_now
+                                            ));
+                                        }
+                                    }
                                 }
-                                running_thread.store(false, Ordering::SeqCst);
-                                return;
+                                Err(error) => {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(format!("media send failed: {error:?}"));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
                             }
                             sender.consume_splice_pad(pad_now);
                         }
@@ -248,6 +303,7 @@ impl WindowsAudioWorker {
                 discontinuities,
                 last_discontinuity_frame,
                 first_non_silent_frame,
+                startup_events,
             }),
             Ok(Err(message)) => {
                 let _ = worker.join();
@@ -290,6 +346,13 @@ impl WindowsAudioWorker {
         match self.first_non_silent_frame.load(Ordering::SeqCst) {
             u64::MAX => None,
             value => Some(value),
+        }
+    }
+
+    pub fn drain_startup_events(&self) -> Vec<String> {
+        match self.startup_events.lock() {
+            Ok(mut events) => std::mem::take(&mut *events),
+            Err(_) => Vec::new(),
         }
     }
 
