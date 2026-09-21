@@ -786,7 +786,7 @@ impl SairplayApp {
                                 } else {
                                     ui.add_space(5.0);
                                     let label =
-                                        self.t("Phát nhạc liên phòng", "Multi-room playback");
+                                        self.t("Phát nhạc liên phòng", "MultiRoom");
                                     if draw_multiroom_toggle(
                                         ui,
                                         label,
@@ -918,7 +918,7 @@ impl SairplayApp {
 
                             ui.vertical(|ui| {
                                 ui.label(
-                                    egui::RichText::new(self.t("Âm lượng", "Volume"))
+                                    egui::RichText::new(self.t("Âm lượng", "Receiver Volume"))
                                         .size(12.0)
                                         .strong()
                                         .color(UiTheme::text()),
@@ -1332,9 +1332,9 @@ impl eframe::App for SairplayApp {
                 let receivers: Vec<DeviceRecord> = all_devices.clone();
                 let stereo_pairs = build_homepod_stereo_pairs(&all_devices);
 
-                let receivers_title = self.t("Thiết Bị", "Devices");
+                let receivers_title = self.t("Thiết Bị", "Receivers");
                 let pairs_title =
-                    self.t("Cặp loa HomePod đã ghép nối", "HomePod Stereo Pairs");
+                    self.t("Cặp loa HomePod đã ghép nối", "Stereo Pair HomePod");
                 ui.columns(2, |columns| {
                     self.render_device_panel(
                         &mut columns[0],
