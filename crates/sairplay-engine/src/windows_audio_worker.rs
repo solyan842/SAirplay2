@@ -90,6 +90,7 @@ impl WindowsAudioWorker {
             let mut cold_armed = false;
             let mut startup_packet_index: u32 = 0;
             let mut startup_started: Option<std::time::Instant> = None;
+            let mut input_starved_since: Option<std::time::Instant> = None;
 
             while running_thread.load(Ordering::SeqCst) {
                 match capture.drain_into(&mut chunker) {
@@ -191,6 +192,7 @@ impl WindowsAudioWorker {
                         // still queued. It only pads once the wire head is
                         // actually behind wall clock.
                         if chunker.has_packet() {
+                            input_starved_since = None;
                             if let Some(added) = sender.recover_delivery_gap(recovery_ntp, lead_frames) {
                                 if startup_started.map(|t| t.elapsed() <= Duration::from_secs(3)).unwrap_or(false) {
                                     if let Ok(mut events) = startup_events_thread.lock() {
@@ -202,20 +204,32 @@ impl WindowsAudioWorker {
                                     }
                                 }
                             }
-                        } else if frames == 0 {
-                            // Source starvation guard is anticipatory: when
-                            // input is dry it starts padding as the effective
-                            // head enters the 250 ms minimum-lead floor.
-                            if let Some(added) = sender.recover_input_gap(recovery_ntp, lead_frames) {
-                                if startup_started.map(|t| t.elapsed() <= Duration::from_secs(3)).unwrap_or(false) {
-                                    if let Ok(mut events) = startup_events_thread.lock() {
-                                        events.push(format!(
-                                            "Startup: input-gap recovery added {} silence frames · total_pad={}.",
-                                            added,
-                                            sender.splice_pad_frames()
-                                        ));
+                        } else if frames > 0 {
+                            // New PCM arrived but not enough for a complete packet;
+                            // this is normal producer cadence, not starvation.
+                            input_starved_since = None;
+                        } else {
+                            // Upstream blocks ap2_session_read(..., 250) and only
+                            // enters starvation recovery after that full timeout.
+                            // WASAPI polling returns ordinary empty drains every
+                            // ~1 ms, so never treat a single empty poll as a gap.
+                            let started = input_starved_since.get_or_insert_with(std::time::Instant::now);
+                            if started.elapsed() >= Duration::from_millis(250) {
+                                if let Some(added) = sender.recover_input_gap(recovery_ntp, lead_frames) {
+                                    if startup_started.map(|t| t.elapsed() <= Duration::from_secs(3)).unwrap_or(false) {
+                                        if let Ok(mut events) = startup_events_thread.lock() {
+                                            events.push(format!(
+                                                "Startup: input-gap recovery after >=250 ms added {} silence frames · total_pad={}.",
+                                                added,
+                                                sender.splice_pad_frames()
+                                            ));
+                                        }
                                     }
                                 }
+                                // Mirror successive 250 ms zero-reads: a still-dry
+                                // source can be checked again after another full
+                                // starvation interval, never on each 1 ms poll.
+                                input_starved_since = Some(std::time::Instant::now());
                             }
                         }
 
