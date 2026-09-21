@@ -729,86 +729,120 @@ impl SairplayApp {
         egui::Frame::new()
             .fill(UiTheme::surface())
             .stroke(egui::Stroke::new(1.0, UiTheme::border()))
-            .corner_radius(egui::CornerRadius::same(14))
+            .corner_radius(egui::CornerRadius::same(15))
             .shadow(egui::epaint::Shadow {
                 offset: [0, 3],
-                blur: 12,
+                blur: 14,
                 spread: 0,
-                color: egui::Color32::from_black_alpha(18),
+                color: egui::Color32::from_black_alpha(16),
             })
-            .inner_margin(egui::Margin::same(12))
+            .inner_margin(egui::Margin::same(11))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    draw_small_airplay_mark(ui);
-                    ui.label(
-                        egui::RichText::new(title)
-                            .size(18.0)
-                            .strong()
-                            .color(egui::Color32::from_rgb(13, 28, 54)),
-                    );
+                ui.set_min_height(286.0);
 
-                    if !stereo_pair {
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                let label = self.t("MultiRoom", "MultiRoom");
-                                let toggle = ui.add(
-                                    egui::RadioButton::new(
-                                        self.multiroom_enabled,
-                                        egui::RichText::new(label).size(15.0),
-                                    ),
-                                );
-                                if toggle.clicked() {
-                                    self.multiroom_enabled = !self.multiroom_enabled;
-                                    self.log.push(format!(
-                                        "MultiRoom GUI mode {}. Transport wiring is intentionally unchanged.",
-                                        if self.multiroom_enabled { "enabled" } else { "disabled" }
-                                    ));
-                                }
-                                toggle.on_hover_text(self.t(
-                                    "Giao diện MultiRoom đã chuẩn bị; transport sẽ nối sau khi đường phát đơn ổn định.",
-                                    "MultiRoom UI is prepared; transport wiring follows after single-room playback is stable.",
-                                ));
-                            },
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 36.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        draw_small_airplay_mark(ui);
+                        ui.add_space(5.0);
+                        ui.label(
+                            egui::RichText::new(title)
+                                .size(19.0)
+                                .strong()
+                                .color(UiTheme::text()),
                         );
-                    }
-                });
 
-                ui.add_space(8.0);
-                ui.separator();
+                        if !stereo_pair {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    draw_info_mark(ui);
+                                    ui.add_space(5.0);
+                                    let label = self.t("MultiRoom", "MultiRoom");
+                                    if draw_multiroom_toggle(ui, label, self.multiroom_enabled).clicked() {
+                                        self.multiroom_enabled = !self.multiroom_enabled;
+                                        self.log.push(format!(
+                                            "MultiRoom GUI mode {}. Transport wiring is intentionally unchanged.",
+                                            if self.multiroom_enabled { "enabled" } else { "disabled" }
+                                        ));
+                                    }
+                                },
+                            );
+                        }
+                    },
+                );
+
+                ui.add_space(5.0);
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(ui.min_rect().left() + 1.0, ui.cursor().top()),
+                        egui::pos2(ui.max_rect().right() - 1.0, ui.cursor().top()),
+                    ],
+                    egui::Stroke::new(1.0, UiTheme::guide()),
+                );
                 ui.add_space(6.0);
 
-                egui::ScrollArea::vertical()
-                    .id_salt(if stereo_pair { "pair_scroll" } else { "receiver_scroll" })
-                    .max_height(214.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if devices.is_empty() {
-                            ui.add_space(20.0);
-                            ui.vertical_centered(|ui| {
-                                let text = if stereo_pair {
-                                    self.t(
-                                        "Chưa phát hiện Stereo Pair HomePod",
-                                        "No HomePod stereo pair detected",
-                                    )
-                                } else {
-                                    self.t(
-                                        "Đang quét thiết bị AirPlay...",
-                                        "Scanning AirPlay receivers...",
-                                    )
-                                };
-                                ui.label(
-                                    egui::RichText::new(text)
-                                        .size(14.0)
-                                        .color(egui::Color32::from_rgb(113, 130, 154)),
+                ui.scope(|ui| {
+                    let style = ui.style_mut();
+                    style.spacing.scroll = egui::style::ScrollStyle::solid();
+                    style.spacing.scroll.bar_width = 8.0;
+                    style.spacing.scroll.handle_min_length = 34.0;
+                    style.spacing.scroll.bar_inner_margin = 6.0;
+                    style.spacing.scroll.bar_outer_margin = 2.0;
+
+                    style.visuals.extreme_bg_color =
+                        egui::Color32::from_rgb(239, 244, 251);
+                    style.visuals.widgets.inactive.bg_fill =
+                        egui::Color32::from_rgb(200, 212, 230);
+                    style.visuals.widgets.inactive.corner_radius =
+                        egui::CornerRadius::same(8);
+                    style.visuals.widgets.hovered.bg_fill =
+                        egui::Color32::from_rgb(178, 195, 219);
+                    style.visuals.widgets.hovered.corner_radius =
+                        egui::CornerRadius::same(8);
+                    style.visuals.widgets.active.bg_fill =
+                        egui::Color32::from_rgb(158, 180, 211);
+                    style.visuals.widgets.active.corner_radius =
+                        egui::CornerRadius::same(8);
+
+                    egui::ScrollArea::vertical()
+                        .id_salt(if stereo_pair { "pair_scroll" } else { "receiver_scroll" })
+                        .max_height(224.0)
+                        .min_scrolled_height(224.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if devices.is_empty() {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(ui.available_width(), 190.0),
+                                    egui::Layout::top_down(egui::Align::Center),
+                                    |ui| {
+                                        ui.add_space(48.0);
+                                        let text = if stereo_pair {
+                                            self.t(
+                                                "Chưa phát hiện Stereo Pair HomePod",
+                                                "No HomePod stereo pair detected",
+                                            )
+                                        } else {
+                                            self.t(
+                                                "Đang quét thiết bị AirPlay...",
+                                                "Scanning AirPlay receivers...",
+                                            )
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(text)
+                                                .size(12.5)
+                                                .color(UiTheme::text_soft()),
+                                        );
+                                    },
                                 );
-                            });
-                        } else {
-                            for device in devices {
-                                self.render_device_row(ui, device, stereo_pair);
+                            } else {
+                                for device in devices {
+                                    self.render_device_row(ui, device, stereo_pair);
+                                }
                             }
-                        }
-                    });
+                        });
+                });
             });
     }
 
@@ -1752,8 +1786,8 @@ fn draw_small_airplay_mark(ui: &mut egui::Ui) {
 }
 
 fn draw_selector(ui: &mut egui::Ui, selected: bool, enabled: bool) -> egui::Response {
-    let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), sense);
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
     let center = rect.center();
 
     let ring = if selected {
@@ -1772,6 +1806,57 @@ fn draw_selector(ui: &mut egui::Ui, selected: bool, enabled: bool) -> egui::Resp
     }
 
     response
+}
+
+fn draw_multiroom_toggle(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(100.0, 26.0), egui::Sense::click());
+    let circle = egui::pos2(rect.left() + 12.0, rect.center().y);
+
+    ui.painter().circle_stroke(
+        circle,
+        8.5,
+        egui::Stroke::new(
+            if selected { 2.0 } else { 1.5 },
+            if selected {
+                UiTheme::blue()
+            } else if response.hovered() {
+                UiTheme::border_active()
+            } else {
+                egui::Color32::from_rgb(124, 153, 197)
+            },
+        ),
+    );
+    if selected {
+        ui.painter().circle_filled(circle, 4.7, UiTheme::blue());
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + 27.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        UiTheme::text(),
+    );
+    response
+}
+
+fn draw_info_mark(ui: &mut egui::Ui) {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+    let color = if response.hovered() {
+        UiTheme::blue()
+    } else {
+        egui::Color32::from_rgb(120, 150, 194)
+    };
+    ui.painter()
+        .circle_stroke(rect.center(), 8.0, egui::Stroke::new(1.3, color));
+    ui.painter().text(
+        rect.center() + egui::vec2(0.0, 0.4),
+        egui::Align2::CENTER_CENTER,
+        "i",
+        egui::FontId::proportional(11.0),
+        color,
+    );
 }
 
 fn draw_status_badge(ui: &mut egui::Ui, text: &str, tone: StatusTone) {
