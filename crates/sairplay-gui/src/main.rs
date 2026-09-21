@@ -45,23 +45,59 @@ enum DeviceArtwork {
     AirplaySpeakers,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusTone {
+    Green,
+    Orange,
+    Red,
+    Gray,
+}
+
+impl StatusTone {
+    fn colors(self) -> (egui::Color32, egui::Color32, egui::Color32) {
+        match self {
+            Self::Green => (
+                egui::Color32::from_rgb(223, 246, 232),
+                egui::Color32::from_rgb(34, 197, 94),
+                egui::Color32::from_rgb(22, 128, 60),
+            ),
+            Self::Orange => (
+                egui::Color32::from_rgb(252, 239, 216),
+                egui::Color32::from_rgb(245, 128, 32),
+                egui::Color32::from_rgb(217, 104, 6),
+            ),
+            Self::Red => (
+                egui::Color32::from_rgb(255, 226, 231),
+                egui::Color32::from_rgb(255, 55, 95),
+                egui::Color32::from_rgb(225, 29, 72),
+            ),
+            Self::Gray => (
+                egui::Color32::from_rgb(233, 239, 247),
+                egui::Color32::from_rgb(128, 148, 182),
+                egui::Color32::from_rgb(96, 119, 155),
+            ),
+        }
+    }
+}
+
 struct UiTheme;
 
 impl UiTheme {
-    fn bg() -> egui::Color32 { egui::Color32::from_rgb(244, 249, 255) }
-    fn surface() -> egui::Color32 { egui::Color32::WHITE }
-    fn surface_soft() -> egui::Color32 { egui::Color32::from_rgb(249, 252, 255) }
-    fn border() -> egui::Color32 { egui::Color32::from_rgb(210, 224, 242) }
-    fn border_hover() -> egui::Color32 { egui::Color32::from_rgb(145, 198, 255) }
-    fn border_active() -> egui::Color32 { egui::Color32::from_rgb(87, 163, 250) }
-    fn text() -> egui::Color32 { egui::Color32::from_rgb(22, 36, 61) }
-    fn text_soft() -> egui::Color32 { egui::Color32::from_rgb(87, 111, 150) }
-    fn blue() -> egui::Color32 { egui::Color32::from_rgb(20, 126, 246) }
-    fn blue_hover() -> egui::Color32 { egui::Color32::from_rgb(42, 144, 255) }
-    fn blue_pressed() -> egui::Color32 { egui::Color32::from_rgb(11, 103, 215) }
-    fn green() -> egui::Color32 { egui::Color32::from_rgb(29, 181, 99) }
-    fn amber() -> egui::Color32 { egui::Color32::from_rgb(232, 159, 27) }
-    fn red() -> egui::Color32 { egui::Color32::from_rgb(222, 70, 77) }
+    fn bg() -> egui::Color32 { egui::Color32::from_rgb(244, 248, 255) }
+    fn surface() -> egui::Color32 { egui::Color32::from_rgb(251, 253, 255) }
+    fn surface_soft() -> egui::Color32 { egui::Color32::from_rgb(247, 250, 255) }
+    fn border() -> egui::Color32 { egui::Color32::from_rgb(216, 229, 244) }
+    fn guide() -> egui::Color32 { egui::Color32::from_rgb(226, 234, 244) }
+    fn border_hover() -> egui::Color32 { egui::Color32::from_rgb(159, 204, 255) }
+    fn border_active() -> egui::Color32 { egui::Color32::from_rgb(22, 119, 255) }
+    fn text() -> egui::Color32 { egui::Color32::from_rgb(15, 30, 58) }
+    fn text_soft() -> egui::Color32 { egui::Color32::from_rgb(107, 129, 166) }
+    fn blue() -> egui::Color32 { egui::Color32::from_rgb(22, 119, 255) }
+    fn blue_hover() -> egui::Color32 { egui::Color32::from_rgb(42, 134, 255) }
+    fn blue_pressed() -> egui::Color32 { egui::Color32::from_rgb(15, 106, 232) }
+    fn green() -> egui::Color32 { egui::Color32::from_rgb(34, 197, 94) }
+    fn amber() -> egui::Color32 { egui::Color32::from_rgb(245, 128, 32) }
+    fn red() -> egui::Color32 { egui::Color32::from_rgb(255, 55, 95) }
 }
 
 struct SairplayApp {
@@ -522,7 +558,7 @@ impl SairplayApp {
         }
     }
 
-    fn device_status(&self, device: &DeviceRecord, stereo_pair: bool) -> (&'static str, egui::Color32) {
+    fn device_status(&self, device: &DeviceRecord, stereo_pair: bool) -> (&'static str, StatusTone) {
         let selected = device
             .airplay
             .as_ref()
@@ -531,31 +567,33 @@ impl SairplayApp {
         match &self.playback {
             PlaybackUiState::Connecting(name) if name == &device.display_name => (
                 self.t("Đang kết nối", "Connecting"),
-                egui::Color32::from_rgb(241, 158, 0),
+                StatusTone::Orange,
             ),
             PlaybackUiState::Playing(name) if name == &device.display_name => (
                 self.t("Đang chạy", "Running"),
-                egui::Color32::from_rgb(18, 185, 91),
+                StatusTone::Green,
             ),
             PlaybackUiState::Error(_) if selected => (
                 self.t("Lỗi kết nối", "Connection Error"),
-                egui::Color32::from_rgb(229, 57, 68),
+                StatusTone::Red,
             ),
             _ if device.route(false, false) == Route::AirPlay2Native => {
                 if stereo_pair {
-                    (self.t("Sẵn sàng", "Ready"), egui::Color32::from_rgb(18, 185, 91))
+                    (self.t("Sẵn sàng", "Ready"), StatusTone::Green)
                 } else {
-                    (self.t("Đang chờ", "Waiting"), egui::Color32::from_rgb(245, 128, 32))
+                    (self.t("Đang chờ", "Waiting"), StatusTone::Orange)
                 }
             }
-            _ => (
-                self.t("Chờ", "Standby"),
-                egui::Color32::from_rgb(104, 124, 154),
-            ),
+            _ => (self.t("Chờ", "Standby"), StatusTone::Gray),
         }
     }
 
     fn render_device_row(&mut self, ui: &mut egui::Ui, device: &DeviceRecord, stereo_pair: bool) {
+        const ROW_H: f32 = 64.0;
+        const SELECTOR_W: f32 = 24.0;
+        const ART_W: f32 = 70.0;
+        const STATUS_W: f32 = 126.0;
+
         let route = device.route(false, false);
         let fullname = device.airplay.as_ref().map(|s| s.fullname.clone());
         let selected = fullname
@@ -573,66 +611,105 @@ impl SairplayApp {
             .unwrap_or_else(|| "-".into());
 
         let artwork = classify_device_artwork(device);
-        let (status, status_color) = self.device_status(device, stereo_pair);
+        let (status, status_tone) = self.device_status(device, stereo_pair);
+        let sense = if selectable { egui::Sense::click() } else { egui::Sense::hover() };
+        let (row_rect, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), sense);
+        let body = row_rect.shrink2(egui::vec2(2.0, 2.0));
 
-        let inner = egui::Frame::new()
-            .fill(if selected {
-                egui::Color32::from_rgb(239, 247, 255)
-            } else {
-                UiTheme::surface()
-            })
-            .stroke(egui::Stroke::new(
-                if selected { 1.5 } else { 1.0 },
-                if selected { UiTheme::border_active() } else { UiTheme::border() },
-            ))
-            .corner_radius(egui::CornerRadius::same(12))
-            .inner_margin(egui::Margin::symmetric(10, 7))
-            .show(ui, |ui| {
-                ui.set_min_height(56.0);
-                ui.horizontal_centered(|ui| {
-                    ui.add_enabled(selectable, egui::RadioButton::new(selected, ""));
-
-                    ui.add_space(6.0);
-                    draw_device_art(ui, artwork, stereo_pair, egui::vec2(62.0, 42.0));
-                    ui.add_space(12.0);
-
-                    ui.vertical(|ui| {
-                        ui.set_min_width(155.0);
-                        ui.label(
-                            egui::RichText::new(&device.display_name)
-                                .size(14.0)
-                                .strong()
-                                .color(UiTheme::text()),
-                        );
-                        ui.add_space(1.0);
-                        ui.label(
-                            egui::RichText::new(address)
-                                .size(11.5)
-                                .color(UiTheme::text_soft()),
-                        );
-                    });
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        draw_status_badge(ui, status, status_color);
-                    });
-                });
-            });
-
-        let id = ui.make_persistent_id(("device-card", &device.display_name, stereo_pair));
-        let response = ui.interact(
-            inner.response.rect,
-            id,
-            if selectable { egui::Sense::click() } else { egui::Sense::hover() },
-        );
-
-        if response.hovered() && !selected {
+        if selected {
+            ui.painter().rect_filled(
+                body,
+                egui::CornerRadius::same(11),
+                egui::Color32::from_rgb(238, 247, 255),
+            );
             ui.painter().rect_stroke(
-                inner.response.rect,
-                egui::CornerRadius::same(12),
-                egui::Stroke::new(1.4, UiTheme::border_hover()),
-                egui::StrokeKind::Outside,
+                body,
+                egui::CornerRadius::same(11),
+                egui::Stroke::new(1.5, UiTheme::border_active()),
+                egui::StrokeKind::Inside,
+            );
+        } else if response.hovered() {
+            ui.painter().rect_filled(
+                body,
+                egui::CornerRadius::same(11),
+                egui::Color32::from_rgb(247, 251, 255),
+            );
+            ui.painter().rect_stroke(
+                body,
+                egui::CornerRadius::same(11),
+                egui::Stroke::new(1.0, UiTheme::border_hover()),
+                egui::StrokeKind::Inside,
+            );
+        } else {
+            ui.painter().line_segment(
+                [
+                    egui::pos2(body.left() + 4.0, body.bottom()),
+                    egui::pos2(body.right() - 4.0, body.bottom()),
+                ],
+                egui::Stroke::new(1.0, UiTheme::guide()),
             );
         }
+
+        let content = body.shrink2(egui::vec2(10.0, 5.0));
+        ui.allocate_ui_at_rect(content, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(SELECTOR_W, 44.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        draw_selector(ui, selected, selectable);
+                    },
+                );
+
+                ui.add_space(8.0);
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ART_W, 44.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        draw_device_art(ui, artwork, stereo_pair, egui::vec2(68.0, 42.5));
+                    },
+                );
+
+                ui.add_space(12.0);
+
+                let text_width = (ui.available_width() - STATUS_W - 14.0).max(110.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(text_width, 44.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.add_space(3.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&device.display_name)
+                                    .size(14.0)
+                                    .strong()
+                                    .color(UiTheme::text()),
+                            )
+                            .truncate(),
+                        );
+                        ui.add_space(1.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(address)
+                                    .size(11.5)
+                                    .color(UiTheme::text_soft()),
+                            )
+                            .truncate(),
+                        );
+                    },
+                );
+
+                ui.add_space(8.0);
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(STATUS_W, 44.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| draw_status_badge(ui, status, status_tone),
+                );
+            });
+        });
 
         if response.clicked() && selectable {
             self.selected_fullname = fullname;
@@ -640,8 +717,6 @@ impl SairplayApp {
                 self.playback = PlaybackUiState::Idle;
             }
         }
-
-        ui.add_space(6.0);
     }
 
     fn render_device_panel(
@@ -1676,25 +1751,46 @@ fn draw_small_airplay_mark(ui: &mut egui::Ui) {
     );
 }
 
-fn draw_status_badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
-    let bg = egui::Color32::from_rgba_unmultiplied(
-        color.r(),
-        color.g(),
-        color.b(),
-        28,
+fn draw_selector(ui: &mut egui::Ui, selected: bool, enabled: bool) -> egui::Response {
+    let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), sense);
+    let center = rect.center();
+
+    let ring = if selected {
+        UiTheme::blue()
+    } else if response.hovered() && enabled {
+        UiTheme::border_active()
+    } else {
+        egui::Color32::from_rgb(124, 153, 197)
+    };
+
+    ui.painter()
+        .circle_stroke(center, 9.0, egui::Stroke::new(if selected { 2.0 } else { 1.5 }, ring));
+
+    if selected {
+        ui.painter().circle_filled(center, 5.2, UiTheme::blue());
+    }
+
+    response
+}
+
+fn draw_status_badge(ui: &mut egui::Ui, text: &str, tone: StatusTone) {
+    let (bg, dot, text_color) = tone.colors();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(122.0, 30.0), egui::Sense::hover());
+
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(15), bg);
+
+    let dot_center = egui::pos2(rect.left() + 16.0, rect.center().y);
+    ui.painter().circle_filled(dot_center, 5.0, dot);
+
+    ui.painter().text(
+        egui::pos2(rect.left() + 28.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::proportional(12.5),
+        text_color,
     );
-    egui::Frame::new()
-        .fill(bg)
-        .corner_radius(egui::CornerRadius::same(18))
-        .inner_margin(egui::Margin::symmetric(12, 6))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let (dot_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                ui.painter().circle_filled(dot_rect.center(), 5.0, color);
-                ui.label(egui::RichText::new(text).size(13.5).color(color));
-            });
-        });
 }
 
 fn draw_device_art(
