@@ -91,29 +91,6 @@ impl fmt::Display for NativeSessionError {
 
 impl std::error::Error for NativeSessionError {}
 
-#[derive(Clone)]
-pub struct NativeVolumeHandle {
-    control: crate::SharedRtspControl,
-    next_cseq: crate::SharedCseq,
-    session_uri: String,
-    dacp_id: String,
-    active_remote: String,
-}
-
-impl NativeVolumeHandle {
-    pub fn set_volume(&self, percent: u8) -> Result<VolumeSetResult, NativeSessionError> {
-        set_native_volume(
-            &self.control,
-            &self.next_cseq,
-            &self.session_uri,
-            &self.dacp_id,
-            &self.active_remote,
-            percent,
-        )
-        .map_err(|e| NativeSessionError::Volume(format!("{e:?}")))
-    }
-}
-
 pub struct NativeSession {
     flow: NativeConnectFlow,
     control: crate::SharedRtspControl,
@@ -522,20 +499,6 @@ impl NativeSession {
             self.dacp_id.clone(),
             self.active_remote.clone(),
         )
-    }
-
-    pub fn set_volume(&self, percent: u8) -> Result<VolumeSetResult, NativeSessionError> {
-        self.volume_handle().set_volume(percent)
-    }
-
-    pub fn volume_handle(&self) -> NativeVolumeHandle {
-        NativeVolumeHandle {
-            control: Arc::clone(&self.control),
-            next_cseq: Arc::clone(&self.next_cseq),
-            session_uri: self.session_uri.clone(),
-            dacp_id: self.dacp_id.clone(),
-            active_remote: self.active_remote.clone(),
-        }
     }
 
     pub fn feedback_running(&self) -> bool {
