@@ -669,7 +669,6 @@ impl SairplayApp {
             .unwrap_or_else(|| "-".into());
 
         let artwork = classify_device_artwork(device);
-        let artwork_texture = self.device_textures.get(&artwork).cloned();
         let (status, status_tone) = self.device_status(device, stereo_pair);
         let sense = if selectable { egui::Sense::click() } else { egui::Sense::hover() };
         let (row_rect, response) =
@@ -732,7 +731,6 @@ impl SairplayApp {
                             artwork,
                             stereo_pair,
                             egui::vec2(54.0, 54.0),
-                            artwork_texture.as_ref(),
                         );
                     },
                 );
@@ -1238,7 +1236,6 @@ impl eframe::App for SairplayApp {
         self.pump_connect_result();
         self.pump_volume_result();
         self.monitor_running_session();
-        self.ensure_device_textures(ctx);
 
         let mut visuals = egui::Visuals::light();
         visuals.panel_fill = UiTheme::bg();
@@ -2187,38 +2184,114 @@ fn draw_status_badge(ui: &mut egui::Ui, text: &str, tone: StatusTone) {
 
 fn draw_device_art(
     ui: &mut egui::Ui,
-    _artwork: DeviceArtwork,
+    artwork: DeviceArtwork,
     _stereo_pair: bool,
     size: egui::Vec2,
-    texture: Option<&egui::TextureHandle>,
 ) {
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
-
-    let target = egui::Rect::from_center_size(
-        rect.center() + egui::vec2(0.0, if response.hovered() { -1.0 } else { 0.0 }),
-        egui::vec2(size.x.min(54.0), size.y.min(54.0)),
-    );
+    let center = rect.center() + egui::vec2(0.0, if response.hovered() { -1.0 } else { 0.0 });
 
     if response.hovered() {
-        ui.painter().rect_filled(
-            target.expand(3.0),
-            egui::CornerRadius::same(10),
-            egui::Color32::from_rgba_unmultiplied(22, 119, 255, 12),
+        ui.painter().circle_filled(
+            center,
+            25.0,
+            egui::Color32::from_rgba_unmultiplied(22, 119, 255, 10),
         );
     }
 
-    if let Some(texture) = texture {
-        ui.put(
-            target,
-            egui::Image::new((texture.id(), target.size()))
-                .fit_to_exact_size(target.size()),
-        );
-    } else {
-        ui.painter().circle_stroke(
-            target.center(),
-            10.0,
-            egui::Stroke::new(1.4, UiTheme::border_hover()),
-        );
+    let light = egui::Color32::from_rgb(136, 148, 166);
+    let dark = egui::Color32::from_rgb(45, 52, 64);
+    let neutral = egui::Color32::from_rgb(82, 100, 126);
+    let silver = egui::Color32::from_rgb(104, 118, 139);
+
+    macro_rules! put_svg {
+        ($source:expr, $rect:expr, $tint:expr) => {{
+            let image_rect = $rect;
+            ui.put(
+                image_rect,
+                egui::Image::new($source)
+                    .fit_to_exact_size(image_rect.size())
+                    .tint($tint),
+            );
+        }};
+    }
+
+    match artwork {
+        DeviceArtwork::HomePodMiniWhite => {
+            let r = egui::Rect::from_center_size(center, egui::vec2(31.0, 31.0));
+            put_svg!(egui::include_image!("../assets/mingcute_homepod_mini_filled.svg"), r, light);
+        }
+        DeviceArtwork::HomePodMiniBlack => {
+            let r = egui::Rect::from_center_size(center, egui::vec2(31.0, 31.0));
+            put_svg!(egui::include_image!("../assets/mingcute_homepod_mini_filled.svg"), r, dark);
+        }
+        DeviceArtwork::HomePodWhite => {
+            let r = egui::Rect::from_center_size(center, egui::vec2(27.0, 34.0));
+            put_svg!(egui::include_image!("../assets/sairplay_homepod_filled.svg"), r, light);
+        }
+        DeviceArtwork::HomePodBlack => {
+            let r = egui::Rect::from_center_size(center, egui::vec2(27.0, 34.0));
+            put_svg!(egui::include_image!("../assets/sairplay_homepod_filled.svg"), r, dark);
+        }
+        DeviceArtwork::HomePodMiniPairWhite
+        | DeviceArtwork::HomePodMiniPairBlack
+        | DeviceArtwork::HomePodMiniPairMixed => {
+            let icon_size = egui::vec2(22.0, 22.0);
+            let left = egui::Rect::from_center_size(center + egui::vec2(-11.5, 0.0), icon_size);
+            let right = egui::Rect::from_center_size(center + egui::vec2(11.5, 0.0), icon_size);
+            let (left_tint, right_tint) = match artwork {
+                DeviceArtwork::HomePodMiniPairWhite => (light, light),
+                DeviceArtwork::HomePodMiniPairBlack => (dark, dark),
+                _ => (light, dark),
+            };
+            put_svg!(egui::include_image!("../assets/mingcute_homepod_mini_filled.svg"), left, left_tint);
+            put_svg!(egui::include_image!("../assets/mingcute_homepod_mini_filled.svg"), right, right_tint);
+        }
+        DeviceArtwork::HomePodPairWhite
+        | DeviceArtwork::HomePodPairBlack
+        | DeviceArtwork::HomePodPairMixed => {
+            let icon_size = egui::vec2(19.0, 27.0);
+            let left = egui::Rect::from_center_size(center + egui::vec2(-10.5, 0.0), icon_size);
+            let right = egui::Rect::from_center_size(center + egui::vec2(10.5, 0.0), icon_size);
+            let (left_tint, right_tint) = match artwork {
+                DeviceArtwork::HomePodPairWhite => (light, light),
+                DeviceArtwork::HomePodPairBlack => (dark, dark),
+                _ => (light, dark),
+            };
+            put_svg!(egui::include_image!("../assets/sairplay_homepod_filled.svg"), left, left_tint);
+            put_svg!(egui::include_image!("../assets/sairplay_homepod_filled.svg"), right, right_tint);
+        }
+        DeviceArtwork::MacBook => {
+            let r = egui::Rect::from_center_size(center, egui::vec2(34.0, 34.0));
+            put_svg!(egui::include_image!("../assets/mingcute_laptop_filled.svg"), r, neutral);
+        }
+        DeviceArtwork::MacMini => {
+            let r = egui::Rect::from_center_size(center, egui::vec2(36.0, 29.0));
+            put_svg!(egui::include_image!("../assets/sairplay_mac_mini_filled.svg"), r, silver);
+        }
+        DeviceArtwork::MusicServer => {
+            let r = egui::Rect::from_center_size(center, egui::vec2(30.0, 30.0));
+            put_svg!(egui::include_image!("../assets/fluent_server_24_filled.svg"), r, neutral);
+        }
+        DeviceArtwork::AirportExpress => {
+            let r = egui::Rect::from_center_size(center, egui::vec2(35.0, 28.0));
+            put_svg!(egui::include_image!("../assets/sairplay_airport_express_filled.svg"), r, light);
+        }
+        DeviceArtwork::Tv => {
+            let r = egui::Rect::from_center_size(center, egui::vec2(36.0, 32.0));
+            put_svg!(egui::include_image!("../assets/sairplay_tv_filled.svg"), r, neutral);
+        }
+        DeviceArtwork::AppleTv => {
+            let r = egui::Rect::from_center_size(center, egui::vec2(36.0, 28.0));
+            put_svg!(egui::include_image!("../assets/sairplay_apple_tv_filled.svg"), r, dark);
+        }
+        DeviceArtwork::AirplaySpeakers => {
+            let icon_size = egui::vec2(17.0, 28.0);
+            let left = egui::Rect::from_center_size(center + egui::vec2(-9.5, 0.0), icon_size);
+            let right = egui::Rect::from_center_size(center + egui::vec2(9.5, 0.0), icon_size);
+            put_svg!(egui::include_image!("../assets/sairplay_bookshelf_speaker_filled.svg"), left, dark);
+            put_svg!(egui::include_image!("../assets/sairplay_bookshelf_speaker_filled.svg"), right, dark);
+        }
     }
 }
 
