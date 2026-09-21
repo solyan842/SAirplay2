@@ -26,6 +26,7 @@ struct SairplayApp {
     session: Option<NativeSession>,
     initial_volume_text: String,
     volume_rx: Option<Receiver<Result<VolumeSetResult, String>>>,
+    pending_volume: Option<u8>,
     last_audio_discontinuities: u64,
     last_rtx: (u64, u64, u64),
 }
@@ -63,8 +64,9 @@ impl Default for SairplayApp {
             playback: PlaybackUiState::Idle,
             connect_rx: None,
             session: None,
-            initial_volume_text: String::new(),
+            initial_volume_text: "35".into(),
             volume_rx: None,
+            pending_volume: None,
             last_audio_discontinuities: 0,
             last_rtx: (0, 0, 0),
         }
@@ -169,43 +171,40 @@ impl SairplayApp {
             return;
         };
 
-        match rx.try_recv() {
+        let finished = match rx.try_recv() {
             Ok(Ok(result)) => {
                 self.log.push(format!(
                     "Receiver volume {}% = {:.2} dB · RTSP {}.",
                     result.percent, result.db, result.status
                 ));
-                self.volume_rx = None;
+                true
             }
             Ok(Err(error)) => {
                 self.log.push(format!("Volume update failed: {error}"));
-                self.volume_rx = None;
+                true
             }
-            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Empty) => false,
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.log.push("Volume worker ended unexpectedly.".into());
-                self.volume_rx = None;
+                true
+            }
+        };
+
+        if finished {
+            self.volume_rx = None;
+            if let Some(volume) = self.pending_volume.take() {
+                self.apply_volume_value(volume);
             }
         }
     }
 
-    fn apply_volume(&mut self) {
+    fn apply_volume_value(&mut self, volume: u8) {
         if self.volume_rx.is_some() {
+            self.pending_volume = Some(volume);
             return;
         }
         let Some(session) = self.session.as_ref() else {
             return;
-        };
-        let volume = match parse_volume_text(&self.initial_volume_text) {
-            Ok(Some(volume)) => volume,
-            Ok(None) => {
-                self.log.push("Enter receiver volume 0–100 before Apply Volume.".into());
-                return;
-            }
-            Err(error) => {
-                self.log.push(error);
-                return;
-            }
         };
 
         let control = session.volume_control();
@@ -498,20 +497,18 @@ impl eframe::App for SairplayApp {
 
             ui.horizontal(|ui| {
                 ui.label("Receiver volume:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.initial_volume_text)
-                        .desired_width(52.0)
-                        .hint_text("0–100"),
+                let mut volume = parse_volume_text(&self.initial_volume_text)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(35);
+                let response = ui.add(
+                    egui::Slider::new(&mut volume, 0..=100)
+                        .show_value(true)
+                        .suffix("%"),
                 );
-                ui.label("blank = unchanged at Start");
-                let apply_enabled = self.session.is_some()
-                    && self.volume_rx.is_none()
-                    && !self.initial_volume_text.trim().is_empty();
-                if ui
-                    .add_enabled(apply_enabled, egui::Button::new("Apply Volume"))
-                    .clicked()
-                {
-                    self.apply_volume();
+                if response.changed() {
+                    self.initial_volume_text = volume.to_string();
+                    self.apply_volume_value(volume);
                 }
                 if self.volume_rx.is_some() {
                     ui.spinner();
