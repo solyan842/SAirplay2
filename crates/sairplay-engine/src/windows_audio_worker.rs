@@ -10,19 +10,6 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
-const EMPTY_POLL_BOUNDARY_TIMEOUT: Duration = Duration::from_millis(250);
-const ACTUAL_ZERO_PCM_BOUNDARY_FRAMES: u64 = 8_820; // 200 ms @ 44.1 kHz
-
-fn should_infer_boundary(
-    elapsed: Duration,
-    zero_pcm_frames: u64,
-    pending_nonzero_bytes: usize,
-) -> bool {
-    let actual_silence_boundary =
-        zero_pcm_frames >= ACTUAL_ZERO_PCM_BOUNDARY_FRAMES && pending_nonzero_bytes == 0;
-    actual_silence_boundary || elapsed >= EMPTY_POLL_BOUNDARY_TIMEOUT
-}
-
 #[derive(Debug)]
 pub enum WindowsAudioWorkerError {
     Capture(WasapiLoopbackError),
@@ -105,7 +92,6 @@ impl WindowsAudioWorker {
             let mut startup_started: Option<std::time::Instant> = None;
             let mut input_starved_since: Option<std::time::Instant> = None;
             let mut nonzero_gap_started: Option<std::time::Instant> = None;
-            let mut zero_pcm_frames_since_nonzero: u64 = 0;
             let mut nonzero_gap_reported = false;
             let mut resume_packet_pending = false;
             let mut inferred_idle = false;
@@ -122,46 +108,6 @@ impl WindowsAudioWorker {
                                     captured_frames_total.saturating_add(offset),
                                     Ordering::SeqCst,
                                 );
-                            }
-
-                            if cold_armed {
-                                input_starved_since = None;
-                                let state = sender.state();
-                                let pad_debt = sender.splice_pad_frames();
-                                let reanchors = sender.timeline_reanchors();
-                                let (head_delta, head_delta_ms) =
-                                    match system_time_to_ntp(SystemTime::now()) {
-                                        Ok(now_ntp) => {
-                                            let delta = sender.timeline_head_delta_frames(now_ntp);
-                                            (delta, delta as f64 * 1000.0 / 44_100.0)
-                                        }
-                                        Err(_) => (i64::MIN, f64::NAN),
-                                    };
-                                if let Ok(mut events) = startup_events_thread.lock() {
-                                    events.push(format!(
-                                        "Diagnostic: WASAPI epoch cut · discontinuities={} · packets={} · discarded_bytes={} · discarded_nonzero_bytes={} · discontinuity_packet_frames={:?} · packet_silent={:?} · packet_nonzero={:?} · seq={} ts={} · head_delta_frames={} ({:.1} ms) · pad_debt={} · reanchors={}.",
-                                        report.discontinuities,
-                                        report.packets,
-                                        report.discontinuity_discarded_bytes,
-                                        report.discontinuity_discarded_nonzero_bytes,
-                                        report.discontinuity_packet_frames,
-                                        report.discontinuity_packet_silent,
-                                        report.discontinuity_packet_nonzero,
-                                        state.sequence,
-                                        state.timestamp,
-                                        head_delta,
-                                        head_delta_ms,
-                                        pad_debt,
-                                        reanchors
-                                    ));
-                                    if report.discontinuity_discarded_nonzero_bytes != 0 {
-                                        events.push(format!(
-                                            "Diagnostic: WASAPI discontinuity discarded partial nonzero PCM before ALAC · bytes={} nonzero_bytes={}.",
-                                            report.discontinuity_discarded_bytes,
-                                            report.discontinuity_discarded_nonzero_bytes
-                                        ));
-                                    }
-                                }
                             }
                         }
                         if let Some(offset) = report.first_non_silent_frame_offset {
@@ -233,45 +179,19 @@ impl WindowsAudioWorker {
                                     idle_keepalive_reported = false;
                                     input_starved_since = None;
                                 }
-                                zero_pcm_frames_since_nonzero = 0;
                                 nonzero_gap_reported = false;
                             } else {
-                                if frames > 0 {
-                                    zero_pcm_frames_since_nonzero =
-                                        zero_pcm_frames_since_nonzero.saturating_add(frames as u64);
-                                }
                                 let gap_started = nonzero_gap_started
                                     .get_or_insert_with(std::time::Instant::now);
-                                let gap_elapsed = gap_started.elapsed();
-                                let pending_nonzero = chunker.pending_nonzero_bytes();
                                 if !nonzero_gap_reported
-                                    && should_infer_boundary(
-                                        gap_elapsed,
-                                        zero_pcm_frames_since_nonzero,
-                                        pending_nonzero,
-                                    )
+                                    && gap_started.elapsed() >= Duration::from_millis(250)
                                 {
-                                    let zero_pcm_ms =
-                                        zero_pcm_frames_since_nonzero.saturating_mul(1000) / 44_100;
-                                    let boundary_reason =
-                                        if zero_pcm_frames_since_nonzero >= ACTUAL_ZERO_PCM_BOUNDARY_FRAMES
-                                            && pending_nonzero == 0
-                                        {
-                                            "actual zero PCM >=200 ms"
-                                        } else {
-                                            "no nonzero PCM >=250 ms fallback"
-                                        };
                                     if let Ok(mut events) = startup_events_thread.lock() {
                                         events.push(format!(
-                                            "Transition: inferred boundary trigger · reason={} · elapsed_ms={} · zero_pcm_frames={} (~{} ms) · wasapi_frames={} · engine_non_silent={} · pending_bytes={} · pending_nonzero_bytes={} · pad_debt={} · reanchors={}.",
-                                            boundary_reason,
-                                            gap_elapsed.as_millis(),
-                                            zero_pcm_frames_since_nonzero,
-                                            zero_pcm_ms,
+                                            "Transition: no nonzero PCM for >=250 ms · wasapi_frames={} · engine_non_silent={} · pending_bytes={} · pad_debt={} · reanchors={}.",
                                             frames,
                                             report.first_non_silent_frame_offset.is_some(),
                                             chunker.pending_bytes(),
-                                            pending_nonzero,
                                             sender.splice_pad_frames(),
                                             sender.timeline_reanchors()
                                         ));
@@ -282,7 +202,7 @@ impl WindowsAudioWorker {
                                     transition_epoch = transition_epoch.saturating_add(1);
 
                                     let pending_before = chunker.pending_bytes();
-                                    let pending_nonzero_before = pending_nonzero;
+                                    let pending_nonzero_before = chunker.pending_nonzero_bytes();
                                     let pad_before = sender.splice_pad_frames();
 
                                     if let Ok(now_ntp) = system_time_to_ntp(SystemTime::now()) {
@@ -712,43 +632,6 @@ impl WindowsAudioWorker {
 
 fn ms_to_ntp(ms: u64) -> u64 {
     ((ms as u128) << 32).div_ceil(1000) as u64
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn actual_zero_pcm_can_infer_boundary_before_empty_poll_timeout() {
-        assert!(should_infer_boundary(
-            Duration::from_millis(208),
-            ACTUAL_ZERO_PCM_BOUNDARY_FRAMES,
-            0,
-        ));
-    }
-
-    #[test]
-    fn empty_poll_gap_below_250_ms_does_not_infer_boundary() {
-        assert!(!should_infer_boundary(
-            Duration::from_millis(239),
-            0,
-            0,
-        ));
-    }
-
-    #[test]
-    fn partial_nonzero_pcm_blocks_fast_boundary_but_not_250_ms_fallback() {
-        assert!(!should_infer_boundary(
-            Duration::from_millis(220),
-            ACTUAL_ZERO_PCM_BOUNDARY_FRAMES,
-            4,
-        ));
-        assert!(should_infer_boundary(
-            Duration::from_millis(250),
-            ACTUAL_ZERO_PCM_BOUNDARY_FRAMES,
-            4,
-        ));
-    }
 }
 
 impl Drop for WindowsAudioWorker {
