@@ -12,9 +12,9 @@ Rule: when the primary source already defines native AirPlay 2 behavior, SAirpla
 ## Verification snapshot
 
 - **Primary source:** music-assistant/airplay-cli @ `431c5c582eef9307c4e39c50a0ea65e970bc1128`.
-- **Code head verified:** `24aff961702661502bfe89e178f870adc6dabcd6`.
-- **Windows CI:** run #328 / `35530517923` — Check PASS, invariant tests PASS, GUI build PASS, artifact upload PASS.
-- **Artifact digest:** `sha256:6b2775cf2e333359821c5b955118bd80b956306147f08411d216756dff98111d`.
+- **Code head verified:** `7bb0405da16b97714a570e9ce71fdec291ca3423`.
+- **Windows CI:** run #340 / `35551534538` — Check PASS, invariant tests PASS, GUI build PASS, artifact upload PASS.
+- **Artifact digest:** `sha256:7dce90301af4b6d24448c537438d1a0d9960b1ba1751467fd35c6df18c045286`.
 - **Hardware status:** pending fresh HomePod mini / AirPort Express test on this parity build. CI-PROVEN never means hardware-proven.
 
 ## Audit matrix
