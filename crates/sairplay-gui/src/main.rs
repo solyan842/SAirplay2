@@ -5,7 +5,7 @@ use sairplay_engine::{
     DeviceCatalog, DeviceRecord, DiscoveredService, DiscoveryEvent, MdnsBrowser, NativeSession,
     NativeSessionConfig, Route, ServiceKind, VolumeSetResult,
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -24,7 +24,7 @@ enum UiLanguage {
     En,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum DeviceArtwork {
     HomePodMiniWhite,
     HomePodMiniBlack,
@@ -121,7 +121,8 @@ struct SairplayApp {
     last_feedback_error: Option<String>,
     show_multiroom_info: bool,
     show_pair_info: bool,
-    device_sprite: Option<egui::TextureHandle>,
+    device_textures: HashMap<DeviceArtwork, egui::TextureHandle>,
+    device_textures_initialized: bool,
 }
 
 impl Default for SairplayApp {
@@ -169,7 +170,8 @@ impl Default for SairplayApp {
             last_feedback_error: None,
             show_multiroom_info: false,
             show_pair_info: false,
-            device_sprite: None,
+            device_textures: HashMap::new(),
+            device_textures_initialized: false,
         }
     }
 }
@@ -564,27 +566,49 @@ impl SairplayApp {
         }
     }
 
-    fn ensure_device_sprite(&mut self, ctx: &egui::Context) {
-        if self.device_sprite.is_some() {
+    fn ensure_device_textures(&mut self, ctx: &egui::Context) {
+        if self.device_textures_initialized {
             return;
         }
+        self.device_textures_initialized = true;
 
-        const BYTES: &[u8] = include_bytes!("../assets/device_icons_sprite.png");
-        match image::load_from_memory(BYTES) {
-            Ok(decoded) => {
-                let rgba = decoded.to_rgba8();
-                let size = [rgba.width() as usize, rgba.height() as usize];
-                let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                self.device_sprite = Some(ctx.load_texture(
-                    "sairplay-device-icons",
-                    color,
-                    egui::TextureOptions::LINEAR,
-                ));
-            }
-            Err(err) => {
-                self.log.push(format!("Device artwork decode failed: {err}"));
+        for artwork in ALL_DEVICE_ARTWORK {
+            let bytes = device_artwork_bytes(artwork);
+            match image::load_from_memory(bytes) {
+                Ok(decoded) => {
+                    let rgba = decoded.to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    if size != [160, 100] {
+                        self.log.push(format!(
+                            "Device artwork {} has unexpected size {}x{}.",
+                            device_artwork_name(artwork),
+                            size[0],
+                            size[1],
+                        ));
+                        continue;
+                    }
+                    let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                    let texture = ctx.load_texture(
+                        format!("sairplay-device-{}", device_artwork_name(artwork)),
+                        color,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.device_textures.insert(artwork, texture);
+                }
+                Err(err) => {
+                    self.log.push(format!(
+                        "Device artwork {} decode failed: {err}",
+                        device_artwork_name(artwork),
+                    ));
+                }
             }
         }
+
+        self.log.push(format!(
+            "Device artwork cache ready: {}/{} textures.",
+            self.device_textures.len(),
+            ALL_DEVICE_ARTWORK.len(),
+        ));
     }
 
     fn device_status(&self, device: &DeviceRecord, stereo_pair: bool) -> (&'static str, StatusTone) {
@@ -622,7 +646,6 @@ impl SairplayApp {
         ui: &mut egui::Ui,
         device: &DeviceRecord,
         stereo_pair: bool,
-        sprite: Option<&egui::TextureHandle>,
     ) {
         const ROW_H: f32 = 64.0;
         const SELECTOR_W: f32 = 24.0;
@@ -646,6 +669,7 @@ impl SairplayApp {
             .unwrap_or_else(|| "-".into());
 
         let artwork = classify_device_artwork(device);
+        let artwork_texture = self.device_textures.get(&artwork).cloned();
         let (status, status_tone) = self.device_status(device, stereo_pair);
         let sense = if selectable { egui::Sense::click() } else { egui::Sense::hover() };
         let (row_rect, response) =
@@ -708,7 +732,7 @@ impl SairplayApp {
                             artwork,
                             stereo_pair,
                             egui::vec2(68.0, 42.5),
-                            sprite,
+                            artwork_texture.as_ref(),
                         );
                     },
                 );
@@ -919,14 +943,8 @@ impl SairplayApp {
                                     },
                                 );
                             } else {
-                                let sprite = self.device_sprite.clone();
                                 for device in devices {
-                                    self.render_device_row(
-                                        ui,
-                                        device,
-                                        stereo_pair,
-                                        sprite.as_ref(),
-                                    );
+                                    self.render_device_row(ui, device, stereo_pair);
                                 }
                             }
                         });
@@ -1220,7 +1238,7 @@ impl eframe::App for SairplayApp {
         self.pump_connect_result();
         self.pump_volume_result();
         self.monitor_running_session();
-        self.ensure_device_sprite(ctx);
+        self.ensure_device_textures(ctx);
 
         let mut visuals = egui::Visuals::light();
         visuals.panel_fill = UiTheme::bg();
@@ -1860,37 +1878,102 @@ fn classify_device_artwork(device: &DeviceRecord) -> DeviceArtwork {
     }
 }
 
-fn device_sprite_cell(artwork: DeviceArtwork) -> usize {
+const ALL_DEVICE_ARTWORK: [DeviceArtwork; 17] = [
+    DeviceArtwork::HomePodMiniWhite,
+    DeviceArtwork::HomePodMiniBlack,
+    DeviceArtwork::HomePodWhite,
+    DeviceArtwork::HomePodBlack,
+    DeviceArtwork::HomePodMiniPairWhite,
+    DeviceArtwork::HomePodMiniPairBlack,
+    DeviceArtwork::HomePodMiniPairMixed,
+    DeviceArtwork::HomePodPairWhite,
+    DeviceArtwork::HomePodPairBlack,
+    DeviceArtwork::HomePodPairMixed,
+    DeviceArtwork::MacBook,
+    DeviceArtwork::MacMini,
+    DeviceArtwork::MusicServer,
+    DeviceArtwork::AirportExpress,
+    DeviceArtwork::Tv,
+    DeviceArtwork::AppleTv,
+    DeviceArtwork::AirplaySpeakers,
+];
+
+fn device_artwork_name(artwork: DeviceArtwork) -> &'static str {
     match artwork {
-        DeviceArtwork::HomePodMiniWhite => 0,
-        DeviceArtwork::HomePodMiniBlack => 1,
-        DeviceArtwork::HomePodWhite => 2,
-        DeviceArtwork::HomePodBlack => 3,
-        DeviceArtwork::HomePodMiniPairWhite => 4,
-        DeviceArtwork::HomePodMiniPairBlack => 5,
-        DeviceArtwork::HomePodMiniPairMixed => 6,
-        DeviceArtwork::HomePodPairWhite => 7,
-        DeviceArtwork::HomePodPairBlack => 8,
-        DeviceArtwork::HomePodPairMixed => 9,
-        DeviceArtwork::MacBook => 10,
-        DeviceArtwork::MacMini => 11,
-        DeviceArtwork::MusicServer => 12,
-        DeviceArtwork::AirportExpress => 13,
-        DeviceArtwork::Tv => 14,
-        DeviceArtwork::AppleTv => 15,
-        DeviceArtwork::AirplaySpeakers => 16,
+        DeviceArtwork::HomePodMiniWhite => "homepod_mini_white",
+        DeviceArtwork::HomePodMiniBlack => "homepod_mini_black",
+        DeviceArtwork::HomePodWhite => "homepod_white",
+        DeviceArtwork::HomePodBlack => "homepod_black",
+        DeviceArtwork::HomePodMiniPairWhite => "homepod_mini_pair_white",
+        DeviceArtwork::HomePodMiniPairBlack => "homepod_mini_pair_black",
+        DeviceArtwork::HomePodMiniPairMixed => "homepod_mini_pair_mixed",
+        DeviceArtwork::HomePodPairWhite => "homepod_pair_white",
+        DeviceArtwork::HomePodPairBlack => "homepod_pair_black",
+        DeviceArtwork::HomePodPairMixed => "homepod_pair_mixed",
+        DeviceArtwork::MacBook => "macbook",
+        DeviceArtwork::MacMini => "mac_mini",
+        DeviceArtwork::MusicServer => "music_server",
+        DeviceArtwork::AirportExpress => "airport_express",
+        DeviceArtwork::Tv => "tv",
+        DeviceArtwork::AppleTv => "apple_tv",
+        DeviceArtwork::AirplaySpeakers => "airplay_speakers",
     }
 }
 
-fn sprite_uv(cell: usize) -> egui::Rect {
-    const COLS: f32 = 5.0;
-    const ROWS: f32 = 4.0;
-    let col = (cell % 5) as f32;
-    let row = (cell / 5) as f32;
-    egui::Rect::from_min_max(
-        egui::pos2(col / COLS, row / ROWS),
-        egui::pos2((col + 1.0) / COLS, (row + 1.0) / ROWS),
-    )
+fn device_artwork_bytes(artwork: DeviceArtwork) -> &'static [u8] {
+    match artwork {
+        DeviceArtwork::HomePodMiniWhite => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_mini_white.png"))
+        }
+        DeviceArtwork::HomePodMiniBlack => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_mini_black.png"))
+        }
+        DeviceArtwork::HomePodWhite => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_white.png"))
+        }
+        DeviceArtwork::HomePodBlack => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_black.png"))
+        }
+        DeviceArtwork::HomePodMiniPairWhite => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_mini_pair_white.png"))
+        }
+        DeviceArtwork::HomePodMiniPairBlack => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_mini_pair_black.png"))
+        }
+        DeviceArtwork::HomePodMiniPairMixed => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_mini_pair_mixed.png"))
+        }
+        DeviceArtwork::HomePodPairWhite => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_pair_white.png"))
+        }
+        DeviceArtwork::HomePodPairBlack => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_pair_black.png"))
+        }
+        DeviceArtwork::HomePodPairMixed => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/homepod_pair_mixed.png"))
+        }
+        DeviceArtwork::MacBook => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/macbook.png"))
+        }
+        DeviceArtwork::MacMini => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/mac_mini.png"))
+        }
+        DeviceArtwork::MusicServer => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/music_server.png"))
+        }
+        DeviceArtwork::AirportExpress => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/airport_express.png"))
+        }
+        DeviceArtwork::Tv => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/tv.png"))
+        }
+        DeviceArtwork::AppleTv => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/apple_tv.png"))
+        }
+        DeviceArtwork::AirplaySpeakers => {
+            include_bytes!(concat!(env!("OUT_DIR"), "/airplay_speakers.png"))
+        }
+    }
 }
 
 fn draw_app_logo(ui: &mut egui::Ui, size: egui::Vec2) -> egui::Response {
@@ -2104,10 +2187,10 @@ fn draw_status_badge(ui: &mut egui::Ui, text: &str, tone: StatusTone) {
 
 fn draw_device_art(
     ui: &mut egui::Ui,
-    artwork: DeviceArtwork,
+    _artwork: DeviceArtwork,
     _stereo_pair: bool,
     size: egui::Vec2,
-    sprite: Option<&egui::TextureHandle>,
+    texture: Option<&egui::TextureHandle>,
 ) {
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
 
@@ -2124,14 +2207,13 @@ fn draw_device_art(
         );
     }
 
-    if let Some(texture) = sprite {
+    if let Some(texture) = texture {
         ui.put(
             target,
             egui::Image::new((texture.id(), target.size()))
-                .uv(sprite_uv(device_sprite_cell(artwork))),
+                .fit_to_exact_size(target.size()),
         );
     } else {
-        // Neutral placeholder only while the embedded PNG is being decoded.
         ui.painter().circle_stroke(
             target.center(),
             10.0,
@@ -2186,6 +2268,22 @@ fn address_rank(ip: IpAddr) -> u8 {
 mod gui_tests {
     use super::*;
     use sairplay_engine::AirPlayTxt;
+
+    #[test]
+    fn all_device_artwork_assets_are_independent_valid_pngs() {
+        assert_eq!(ALL_DEVICE_ARTWORK.len(), 17);
+
+        for artwork in ALL_DEVICE_ARTWORK {
+            let decoded = image::load_from_memory(device_artwork_bytes(artwork))
+                .unwrap_or_else(|err| panic!("{} failed to decode: {err}", device_artwork_name(artwork)));
+            assert_eq!(
+                (decoded.width(), decoded.height()),
+                (160, 100),
+                "{} has wrong dimensions",
+                device_artwork_name(artwork),
+            );
+        }
+    }
 
     fn service(addresses: &[&str]) -> DiscoveredService {
         DiscoveredService {
