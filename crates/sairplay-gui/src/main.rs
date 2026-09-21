@@ -770,33 +770,35 @@ impl SairplayApp {
             .corner_radius(egui::CornerRadius::same(10))
             .inner_margin(egui::Margin::symmetric(14, 7))
             .show(ui, |ui| {
-                let response = ui
-                    .horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("⌕")
-                                .size(18.0)
-                                .color(egui::Color32::from_rgb(10, 120, 246)),
-                        );
-                        ui.label(egui::RichText::new(text).strong().size(14.0));
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new(activate)
-                                .size(14.0)
-                                .color(egui::Color32::from_rgb(71, 106, 160)),
-                        );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.label(
-                                    egui::RichText::new("›")
-                                        .size(24.0)
-                                        .color(egui::Color32::from_rgb(55, 93, 151)),
-                                );
-                            },
-                        );
-                    })
-                    .response
-                    .interact(egui::Sense::click());
+                let inner = ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("⌕")
+                            .size(18.0)
+                            .color(egui::Color32::from_rgb(10, 120, 246)),
+                    );
+                    ui.label(egui::RichText::new(text).strong().size(14.0));
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(activate)
+                            .size(14.0)
+                            .color(egui::Color32::from_rgb(71, 106, 160)),
+                    );
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.label(
+                                egui::RichText::new("›")
+                                    .size(24.0)
+                                    .color(egui::Color32::from_rgb(55, 93, 151)),
+                            );
+                        },
+                    );
+                });
+                let response = ui.interact(
+                    inner.response.rect,
+                    ui.make_persistent_id("activation_row"),
+                    egui::Sense::click(),
+                );
                 if response.clicked() {
                     self.activation_open = true;
                 }
@@ -1039,16 +1041,18 @@ impl eframe::App for SairplayApp {
                     .cloned()
                     .collect();
 
+                let receivers_title = self.t("Receivers", "Receivers");
+                let pairs_title = self.t("Stereo Pair HomePod", "Stereo Pair HomePod");
                 ui.columns(2, |columns| {
                     self.render_device_panel(
                         &mut columns[0],
-                        self.t("Receivers", "Receivers"),
+                        receivers_title,
                         &receivers,
                         false,
                     );
                     self.render_device_panel(
                         &mut columns[1],
-                        self.t("Stereo Pair HomePod", "Stereo Pair HomePod"),
+                        pairs_title,
                         &stereo_pairs,
                         true,
                     );
@@ -1126,7 +1130,7 @@ fn draw_app_logo(ui: &mut egui::Ui, size: egui::Vec2) -> egui::Response {
             egui::pos2(rect.left() + 8.0, center.y + 5.0),
             egui::pos2(rect.right() - 8.0, rect.bottom() - 7.0),
         ),
-        egui::CornerRadius::ZERO,
+        egui::CornerRadius::same(0),
         egui::Color32::from_rgb(18, 132, 248),
     );
     painter.line_segment(
@@ -1391,8 +1395,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("SAirplay2")
-            .with_inner_size([980.0, 500.0])
-            .with_min_inner_size([820.0, 440.0]),
+            .with_inner_size([1280.0, 760.0])
+            .with_min_inner_size([1080.0, 680.0]),
         ..Default::default()
     };
 
