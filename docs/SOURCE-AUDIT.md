@@ -16,7 +16,14 @@ Rule: when the primary source already defines native AirPlay 2 behavior, SAirpla
 - **Windows CI:** run #348 / `35552066871` — Check PASS, invariant tests PASS, GUI build PASS, artifact upload PASS.
 - **Artifact:** `SAirplay2-v0.1.0-Windows` / ID `10619260379` / 2,979,257 bytes.
 - **Artifact digest:** `sha256:caf8a76762a4b26f4e86e6eddc5ea0e15d90a50a066c3a448111c85400dbabad`.
-- **Hardware status:** pending fresh HomePod mini / AirPort Express test on this parity build. CI-PROVEN never means hardware-proven.
+- **Hardware status:** AirPort Express HARDWARE-MEASURED on CI #348 / code `4bda14a09ae819308a6dfcd77432518f0eacb666`: cold start has immediate audio; continuous playback passes the old 25 s failure point and >60 s; stop/rest behavior is good. Intermittent very small crackle remains **UNKNOWN** and is not yet attributed to RTP, retransmit, pacing, ALAC, or Windows capture. HomePod mini remains hardware-pending. CI-PROVEN never means hardware-proven.
+
+## Hardware observations
+
+- **AirPort Express (`AirPort10,115`) — HARDWARE-MEASURED:** CI #348 starts with audio immediately, remains audible beyond 25–60 s, and stop/rest behavior is good.
+- **Residual symptom — HARDWARE-MEASURED:** occasional very small crackle/click. Root cause is **UNKNOWN**.
+- **Windows capture cross-check — CROSS-CHECKED:** Microsoft documents `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY` as a capture glitch indicator. Current `wasapi_loopback.rs` does not inspect that flag, so WASAPI discontinuity is a candidate to instrument before changing media-wire behavior.
+- **HomePod mini:** no fresh hardware measurement yet for CI #348.
 
 ## Audit matrix
 
