@@ -4,7 +4,7 @@ use crate::{
     EventChannel, FeedbackWorker, MediaHandshakeConfig, NativeConnectFlow, NativePhase,
     NtpSessionSetupConfig, NtpTimingResponder, PairingError, PreflightError, PtpEngine,
     PtpSessionSetupConfig, RealtimeMediaSender, RecordConfig, RetransmitRing,
-    NativeVolumeControl, RetransmitWorker, RtpState, SetPeersConfig, TransientPairingClient,
+    NativeVolumeControl, RetransmitStats, RetransmitWorker, RtpState, SetPeersConfig, TransientPairingClient,
     VolumeSetResult, set_native_volume, system_time_to_ntp,
 };
 use rand::RngCore;
@@ -485,6 +485,21 @@ impl NativeSession {
     #[cfg(windows)]
     pub fn audio_error(&self) -> Option<String> {
         self.audio_worker.as_ref().and_then(WindowsAudioWorker::last_error)
+    }
+
+    #[cfg(windows)]
+    pub fn audio_discontinuities(&self) -> u64 {
+        self.audio_worker
+            .as_ref()
+            .map(WindowsAudioWorker::discontinuity_count)
+            .unwrap_or(0)
+    }
+
+    pub fn retransmit_stats(&self) -> RetransmitStats {
+        self.retransmit
+            .as_ref()
+            .map(RetransmitWorker::stats)
+            .unwrap_or_default()
     }
 
     pub fn initial_volume_result(&self) -> Option<VolumeSetResult> {
