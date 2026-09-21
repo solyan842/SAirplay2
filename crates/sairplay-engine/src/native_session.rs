@@ -537,6 +537,20 @@ impl NativeSession {
         self.feedback.last_error()
     }
 
+    pub fn uses_ptp_timing(&self) -> bool {
+        self._ptp_timing.is_some()
+    }
+
+    pub fn ptp_probe_exchange(&self) -> Option<crate::PtpExchange> {
+        self._ptp_timing
+            .as_ref()
+            .and_then(PtpEngine::peer_exchange)
+    }
+
+    pub fn ptp_follow_locked(&self) -> Option<bool> {
+        self._ptp_timing.as_ref().map(PtpEngine::follow_locked)
+    }
+
     #[cfg(windows)]
     pub fn stop_windows_audio(&mut self) {
         if let Some(mut worker) = self.audio_worker.take() {
