@@ -66,6 +66,8 @@ impl Drop for ComGuard {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WasapiDrainReport {
     pub frames: usize,
+    pub content_frames: usize,
+    pub silent_frames: usize,
     pub discontinuities: u64,
     pub discontinuity_frame_offset: Option<u64>,
     pub first_non_silent_frame_offset: Option<u64>,
@@ -196,7 +198,14 @@ impl WasapiLoopbackCapture {
 
                 let byte_len = frames as usize * BLOCK_ALIGN as usize;
                 if silent {
-                    chunker.push(&vec![0u8; byte_len]);
+                    // AUDCLNT_BUFFERFLAGS_SILENT means the packet is silence;
+                    // do not queue it as source content. Once the AirPlay line
+                    // is armed, the worker supplies source-equivalent silence
+                    // keepalive directly at the transport pacing boundary.
+                    // This prevents idle/track-gap silence from accumulating
+                    // ahead of newly arriving PCM in the content queue.
+                    report.silent_frames =
+                        report.silent_frames.saturating_add(frames as usize);
                 } else {
                     if data.is_null() && byte_len != 0 {
                         let _ = self.capture_client.ReleaseBuffer(frames);
@@ -204,6 +213,8 @@ impl WasapiLoopbackCapture {
                     }
                     let bytes = std::slice::from_raw_parts(data as *const u8, byte_len);
                     chunker.push(bytes);
+                    report.content_frames =
+                        report.content_frames.saturating_add(frames as usize);
                 }
 
                 self.capture_client
