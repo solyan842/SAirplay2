@@ -529,7 +529,7 @@ impl SairplayApp {
             .corner_radius(egui::CornerRadius::same(12))
             .inner_margin(egui::Margin::symmetric(12, 9))
             .show(ui, |ui| {
-                ui.set_min_height(72.0);
+                ui.set_min_height(56.0);
                 ui.horizontal(|ui| {
                     let response = ui.add_enabled(
                         selectable,
@@ -543,20 +543,20 @@ impl SairplayApp {
                     }
 
                     ui.add_space(2.0);
-                    draw_device_art(ui, artwork, stereo_pair, egui::vec2(86.0, 54.0));
+                    draw_device_art(ui, artwork, stereo_pair, egui::vec2(68.0, 44.0));
                     ui.add_space(6.0);
 
                     ui.vertical(|ui| {
                         ui.add_space(4.0);
                         ui.label(
                             egui::RichText::new(&device.display_name)
-                                .size(16.0)
+                                .size(14.5)
                                 .strong()
                                 .color(egui::Color32::from_rgb(20, 31, 51)),
                         );
                         ui.label(
                             egui::RichText::new(address)
-                                .size(13.5)
+                                .size(12.0)
                                 .color(egui::Color32::from_rgb(70, 106, 165)),
                         );
                     });
@@ -590,7 +590,7 @@ impl SairplayApp {
                     draw_small_airplay_mark(ui);
                     ui.label(
                         egui::RichText::new(title)
-                            .size(22.0)
+                            .size(18.0)
                             .strong()
                             .color(egui::Color32::from_rgb(13, 28, 54)),
                     );
@@ -628,7 +628,7 @@ impl SairplayApp {
 
                 egui::ScrollArea::vertical()
                     .id_salt(if stereo_pair { "pair_scroll" } else { "receiver_scroll" })
-                    .max_height(345.0)
+                    .max_height(214.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         if devices.is_empty() {
@@ -684,7 +684,7 @@ impl SairplayApp {
                             .flatten()
                             .unwrap_or(50);
                         let response = ui.add_sized(
-                            [280.0, 22.0],
+                            [205.0, 20.0],
                             egui::Slider::new(&mut volume, 0..=100)
                                 .show_value(true)
                                 .suffix("%"),
@@ -714,7 +714,7 @@ impl SairplayApp {
                                     .color(egui::Color32::WHITE),
                             )
                             .fill(egui::Color32::from_rgb(15, 128, 247))
-                            .min_size(egui::vec2(160.0, 44.0)),
+                            .min_size(egui::vec2(112.0, 38.0)),
                         )
                         .clicked()
                     {
@@ -727,7 +727,7 @@ impl SairplayApp {
                         .add_enabled(
                             stop_enabled,
                             egui::Button::new(egui::RichText::new(stop_text).size(16.0))
-                                .min_size(egui::vec2(140.0, 44.0)),
+                                .min_size(egui::vec2(100.0, 38.0)),
                         )
                         .clicked()
                     {
@@ -915,7 +915,7 @@ impl eframe::App for SairplayApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let logo = draw_app_logo(ui, egui::vec2(86.0, 86.0));
+                    let logo = draw_app_logo(ui, egui::vec2(70.0, 70.0));
                     if logo
                         .on_hover_text(self.t(
                             "Nhấn để quét lại thiết bị",
@@ -927,99 +927,61 @@ impl eframe::App for SairplayApp {
                     }
 
                     ui.add_space(10.0);
-                    ui.vertical(|ui| {
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("SAirplay2")
-                                .size(35.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(7, 19, 52)),
-                        );
-                        ui.label(
-                            egui::RichText::new(
-                                "Native AirPlay — Apple's lossless wireless audio transport using ALAC",
-                            )
-                            .size(15.5)
-                            .color(egui::Color32::from_rgb(79, 105, 154)),
-                        );
-                    });
 
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(455.0, 70.0),
+                        egui::Layout::top_down(egui::Align::Min),
                         |ui| {
-                            ui.vertical(|ui| {
-                                let vi_fill = if self.language == UiLanguage::Vi {
-                                    egui::Color32::from_rgb(245, 249, 255)
-                                } else {
-                                    egui::Color32::WHITE
-                                };
-                                let en_fill = if self.language == UiLanguage::En {
-                                    egui::Color32::from_rgb(18, 126, 246)
-                                } else {
-                                    egui::Color32::from_rgb(238, 244, 251)
-                                };
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            egui::RichText::new("VI")
-                                                .strong()
-                                                .color(egui::Color32::from_rgb(24, 46, 86)),
-                                        )
-                                        .fill(vi_fill)
-                                        .min_size(egui::vec2(54.0, 34.0)),
-                                    )
-                                    .clicked()
-                                {
-                                    self.language = UiLanguage::Vi;
-                                }
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            egui::RichText::new("EN")
-                                                .strong()
-                                                .color(if self.language == UiLanguage::En {
-                                                    egui::Color32::WHITE
-                                                } else {
-                                                    egui::Color32::from_rgb(24, 46, 86)
-                                                }),
-                                        )
-                                        .fill(en_fill)
-                                        .min_size(egui::vec2(54.0, 34.0)),
-                                    )
-                                    .clicked()
-                                {
-                                    self.language = UiLanguage::En;
-                                }
-                            });
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new("SAirplay2")
+                                    .size(28.0)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(7, 19, 52)),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "Native AirPlay — Apple's lossless wireless audio transport using ALAC",
+                                )
+                                .size(12.5)
+                                .color(egui::Color32::from_rgb(79, 105, 154)),
+                            );
+                        },
+                    );
 
-                            ui.add_space(12.0);
-                            let (status, detail, color) = self.header_status();
+                    ui.add_space(6.0);
+
+                    let (status, detail, color) = self.header_status();
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(205.0, 70.0),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
                             egui::Frame::new()
                                 .fill(egui::Color32::WHITE)
                                 .stroke(egui::Stroke::new(
                                     1.0,
                                     egui::Color32::from_rgb(211, 226, 243),
                                 ))
-                                .corner_radius(egui::CornerRadius::same(28))
-                                .inner_margin(egui::Margin::symmetric(16, 10))
+                                .corner_radius(egui::CornerRadius::same(24))
+                                .inner_margin(egui::Margin::symmetric(12, 9))
                                 .show(ui, |ui| {
+                                    ui.set_min_width(176.0);
                                     ui.horizontal(|ui| {
-                                        ui.painter().circle_filled(
-                                            ui.cursor().min + egui::vec2(8.0, 16.0),
-                                            7.0,
-                                            color,
+                                        let (dot_rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(14.0, 14.0),
+                                            egui::Sense::hover(),
                                         );
-                                        ui.add_space(20.0);
+                                        ui.painter().circle_filled(dot_rect.center(), 6.0, color);
                                         ui.vertical(|ui| {
                                             ui.label(
                                                 egui::RichText::new(status)
-                                                    .size(15.5)
+                                                    .size(14.0)
                                                     .strong()
                                                     .color(egui::Color32::from_rgb(18, 29, 49)),
                                             );
                                             ui.label(
                                                 egui::RichText::new(detail)
-                                                    .size(12.0)
+                                                    .size(10.5)
                                                     .color(egui::Color32::from_rgb(79, 105, 154)),
                                             );
                                         });
@@ -1027,9 +989,67 @@ impl eframe::App for SairplayApp {
                                 });
                         },
                     );
-                });
 
-                ui.add_space(12.0);
+                    ui.add_space(6.0);
+
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(46.0, 70.0),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            let vi_selected = self.language == UiLanguage::Vi;
+                            let en_selected = self.language == UiLanguage::En;
+
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("VI")
+                                            .size(12.0)
+                                            .strong()
+                                            .color(if vi_selected {
+                                                egui::Color32::WHITE
+                                            } else {
+                                                egui::Color32::from_rgb(24, 46, 86)
+                                            }),
+                                    )
+                                    .fill(if vi_selected {
+                                        egui::Color32::from_rgb(18, 126, 246)
+                                    } else {
+                                        egui::Color32::from_rgb(238, 244, 251)
+                                    })
+                                    .min_size(egui::vec2(42.0, 28.0)),
+                                )
+                                .clicked()
+                            {
+                                self.language = UiLanguage::Vi;
+                            }
+
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("EN")
+                                            .size(12.0)
+                                            .strong()
+                                            .color(if en_selected {
+                                                egui::Color32::WHITE
+                                            } else {
+                                                egui::Color32::from_rgb(24, 46, 86)
+                                            }),
+                                    )
+                                    .fill(if en_selected {
+                                        egui::Color32::from_rgb(18, 126, 246)
+                                    } else {
+                                        egui::Color32::from_rgb(238, 244, 251)
+                                    })
+                                    .min_size(egui::vec2(42.0, 28.0)),
+                                )
+                                .clicked()
+                            {
+                                self.language = UiLanguage::En;
+                            }
+                        },
+                    );
+                });
+                ui.add_space(8.0);
 
                 let all_devices = self.catalog.devices().to_vec();
                 let receivers: Vec<DeviceRecord> = all_devices
@@ -1060,9 +1080,9 @@ impl eframe::App for SairplayApp {
                     );
                 });
 
-                ui.add_space(10.0);
+                ui.add_space(7.0);
                 self.render_controls(ui);
-                ui.add_space(8.0);
+                ui.add_space(6.0);
                 self.render_trial_row(ui);
             });
 
@@ -1430,18 +1450,50 @@ mod gui_tests {
     }
 }
 
+fn install_windows_ui_font(ctx: &egui::Context) {
+    #[cfg(windows)]
+    {
+        let candidates = [
+            r"C:\\Windows\\Fonts\\segoeui.ttf",
+            r"C:\\Windows\\Fonts\\arial.ttf",
+        ];
+
+        for path in candidates {
+            if let Ok(bytes) = std::fs::read(path) {
+                let mut fonts = egui::FontDefinitions::default();
+                fonts.font_data.insert(
+                    "windows_ui".to_owned(),
+                    egui::FontData::from_owned(bytes).into(),
+                );
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, "windows_ui".to_owned());
+                ctx.set_fonts(fonts);
+                return;
+            }
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("SAirplay2")
-            .with_inner_size([1280.0, 760.0])
-            .with_min_inner_size([1080.0, 680.0]),
+            .with_inner_size([960.0, 620.0])
+            .with_min_inner_size([960.0, 620.0])
+            .with_max_inner_size([960.0, 620.0])
+            .with_resizable(false),
         ..Default::default()
     };
 
     eframe::run_native(
         "SAirplay2",
         options,
-        Box::new(|_| Ok(Box::new(SairplayApp::default()))),
+        Box::new(|cc| {
+            install_windows_ui_font(&cc.egui_ctx);
+            Ok(Box::new(SairplayApp::default()))
+        }),
     )
 }
