@@ -81,6 +81,6 @@ pub use pcm_chunker::{Pcm352Chunker, PCM352_PACKET_BYTES};
 pub use wasapi_loopback::{WasapiLoopbackCapture, WasapiLoopbackError};
 #[cfg(windows)]
 pub use windows_audio_worker::{WindowsAudioWorker, WindowsAudioWorkerError};
-pub use native_session::{NativeSession, NativeSessionConfig, NativeSessionError};
+pub use native_session::{NativeSession, NativeSessionConfig, NativeSessionError, NativeVolumeHandle};
 pub use ptp_engine::{PtpClock, PtpEngine, PtpEngineError, PtpExchange};
 pub use ptp_session_setup::{build_ptp_session_plist, setup_ptp_session, PtpSessionSetupConfig, PtpSessionSetupError, PtpSessionSetupResult};
