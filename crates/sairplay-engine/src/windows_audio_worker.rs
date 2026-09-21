@@ -4,7 +4,7 @@ use crate::{
 };
 use std::fmt;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
@@ -33,6 +33,7 @@ pub struct WindowsAudioWorker {
     running: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     last_error: Arc<Mutex<Option<String>>>,
+    discontinuities: Arc<AtomicU64>,
 }
 
 impl WindowsAudioWorker {
@@ -49,6 +50,8 @@ impl WindowsAudioWorker {
         let running_thread = Arc::clone(&running);
         let last_error = Arc::new(Mutex::new(None));
         let last_error_thread = Arc::clone(&last_error);
+        let discontinuities = Arc::new(AtomicU64::new(0));
+        let discontinuities_thread = Arc::clone(&discontinuities);
 
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
@@ -73,7 +76,11 @@ impl WindowsAudioWorker {
 
             while running_thread.load(Ordering::SeqCst) {
                 match capture.drain_into(&mut chunker) {
-                    Ok(frames) => {
+                    Ok(report) => {
+                        if report.discontinuities != 0 {
+                            discontinuities_thread.fetch_add(report.discontinuities, Ordering::SeqCst);
+                        }
+                        let frames = report.frames;
                         let recovery_ntp = match system_time_to_ntp(SystemTime::now()) {
                             Ok(value) => value,
                             Err(error) => {
@@ -157,6 +164,7 @@ impl WindowsAudioWorker {
                 running,
                 worker: Some(worker),
                 last_error,
+                discontinuities,
             }),
             Ok(Err(message)) => {
                 let _ = worker.join();
@@ -182,6 +190,10 @@ impl WindowsAudioWorker {
 
     pub fn last_error(&self) -> Option<String> {
         self.last_error.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    pub fn discontinuity_count(&self) -> u64 {
+        self.discontinuities.load(Ordering::SeqCst)
     }
 
     pub fn stop(&mut self) {
