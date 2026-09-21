@@ -318,6 +318,23 @@ impl WindowsAudioWorker {
                                 let silence = [0u8; crate::PCM352_PACKET_BYTES];
                                 match sender.send_pcm_352(&silence, ntp, lead_frames) {
                                     Ok(result) => {
+                                        let expected_sync =
+                                            result.first_marker || result.sequence_sent % 100 == 0;
+                                        if !result.audio_delivered
+                                            || (expected_sync && !result.sync_sent)
+                                        {
+                                            if let Ok(mut events) = startup_events_thread.lock() {
+                                                events.push(format!(
+                                                    "Diagnostic: idle media delivery anomaly · seq={} ts={} marker={} sync_expected={} sync_sent={} audio_sent={}.",
+                                                    result.sequence_sent,
+                                                    result.timestamp_sent,
+                                                    result.first_marker,
+                                                    expected_sync,
+                                                    result.sync_sent,
+                                                    result.audio_delivered
+                                                ));
+                                            }
+                                        }
                                         if !idle_keepalive_reported {
                                             if let Ok(mut events) = startup_events_thread.lock() {
                                                 events.push(format!(
@@ -376,6 +393,24 @@ impl WindowsAudioWorker {
                             match sender.send_pcm_352(&packet, ntp, lead_frames) {
                                 Ok(result) => {
                                     startup_packet_index = startup_packet_index.saturating_add(1);
+                                    let expected_sync =
+                                        result.first_marker || result.sequence_sent % 100 == 0;
+                                    if !result.audio_delivered
+                                        || (expected_sync && !result.sync_sent)
+                                    {
+                                        if let Ok(mut events) = startup_events_thread.lock() {
+                                            events.push(format!(
+                                                "Diagnostic: media delivery anomaly · seq={} ts={} marker={} sync_expected={} sync_sent={} audio_sent={} pad_before={}.",
+                                                result.sequence_sent,
+                                                result.timestamp_sent,
+                                                result.first_marker,
+                                                expected_sync,
+                                                result.sync_sent,
+                                                result.audio_delivered,
+                                                pad_now
+                                            ));
+                                        }
+                                    }
                                     if resume_packet_pending {
                                         if let Ok(mut events) = startup_events_thread.lock() {
                                             events.push(format!(
