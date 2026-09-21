@@ -500,6 +500,14 @@ impl NativeSession {
             .and_then(WindowsAudioWorker::first_non_silent_frame)
     }
 
+    #[cfg(windows)]
+    pub fn drain_startup_events(&self) -> Vec<String> {
+        self.audio_worker
+            .as_ref()
+            .map(WindowsAudioWorker::drain_startup_events)
+            .unwrap_or_default()
+    }
+
     pub fn retransmit_stats(&self) -> RetransmitStats {
         self.retransmit
             .as_ref()
