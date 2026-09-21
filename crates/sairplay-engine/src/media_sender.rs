@@ -311,6 +311,10 @@ impl RealtimeMediaSender {
     /// Receiver PTP probe streak (Delay_Req/Pdelay_Req) observed by the timing
     /// engine. Diagnostic only: mirrors the upstream clock-readiness evidence
     /// without changing media/timeline behavior.
+    pub fn uses_ptp_timing(&self) -> bool {
+        matches!(self.timing, RealtimeTiming::Ptp { .. })
+    }
+
     pub fn ptp_probe_exchange(&self) -> Option<PtpExchange> {
         match &self.timing {
             RealtimeTiming::Ptp { clock } => clock.exchange(),
