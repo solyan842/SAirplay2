@@ -70,6 +70,7 @@ struct SairplayApp {
     multiroom_enabled: bool,
     activation_open: bool,
     activation_key: String,
+    last_feedback_error: Option<String>,
 }
 
 impl Default for SairplayApp {
@@ -114,6 +115,7 @@ impl Default for SairplayApp {
             multiroom_enabled: false,
             activation_open: false,
             activation_key: String::new(),
+            last_feedback_error: None,
         }
     }
 }
@@ -335,17 +337,31 @@ impl SairplayApp {
             self.log.push("Audio worker stopped.".into());
             self.playback = PlaybackUiState::Error("Audio worker stopped".into());
             self.session = None;
-        } else if let Some(error) = session.feedback_error() {
-            self.log.push(format!("Feedback keepalive: {error}"));
-            if !session.feedback_running() {
-                self.playback = PlaybackUiState::Error(error);
-                self.session = None;
+        } else {
+            let feedback_error = session.feedback_error();
+            let feedback_running = session.feedback_running();
+
+            match feedback_error {
+                Some(error) => {
+                    if self.last_feedback_error.as_deref() != Some(error.as_str()) {
+                        self.log.push(format!("Feedback keepalive: {error}"));
+                        self.last_feedback_error = Some(error.clone());
+                    }
+                    if !feedback_running {
+                        self.playback = PlaybackUiState::Error(error);
+                        self.session = None;
+                    }
+                }
+                None => {
+                    self.last_feedback_error = None;
+                    if !feedback_running {
+                        let error = "Feedback keepalive worker stopped".to_string();
+                        self.log.push(error.clone());
+                        self.playback = PlaybackUiState::Error(error);
+                        self.session = None;
+                    }
+                }
             }
-        } else if !session.feedback_running() {
-            let error = "Feedback keepalive worker stopped".to_string();
-            self.log.push(error.clone());
-            self.playback = PlaybackUiState::Error(error);
-            self.session = None;
         }
     }
 
@@ -413,6 +429,7 @@ impl SairplayApp {
         self.session = None;
         self.last_audio_discontinuities = 0;
         self.last_rtx = (0, 0, 0);
+        self.last_feedback_error = None;
         self.log.push(format!(
             "{name}: preflight starting on {host}:{port} · model={} · features=0x{:016X} · PTP={} · follow-clock={} · initial-volume={} · Playing waits for Ready + audio.",
             service.txt.model.as_deref().unwrap_or("-"),
@@ -422,6 +439,20 @@ impl SairplayApp {
             initial_volume
                 .map(|v| format!("{v}%"))
                 .unwrap_or_else(|| "unchanged".into()),
+        ));
+        self.log.push(format!(
+            "{name}: HomePod/group TXT · igl={} · pgid={} · tsid={} · tsm={} · gpn={} · osvers={} · srcvers={}.",
+            service.txt.fields.get("igl").map(String::as_str).unwrap_or("-"),
+            service.txt.fields.get("pgid").map(String::as_str).unwrap_or("-"),
+            service.txt.fields.get("tsid").map(String::as_str).unwrap_or("-"),
+            service.txt.fields.get("tsm").map(String::as_str).unwrap_or("-"),
+            service.txt.fields.get("gpn").map(String::as_str).unwrap_or("-"),
+            service.txt.fields.get("osvers").map(String::as_str).unwrap_or("-"),
+            service.txt.fields
+                .get("srcvers")
+                .or_else(|| service.txt.fields.get("vs"))
+                .map(String::as_str)
+                .unwrap_or("-"),
         ));
 
         thread::Builder::new()
