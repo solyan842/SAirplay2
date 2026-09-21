@@ -47,6 +47,9 @@ impl WindowsAudioWorker {
     pub fn start(
         mut sender: RealtimeMediaSender,
         lead_frames: u32,
+        latency_max: Option<u32>,
+        rtp_offset: u32,
+        cold_start_delay_ms: u64,
     ) -> Result<Self, WindowsAudioWorkerError> {
         let running = Arc::new(AtomicBool::new(true));
         let running_thread = Arc::clone(&running);
@@ -80,6 +83,8 @@ impl WindowsAudioWorker {
 
             let mut chunker = Pcm352Chunker::new();
             let mut captured_frames_total = 0u64;
+            let mut source_present = false;
+            let mut cold_armed = false;
 
             while running_thread.load(Ordering::SeqCst) {
                 match capture.drain_into(&mut chunker) {
@@ -104,6 +109,59 @@ impl WindowsAudioWorker {
                         }
                         let frames = report.frames;
                         captured_frames_total = captured_frames_total.saturating_add(frames as u64);
+
+                        // Before the first START, upstream has no live wire feed.
+                        // Shared-mode WASAPI may still emit engine SILENT buffers
+                        // while no application audio exists; those are equivalent
+                        // to "no stdin bytes yet", not content to stream.
+                        if !source_present {
+                            if report.first_non_silent_frame_offset.is_some() {
+                                source_present = true;
+                            } else {
+                                chunker.clear();
+                                thread::sleep(Duration::from_millis(1));
+                                continue;
+                            }
+                        }
+
+                        // Cold START is committed only once a complete 352-frame
+                        // transport packet is buffered, matching airplay-cli's
+                        // audio-buffered gate. Nothing is sent before this point.
+                        if !cold_armed {
+                            if !chunker.has_packet() {
+                                if frames == 0 {
+                                    thread::sleep(Duration::from_millis(1));
+                                }
+                                continue;
+                            }
+
+                            let now_ntp = match system_time_to_ntp(SystemTime::now()) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(format!("NTP clock conversion failed: {error:?}"));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            };
+                            let start_ntp =
+                                now_ntp.saturating_add(ms_to_ntp(cold_start_delay_ms));
+                            if let Err(error) = sender.arm_cold_start(
+                                start_ntp,
+                                latency_max,
+                                lead_frames,
+                                rtp_offset,
+                            ) {
+                                if let Ok(mut slot) = last_error_thread.lock() {
+                                    *slot = Some(format!("cold START failed: {error:?}"));
+                                }
+                                running_thread.store(false, Ordering::SeqCst);
+                                return;
+                            }
+                            cold_armed = true;
+                        }
+
                         let recovery_ntp = match system_time_to_ntp(SystemTime::now()) {
                             Ok(value) => value,
                             Err(error) => {
@@ -241,6 +299,10 @@ impl WindowsAudioWorker {
             let _ = worker.join();
         }
     }
+}
+
+fn ms_to_ntp(ms: u64) -> u64 {
+    ((ms as u128) << 32).div_ceil(1000) as u64
 }
 
 impl Drop for WindowsAudioWorker {
