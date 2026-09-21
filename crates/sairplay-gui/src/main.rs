@@ -600,9 +600,11 @@ impl SairplayApp {
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 let label = self.t("MultiRoom", "MultiRoom");
-                                let toggle = ui.selectable_label(
-                                    self.multiroom_enabled,
-                                    egui::RichText::new(format!("○  {label}")).size(15.0),
+                                let toggle = ui.add(
+                                    egui::RadioButton::new(
+                                        self.multiroom_enabled,
+                                        egui::RichText::new(label).size(15.0),
+                                    ),
                                 );
                                 if toggle.clicked() {
                                     self.multiroom_enabled = !self.multiroom_enabled;
