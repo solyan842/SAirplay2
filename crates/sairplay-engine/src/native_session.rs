@@ -105,6 +105,8 @@ pub struct NativeSession {
     dacp_id: String,
     active_remote: String,
     lead_frames: u32,
+    latency_max: Option<u32>,
+    rtp_offset: u32,
     initial_volume_result: Option<VolumeSetResult>,
     #[cfg(windows)]
     audio_worker: Option<WindowsAudioWorker>,
@@ -355,28 +357,14 @@ impl NativeSession {
         )
         .map_err(NativeSessionError::Feedback)?;
 
-        // START(0) source contract: begin at the feasibility floor.
-        // Base floor is now + 250 ms. A live PTP receiver probe streak can
-        // raise it to the clock-servo readiness instant; Apple receivers use
-        // the source's observed fast-seat bound after the third exchange.
-        let now_ntp = system_time_to_ntp(SystemTime::now())
-            .map_err(|e| NativeSessionError::Timing(format!("{e:?}")))?;
-        let mut floor_delay_ms = 250u64;
-        if let Some(engine) = ptp_timing.as_ref() {
-            if let Some(exchange) = engine.peer_exchange() {
-                let readiness = clock_ready_delay_ms(exchange, config.apple_model);
-                floor_delay_ms = floor_delay_ms.max(readiness);
-            }
-        }
-        let start_ntp = now_ntp.saturating_add(ms_to_ntp(floor_delay_ms));
-        let head_ts = ntp_to_frames(start_ntp, 44_100);
-
-        // Source native START derives the wire timeline from process identity:
-        // head_ts remains pure wall-clock scheduling; RTP adds this offset.
+        // Cold START is intentionally deferred until the Windows capture path
+        // has one complete transport packet buffered. Upstream's caller gates
+        // START on audio-present; sending/anchoring before that creates a
+        // silence->content cold boundary that the reference path avoids.
         let pid = std::process::id();
         let rtp_offset = pid.wrapping_mul(2_654_435_761u32) & 0x0FFF_FF00u32;
         let sequence = pid.wrapping_mul(40_503u32) as u16;
-        let rtp_timestamp = (head_ts as u32).wrapping_add(rtp_offset);
+        let rtp_timestamp = rtp_offset;
 
         let ptp_clock = ptp_timing.as_ref().map(PtpEngine::clock_handle);
         let ssrc = if ptp_clock.is_some() { 0 } else { session_id };
@@ -400,23 +388,6 @@ impl NativeSession {
         if retransmit.is_some() {
             sender.set_retransmit_ring(rtx_ring);
         }
-        sender.configure_source_timeline(
-            start_ntp,
-            head_ts,
-            latency_max,
-            effective_lead_frames,
-        );
-
-        // Source announces the PTP timeline immediately at START, before the
-        // first audio packet; the first packet announces it once more.
-        if ptp_clock.is_some() {
-            let anchor_now = system_time_to_ntp(SystemTime::now())
-                .map_err(|e| NativeSessionError::Timing(format!("{e:?}")))?;
-            sender
-                .prime_ptp_anchor(anchor_now, effective_lead_frames)
-                .map_err(|e| NativeSessionError::Media(format!("initial PTP anchor failed: {e:?}")))?;
-        }
-
         Ok(Self {
             flow,
             control,
@@ -431,6 +402,8 @@ impl NativeSession {
             dacp_id: config.dacp_id.clone(),
             active_remote: config.active_remote.clone(),
             lead_frames: effective_lead_frames,
+            latency_max,
+            rtp_offset,
             initial_volume_result,
             #[cfg(windows)]
             audio_worker: None,
@@ -468,7 +441,12 @@ impl NativeSession {
             NativeSessionError::Flow("realtime sender is already owned by audio worker".into())
         })?;
 
-        match WindowsAudioWorker::start(sender, self.lead_frames) {
+        match WindowsAudioWorker::start(
+            sender,
+            self.lead_frames,
+            self.latency_max,
+            self.rtp_offset,
+        ) {
             Ok(worker) => {
                 self.audio_worker = Some(worker);
                 Ok(())
