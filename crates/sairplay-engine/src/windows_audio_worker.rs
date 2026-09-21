@@ -97,6 +97,8 @@ impl WindowsAudioWorker {
             let mut inferred_idle = false;
             let mut idle_keepalive_reported = false;
             let mut transition_epoch: u64 = 0;
+            let mut last_ptp_probe_alive: Option<bool> = None;
+            let mut last_ptp_snapshot = std::time::Instant::now();
 
             while running_thread.load(Ordering::SeqCst) {
                 match capture.drain_into(&mut chunker) {
@@ -121,6 +123,36 @@ impl WindowsAudioWorker {
                         }
                         let frames = report.frames;
                         captured_frames_total = captured_frames_total.saturating_add(frames as u64);
+
+                        // SOURCE-ALIGNED DIAGNOSTIC ONLY: upstream monitors the
+                        // receiver's uninterrupted Delay_Req/Pdelay_Req probe
+                        // streak as clock-readiness evidence. Do the same here,
+                        // without changing PCM, RTP, anchors or session state.
+                        if cold_armed && sender.uses_ptp_timing() {
+                            let exchange = sender.ptp_probe_exchange();
+                            let alive = exchange.is_some();
+                            let state_changed = last_ptp_probe_alive != Some(alive);
+                            let snapshot_due =
+                                last_ptp_snapshot.elapsed() >= Duration::from_secs(30);
+                            if state_changed || snapshot_due {
+                                if let Ok(mut events) = startup_events_thread.lock() {
+                                    match exchange {
+                                        Some(ex) => events.push(format!(
+                                            "Diagnostic: PTP probe streak alive · exchanges={} · streak_age_ms={} · last_probe_age_ms={} · third_probe_age_ms={}.",
+                                            ex.count,
+                                            ex.first_ms,
+                                            ex.last_ms,
+                                            ex.third_ms
+                                        )),
+                                        None => events.push(
+                                            "Diagnostic: PTP probe streak unavailable · no Delay_Req/Pdelay_Req seen within 3 s.".into()
+                                        ),
+                                    }
+                                }
+                                last_ptp_snapshot = std::time::Instant::now();
+                            }
+                            last_ptp_probe_alive = Some(alive);
+                        }
 
                         // Windows has no explicit player FLUSH/START command pipe,
                         // so a sustained all-zero interval is our local boundary
