@@ -538,22 +538,22 @@ impl SairplayApp {
             PlaybackUiState::Idle => (
                 self.t("Sẵn sàng", "Ready"),
                 self.t("Đang chờ phát nhạc...", "Waiting for playback..."),
-                egui::Color32::from_rgb(18, 185, 91),
+                UiTheme::green(),
             ),
             PlaybackUiState::Connecting(_) => (
                 self.t("Đang kết nối", "Connecting"),
                 self.t("Đang chuẩn bị thiết bị...", "Preparing receiver..."),
-                egui::Color32::from_rgb(241, 158, 0),
+                UiTheme::amber(),
             ),
             PlaybackUiState::Playing(_) => (
                 self.t("Đang chạy", "Running"),
                 self.t("Đang truyền âm thanh qua AirPlay", "Streaming via AirPlay"),
-                egui::Color32::from_rgb(18, 185, 91),
+                UiTheme::green(),
             ),
             PlaybackUiState::Error(_) => (
                 self.t("Lỗi kết nối", "Connection Error"),
                 self.t("Xem Log để kiểm tra", "Open Log for details"),
-                egui::Color32::from_rgb(229, 57, 68),
+                UiTheme::red(),
             ),
         }
     }
@@ -847,7 +847,7 @@ impl SairplayApp {
     }
 
     fn render_controls(&mut self, ui: &mut egui::Ui) {
-        const CARD_INNER_W: f32 = 276.0;
+        const CARD_INNER_W: f32 = 286.0;
         const CARD_INNER_H: f32 = 42.0;
         const CARD_GAP: f32 = 7.0;
 
@@ -1143,10 +1143,14 @@ impl eframe::App for SairplayApp {
         visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, UiTheme::border_hover());
         visuals.widgets.active.bg_fill = egui::Color32::from_rgb(231, 242, 255);
         visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, UiTheme::border_active());
+        visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(10);
+        visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(10);
+        visuals.widgets.active.corner_radius = egui::CornerRadius::same(10);
+        visuals.hyperlink_color = UiTheme::blue();
         ctx.set_visuals(visuals);
 
         egui::TopBottomPanel::bottom("app_footer")
-            .exact_height(31.0)
+            .exact_height(28.0)
             .frame(
                 egui::Frame::new()
                     .fill(UiTheme::surface())
@@ -1154,7 +1158,7 @@ impl eframe::App for SairplayApp {
                         1.0,
                         egui::Color32::from_rgb(218, 229, 242),
                     ))
-                    .inner_margin(egui::Margin::symmetric(16, 5)),
+                    .inner_margin(egui::Margin::symmetric(14, 4)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -1191,104 +1195,87 @@ impl eframe::App for SairplayApp {
             .frame(
                 egui::Frame::new()
                     .fill(UiTheme::bg())
-                    .inner_margin(egui::Margin::same(18)),
+                    .inner_margin(egui::Margin::same(14)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let logo = draw_app_logo(ui, egui::vec2(70.0, 70.0));
-                    if logo
-                        .on_hover_text(self.t(
-                            "Nhấn để quét lại thiết bị",
-                            "Click to scan devices again",
-                        ))
-                        .clicked()
-                    {
-                        self.rescan_devices();
-                    }
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 76.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        let logo = draw_app_logo(ui, egui::vec2(74.0, 74.0));
+                        if logo
+                            .on_hover_text(self.t(
+                                "Nhấn để quét lại thiết bị",
+                                "Click to scan devices again",
+                            ))
+                            .clicked()
+                        {
+                            self.rescan_devices();
+                        }
 
-                    ui.add_space(10.0);
+                        ui.add_space(14.0);
 
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(455.0, 70.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new("SAirplay2")
-                                    .size(28.0)
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(7, 19, 52)),
-                            );
-                            ui.label(
-                                egui::RichText::new(
-                                    "Native AirPlay — Apple's lossless wireless audio transport using ALAC",
-                                )
-                                .size(12.5)
-                                .color(egui::Color32::from_rgb(79, 105, 154)),
-                            );
-                        },
-                    );
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(500.0, 72.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new("SAirplay2")
+                                        .size(32.0)
+                                        .strong()
+                                        .color(UiTheme::text()),
+                                );
+                                ui.add_space(1.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Native AirPlay — Apple's lossless wireless audio transport using ALAC",
+                                    )
+                                    .size(13.0)
+                                    .color(UiTheme::text_soft()),
+                                );
+                            },
+                        );
 
-                    ui.add_space(6.0);
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(50.0, 68.0),
+                                    egui::Layout::top_down(egui::Align::Center),
+                                    |ui| {
+                                        ui.add_space(2.0);
+                                        if draw_lang_button(
+                                            ui,
+                                            "VI",
+                                            self.language == UiLanguage::Vi,
+                                        )
+                                        .clicked()
+                                        {
+                                            self.language = UiLanguage::Vi;
+                                        }
+                                        ui.add_space(4.0);
+                                        if draw_lang_button(
+                                            ui,
+                                            "EN",
+                                            self.language == UiLanguage::En,
+                                        )
+                                        .clicked()
+                                        {
+                                            self.language = UiLanguage::En;
+                                        }
+                                    },
+                                );
 
-                    let (status, detail, color) = self.header_status();
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(205.0, 70.0),
-                        egui::Layout::top_down(egui::Align::Center),
-                        |ui| {
-                            egui::Frame::new()
-                                .fill(UiTheme::surface())
-                                .stroke(egui::Stroke::new(1.0, UiTheme::border()))
-                                .corner_radius(egui::CornerRadius::same(24))
-                                .shadow(egui::epaint::Shadow {
-                                    offset: [0, 2],
-                                    blur: 10,
-                                    spread: 0,
-                                    color: egui::Color32::from_black_alpha(16),
-                                })
-                                .inner_margin(egui::Margin::symmetric(12, 9))
-                                .show(ui, |ui| {
-                                    ui.set_min_width(176.0);
-                                    ui.horizontal(|ui| {
-                                        let (dot_rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(14.0, 14.0),
-                                            egui::Sense::hover(),
-                                        );
-                                        ui.painter().circle_filled(dot_rect.center(), 6.0, color);
-                                        ui.vertical(|ui| {
-                                            ui.label(
-                                                egui::RichText::new(status)
-                                                    .size(14.0)
-                                                    .strong()
-                                                    .color(egui::Color32::from_rgb(18, 29, 49)),
-                                            );
-                                            ui.label(
-                                                egui::RichText::new(detail)
-                                                    .size(10.5)
-                                                    .color(egui::Color32::from_rgb(79, 105, 154)),
-                                            );
-                                        });
-                                    });
-                                });
-                        },
-                    );
+                                ui.add_space(10.0);
 
-                    ui.add_space(6.0);
-
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(46.0, 70.0),
-                        egui::Layout::top_down(egui::Align::Center),
-                        |ui| {
-                            if draw_lang_button(ui, "VI", self.language == UiLanguage::Vi).clicked() {
-                                self.language = UiLanguage::Vi;
-                            }
-                            ui.add_space(4.0);
-                            if draw_lang_button(ui, "EN", self.language == UiLanguage::En).clicked() {
-                                self.language = UiLanguage::En;
-                            }
-                        },
-                    );
-                });
+                                let (status, detail, color) = self.header_status();
+                                draw_header_status_card(ui, status, detail, color);
+                            },
+                        );
+                    },
+                );
+                ui.add_space(8.0);
                 ui.add_space(8.0);
 
                 let all_devices = self.catalog.devices().to_vec();
@@ -1326,6 +1313,48 @@ impl eframe::App for SairplayApp {
         self.render_activation_window(ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
+}
+
+fn draw_header_status_card(
+    ui: &mut egui::Ui,
+    status: &str,
+    detail: &str,
+    color: egui::Color32,
+) {
+    egui::Frame::new()
+        .fill(UiTheme::surface())
+        .stroke(egui::Stroke::new(1.0, UiTheme::border()))
+        .corner_radius(egui::CornerRadius::same(26))
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 2],
+            blur: 12,
+            spread: 0,
+            color: egui::Color32::from_black_alpha(16),
+        })
+        .inner_margin(egui::Margin::symmetric(14, 9))
+        .show(ui, |ui| {
+            ui.set_min_width(174.0);
+            ui.set_min_height(38.0);
+            ui.horizontal_centered(|ui| {
+                let (dot_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(17.0, 17.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot_rect.center(), 7.0, color);
+                ui.add_space(7.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(status)
+                            .size(14.0)
+                            .strong()
+                            .color(UiTheme::text()),
+                    );
+                    ui.label(
+                        egui::RichText::new(detail)
+                            .size(10.5)
+                            .color(UiTheme::text_soft()),
+                    );
+                });
+            });
+        });
 }
 
 fn draw_volume_slider(ui: &mut egui::Ui, value: &mut u8, size: egui::Vec2) -> egui::Response {
@@ -1403,7 +1432,7 @@ fn draw_key_icon_at(ui: &mut egui::Ui, center: egui::Pos2) {
 
 fn draw_lang_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(42.0, 28.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(48.0, 30.0), egui::Sense::click());
     let button_rect = rect.shrink(1.0);
 
     let fill = if selected {
@@ -1431,10 +1460,10 @@ fn draw_lang_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Res
     };
 
     ui.painter()
-        .rect_filled(button_rect, egui::CornerRadius::same(10), fill);
+        .rect_filled(button_rect, egui::CornerRadius::same(11), fill);
     ui.painter().rect_stroke(
         button_rect,
-        egui::CornerRadius::same(10),
+        egui::CornerRadius::same(11),
         stroke,
         egui::StrokeKind::Inside,
     );
@@ -1492,7 +1521,7 @@ fn draw_action_button(
         )
     };
 
-    ui.painter().rect_filled(rect, egui::CornerRadius::same(10), fill);
+    ui.painter().rect_filled(rect, egui::CornerRadius::same(11), fill);
     ui.painter().rect_stroke(
         rect,
         egui::CornerRadius::same(10),
