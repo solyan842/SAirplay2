@@ -228,6 +228,13 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn wsaenobufs_is_classified_as_transient_send_pressure() {
+        let error = io::Error::from_raw_os_error(10055);
+        assert!(is_transient_send_pressure(&error));
+    }
+
     #[test]
     fn cannot_send_before_remote_setup_is_attached() {
         let transport = MediaTransport::bind(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
