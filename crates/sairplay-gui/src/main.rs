@@ -5,6 +5,7 @@ use sairplay_engine::{
     DeviceCatalog, DeviceRecord, DiscoveredService, DiscoveryEvent, MdnsBrowser, NativeSession,
     NativeSessionConfig, Route, ServiceKind, VolumeSetResult,
 };
+use std::collections::{BTreeMap, HashSet};
 use std::net::IpAddr;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -1069,16 +1070,13 @@ impl eframe::App for SairplayApp {
                 ui.add_space(8.0);
 
                 let all_devices = self.catalog.devices().to_vec();
-                let receivers: Vec<DeviceRecord> = all_devices
-                    .iter()
-                    .filter(|device| !is_homepod_stereo_pair(device))
-                    .cloned()
-                    .collect();
-                let stereo_pairs: Vec<DeviceRecord> = all_devices
-                    .iter()
-                    .filter(|device| is_homepod_stereo_pair(device))
-                    .cloned()
-                    .collect();
+
+                // Keep every physical/discovered receiver in the Receivers column.
+                // A HomePod member advertising a tight-sync ID is still an
+                // individual mDNS endpoint. Only synthesize a Stereo Pair row
+                // when at least two distinct HomePods share that tight-sync ID.
+                let receivers: Vec<DeviceRecord> = all_devices.clone();
+                let stereo_pairs = build_homepod_stereo_pairs(&all_devices);
 
                 let receivers_title = self.t("Receivers", "Receivers");
                 let pairs_title = self.t("Stereo Pair HomePod", "Stereo Pair HomePod");
@@ -1222,12 +1220,94 @@ fn draw_speaker_icon(ui: &mut egui::Ui, size: egui::Vec2) {
     );
 }
 
-fn is_homepod_stereo_pair(device: &DeviceRecord) -> bool {
-    let Some(service) = device.airplay.as_ref() else {
-        return false;
-    };
+fn homepod_tsid(device: &DeviceRecord) -> Option<&str> {
+    let service = device.airplay.as_ref()?;
     let model = service.txt.model.as_deref().unwrap_or("");
-    model.starts_with("AudioAccessory") && service.txt.fields.contains_key("tsid")
+    if !model.starts_with("AudioAccessory") {
+        return None;
+    }
+
+    service
+        .txt
+        .fields
+        .get("tsid")
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn homepod_member_identity(device: &DeviceRecord) -> Option<String> {
+    let service = device.airplay.as_ref()?;
+    Some(
+        service
+            .txt
+            .fields
+            .get("deviceid")
+            .cloned()
+            .unwrap_or_else(|| service.fullname.clone()),
+    )
+}
+
+fn build_homepod_stereo_pairs(devices: &[DeviceRecord]) -> Vec<DeviceRecord> {
+    let mut grouped: BTreeMap<String, Vec<&DeviceRecord>> = BTreeMap::new();
+
+    for device in devices {
+        if let Some(tsid) = homepod_tsid(device) {
+            grouped.entry(tsid.to_owned()).or_default().push(device);
+        }
+    }
+
+    let mut pairs = Vec::new();
+
+    for (_tsid, members) in grouped {
+        let mut unique_members = HashSet::new();
+        let mut distinct = Vec::new();
+
+        for member in members {
+            let Some(identity) = homepod_member_identity(member) else {
+                continue;
+            };
+            if unique_members.insert(identity) {
+                distinct.push(member);
+            }
+        }
+
+        if distinct.len() < 2 {
+            continue;
+        }
+
+        // tsm=1 is the tight-sync master when advertised. Prefer it as the
+        // representative endpoint for the synthetic pair row, otherwise keep
+        // discovery order. Catalog data itself remains unchanged.
+        let representative = distinct
+            .iter()
+            .copied()
+            .find(|device| {
+                device
+                    .airplay
+                    .as_ref()
+                    .and_then(|service| service.txt.fields.get("tsm"))
+                    .is_some_and(|value| value == "1")
+            })
+            .unwrap_or(distinct[0]);
+
+        let pair_name = distinct
+            .iter()
+            .filter_map(|device| {
+                device
+                    .airplay
+                    .as_ref()
+                    .and_then(|service| service.txt.fields.get("gpn"))
+            })
+            .find(|name| !name.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| "HomePod Stereo Pair".to_owned());
+
+        let mut pair = representative.clone();
+        pair.display_name = pair_name;
+        pairs.push(pair);
+    }
+
+    pairs
 }
 
 fn classify_device_artwork(device: &DeviceRecord) -> DeviceArtwork {
@@ -1514,28 +1594,110 @@ mod gui_tests {
         assert_eq!(preferred_service_address(&s), "Test.local");
     }
 
-    #[test]
-    fn homepod_tsid_is_listed_as_stereo_pair() {
-        let txt = AirPlayTxt::parse([
+    fn homepod_device(
+        name: &str,
+        address: &str,
+        device_id: &str,
+        tsid: Option<&str>,
+        group_name: Option<&str>,
+        tsm: Option<&str>,
+    ) -> DeviceRecord {
+        let mut fields = vec![
             ("model", "AudioAccessory5,1"),
-            ("tsid", "stereo-group-1"),
             ("features", "274877906944"),
-        ])
-        .unwrap();
-        let device = DeviceRecord {
-            display_name: "Living Room".into(),
+            ("deviceid", device_id),
+        ];
+        if let Some(value) = tsid {
+            fields.push(("tsid", value));
+        }
+        if let Some(value) = group_name {
+            fields.push(("gpn", value));
+        }
+        if let Some(value) = tsm {
+            fields.push(("tsm", value));
+        }
+
+        DeviceRecord {
+            display_name: name.into(),
             airplay: Some(DiscoveredService {
                 kind: ServiceKind::AirPlay,
-                fullname: "Living Room._airplay._tcp.local.".into(),
-                display_name: "Living Room".into(),
-                host: "living-room.local.".into(),
+                fullname: format!("{name}._airplay._tcp.local."),
+                display_name: name.into(),
+                host: format!("{}.local.", name.replace(' ', "-")),
                 port: 7000,
-                addresses: vec!["192.168.1.30".into()],
-                txt,
+                addresses: vec![address.into()],
+                txt: AirPlayTxt::parse(fields).unwrap(),
             }),
             raop: None,
-        };
-        assert!(is_homepod_stereo_pair(&device));
+        }
+    }
+
+    #[test]
+    fn single_homepod_with_tsid_does_not_create_pair_row() {
+        let device = homepod_device(
+            "White",
+            "192.168.1.30",
+            "AA:BB:CC:DD:EE:01",
+            Some("stereo-group-1"),
+            Some("Living Room"),
+            None,
+        );
+
+        assert_eq!(build_homepod_stereo_pairs(&[device]).len(), 0);
+    }
+
+    #[test]
+    fn two_distinct_homepods_with_same_tsid_create_one_pair_row() {
+        let left = homepod_device(
+            "White",
+            "192.168.1.30",
+            "AA:BB:CC:DD:EE:01",
+            Some("stereo-group-1"),
+            Some("Living Room"),
+            Some("0"),
+        );
+        let right = homepod_device(
+            "Black",
+            "192.168.1.31",
+            "AA:BB:CC:DD:EE:02",
+            Some("stereo-group-1"),
+            Some("Living Room"),
+            Some("1"),
+        );
+
+        let pairs = build_homepod_stereo_pairs(&[left, right]);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].display_name, "Living Room");
+        assert_eq!(
+            pairs[0]
+                .airplay
+                .as_ref()
+                .and_then(|service| service.txt.fields.get("deviceid"))
+                .map(String::as_str),
+            Some("AA:BB:CC:DD:EE:02")
+        );
+    }
+
+    #[test]
+    fn homepods_with_different_tsid_do_not_create_pair_row() {
+        let one = homepod_device(
+            "White",
+            "192.168.1.30",
+            "AA:BB:CC:DD:EE:01",
+            Some("stereo-group-1"),
+            Some("Living Room"),
+            None,
+        );
+        let two = homepod_device(
+            "Black",
+            "192.168.1.31",
+            "AA:BB:CC:DD:EE:02",
+            Some("stereo-group-2"),
+            Some("Bedroom"),
+            None,
+        );
+
+        assert_eq!(build_homepod_stereo_pairs(&[one, two]).len(), 0);
     }
 
     #[test]
