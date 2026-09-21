@@ -109,6 +109,46 @@ impl WindowsAudioWorker {
                                     Ordering::SeqCst,
                                 );
                             }
+
+                            if cold_armed {
+                                input_starved_since = None;
+                                let state = sender.state();
+                                let pad_debt = sender.splice_pad_frames();
+                                let reanchors = sender.timeline_reanchors();
+                                let (head_delta, head_delta_ms) =
+                                    match system_time_to_ntp(SystemTime::now()) {
+                                        Ok(now_ntp) => {
+                                            let delta = sender.timeline_head_delta_frames(now_ntp);
+                                            (delta, delta as f64 * 1000.0 / 44_100.0)
+                                        }
+                                        Err(_) => (i64::MIN, f64::NAN),
+                                    };
+                                if let Ok(mut events) = startup_events_thread.lock() {
+                                    events.push(format!(
+                                        "Diagnostic: WASAPI epoch cut · discontinuities={} · packets={} · discarded_bytes={} · discarded_nonzero_bytes={} · discontinuity_packet_frames={:?} · packet_silent={:?} · packet_nonzero={:?} · seq={} ts={} · head_delta_frames={} ({:.1} ms) · pad_debt={} · reanchors={}.",
+                                        report.discontinuities,
+                                        report.packets,
+                                        report.discontinuity_discarded_bytes,
+                                        report.discontinuity_discarded_nonzero_bytes,
+                                        report.discontinuity_packet_frames,
+                                        report.discontinuity_packet_silent,
+                                        report.discontinuity_packet_nonzero,
+                                        state.sequence,
+                                        state.timestamp,
+                                        head_delta,
+                                        head_delta_ms,
+                                        pad_debt,
+                                        reanchors
+                                    ));
+                                    if report.discontinuity_discarded_nonzero_bytes != 0 {
+                                        events.push(format!(
+                                            "Diagnostic: WASAPI discontinuity discarded partial nonzero PCM before ALAC · bytes={} nonzero_bytes={}.",
+                                            report.discontinuity_discarded_bytes,
+                                            report.discontinuity_discarded_nonzero_bytes
+                                        ));
+                                    }
+                                }
+                            }
                         }
                         if let Some(offset) = report.first_non_silent_frame_offset {
                             let absolute = captured_frames_total.saturating_add(offset);
