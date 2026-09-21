@@ -187,7 +187,7 @@ impl WindowsAudioWorker {
                                             head_delta as f64 * 1000.0 / 44_100.0;
                                         if let Ok(mut events) = startup_events_thread.lock() {
                                             events.push(format!(
-                                                "Transition: boundary #{} resume · head_delta_frames={} ({:.1} ms) · seq={} ts={} · pending_bytes={} · pad_debt={} · reanchors={}.",
+                                                "Transition: boundary #{} resume · head_delta_frames={} ({:.1} ms) · seq={} ts={} · pending_bytes={} · pad_debt={} · reanchors={} · {}.",
                                                 transition_epoch,
                                                 head_delta,
                                                 head_delta_ms,
@@ -195,7 +195,8 @@ impl WindowsAudioWorker {
                                                 state.timestamp,
                                                 chunker.pending_bytes(),
                                                 sender.splice_pad_frames(),
-                                                sender.timeline_reanchors()
+                                                sender.timeline_reanchors(),
+                                                ptp_probe_summary(&sender)
                                             ));
                                             if head_delta <= 0 {
                                                 events.push(format!(
@@ -244,7 +245,7 @@ impl WindowsAudioWorker {
                                             head_delta as f64 * 1000.0 / 44_100.0;
                                         if let Ok(mut events) = startup_events_thread.lock() {
                                             events.push(format!(
-                                                "Transition: boundary #{} inferred · head_delta_frames={} ({:.1} ms) · seq={} ts={} · pending_bytes={} ({} frames) · pending_nonzero_bytes={} · pad_debt={} · reanchors={}.",
+                                                "Transition: boundary #{} inferred · head_delta_frames={} ({:.1} ms) · seq={} ts={} · pending_bytes={} ({} frames) · pending_nonzero_bytes={} · pad_debt={} · reanchors={} · {}.",
                                                 transition_epoch,
                                                 head_delta,
                                                 head_delta_ms,
@@ -254,7 +255,8 @@ impl WindowsAudioWorker {
                                                 pending_before / 4,
                                                 pending_nonzero_before,
                                                 pad_before,
-                                                sender.timeline_reanchors()
+                                                sender.timeline_reanchors(),
+                                                ptp_probe_summary(&sender)
                                             ));
                                             if head_delta <= 0 {
                                                 events.push(format!(
@@ -664,6 +666,19 @@ impl WindowsAudioWorker {
 
 fn ms_to_ntp(ms: u64) -> u64 {
     ((ms as u128) << 32).div_ceil(1000) as u64
+}
+
+fn ptp_probe_summary(sender: &RealtimeMediaSender) -> String {
+    if !sender.uses_ptp_timing() {
+        return "ptp_probe=not-applicable".into();
+    }
+    match sender.ptp_probe_exchange() {
+        Some(ex) => format!(
+            "ptp_probe=alive exchanges={} streak_age_ms={} last_probe_age_ms={} third_probe_age_ms={}",
+            ex.count, ex.first_ms, ex.last_ms, ex.third_ms
+        ),
+        None => "ptp_probe=unavailable".into(),
+    }
 }
 
 impl Drop for WindowsAudioWorker {
