@@ -34,6 +34,8 @@ pub struct WindowsAudioWorker {
     worker: Option<JoinHandle<()>>,
     last_error: Arc<Mutex<Option<String>>>,
     discontinuities: Arc<AtomicU64>,
+    last_discontinuity_frame: Arc<AtomicU64>,
+    first_non_silent_frame: Arc<AtomicU64>,
 }
 
 impl WindowsAudioWorker {
@@ -52,6 +54,10 @@ impl WindowsAudioWorker {
         let last_error_thread = Arc::clone(&last_error);
         let discontinuities = Arc::new(AtomicU64::new(0));
         let discontinuities_thread = Arc::clone(&discontinuities);
+        let last_discontinuity_frame = Arc::new(AtomicU64::new(u64::MAX));
+        let last_discontinuity_frame_thread = Arc::clone(&last_discontinuity_frame);
+        let first_non_silent_frame = Arc::new(AtomicU64::new(u64::MAX));
+        let first_non_silent_frame_thread = Arc::clone(&first_non_silent_frame);
 
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
@@ -73,14 +79,31 @@ impl WindowsAudioWorker {
             };
 
             let mut chunker = Pcm352Chunker::new();
+            let mut captured_frames_total = 0u64;
 
             while running_thread.load(Ordering::SeqCst) {
                 match capture.drain_into(&mut chunker) {
                     Ok(report) => {
                         if report.discontinuities != 0 {
                             discontinuities_thread.fetch_add(report.discontinuities, Ordering::SeqCst);
+                            if let Some(offset) = report.discontinuity_frame_offset {
+                                last_discontinuity_frame_thread.store(
+                                    captured_frames_total.saturating_add(offset),
+                                    Ordering::SeqCst,
+                                );
+                            }
+                        }
+                        if let Some(offset) = report.first_non_silent_frame_offset {
+                            let absolute = captured_frames_total.saturating_add(offset);
+                            let _ = first_non_silent_frame_thread.compare_exchange(
+                                u64::MAX,
+                                absolute,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            );
                         }
                         let frames = report.frames;
+                        captured_frames_total = captured_frames_total.saturating_add(frames as u64);
                         let recovery_ntp = match system_time_to_ntp(SystemTime::now()) {
                             Ok(value) => value,
                             Err(error) => {
@@ -165,6 +188,8 @@ impl WindowsAudioWorker {
                 worker: Some(worker),
                 last_error,
                 discontinuities,
+                last_discontinuity_frame,
+                first_non_silent_frame,
             }),
             Ok(Err(message)) => {
                 let _ = worker.join();
@@ -194,6 +219,20 @@ impl WindowsAudioWorker {
 
     pub fn discontinuity_count(&self) -> u64 {
         self.discontinuities.load(Ordering::SeqCst)
+    }
+
+    pub fn last_discontinuity_frame(&self) -> Option<u64> {
+        match self.last_discontinuity_frame.load(Ordering::SeqCst) {
+            u64::MAX => None,
+            value => Some(value),
+        }
+    }
+
+    pub fn first_non_silent_frame(&self) -> Option<u64> {
+        match self.first_non_silent_frame.load(Ordering::SeqCst) {
+            u64::MAX => None,
+            value => Some(value),
+        }
     }
 
     pub fn stop(&mut self) {
