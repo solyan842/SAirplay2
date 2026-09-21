@@ -91,6 +91,7 @@ impl WindowsAudioWorker {
             let mut startup_packet_index: u32 = 0;
             let mut startup_started: Option<std::time::Instant> = None;
             let mut input_starved_since: Option<std::time::Instant> = None;
+            let mut silence_keepalive = false;
 
             while running_thread.load(Ordering::SeqCst) {
                 match capture.drain_into(&mut chunker) {
@@ -193,6 +194,7 @@ impl WindowsAudioWorker {
                         // actually behind wall clock.
                         if chunker.has_packet() {
                             input_starved_since = None;
+                            silence_keepalive = false;
                             if let Some(added) = sender.recover_delivery_gap(recovery_ntp, lead_frames) {
                                 if startup_started.map(|t| t.elapsed() <= Duration::from_secs(3)).unwrap_or(false) {
                                     if let Ok(mut events) = startup_events_thread.lock() {
@@ -208,28 +210,38 @@ impl WindowsAudioWorker {
                             // New PCM arrived but not enough for a complete packet;
                             // this is normal producer cadence, not starvation.
                             input_starved_since = None;
+                            silence_keepalive = false;
                         } else {
-                            // Upstream blocks ap2_session_read(..., 250) and only
-                            // enters starvation recovery after that full timeout.
-                            // WASAPI polling returns ordinary empty drains every
-                            // ~1 ms, so never treat a single empty poll as a gap.
+                            // Match upstream's 250 ms blocking zero-read boundary.
+                            // Once an already-started splice line has genuinely gone
+                            // dry, keep the wire hot with ordinary encoded silence
+                            // instead of accumulating a large unsent silence debt.
                             let started = input_starved_since.get_or_insert_with(std::time::Instant::now);
                             if started.elapsed() >= Duration::from_millis(250) {
-                                if let Some(added) = sender.recover_input_gap(recovery_ntp, lead_frames) {
-                                    if startup_started.map(|t| t.elapsed() <= Duration::from_secs(3)).unwrap_or(false) {
-                                        if let Ok(mut events) = startup_events_thread.lock() {
-                                            events.push(format!(
-                                                "Startup: input-gap recovery after >=250 ms added {} silence frames · total_pad={}.",
-                                                added,
-                                                sender.splice_pad_frames()
-                                            ));
-                                        }
+                                silence_keepalive = true;
+                            }
+                        }
+
+                        if silence_keepalive && !chunker.has_packet() {
+                            let ntp = match system_time_to_ntp(SystemTime::now()) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(format!("NTP clock conversion failed: {error:?}"));
                                     }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
                                 }
-                                // Mirror successive 250 ms zero-reads: a still-dry
-                                // source can be checked again after another full
-                                // starvation interval, never on each 1 ms poll.
-                                input_starved_since = Some(std::time::Instant::now());
+                            };
+                            if sender.can_accept_frames(ntp) {
+                                let silence = [0u8; crate::ALAC_PCM_PACKET_BYTES];
+                                if let Err(error) = sender.send_pcm_352(&silence, ntp, lead_frames) {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(format!("silence keepalive failed: {error:?}"));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
                             }
                         }
 
