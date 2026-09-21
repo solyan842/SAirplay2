@@ -1395,7 +1395,7 @@ mod gui_tests {
         let txt = AirPlayTxt::parse([
             ("model", "AudioAccessory5,1"),
             ("tsid", "stereo-group-1"),
-            ("features", (1u64 << 38).to_string().as_str()),
+            ("features", "274877906944"),
         ])
         .unwrap();
         let device = DeviceRecord {
