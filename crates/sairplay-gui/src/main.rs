@@ -26,6 +26,8 @@ struct SairplayApp {
     session: Option<NativeSession>,
     initial_volume_text: String,
     volume_rx: Option<Receiver<Result<VolumeSetResult, String>>>,
+    last_audio_discontinuities: u64,
+    last_rtx: (u64, u64, u64),
 }
 
 impl Default for SairplayApp {
@@ -63,6 +65,8 @@ impl Default for SairplayApp {
             session: None,
             initial_volume_text: String::new(),
             volume_rx: None,
+            last_audio_discontinuities: 0,
+            last_rtx: (0, 0, 0),
         }
     }
 }
@@ -221,6 +225,26 @@ impl SairplayApp {
             return;
         };
 
+        let audio_discontinuities = session.audio_discontinuities();
+        let rtx = session.retransmit_stats();
+
+        if audio_discontinuities > self.last_audio_discontinuities {
+            self.log.push(format!(
+                "Diagnostic: WASAPI discontinuity count {} -> {}.",
+                self.last_audio_discontinuities, audio_discontinuities
+            ));
+            self.last_audio_discontinuities = audio_discontinuities;
+        }
+
+        let rtx_now = (rtx.requested, rtx.answered, rtx.expired);
+        if rtx_now != self.last_rtx {
+            self.log.push(format!(
+                "Diagnostic: RTX requested={} answered={} expired={}.",
+                rtx.requested, rtx.answered, rtx.expired
+            ));
+            self.last_rtx = rtx_now;
+        }
+
         if let Some(error) = session.audio_error() {
             self.log.push(format!("Audio worker stopped: {error}"));
             self.playback = PlaybackUiState::Error(error);
@@ -305,6 +329,8 @@ impl SairplayApp {
         self.connect_rx = Some(rx);
         self.playback = PlaybackUiState::Connecting(name.clone());
         self.session = None;
+        self.last_audio_discontinuities = 0;
+        self.last_rtx = (0, 0, 0);
         self.log.push(format!(
             "{name}: preflight starting on {host}:{port} · model={} · features=0x{:016X} · PTP={} · follow-clock={} · initial-volume={} · Playing waits for Ready + audio.",
             service.txt.model.as_deref().unwrap_or("-"),
@@ -342,6 +368,8 @@ impl SairplayApp {
             self.log.push("Playback stopped; native session resources released.".into());
         }
         self.playback = PlaybackUiState::Idle;
+        self.last_audio_discontinuities = 0;
+        self.last_rtx = (0, 0, 0);
     }
 
     fn status_text(&self) -> String {
