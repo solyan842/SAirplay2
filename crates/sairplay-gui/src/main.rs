@@ -576,22 +576,23 @@ impl SairplayApp {
             .corner_radius(egui::CornerRadius::same(12))
             .inner_margin(egui::Margin::symmetric(10, 7))
             .show(ui, |ui| {
-                ui.set_min_height(54.0);
-                ui.horizontal(|ui| {
+                ui.set_min_height(56.0);
+                ui.horizontal_centered(|ui| {
                     ui.add_enabled(selectable, egui::RadioButton::new(selected, ""));
 
-                    ui.add_space(2.0);
-                    draw_device_art(ui, artwork, stereo_pair, egui::vec2(62.0, 42.0));
                     ui.add_space(6.0);
+                    draw_device_art(ui, artwork, stereo_pair, egui::vec2(62.0, 42.0));
+                    ui.add_space(12.0);
 
                     ui.vertical(|ui| {
-                        ui.add_space(3.0);
+                        ui.set_min_width(155.0);
                         ui.label(
                             egui::RichText::new(&device.display_name)
                                 .size(14.0)
                                 .strong()
                                 .color(UiTheme::text()),
                         );
+                        ui.add_space(1.0);
                         ui.label(
                             egui::RichText::new(address)
                                 .size(11.5)
@@ -725,9 +726,11 @@ impl SairplayApp {
     }
 
     fn render_controls(&mut self, ui: &mut egui::Ui) {
+        const CARD_INNER_W: f32 = 276.0;
+        const CARD_INNER_H: f32 = 42.0;
+        const CARD_GAP: f32 = 7.0;
+
         ui.horizontal(|ui| {
-            // Volume is intentionally isolated in its own card so dragging the
-            // slider does not visually pulse/repaint the transport/info cards.
             egui::Frame::new()
                 .fill(UiTheme::surface())
                 .stroke(egui::Stroke::new(1.0, UiTheme::border()))
@@ -738,164 +741,180 @@ impl SairplayApp {
                     spread: 0,
                     color: egui::Color32::from_black_alpha(14),
                 })
-                .inner_margin(egui::Margin::symmetric(12, 8))
+                .inner_margin(egui::Margin::symmetric(10, 8))
                 .show(ui, |ui| {
-                    ui.set_min_width(276.0);
-                    ui.horizontal(|ui| {
-                        draw_speaker_icon(ui, egui::vec2(25.0, 25.0));
-                        ui.add_space(5.0);
-                        ui.vertical(|ui| {
-                            ui.label(
-                                egui::RichText::new(self.t("Âm lượng Receiver", "Receiver Volume"))
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(CARD_INNER_W, CARD_INNER_H),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            draw_speaker_icon(ui, egui::vec2(25.0, 25.0));
+                            ui.add_space(6.0);
+
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new(self.t("Âm lượng Receiver", "Receiver Volume"))
+                                        .size(12.0)
+                                        .strong()
+                                        .color(UiTheme::text()),
+                                );
+
+                                let mut volume = parse_volume_text(&self.initial_volume_text)
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or(50);
+
+                                ui.horizontal(|ui| {
+                                    let response = ui
+                                        .scope(|ui| {
+                                            let visuals = &mut ui.style_mut().visuals;
+                                            visuals.selection.bg_fill = UiTheme::blue();
+                                            visuals.widgets.inactive.bg_fill = UiTheme::blue();
+                                            visuals.widgets.inactive.bg_stroke =
+                                                egui::Stroke::new(1.0, UiTheme::blue());
+                                            visuals.widgets.hovered.bg_fill = UiTheme::blue_hover();
+                                            visuals.widgets.hovered.bg_stroke =
+                                                egui::Stroke::new(1.0, UiTheme::blue_hover());
+                                            visuals.widgets.active.bg_fill = UiTheme::blue_pressed();
+                                            visuals.widgets.active.bg_stroke =
+                                                egui::Stroke::new(1.0, UiTheme::blue_pressed());
+
+                                            ui.add_sized(
+                                                [140.0, 18.0],
+                                                egui::Slider::new(&mut volume, 0..=100)
+                                                    .show_value(false),
+                                            )
+                                        })
+                                        .inner;
+
+                                    if response.changed() {
+                                        self.initial_volume_text = volume.to_string();
+                                        self.apply_volume_value(volume);
+                                    }
+
+                                    egui::Frame::new()
+                                        .fill(egui::Color32::from_rgb(242, 246, 251))
+                                        .corner_radius(egui::CornerRadius::same(6))
+                                        .inner_margin(egui::Margin::symmetric(7, 3))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!("{volume}%"))
+                                                    .size(11.0)
+                                                    .strong()
+                                                    .color(UiTheme::text_soft()),
+                                            );
+                                        });
+
+                                    if self.volume_rx.is_some() {
+                                        ui.spinner();
+                                    }
+                                });
+                            });
+                        },
+                    );
+                });
+
+            ui.add_space(CARD_GAP);
+
+            egui::Frame::new()
+                .fill(UiTheme::surface())
+                .stroke(egui::Stroke::new(1.0, UiTheme::border()))
+                .corner_radius(egui::CornerRadius::same(13))
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 2],
+                    blur: 9,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(14),
+                })
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(CARD_INNER_W, CARD_INNER_H),
+                        egui::Layout::left_to_right(egui::Align::Center)
+                            .with_main_align(egui::Align::Center),
+                        |ui| {
+                            let start_enabled = self.selected_fullname.is_some()
+                                && !self.multiroom_enabled
+                                && matches!(
+                                    self.playback,
+                                    PlaybackUiState::Idle | PlaybackUiState::Error(_)
+                                );
+
+                            if draw_action_button(
+                                ui,
+                                &format!("▶  {}", self.t("Bắt đầu", "Start")),
+                                egui::vec2(112.0, 36.0),
+                                start_enabled,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                self.start_selected();
+                            }
+
+                            ui.add_space(8.0);
+
+                            let stop_enabled = self.session.is_some();
+                            if draw_action_button(
+                                ui,
+                                &format!("■  {}", self.t("Dừng", "Stop")),
+                                egui::vec2(92.0, 36.0),
+                                stop_enabled,
+                                false,
+                            )
+                            .clicked()
+                            {
+                                self.stop_playback();
+                            }
+                        },
+                    );
+                });
+
+            ui.add_space(CARD_GAP);
+
+            egui::Frame::new()
+                .fill(UiTheme::surface())
+                .stroke(egui::Stroke::new(1.0, UiTheme::border()))
+                .corner_radius(egui::CornerRadius::same(13))
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 2],
+                    blur: 9,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(14),
+                })
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(CARD_INNER_W, CARD_INNER_H),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new(self.t(
+                                        "Kết nối qua AirPlay 2",
+                                        "Connect via AirPlay 2",
+                                    ))
                                     .size(12.0)
                                     .strong()
                                     .color(UiTheme::text()),
-                            );
+                                );
 
-                            let mut volume = parse_volume_text(&self.initial_volume_text)
-                                .ok()
-                                .flatten()
-                                .unwrap_or(50);
+                                let detail = if self.multiroom_enabled {
+                                    self.t(
+                                        "MultiRoom · giao diện đã sẵn sàng",
+                                        "MultiRoom · UI prepared",
+                                    )
+                                } else {
+                                    self.t("Sẵn sàng truyền · ALAC", "Ready to stream · ALAC")
+                                };
 
-                            ui.horizontal(|ui| {
-                                let response = ui
-                                    .scope(|ui| {
-                                        let visuals = &mut ui.style_mut().visuals;
-                                        visuals.selection.bg_fill = UiTheme::blue();
-                                        visuals.widgets.inactive.bg_fill = UiTheme::blue();
-                                        visuals.widgets.inactive.bg_stroke =
-                                            egui::Stroke::new(1.0, UiTheme::blue());
-                                        visuals.widgets.hovered.bg_fill = UiTheme::blue_hover();
-                                        visuals.widgets.hovered.bg_stroke =
-                                            egui::Stroke::new(1.0, UiTheme::blue_hover());
-                                        visuals.widgets.active.bg_fill = UiTheme::blue_pressed();
-                                        visuals.widgets.active.bg_stroke =
-                                            egui::Stroke::new(1.0, UiTheme::blue_pressed());
-
-                                        ui.add_sized(
-                                            [145.0, 18.0],
-                                            egui::Slider::new(&mut volume, 0..=100)
-                                                .show_value(false),
-                                        )
-                                    })
-                                    .inner;
-                                if response.changed() {
-                                    self.initial_volume_text = volume.to_string();
-                                    self.apply_volume_value(volume);
-                                }
-
-                                egui::Frame::new()
-                                    .fill(egui::Color32::from_rgb(242, 246, 251))
-                                    .corner_radius(egui::CornerRadius::same(6))
-                                    .inner_margin(egui::Margin::symmetric(7, 3))
-                                    .show(ui, |ui| {
-                                        ui.label(
-                                            egui::RichText::new(format!("{volume}%"))
-                                                .size(11.0)
-                                                .strong()
-                                                .color(UiTheme::text_soft()),
-                                        );
-                                    });
-
-                                if self.volume_rx.is_some() {
-                                    ui.spinner();
-                                }
+                                ui.label(
+                                    egui::RichText::new(detail)
+                                        .size(10.8)
+                                        .color(UiTheme::text_soft()),
+                                );
                             });
-                        });
-                    });
-                });
-
-            ui.add_space(7.0);
-
-            egui::Frame::new()
-                .fill(UiTheme::surface())
-                .stroke(egui::Stroke::new(1.0, UiTheme::border()))
-                .corner_radius(egui::CornerRadius::same(13))
-                .shadow(egui::epaint::Shadow {
-                    offset: [0, 2],
-                    blur: 9,
-                    spread: 0,
-                    color: egui::Color32::from_black_alpha(14),
-                })
-                .inner_margin(egui::Margin::symmetric(11, 8))
-                .show(ui, |ui| {
-                    ui.set_min_width(235.0);
-                    ui.horizontal(|ui| {
-                        let start_enabled = self.selected_fullname.is_some()
-                            && !self.multiroom_enabled
-                            && matches!(
-                                self.playback,
-                                PlaybackUiState::Idle | PlaybackUiState::Error(_)
-                            );
-                        if draw_action_button(
-                            ui,
-                            &format!("▶  {}", self.t("Bắt đầu", "Start")),
-                            egui::vec2(112.0, 36.0),
-                            start_enabled,
-                            true,
-                        )
-                        .clicked()
-                        {
-                            self.start_selected();
-                        }
-
-                        ui.add_space(6.0);
-
-                        let stop_enabled = self.session.is_some();
-                        if draw_action_button(
-                            ui,
-                            &format!("■  {}", self.t("Dừng", "Stop")),
-                            egui::vec2(92.0, 36.0),
-                            stop_enabled,
-                            false,
-                        )
-                        .clicked()
-                        {
-                            self.stop_playback();
-                        }
-                    });
-                });
-
-            ui.add_space(7.0);
-
-            egui::Frame::new()
-                .fill(UiTheme::surface())
-                .stroke(egui::Stroke::new(1.0, UiTheme::border()))
-                .corner_radius(egui::CornerRadius::same(13))
-                .shadow(egui::epaint::Shadow {
-                    offset: [0, 2],
-                    blur: 9,
-                    spread: 0,
-                    color: egui::Color32::from_black_alpha(14),
-                })
-                .inner_margin(egui::Margin::symmetric(13, 8))
-                .show(ui, |ui| {
-                    ui.set_min_width(260.0);
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new(self.t(
-                                "Kết nối qua AirPlay 2",
-                                "Connect via AirPlay 2",
-                            ))
-                            .size(12.0)
-                            .strong()
-                            .color(UiTheme::text()),
-                        );
-
-                        let detail = if self.multiroom_enabled {
-                            self.t(
-                                "MultiRoom · giao diện đã sẵn sàng",
-                                "MultiRoom · UI prepared",
-                            )
-                        } else {
-                            self.t("Sẵn sàng truyền · ALAC", "Ready to stream · ALAC")
-                        };
-                        ui.label(
-                            egui::RichText::new(detail)
-                                .size(10.8)
-                                .color(UiTheme::text_soft()),
-                        );
-                    });
+                        },
+                    );
                 });
         });
     }
