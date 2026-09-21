@@ -1,4 +1,4 @@
-use crate::{EncryptedRtspChannel, RtspRequest};
+use crate::{EncryptedRtspChannel, EncryptedRtspError, RtspRequest};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Mutex, TryLockError,
@@ -133,11 +133,25 @@ impl FeedbackWorker {
                             }
                         }
                         Err(error) => {
-                            misses = misses.saturating_add(1);
-                            if let Ok(mut slot) = error_thread.lock() {
-                                *slot = Some(format!(
-                                    "/feedback CSeq {cseq} failed: {error:?} (miss {misses}/{MAX_CONSECUTIVE_MISSES})"
-                                ));
+                            // Pinned source only tolerates timeout-shaped
+                            // /feedback failures. A hard peer/channel error
+                            // means the RTSP connection is already gone and is
+                            // terminal immediately.
+                            if matches!(error, EncryptedRtspError::Timeout) {
+                                misses = misses.saturating_add(1);
+                                if let Ok(mut slot) = error_thread.lock() {
+                                    *slot = Some(format!(
+                                        "/feedback CSeq {cseq} timed out (miss {misses}/{MAX_CONSECUTIVE_MISSES})"
+                                    ));
+                                }
+                            } else {
+                                if let Ok(mut slot) = error_thread.lock() {
+                                    *slot = Some(format!(
+                                        "/feedback CSeq {cseq} hard failure: {error:?} · peer/control channel closed"
+                                    ));
+                                }
+                                running_thread.store(false, Ordering::SeqCst);
+                                return;
                             }
                         }
                     }
@@ -209,6 +223,23 @@ mod tests {
                 return cipher.decrypt(&carry[..total]).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn only_timeout_is_a_tolerable_feedback_transport_error() {
+        assert!(matches!(
+            EncryptedRtspError::Timeout,
+            EncryptedRtspError::Timeout
+        ));
+        assert!(!matches!(
+            EncryptedRtspError::Closed,
+            EncryptedRtspError::Timeout
+        ));
+        let write = EncryptedRtspError::Write(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "closed",
+        ));
+        assert!(!matches!(write, EncryptedRtspError::Timeout));
     }
 
     #[test]
