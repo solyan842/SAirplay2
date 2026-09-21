@@ -14,6 +14,10 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub type SharedRtspControl = Arc<Mutex<EncryptedRtspChannel>>;
 pub type SharedCseq = Arc<AtomicU32>;
 
+fn feedback_transport_error_is_timeout(error: &EncryptedRtspError) -> bool {
+    matches!(error, EncryptedRtspError::Timeout)
+}
+
 pub struct FeedbackWorker {
     stop: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
@@ -137,7 +141,7 @@ impl FeedbackWorker {
                             // /feedback failures. A hard peer/channel error
                             // means the RTSP connection is already gone and is
                             // terminal immediately.
-                            if matches!(error, EncryptedRtspError::Timeout) {
+                            if feedback_transport_error_is_timeout(&error) {
                                 misses = misses.saturating_add(1);
                                 if let Ok(mut slot) = error_thread.lock() {
                                     *slot = Some(format!(
@@ -227,19 +231,13 @@ mod tests {
 
     #[test]
     fn only_timeout_is_a_tolerable_feedback_transport_error() {
-        assert!(matches!(
-            EncryptedRtspError::Timeout,
-            EncryptedRtspError::Timeout
-        ));
-        assert!(!matches!(
-            EncryptedRtspError::Closed,
-            EncryptedRtspError::Timeout
-        ));
+        assert!(feedback_transport_error_is_timeout(&EncryptedRtspError::Timeout));
+        assert!(!feedback_transport_error_is_timeout(&EncryptedRtspError::Closed));
         let write = EncryptedRtspError::Write(std::io::Error::new(
             std::io::ErrorKind::ConnectionAborted,
             "closed",
         ));
-        assert!(!matches!(write, EncryptedRtspError::Timeout));
+        assert!(!feedback_transport_error_is_timeout(&write));
     }
 
     #[test]
