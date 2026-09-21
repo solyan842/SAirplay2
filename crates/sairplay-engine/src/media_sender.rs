@@ -588,6 +588,8 @@ mod tests {
                 sequence_sent: 0x1234,
                 timestamp_sent: 100_000,
                 sync_sent: true,
+                audio_delivered: true,
+                first_marker: true,
             }
         );
 
