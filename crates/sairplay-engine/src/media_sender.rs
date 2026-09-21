@@ -161,6 +161,33 @@ impl RealtimeMediaSender {
         }
     }
 
+    /// Arm the first native realtime timeline only after one complete PCM
+    /// transport packet is buffered. This mirrors airplay-cli's cold START
+    /// contract: before the first START no silence/audio is sent; the first
+    /// real packet is released against one freshly frozen anchor line.
+    pub fn arm_cold_start(
+        &mut self,
+        start_ntp: u64,
+        latency_max: Option<u32>,
+        lead_frames: u32,
+        rtp_offset: u32,
+    ) -> Result<(), MediaSendError> {
+        let head_ts = ntp_to_frames(start_ntp, 44_100);
+        self.state.timestamp = (head_ts as u32).wrapping_add(rtp_offset);
+        self.state.first_packet = true;
+        self.ptp_anchor_wall0 = None;
+        self.ptp_anchor_pos0 = self.state.timestamp;
+        self.splice_pad_frames = 0;
+        self.configure_source_timeline(start_ntp, head_ts, latency_max, lead_frames);
+
+        // Source announces the frozen PTP line at START, immediately before
+        // the first audio release. NTP sends its first sync with first audio.
+        if matches!(&self.timing, RealtimeTiming::Ptp { .. }) {
+            let _ = self.prime_ptp_anchor(start_ntp, lead_frames)?;
+        }
+        Ok(())
+    }
+
     fn splice_pad_to_lead(
         &mut self,
         now_ts: u64,
