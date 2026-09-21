@@ -1214,31 +1214,12 @@ fn draw_action_button(
 
 fn draw_speaker_icon(ui: &mut egui::Ui, size: egui::Vec2) {
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    let p = ui.painter_at(rect);
-    let c = UiTheme::text_soft();
-    let mid = rect.center();
-    p.line_segment(
-        [egui::pos2(rect.left() + 5.0, mid.y - 5.0), egui::pos2(rect.left() + 5.0, mid.y + 5.0)],
-        egui::Stroke::new(2.0, c),
+    ui.put(
+        rect.shrink(3.0),
+        egui::Image::new(egui::include_image!("../assets/fluent_speaker_2_24_filled.svg"))
+            .fit_to_exact_size(rect.shrink(3.0).size())
+            .tint(UiTheme::text_soft()),
     );
-    p.line_segment(
-        [egui::pos2(rect.left() + 5.0, mid.y - 5.0), egui::pos2(rect.left() + 11.0, mid.y - 5.0)],
-        egui::Stroke::new(2.0, c),
-    );
-    p.line_segment(
-        [egui::pos2(rect.left() + 11.0, mid.y - 5.0), egui::pos2(rect.left() + 16.0, mid.y - 10.0)],
-        egui::Stroke::new(2.0, c),
-    );
-    p.line_segment(
-        [egui::pos2(rect.left() + 11.0, mid.y + 5.0), egui::pos2(rect.left() + 16.0, mid.y + 10.0)],
-        egui::Stroke::new(2.0, c),
-    );
-    p.line_segment(
-        [egui::pos2(rect.left() + 16.0, mid.y - 10.0), egui::pos2(rect.left() + 16.0, mid.y + 10.0)],
-        egui::Stroke::new(2.0, c),
-    );
-    p.circle_stroke(mid + egui::vec2(5.0, 0.0), 8.0, egui::Stroke::new(1.6, c));
-    p.circle_stroke(mid + egui::vec2(5.0, 0.0), 12.0, egui::Stroke::new(1.2, c));
 }
 
 fn is_homepod_stereo_pair(device: &DeviceRecord) -> bool {
@@ -1333,19 +1314,13 @@ fn draw_small_airplay_mark(ui: &mut egui::Ui) {
     };
     painter.circle_filled(rect.center(), 16.0, bg);
 
-    let c = UiTheme::blue();
-    let center = rect.center();
-    painter.circle_stroke(center + egui::vec2(0.0, -1.0), 9.0, egui::Stroke::new(1.8, c));
-    painter.circle_stroke(center + egui::vec2(0.0, -1.0), 5.5, egui::Stroke::new(1.6, c));
-    painter.rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(rect.left() + 6.0, center.y + 2.0),
-            egui::pos2(rect.right() - 6.0, rect.bottom() - 4.0),
-        ),
-        egui::CornerRadius::same(0),
-        bg,
+    let icon_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(19.0, 19.0));
+    ui.put(
+        icon_rect,
+        egui::Image::new(egui::include_image!("../assets/fluent_cast_24_filled.svg"))
+            .fit_to_exact_size(icon_rect.size())
+            .tint(UiTheme::blue()),
     );
-    painter.circle_filled(center + egui::vec2(0.0, 7.0), 2.7, c);
 }
 
 fn draw_status_badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
@@ -1377,174 +1352,84 @@ fn draw_device_art(
 ) {
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
-    let lift = if response.hovered() { -1.0 } else { 0.0 };
 
-    match artwork {
-        DeviceArtwork::AirportExpress => {
-            let shadow = egui::Rect::from_center_size(
-                rect.center() + egui::vec2(0.0, 7.0),
-                egui::vec2(46.0, 10.0),
-            );
-            painter.rect_filled(
-                shadow,
-                egui::CornerRadius::same(5),
-                egui::Color32::from_black_alpha(18),
-            );
+    let card = egui::Rect::from_center_size(
+        rect.center() + egui::vec2(0.0, if response.hovered() { -1.0 } else { 0.0 }),
+        egui::vec2(size.x.min(58.0), size.y.min(40.0)),
+    );
 
-            let body = egui::Rect::from_center_size(
-                rect.center() + egui::vec2(0.0, lift),
-                egui::vec2(44.0, 34.0),
-            );
-            painter.rect_filled(
-                body,
-                egui::CornerRadius::same(8),
-                egui::Color32::from_rgb(247, 248, 250),
-            );
-            painter.rect_stroke(
-                body,
-                egui::CornerRadius::same(8),
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(214, 219, 226)),
-                egui::StrokeKind::Inside,
-            );
-            painter.circle_stroke(
-                body.center(),
-                6.5,
-                egui::Stroke::new(1.3, egui::Color32::from_rgb(181, 187, 195)),
-            );
-            painter.circle_filled(
-                egui::pos2(body.right() - 7.0, body.bottom() - 6.0),
-                1.7,
-                egui::Color32::from_rgb(113, 186, 120),
-            );
-        }
-        DeviceArtwork::HomePodLight | DeviceArtwork::HomePodDark => {
-            let dark = artwork == DeviceArtwork::HomePodDark;
-            let body = if dark {
-                egui::Color32::from_rgb(49, 51, 56)
-            } else {
-                egui::Color32::from_rgb(224, 227, 231)
-            };
-            let top = if dark {
-                egui::Color32::from_rgb(92, 96, 106)
-            } else {
-                egui::Color32::from_rgb(248, 249, 251)
-            };
-            let mesh = if dark {
-                egui::Color32::from_rgb(75, 78, 84)
-            } else {
-                egui::Color32::from_rgb(200, 205, 212)
-            };
+    painter.rect_filled(
+        card.translate(egui::vec2(0.0, 2.0)),
+        egui::CornerRadius::same(10),
+        egui::Color32::from_black_alpha(if response.hovered() { 18 } else { 12 }),
+    );
+    painter.rect_filled(
+        card,
+        egui::CornerRadius::same(10),
+        if response.hovered() {
+            egui::Color32::from_rgb(247, 251, 255)
+        } else {
+            egui::Color32::from_rgb(250, 252, 255)
+        },
+    );
+    painter.rect_stroke(
+        card,
+        egui::CornerRadius::same(10),
+        egui::Stroke::new(
+            1.0,
+            if response.hovered() { UiTheme::border_hover() } else { UiTheme::border() },
+        ),
+        egui::StrokeKind::Inside,
+    );
 
-            let draw_one = |p: &egui::Painter, center: egui::Pos2, scale: f32| {
-                let r = egui::Rect::from_center_size(
-                    center + egui::vec2(0.0, lift),
-                    egui::vec2(27.0 * scale, 37.0 * scale),
-                );
-                p.rect_filled(r, egui::CornerRadius::same((10.0 * scale) as u8), body);
-                p.circle_filled(
-                    egui::pos2(r.center().x, r.top() + 5.0 * scale),
-                    5.0 * scale,
-                    top,
-                );
-                for n in 0..4 {
-                    let y = r.top() + 11.0 * scale + n as f32 * 5.0 * scale;
-                    p.line_segment(
-                        [
-                            egui::pos2(r.left() + 5.0 * scale, y),
-                            egui::pos2(r.right() - 5.0 * scale, y),
-                        ],
-                        egui::Stroke::new(0.6, mesh),
-                    );
-                }
-                p.rect_filled(
-                    egui::Rect::from_center_size(
-                        egui::pos2(r.center().x, r.bottom() + 2.5 * scale),
-                        egui::vec2(24.0 * scale, 4.0 * scale),
-                    ),
-                    egui::CornerRadius::same(2),
-                    egui::Color32::from_black_alpha(18),
-                );
-            };
+    let (source, tint) = match artwork {
+        DeviceArtwork::AirportExpress => (
+            egui::include_image!("../assets/fluent_router_24_filled.svg"),
+            egui::Color32::from_rgb(112, 124, 143),
+        ),
+        DeviceArtwork::HomePodLight => (
+            egui::include_image!("../assets/fluent_speaker_2_24_filled.svg"),
+            egui::Color32::from_rgb(131, 142, 160),
+        ),
+        DeviceArtwork::HomePodDark => (
+            egui::include_image!("../assets/fluent_speaker_2_24_filled.svg"),
+            egui::Color32::from_rgb(52, 58, 69),
+        ),
+        DeviceArtwork::MacBook => (
+            egui::include_image!("../assets/fluent_laptop_24_filled.svg"),
+            egui::Color32::from_rgb(88, 104, 128),
+        ),
+        DeviceArtwork::MusicServer => (
+            egui::include_image!("../assets/fluent_server_24_filled.svg"),
+            egui::Color32::from_rgb(93, 108, 128),
+        ),
+    };
 
-            if stereo_pair {
-                draw_one(&painter, rect.center() + egui::vec2(-15.0, 0.0), 0.9);
-                draw_one(&painter, rect.center() + egui::vec2(15.0, 0.0), 0.9);
-            } else {
-                draw_one(&painter, rect.center(), 1.0);
-            }
-        }
-        DeviceArtwork::MacBook => {
-            let screen = egui::Rect::from_center_size(
-                rect.center() + egui::vec2(0.0, -4.0 + lift),
-                egui::vec2(48.0, 31.0),
-            );
-            painter.rect_filled(
-                screen,
-                egui::CornerRadius::same(3),
-                egui::Color32::from_rgb(62, 68, 78),
-            );
-            painter.rect_filled(
-                screen.shrink(2.5),
-                egui::CornerRadius::same(2),
-                egui::Color32::from_rgb(36, 91, 169),
-            );
-            painter.circle_filled(
-                egui::pos2(screen.center().x, screen.top() + 2.0),
-                1.0,
-                egui::Color32::from_rgb(124, 132, 145),
-            );
-            let base_y = screen.bottom() + 4.0;
-            painter.line_segment(
-                [
-                    egui::pos2(screen.left() - 6.0, base_y),
-                    egui::pos2(screen.right() + 6.0, base_y),
-                ],
-                egui::Stroke::new(4.0, egui::Color32::from_rgb(150, 157, 166)),
-            );
-        }
-        DeviceArtwork::MusicServer => {
-            let body = egui::Rect::from_center_size(
-                rect.center() + egui::vec2(0.0, lift),
-                egui::vec2(55.0, 28.0),
-            );
-            painter.rect_filled(
-                body,
-                egui::CornerRadius::same(3),
-                egui::Color32::from_rgb(168, 174, 182),
-            );
-            painter.rect_stroke(
-                body,
-                egui::CornerRadius::same(3),
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(138, 145, 154)),
-                egui::StrokeKind::Inside,
-            );
-            let display = egui::Rect::from_center_size(
-                body.center(),
-                egui::vec2(18.0, 9.0),
-            );
-            painter.rect_filled(
-                display,
-                egui::CornerRadius::same(2),
-                egui::Color32::from_rgb(24, 38, 45),
-            );
-            painter.circle_filled(
-                egui::pos2(body.right() - 8.0, body.center().y),
-                3.0,
-                egui::Color32::from_rgb(71, 78, 86),
-            );
-            painter.circle_stroke(
-                egui::pos2(body.left() + 8.0, body.center().y),
-                3.3,
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(94, 101, 109)),
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(body.left() + 19.0, body.top() + 7.0),
-                    egui::pos2(body.left() + 19.0, body.bottom() - 7.0),
-                ],
-                egui::Stroke::new(0.8, egui::Color32::from_rgb(134, 141, 149)),
-            );
-        }
+    if stereo_pair && matches!(artwork, DeviceArtwork::HomePodLight | DeviceArtwork::HomePodDark) {
+        let icon_size = egui::vec2(22.0, 22.0);
+        let left = egui::Rect::from_center_size(card.center() + egui::vec2(-11.0, 0.0), icon_size);
+        let right = egui::Rect::from_center_size(card.center() + egui::vec2(11.0, 0.0), icon_size);
+
+        ui.put(
+            left,
+            egui::Image::new(source.clone())
+                .fit_to_exact_size(left.size())
+                .tint(tint),
+        );
+        ui.put(
+            right,
+            egui::Image::new(source)
+                .fit_to_exact_size(right.size())
+                .tint(tint),
+        );
+    } else {
+        let icon_rect = egui::Rect::from_center_size(card.center(), egui::vec2(29.0, 29.0));
+        ui.put(
+            icon_rect,
+            egui::Image::new(source)
+                .fit_to_exact_size(icon_rect.size())
+                .tint(tint),
+        );
     }
 }
 
@@ -1709,6 +1594,7 @@ fn main() -> eframe::Result<()> {
         "SAirplay2",
         options,
         Box::new(|cc| {
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             install_windows_ui_font(&cc.egui_ctx);
             Ok(Box::new(SairplayApp::default()))
         }),
