@@ -1384,20 +1384,20 @@ fn draw_device_art(
 
     let (source, tint) = match artwork {
         DeviceArtwork::AirportExpress => (
-            egui::include_image!("../assets/fluent_router_24_filled.svg"),
-            egui::Color32::from_rgb(112, 124, 143),
+            egui::include_image!("../assets/mingcute_router_modem_filled.svg"),
+            egui::Color32::from_rgb(104, 119, 140),
         ),
         DeviceArtwork::HomePodLight => (
-            egui::include_image!("../assets/fluent_speaker_2_24_filled.svg"),
-            egui::Color32::from_rgb(131, 142, 160),
+            egui::include_image!("../assets/mingcute_homepod_mini_filled.svg"),
+            egui::Color32::from_rgb(138, 149, 166),
         ),
         DeviceArtwork::HomePodDark => (
-            egui::include_image!("../assets/fluent_speaker_2_24_filled.svg"),
-            egui::Color32::from_rgb(52, 58, 69),
+            egui::include_image!("../assets/mingcute_homepod_mini_filled.svg"),
+            egui::Color32::from_rgb(49, 56, 67),
         ),
         DeviceArtwork::MacBook => (
-            egui::include_image!("../assets/fluent_laptop_24_filled.svg"),
-            egui::Color32::from_rgb(88, 104, 128),
+            egui::include_image!("../assets/mingcute_laptop_filled.svg"),
+            egui::Color32::from_rgb(84, 101, 126),
         ),
         DeviceArtwork::MusicServer => (
             egui::include_image!("../assets/fluent_server_24_filled.svg"),
