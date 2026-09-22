@@ -42,6 +42,8 @@ Replace-Once -Path $raop -Label "isolated startup FLUSH probe" -Old @'
 		uint16_t sairplay_start_seq = p->seq_number + 1;
 		uint32_t sairplay_start_ts = NTP2TS(raopcl_get_ntp(NULL), p->sample_rate);
 
+		LOG_INFO("[SAIRPLAY-DIAG] record_rtp seq=%u rtptime=%u",
+				 sairplay_start_seq, sairplay_start_ts);
 		if (!rtspcl_record(p->rtspcl, sairplay_start_seq, sairplay_start_ts, kd)) goto erexit;
 
 		if (getenv("SAIRPLAY_STARTUP_FLUSH") && *getenv("SAIRPLAY_STARTUP_FLUSH")) {
@@ -172,6 +174,28 @@ Replace-Once -Path $raop -Label "first UDP send outcome" -Old @'
 			p->sane.audio.avail++;
 		}
 	}
+'@
+
+Replace-Once -Path $raop -Label "first RTP header timeline" -Old @'
+	packet->timestamp = htonl(p->head_ts);
+	packet->ssrc = htonl(p->ssrc);
+
+	memcpy((uint8_t*) packet + sizeof(rtp_audio_pkt_t), encoded, size);
+'@ -New @'
+	packet->timestamp = htonl(p->head_ts);
+	packet->ssrc = htonl(p->ssrc);
+
+	{
+		static bool sairplay_diag_rtp_header_logged = false;
+		if (!sairplay_diag_rtp_header_logged) {
+			LOG_INFO("[SAIRPLAY-DIAG] first_rtp_header seq=%u rtptime=%u marker=%u payload=%d",
+					 p->seq_number, (uint32_t) p->head_ts,
+					 (unsigned) ((packet->hdr.type & 0x80) != 0), size);
+			sairplay_diag_rtp_header_logged = true;
+		}
+	}
+
+	memcpy((uint8_t*) packet + sizeof(rtp_audio_pkt_t), encoded, size);
 '@
 
 Write-Host "Applied SAirplay2 one-shot libraop runtime diagnostics."
