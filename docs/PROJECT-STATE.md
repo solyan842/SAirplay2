@@ -293,3 +293,66 @@ When a new stable milestone is confirmed by runtime testing, update this file wi
 - what is confirmed working,
 - remaining issue,
 - next single action.
+
+
+## 13. Command-line audit — 2026-09-22
+
+Compared directly against:
+
+- `philippe44/libraop@81c2182649da8645ac2a58b78e9f370c79a4165b` — `src/cliraop.c`
+- `music-assistant/airplay-cli@431c5c582eef9307c4e39c50a0ea65e970bc1128` — `src/cliairplay.c`
+- `music-assistant/server@9e311eb84aba0a940bdfbf7433d5a29c07bab1b6` — AirPlay `stream.py`
+
+Current SAirplay2 legacy helper invocation is structurally:
+
+```
+cliraop
+  -p <port>
+  -v <0..100>
+  -l 44100
+  -t <et>
+  -m <md>
+  -d 3
+  [-n <start_ntp>]
+  -a
+  [-u]
+  [-s <secret>]
+  <host>
+  -
+```
+
+Findings:
+
+1. **The current arguments are valid for the pinned old `cliraop`.**
+   - `-p/-v/-l/-t/-m/-d/-n/-a/-u/-s` all map directly to the pinned source.
+   - stdin `-` is the expected PCM input path.
+   - `-a` selects compressed ALAC in the pinned helper.
+
+2. **Encryption is not the current TV mismatch.**
+   - Music Assistant appends `--encrypt` by default for a RAOP target when its encryption config is enabled.
+   - However current `cliairplay` only selects `RAOP_RSA` when both `--encrypt` is present **and** the receiver `et` contains `1`.
+   - The test TV advertises `et=0,3,5`.
+   - Therefore current `cliairplay` would still use `RAOP_CLEAR` for this TV.
+   - SAirplay2 currently also uses clear RAOP because it does not pass old `cliraop -e`.
+   - Do **not** add `-e` as a speculative fix for this receiver.
+
+3. **The major behavioral difference is the newer source's AppleTV guard.**
+   - Current `cliairplay::run_raop()` refuses RAOP when:
+     - `am` contains `AppleTV`,
+     - `pk` is present,
+     - and no stored `secret` exists.
+   - SAirplay2 development head `13c3937...` copied this fail-closed rule before spawning old `cliraop`.
+   - The embedded TV under test advertises `AppleTV3,1` + `pk` but exposes no usable PIN UI.
+   - Therefore matching the newer generic guard is source-consistent, but it is **not proof that this particular embedded TV actually requires legacy AppleTV pairing**.
+   - This guard must not be used to justify forcing PIN pairing on this receiver.
+
+4. **Old `cliraop` itself does not consume `am/pk/pw/cn`.**
+   - It receives `et`, `md`, optional auth/secret/password/encryption and codec choice.
+   - The newer unified `cliairplay` accepts the richer discovery fields and owns route/auth/codec decisions.
+   - This is an architectural difference to evaluate separately; it does not justify changing the HomePod/native engine.
+
+Result of this audit:
+
+- No transport code was changed.
+- No encryption patch is warranted.
+- The next single investigation should be whether the unified `cliairplay` RAOP path can be built and run on Windows in isolation for this legacy-TV route, and whether its AppleTV guard must be adapted for embedded receivers before any migration is attempted.
