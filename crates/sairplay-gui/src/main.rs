@@ -259,6 +259,7 @@ struct SairplayApp {
     pairing_name: String,
     pairing_pin_sent: bool,
     pairing_retry_start: bool,
+    native_retry_available: bool,
     last_audio_discontinuities: u64,
     last_rtx: (u64, u64, u64),
     language: UiLanguage,
@@ -321,6 +322,7 @@ impl Default for SairplayApp {
             pairing_name: String::new(),
             pairing_pin_sent: false,
             pairing_retry_start: false,
+            native_retry_available: true,
             last_audio_discontinuities: 0,
             last_rtx: (0, 0, 0),
             language: UiLanguage::Vi,
@@ -351,12 +353,13 @@ impl SairplayApp {
                     };
                     if service.kind == ServiceKind::AirPlay {
                         self.log.push(format!(
-                            "mDNS {kind}: {} @ {}:{} · model={} · features=0x{:016X} · PTP={} · buffered={}",
+                            "mDNS {kind}: {} @ {}:{} · model={} · features=0x{:016X} · flags=0x{:X} · PTP={} · buffered={}",
                             service.display_name,
                             service.host,
                             service.port,
                             service.txt.model.as_deref().unwrap_or("-"),
                             service.txt.features,
+                            service.txt.flags,
                             service.txt.supports_ptp(),
                             service.txt.supports_buffered_audio(),
                         ));
@@ -693,26 +696,19 @@ impl SairplayApp {
     }
 
     fn legacy_pairing_required(&self, device: &DeviceRecord) -> bool {
-        let props = device.raop.as_ref().or(device.airplay.as_ref());
-        let Some(props) = props else {
+        let Some(service) = device.airplay.as_ref().or(device.raop.as_ref()) else {
             return false;
         };
-        let am = props
-            .txt
-            .fields
-            .get("am")
-            .or(props.txt.fields.get("model"))
-            .map(String::as_str)
-            .unwrap_or("");
-        let pk = props
-            .txt
-            .fields
-            .get("pk")
-            .map(String::as_str)
-            .unwrap_or("");
-        if !am.to_ascii_lowercase().contains("appletv") || pk.trim().is_empty() {
+
+        // Follow the source route semantics: full legacy PIN pairing is only
+        // demanded when the receiver's status flags explicitly advertise
+        // PIN-required (0x8) or legacy-pairing (0x200). A pk field by itself
+        // is not sufficient evidence; many TV/projector AirPlay clones expose
+        // AppleTV-like model/pk TXT records without any on-screen pairing UI.
+        if !(service.txt.pin_required() || service.txt.legacy_pairing()) {
             return false;
         }
+
         let Some(key) = Self::legacy_pairing_key(device) else {
             return true;
         };
@@ -939,7 +935,7 @@ impl SairplayApp {
                 ));
                 self.playback = PlaybackUiState::Idle;
                 if std::mem::take(&mut self.pairing_retry_start) {
-                    self.start_selected();
+                    self.start_selected_inner();
                 }
             }
             LegacyPairingResult::Failed { device_name, error } => {
@@ -1087,8 +1083,28 @@ impl SairplayApp {
                         self.last_feedback_error = Some(error.clone());
                     }
                     if !feedback_running {
-                        self.playback = PlaybackUiState::Error(error);
+                        let is_hard_close = error.contains("hard failure")
+                            && error.contains("peer/control channel closed");
+                        let native_session = matches!(
+                            self.session,
+                            Some(ActiveSession::Single(_)) | Some(ActiveSession::Group(_))
+                        );
+
                         self.session = None;
+                        self.active_fullnames.clear();
+
+                        if is_hard_close && native_session && self.native_retry_available {
+                            self.native_retry_available = false;
+                            self.log.push(
+                                "Native control channel closed during initial keepalive; rebuilding the same session once automatically."
+                                    .into(),
+                            );
+                            self.playback = PlaybackUiState::Idle;
+                            std::thread::sleep(std::time::Duration::from_millis(250));
+                            self.start_selected_inner();
+                        } else {
+                            self.playback = PlaybackUiState::Error(error);
+                        }
                     }
                 }
                 None => {
@@ -1105,6 +1121,11 @@ impl SairplayApp {
     }
 
     fn start_selected(&mut self) {
+        self.native_retry_available = true;
+        self.start_selected_inner();
+    }
+
+    fn start_selected_inner(&mut self) {
         if !matches!(self.playback, PlaybackUiState::Idle | PlaybackUiState::Error(_)) {
             return;
         }
@@ -1337,6 +1358,7 @@ impl SairplayApp {
         self.playback = PlaybackUiState::Idle;
         self.last_audio_discontinuities = 0;
         self.last_rtx = (0, 0, 0);
+        self.native_retry_available = true;
     }
 
     fn header_status(&self) -> (&'static str, &'static str, egui::Color32) {
@@ -3349,12 +3371,15 @@ fn legacy_config_for_device(
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned);
 
-    if config.am.to_ascii_lowercase().contains("appletv")
-        && !config.pk.trim().is_empty()
-        && config.secret.is_none()
-    {
+    let pairing_required = device
+        .airplay
+        .as_ref()
+        .or(device.raop.as_ref())
+        .is_some_and(|service| service.txt.pin_required() || service.txt.legacy_pairing());
+
+    if pairing_required && config.secret.is_none() {
         return Err(format!(
-            "{} requires AppleTV/TV AirPlay pairing credentials before RAOP playback (pk advertised).",
+            "{} requires legacy AirPlay PIN pairing (status flags advertise PIN/legacy pairing).",
             device.display_name
         ));
     }
