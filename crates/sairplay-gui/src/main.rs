@@ -7,8 +7,11 @@ use sairplay_engine::{
     NativeSession, NativeSessionConfig, RetransmitStats, Route, ServiceKind, VolumeSetResult,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::io::{BufRead, BufReader, Write};
 use std::net::IpAddr;
-use std::sync::mpsc::{self, Receiver};
+use std::os::windows::process::CommandExt;
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +131,18 @@ struct MembershipAdded {
     members: Vec<(String, NativeSession)>,
 }
 
+enum LegacyPairingResult {
+    Success {
+        device_key: String,
+        device_name: String,
+        secret: String,
+    },
+    Failed {
+        device_name: String,
+        error: String,
+    },
+}
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiLanguage {
@@ -226,6 +241,14 @@ struct SairplayApp {
     initial_volume_text: String,
     volume_rx: Option<Receiver<Result<Vec<VolumeSetResult>, String>>>,
     pending_volume: Option<u8>,
+    legacy_secrets: BTreeMap<String, String>,
+    pairing_rx: Option<Receiver<LegacyPairingResult>>,
+    pairing_pin_tx: Option<SyncSender<String>>,
+    pairing_open: bool,
+    pairing_pin: String,
+    pairing_name: String,
+    pairing_pin_sent: bool,
+    pairing_retry_start: bool,
     last_audio_discontinuities: u64,
     last_rtx: (u64, u64, u64),
     language: UiLanguage,
@@ -278,6 +301,14 @@ impl Default for SairplayApp {
             initial_volume_text: "50".into(),
             volume_rx: None,
             pending_volume: None,
+            legacy_secrets: BTreeMap::new(),
+            pairing_rx: None,
+            pairing_pin_tx: None,
+            pairing_open: false,
+            pairing_pin: String::new(),
+            pairing_name: String::new(),
+            pairing_pin_sent: false,
+            pairing_retry_start: false,
             last_audio_discontinuities: 0,
             last_rtx: (0, 0, 0),
             language: UiLanguage::Vi,
@@ -630,6 +661,353 @@ impl SairplayApp {
             .expect("failed to spawn volume worker");
     }
 
+    fn legacy_pairing_key(device: &DeviceRecord) -> Option<String> {
+        device
+            .raop
+            .as_ref()
+            .or(device.airplay.as_ref())
+            .map(|service| service.fullname.clone())
+    }
+
+    fn legacy_pairing_required(&self, device: &DeviceRecord) -> bool {
+        let props = device.raop.as_ref().or(device.airplay.as_ref());
+        let Some(props) = props else {
+            return false;
+        };
+        let am = props
+            .txt
+            .fields
+            .get("am")
+            .or(props.txt.fields.get("model"))
+            .map(String::as_str)
+            .unwrap_or("");
+        let pk = props
+            .txt
+            .fields
+            .get("pk")
+            .map(String::as_str)
+            .unwrap_or("");
+        if !am.to_ascii_lowercase().contains("appletv") || pk.trim().is_empty() {
+            return false;
+        }
+        let Some(key) = Self::legacy_pairing_key(device) else {
+            return true;
+        };
+        !self.legacy_secrets.contains_key(&key)
+    }
+
+    fn begin_legacy_pairing(&mut self, device: &DeviceRecord) {
+        let Some(service) = device.raop.as_ref().or(device.airplay.as_ref()) else {
+            return;
+        };
+        let Some(device_key) = Self::legacy_pairing_key(device) else {
+            return;
+        };
+
+        let host = preferred_service_address(service);
+        let port = service.port;
+        let et = service
+            .txt
+            .fields
+            .get("et")
+            .cloned()
+            .unwrap_or_else(|| "0,4".into());
+        let md = service
+            .txt
+            .fields
+            .get("md")
+            .cloned()
+            .unwrap_or_else(|| "0,1,2".into());
+        let name = device.display_name.clone();
+
+        let helper = match std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("cliraop.exe")))
+        {
+            Some(path) if path.is_file() => path,
+            _ => {
+                let error = "cliraop.exe is missing next to SAirplay2.".to_owned();
+                self.log.push(error.clone());
+                self.playback = PlaybackUiState::Error(error);
+                return;
+            }
+        };
+
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let (pin_tx, pin_rx) = mpsc::sync_channel::<String>(1);
+        self.pairing_rx = Some(result_rx);
+        self.pairing_pin_tx = Some(pin_tx);
+        self.pairing_open = true;
+        self.pairing_pin.clear();
+        self.pairing_name = name.clone();
+        self.pairing_pin_sent = false;
+        self.pairing_retry_start = true;
+        self.playback = PlaybackUiState::Idle;
+        self.log.push(format!(
+            "{name}: starting source AppleTV PIN pairing on {host}:{port}."
+        ));
+
+        thread::Builder::new()
+            .name("sairplay-appletv-pairing".into())
+            .spawn(move || {
+                let mut command = Command::new(&helper);
+                command
+                    .arg("-r")
+                    .arg("-p")
+                    .arg(port.to_string())
+                    .arg("-a")
+                    .arg("-t")
+                    .arg(&et)
+                    .arg("-m")
+                    .arg(&md)
+                    // cliraop pairing mode still parses the normal positional
+                    // player/file arguments after pairing. Use the selected
+                    // receiver and NUL so it exits cleanly after validating.
+                    .arg(&host)
+                    .arg("NUL")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .creation_flags(0x08000000);
+
+                let mut child = match command.spawn() {
+                    Ok(child) => child,
+                    Err(error) => {
+                        let _ = result_tx.send(LegacyPairingResult::Failed {
+                            device_name: name,
+                            error: format!("cannot start source pairing helper: {error}"),
+                        });
+                        return;
+                    }
+                };
+
+                let Some(mut stdin) = child.stdin.take() else {
+                    let _ = child.kill();
+                    let _ = result_tx.send(LegacyPairingResult::Failed {
+                        device_name: name,
+                        error: "pairing helper stdin was not created".into(),
+                    });
+                    return;
+                };
+                let stdout = child.stdout.take();
+                let stderr = child.stderr.take();
+
+                // AppleTVpairing() performs a 5 s mDNS scan and then scanf()s
+                // the selected IP. Feeding it now is safe; the pipe buffers it.
+                if writeln!(stdin, "{host}").is_err() || stdin.flush().is_err() {
+                    let _ = child.kill();
+                    let _ = result_tx.send(LegacyPairingResult::Failed {
+                        device_name: name,
+                        error: "cannot send receiver address to pairing helper".into(),
+                    });
+                    return;
+                }
+
+                let pin = match pin_rx.recv() {
+                    Ok(pin) => pin,
+                    Err(_) => {
+                        let _ = child.kill();
+                        return;
+                    }
+                };
+                if writeln!(stdin, "{pin}").is_err() || stdin.flush().is_err() {
+                    let _ = child.kill();
+                    let _ = result_tx.send(LegacyPairingResult::Failed {
+                        device_name: name,
+                        error: "cannot send PIN to pairing helper".into(),
+                    });
+                    return;
+                }
+                drop(stdin);
+
+                let stderr_thread = stderr.map(|stderr| {
+                    thread::spawn(move || {
+                        BufReader::new(stderr)
+                            .lines()
+                            .map_while(Result::ok)
+                            .collect::<Vec<_>>()
+                    })
+                });
+
+                let output = stdout
+                    .map(|stdout| {
+                        BufReader::new(stdout)
+                            .lines()
+                            .map_while(Result::ok)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                let status = child.wait();
+                let stderr_lines = stderr_thread
+                    .and_then(|join| join.join().ok())
+                    .unwrap_or_default();
+
+                let secret = output.iter().find_map(|line| {
+                    line.trim()
+                        .strip_prefix("secret is ")
+                        .map(|value| value.trim().to_owned())
+                });
+
+                match secret {
+                    Some(secret) if !secret.is_empty() => {
+                        let _ = result_tx.send(LegacyPairingResult::Success {
+                            device_key,
+                            device_name: name,
+                            secret,
+                        });
+                    }
+                    _ => {
+                        let detail = stderr_lines
+                            .iter()
+                            .rev()
+                            .find(|line| !line.trim().is_empty())
+                            .cloned()
+                            .or_else(|| {
+                                output
+                                    .iter()
+                                    .rev()
+                                    .find(|line| !line.trim().is_empty())
+                                    .cloned()
+                            })
+                            .unwrap_or_else(|| format!("pairing helper exited with {status:?}"));
+                        let _ = result_tx.send(LegacyPairingResult::Failed {
+                            device_name: name,
+                            error: detail,
+                        });
+                    }
+                }
+            })
+            .expect("failed to spawn AppleTV pairing worker");
+    }
+
+    fn pump_legacy_pairing(&mut self) {
+        let Some(rx) = &self.pairing_rx else {
+            return;
+        };
+
+        let result = match rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(LegacyPairingResult::Failed {
+                device_name: self.pairing_name.clone(),
+                error: "pairing worker ended unexpectedly".into(),
+            }),
+        };
+
+        let Some(result) = result else {
+            return;
+        };
+
+        self.pairing_rx = None;
+        self.pairing_pin_tx = None;
+        self.pairing_open = false;
+        self.pairing_pin_sent = false;
+
+        match result {
+            LegacyPairingResult::Success {
+                device_key,
+                device_name,
+                secret,
+            } => {
+                self.legacy_secrets.insert(device_key, secret);
+                self.log.push(format!(
+                    "{device_name}: AppleTV PIN pairing success; session credential is ready."
+                ));
+                self.playback = PlaybackUiState::Idle;
+                if std::mem::take(&mut self.pairing_retry_start) {
+                    self.start_selected();
+                }
+            }
+            LegacyPairingResult::Failed { device_name, error } => {
+                self.pairing_retry_start = false;
+                let message = format!("{device_name}: AppleTV pairing failed: {error}");
+                self.log.push(message.clone());
+                self.playback = PlaybackUiState::Error(message);
+            }
+        }
+    }
+
+    fn render_pairing_window(&mut self, ctx: &egui::Context) {
+        if !self.pairing_open {
+            return;
+        }
+
+        let title = self.t("Ghép nối AirPlay", "AirPlay Pairing");
+        let instruction = self.t(
+            "Chờ mã PIN 4 số xuất hiện trên TV, sau đó nhập mã vào đây.",
+            "Wait for the 4-digit PIN to appear on the TV, then enter it here.",
+        );
+        let waiting = self.t(
+            "Đang chờ hoàn tất ghép nối...",
+            "Waiting for pairing to complete...",
+        );
+
+        let mut open = self.pairing_open;
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(390.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(&self.pairing_name)
+                        .size(15.0)
+                        .strong(),
+                );
+                ui.add_space(5.0);
+                ui.label(egui::RichText::new(instruction).size(12.5));
+                ui.add_space(10.0);
+
+                let edit = ui.add_enabled(
+                    !self.pairing_pin_sent,
+                    egui::TextEdit::singleline(&mut self.pairing_pin)
+                        .hint_text("1234")
+                        .desired_width(110.0),
+                );
+                if edit.changed() {
+                    self.pairing_pin.retain(|c| c.is_ascii_digit());
+                    self.pairing_pin.truncate(4);
+                }
+
+                ui.add_space(8.0);
+                if self.pairing_pin_sent {
+                    ui.label(
+                        egui::RichText::new(waiting)
+                            .size(12.0)
+                            .color(UiTheme::text_soft()),
+                    );
+                } else if ui
+                    .add_enabled(
+                        self.pairing_pin.len() == 4,
+                        egui::Button::new(self.t("Ghép nối", "Pair"))
+                            .min_size(egui::vec2(100.0, 32.0)),
+                    )
+                    .clicked()
+                {
+                    if let Some(tx) = &self.pairing_pin_tx {
+                        if tx.send(self.pairing_pin.clone()).is_ok() {
+                            self.pairing_pin_sent = true;
+                            self.log.push(format!(
+                                "{}: PIN submitted to source pairing helper.",
+                                self.pairing_name
+                            ));
+                        }
+                    }
+                }
+            });
+
+        if !open && !self.pairing_pin_sent {
+            self.pairing_open = false;
+            self.pairing_pin_tx = None;
+            self.pairing_rx = None;
+            self.pairing_retry_start = false;
+            self.log.push(format!("{}: pairing cancelled.", self.pairing_name));
+        } else {
+            self.pairing_open = open;
+        }
+    }
+
     fn monitor_running_session(&mut self) {
         let Some(session) = self.session.as_ref() else {
             return;
@@ -761,6 +1139,16 @@ impl SairplayApp {
             return;
         }
 
+        if all_legacy {
+            if let Some((_, device)) = selected_devices
+                .iter()
+                .find(|(_, device)| self.legacy_pairing_required(device))
+            {
+                self.begin_legacy_pairing(device);
+                return;
+            }
+        }
+
         let active_fullnames: BTreeSet<String> =
             selected_devices.iter().map(|(fullname, _)| fullname.clone()).collect();
         let member_count = selected_devices.len();
@@ -858,7 +1246,12 @@ impl SairplayApp {
         } else {
             let mut configs = Vec::<LegacyMemberConfig>::with_capacity(member_count);
             for (_, device) in &selected_devices {
-                match legacy_config_for_device(device, initial_volume) {
+                let pairing_key = Self::legacy_pairing_key(device);
+                let secret = pairing_key
+                    .as_ref()
+                    .and_then(|key| self.legacy_secrets.get(key))
+                    .map(String::as_str);
+                match legacy_config_for_device(device, initial_volume, secret) {
                     Ok(config) => {
                         self.log.push(format!(
                             "{}: source libraop route {:?} on {}:{} · et={} · md={} · am={} · pk={}.",
@@ -1683,6 +2076,7 @@ impl eframe::App for SairplayApp {
         self.pump_connect_result();
         self.pump_membership_result();
         self.pump_volume_result();
+        self.pump_legacy_pairing();
         self.monitor_running_session();
 
         let mut visuals = egui::Visuals::light();
@@ -1879,6 +2273,7 @@ impl eframe::App for SairplayApp {
                 self.render_trial_row(ui);
             });
 
+        self.render_pairing_window(ctx);
         self.render_activation_window(ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
@@ -2804,6 +3199,7 @@ fn draw_device_art(
 fn legacy_config_for_device(
     device: &DeviceRecord,
     initial_volume: Option<u8>,
+    secret: Option<&str>,
 ) -> Result<LegacyMemberConfig, String> {
     let route = device.route(false, false);
     if !matches!(route, Route::Raop | Route::AirPlay2Compat) {
@@ -2851,12 +3247,13 @@ fn legacy_config_for_device(
         .cloned()
         .unwrap_or_default();
 
-    // Primary-source behavior: an AppleTV-class RAOP receiver that publishes
-    // a public key needs the stored AppleTV pairing secret. SAirplay2 does not
-    // yet have that secret in the legacy credential store, so report the real
-    // requirement instead of entering a doomed RAOP connect attempt.
+    config.secret = secret
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
+
     if config.am.to_ascii_lowercase().contains("appletv")
         && !config.pk.trim().is_empty()
+        && config.secret.is_none()
     {
         return Err(format!(
             "{} requires AppleTV/TV AirPlay pairing credentials before RAOP playback (pk advertised).",
