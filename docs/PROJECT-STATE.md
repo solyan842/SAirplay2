@@ -395,3 +395,52 @@ Next single investigation:
 - Trace the pinned old `cliraop/libraop` path from stdin consumption through `raopcl_accept_frames()` to `raopcl_send_chunk()`, and compare the exact state/timing conditions with the TV session that connects successfully but remains silent.
 - Prefer instrumentation or source-proven checks that are isolated to the legacy-TV path.
 - Do not alter HomePod/native, MultiRoom, Stereo Pair, or the stable branch.
+
+
+## 15. Legacy PCM-to-RTP source trace — 2026-09-22
+
+Compared directly against pinned `philippe44/libraop@81c2182649da8645ac2a58b78e9f370c79a4165b`.
+
+Trace:
+
+1. `cliraop` calls `raopcl_connect()`.
+2. A successful connect opens local timing/control/audio UDP sockets, parses SETUP `Transport`, and requires non-zero receiver `server_port` (audio) plus `control_port`.
+3. After RECORD, the client state becomes `RAOP_FLUSHED`.
+4. Main loop calls `raopcl_accept_frames()`.
+5. On the first accepted frame while state is `RAOP_FLUSHED`, `raopcl_accept_frames()`:
+   - marks first packet,
+   - moves state to `RAOP_STREAMING`,
+   - sends initial sync,
+   - then permits PCM consumption according to head timestamp pacing.
+6. `cliraop` then reads PCM from stdin and calls `raopcl_send_chunk()`.
+7. `raopcl_send_chunk()` encodes according to selected codec, builds RTP, advances sequence/timestamp, and calls `_raopcl_send_audio()`.
+8. `_raopcl_send_audio()` sends UDP only when:
+   - audio socket fd is valid,
+   - state is `RAOP_STREAMING`.
+   It targets the receiver's SETUP-returned `server_port` using `sendto()`.
+
+Important findings:
+
+- Successful `raopcl_connect()` means the TV returned non-zero RTP audio/control ports; otherwise connect would fail with `missing a RTP port in response`.
+- State transition is unlikely to be the silent-audio root cause by itself: both `raopcl_accept_frames()` and the late path in `raopcl_send_chunk()` can transition `RAOP_FLUSHED -> RAOP_STREAMING`.
+- SAirplay2 already handles `cn` source-consistently:
+  - if `cn` contains `1`, `compressed_alac=true` and old helper receives `-a`;
+  - if `cn` is present without `1`, it does not force compressed ALAC;
+  - if `cn` is absent, compressed ALAC remains the default, matching current unified `cliairplay` default behavior.
+- Therefore there is no source-backed reason yet to change codec, encryption, timing, or pairing again.
+
+The remaining evidence gap is runtime inside the old Windows helper. We currently do not know, for the failing TV session:
+
+- whether the first PCM read from stdin occurs,
+- whether `raopcl_accept_frames()` returns true,
+- whether the first `raopcl_send_chunk()` is executed,
+- what receiver audio `server_port` was parsed from SETUP,
+- whether the first UDP `sendto()` succeeds or fails.
+
+Next single action:
+
+- Add **temporary, minimal diagnostic instrumentation only to the legacy `cliraop` helper** for those five facts.
+- Do not change pacing, codec, encryption, pairing, queueing, or GUI behavior.
+- Keep diagnostics one-shot / first-event focused to avoid log spam.
+- Build through GitHub Actions first, then run one TV test.
+- Remove the diagnostics once the failing stage is identified.
