@@ -45,38 +45,34 @@ Replace-Once -Path $raop -Label "RECORD RTP timeline diagnostic" -Old @'
 	}
 '@
 
-Replace-Once -Path $raop -Label "pyatv-compatible PCM L16 fmtp" -Old @'
-		case RAOP_PCM: {
-			char buf[256];
+Replace-Once -Path $raop -Label "match RTP SSRC to SDP session id probe" -Old @'
+	RAND_bytes((uint8_t*) &p->ssrc, sizeof(p->ssrc));
+	VALGRIND_MAKE_MEM_DEFINED(&p->ssrc, sizeof(p->ssrc));
 
-			sprintf(buf,
-					"m=audio 0 RTP/AVP 96\r\n"
-					"a=rtpmap:96 L%d/%d/%d\r\n",
-					p->sample_size, p->sample_rate, p->channels);
-			strcat(sdp, buf);
-			break;
-		}
+	p->encrypt = (p->crypto != RAOP_CLEAR);
 '@ -New @'
-		case RAOP_PCM: {
-			char buf[256];
+	RAND_bytes((uint8_t*) &p->ssrc, sizeof(p->ssrc));
+	VALGRIND_MAKE_MEM_DEFINED(&p->ssrc, sizeof(p->ssrc));
 
-			if (getenv("SAIRPLAY_PCM_L16_FMTP") && *getenv("SAIRPLAY_PCM_L16_FMTP")) {
-				sprintf(buf,
-						"m=audio 0 RTP/AVP 96\r\n"
-						"a=rtpmap:96 L%d/%d/%d\r\n"
-						"a=fmtp:96 %d 0 %d 40 10 14 %d 255 0 0 %d\r\n",
-						p->sample_size, p->sample_rate, p->channels,
-						p->chunk_len, p->sample_size, p->channels, p->sample_rate);
-				LOG_INFO("[SAIRPLAY-DIAG] pcm_l16_sdp=pyatv-compatible");
-			} else {
-				sprintf(buf,
-						"m=audio 0 RTP/AVP 96\r\n"
-						"a=rtpmap:96 L%d/%d/%d\r\n",
-						p->sample_size, p->sample_rate, p->channels);
-			}
-			strcat(sdp, buf);
-			break;
-		}
+	p->encrypt = (p->crypto != RAOP_CLEAR);
+'@
+
+Replace-Once -Path $raop -Label "apply session id as RTP SSRC" -Old @'
+	sprintf(sid, "%010lu", (long unsigned int) seed.sid);
+	sprintf(sci, "%016llx", (long long int) seed.sci);
+
+	// RTSP misc setup
+'@ -New @'
+	sprintf(sid, "%010lu", (long unsigned int) seed.sid);
+	sprintf(sci, "%016llx", (long long int) seed.sci);
+
+	if (getenv("SAIRPLAY_MATCH_SSRC_SESSION") && *getenv("SAIRPLAY_MATCH_SSRC_SESSION")) {
+		p->ssrc = seed.sid;
+		LOG_INFO("[SAIRPLAY-DIAG] ssrc_matches_session session_id=%u ssrc=%u",
+				 seed.sid, (uint32_t) p->ssrc);
+	}
+
+	// RTSP misc setup
 '@
 
 Replace-Once -Path $cliraop -Label "cliraop first accepted/read PCM" -Old @'

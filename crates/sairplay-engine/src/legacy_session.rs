@@ -41,7 +41,7 @@ pub struct LegacyMemberConfig {
     pub secret: Option<String>,
     pub compressed_alac: bool,
     pub mfi_auth: bool,
-    pub pcm_l16_probe: bool,
+    pub match_ssrc_session_probe: bool,
 }
 
 impl LegacyMemberConfig {
@@ -59,7 +59,7 @@ impl LegacyMemberConfig {
             secret: None,
             compressed_alac: true,
             mfi_auth: false,
-            pcm_l16_probe: false,
+            match_ssrc_session_probe: false,
         }
     }
 }
@@ -476,10 +476,10 @@ fn spawn_member(
     }
 
     let mut command = Command::new(helper);
-    if config.pcm_l16_probe {
-        command.env("SAIRPLAY_PCM_L16_FMTP", "1");
+    if config.match_ssrc_session_probe {
+        command.env("SAIRPLAY_MATCH_SSRC_SESSION", "1");
         if let Ok(mut events) = startup_events.lock() {
-            events.push(format!("{}: [SAIRPLAY-DIAG] codec=pcm-l16 pyatv-fmtp=enabled", config.name));
+            events.push(format!("{}: [SAIRPLAY-DIAG] match_ssrc_session=enabled", config.name));
         }
     }
     command

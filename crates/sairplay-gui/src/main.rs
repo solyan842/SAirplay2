@@ -3324,16 +3324,13 @@ fn legacy_config_for_device(
             .any(|value| value.trim() == "1");
     }
 
-    // pyatv's AirPlay-v1 sender uses L16/44100/2 PCM and includes the
-    // Apple-style fmtp line even for L16. Reproduce that exact wire contract
-    // only for this embedded AppleTV-class receiver.
-    config.pcm_l16_probe = config.am.to_ascii_lowercase().contains("appletv")
+    // pyatv uses the same 32-bit session_id for SDP identity and RTP SSRC.
+    // Probe that exact relationship only on this embedded AppleTV-class
+    // receiver; keep the normal cn-driven compressed-ALAC codec unchanged.
+    config.match_ssrc_session_probe = config.am.to_ascii_lowercase().contains("appletv")
         && !config.pk.trim().is_empty()
         && config.secret.is_none()
         && !pairing_required;
-    if config.pcm_l16_probe {
-        config.compressed_alac = false;
-    }
 
     Ok(config)
 }
