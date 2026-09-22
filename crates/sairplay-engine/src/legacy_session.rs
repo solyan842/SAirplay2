@@ -119,6 +119,8 @@ impl LegacyGroupSession {
             return Err(LegacyGroupError::EmptyGroup);
         }
 
+        let member_count = configs.len();
+        let scheduled_group_start = member_count > 1;
         let helper = helper_path()?;
         let now_ntp = system_time_to_ntp(SystemTime::now())
             .map_err(|error| LegacyGroupError::Time(format!(
@@ -139,7 +141,7 @@ impl LegacyGroupSession {
             spawned.push(spawn_member(
                 &helper,
                 config,
-                start_ntp,
+                scheduled_group_start.then_some(start_ntp),
                 Arc::clone(&running),
                 Arc::clone(&last_error),
                 Arc::clone(&startup_events),
@@ -200,34 +202,42 @@ impl LegacyGroupSession {
             .map(|member| member.writer)
             .collect::<Vec<_>>();
 
-        // cliraop -n receives the desired audible NTP instant and internally
-        // subtracts libraop's measured latency. Feed PCM when that internal
-        // send window opens, not a fixed delay after connection.
-        let total_latency_frames =
-            RAOP_CONFIGURED_LATENCY_FRAMES + RAOP_FIXED_LATENCY_FRAMES;
-        let feed_ntp = start_ntp.saturating_sub(frames_to_ntp(total_latency_frames));
+        // Source behavior for a single RAOP receiver is immediate playback:
+        // cliraop enters PLAYING after connect and raopcl_accept_frames() owns
+        // all pacing. Do not impose our shared NTP anchor on that path.
+        //
+        // Only a real legacy group needs -n and a common audible anchor.
+        let feed_ntp = if scheduled_group_start {
+            let total_latency_frames =
+                RAOP_CONFIGURED_LATENCY_FRAMES + RAOP_FIXED_LATENCY_FRAMES;
+            Some(start_ntp.saturating_sub(frames_to_ntp(total_latency_frames)))
+        } else {
+            None
+        };
 
         let worker = thread::Builder::new()
             .name("sairplay-legacy-audio".into())
             .spawn(move || {
-                while running_thread.load(Ordering::SeqCst) {
-                    let now_ntp = match system_time_to_ntp(SystemTime::now()) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            if let Ok(mut slot) = error_thread.lock() {
-                                *slot = Some(format!(
-                                    "legacy feed clock conversion failed: {error:?}"
-                                ));
+                if let Some(feed_ntp) = feed_ntp {
+                    while running_thread.load(Ordering::SeqCst) {
+                        let now_ntp = match system_time_to_ntp(SystemTime::now()) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                if let Ok(mut slot) = error_thread.lock() {
+                                    *slot = Some(format!(
+                                        "legacy feed clock conversion failed: {error:?}"
+                                    ));
+                                }
+                                running_thread.store(false, Ordering::SeqCst);
+                                break;
                             }
-                            running_thread.store(false, Ordering::SeqCst);
+                        };
+                        if now_ntp >= feed_ntp {
                             break;
                         }
-                    };
-                    if now_ntp >= feed_ntp {
-                        break;
+                        let remaining_ms = ntp_delta_to_ms(feed_ntp - now_ntp);
+                        thread::sleep(Duration::from_millis(remaining_ms.clamp(1, 10)));
                     }
-                    let remaining_ms = ntp_delta_to_ms(feed_ntp - now_ntp);
-                    thread::sleep(Duration::from_millis(remaining_ms.clamp(1, 10)));
                 }
 
                 if !running_thread.load(Ordering::SeqCst) {
@@ -437,7 +447,7 @@ impl Drop for LegacyGroupSession {
 fn spawn_member(
     helper: &Path,
     config: LegacyMemberConfig,
-    start_ntp: u64,
+    start_ntp: Option<u64>,
     running: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
     startup_events: Arc<Mutex<Vec<String>>>,
@@ -451,14 +461,16 @@ fn spawn_member(
         .arg(config.volume.min(100).to_string())
         .arg("-l")
         .arg(RAOP_CONFIGURED_LATENCY_FRAMES.to_string())
-        .arg("-n")
-        .arg(start_ntp.to_string())
         .arg("-t")
         .arg(&config.et)
         .arg("-m")
         .arg(&config.md)
         .arg("-d")
         .arg("3");
+
+    if let Some(start_ntp) = start_ntp {
+        command.arg("-n").arg(start_ntp.to_string());
+    }
 
     if config.compressed_alac {
         command.arg("-a");
