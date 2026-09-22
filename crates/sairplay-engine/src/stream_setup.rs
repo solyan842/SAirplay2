@@ -346,7 +346,7 @@ mod tests {
             let stream = root.get("streams").unwrap().as_array().unwrap()[0]
                 .as_dictionary().unwrap();
             assert_eq!(stream.get("type").and_then(Value::as_unsigned_integer), Some(96));
-            assert_eq!(stream.get("audioFormat").and_then(Value::as_unsigned_integer), Some(ALAC_44100_16_2));
+            assert_eq!(stream.get("audioFormat").and_then(Value::as_unsigned_integer), Some(crate::ALAC_44100_16_2));
             assert_eq!(stream.get("sr").and_then(Value::as_unsigned_integer), Some(44_100));
             assert_eq!(stream.get("spf").and_then(Value::as_unsigned_integer), Some(352));
 
