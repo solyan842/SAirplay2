@@ -9,6 +9,27 @@ pub enum AlacEncodeError {
     MisalignedPcm,
 }
 
+
+/// Exact port of airplay-cli's truncate_32to24 helper.
+///
+/// The 24-bit source contract feeds signed s32le carriers into the transport
+/// layer. The ALAC encoder consumes packed s24le, so the low byte of each
+/// 32-bit little-endian sample is discarded and bytes 1,2,3 are preserved.
+pub fn truncate_s32le_to_s24le(input: &[u8]) -> Result<Vec<u8>, AlacEncodeError> {
+    if input.is_empty() {
+        return Err(AlacEncodeError::Empty);
+    }
+    if input.len() % 4 != 0 {
+        return Err(AlacEncodeError::MisalignedPcm);
+    }
+
+    let mut out = Vec::with_capacity((input.len() / 4) * 3);
+    for sample in input.chunks_exact(4) {
+        out.extend_from_slice(&sample[1..4]);
+    }
+    Ok(out)
+}
+
 /// Source-aligned raw ALAC framing for the locked SAirplay2 baseline:
 /// signed 16-bit native/little-endian stereo, 44.1 kHz, max 352 frames.
 ///
@@ -121,5 +142,24 @@ mod tests {
         let encoded = encode_alac_16_stereo_352(&pcm).unwrap();
         assert_eq!(encoded[6] & 1, 1);
         assert_eq!(&encoded[7..11], &[0x00, 0x00, 0xff, 0xfe]);
+    }
+
+
+    #[test]
+    fn source_24bit_truncation_takes_upper_three_s32le_bytes() {
+        let input = [
+            0x11, 0x22, 0x33, 0x44,
+            0xaa, 0xbb, 0xcc, 0xdd,
+        ];
+        let packed = truncate_s32le_to_s24le(&input).unwrap();
+        assert_eq!(packed, [0x22, 0x33, 0x44, 0xbb, 0xcc, 0xdd]);
+    }
+
+    #[test]
+    fn source_24bit_truncation_rejects_partial_s32_sample() {
+        assert_eq!(
+            truncate_s32le_to_s24le(&[1, 2, 3]),
+            Err(AlacEncodeError::MisalignedPcm)
+        );
     }
 }
