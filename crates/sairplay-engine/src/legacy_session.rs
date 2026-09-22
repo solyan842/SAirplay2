@@ -41,7 +41,6 @@ pub struct LegacyMemberConfig {
     pub secret: Option<String>,
     pub compressed_alac: bool,
     pub mfi_auth: bool,
-    pub relative_rtp_clock_probe: bool,
 }
 
 impl LegacyMemberConfig {
@@ -59,7 +58,6 @@ impl LegacyMemberConfig {
             secret: None,
             compressed_alac: true,
             mfi_auth: false,
-            relative_rtp_clock_probe: false,
         }
     }
 }
@@ -466,22 +464,7 @@ fn spawn_member(
     startup_events: Arc<Mutex<Vec<String>>>,
     active_members: Arc<AtomicU64>,
 ) -> Result<SpawnedMember, LegacyGroupError> {
-    if let Ok(mut events) = startup_events.lock() {
-        events.push(format!(
-            "{}: [SAIRPLAY-DIAG] codec={} cn={}",
-            config.name,
-            if config.compressed_alac { "compressed-alac" } else { "pcm-l16" },
-            if config.cn.trim().is_empty() { "<absent>" } else { config.cn.as_str() }
-        ));
-    }
-
     let mut command = Command::new(helper);
-    if config.relative_rtp_clock_probe {
-        command.env("SAIRPLAY_RELATIVE_RTP_CLOCK", "1");
-        if let Ok(mut events) = startup_events.lock() {
-            events.push(format!("{}: [SAIRPLAY-DIAG] relative_rtp_clock=enabled", config.name));
-        }
-    }
     command
         .arg("-p")
         .arg(config.port.to_string())
@@ -547,14 +530,12 @@ fn spawn_member(
                 let Ok(line) = line else { break };
                 let lower = line.to_ascii_lowercase();
 
-                // Keep the actual source diagnostics while connecting. They are
-                // invaluable for TV/receiver interoperability and replace the
-                // previous opaque "timed out waiting on channel" wrapper error.
+                // Keep source errors while connecting so readiness failures
+                // preserve the helper's actual RTSP/transport reason.
                 if let Ok(mut events) = reader_events.lock() {
                     if !connected
                         || lower.contains("error")
                         || lower.contains("failed")
-                        || lower.contains("[sairplay-diag]")
                     {
                         events.push(format!("{reader_name}: {line}"));
                     }

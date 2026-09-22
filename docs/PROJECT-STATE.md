@@ -466,7 +466,7 @@ Reason:
 Important:
 - build remains reproducible by pinning the exact adopted SHA;
 - do not float against `master` implicitly;
-- temporary one-shot diagnostic patch is still applied after checkout until the TV failure is isolated.
+- the temporary TV-specific diagnostic patch was removed before the clean baseline milestone; the helper is now built from the pinned upstream source without local protocol patches.
 
 
 ## 17. Embedded AppleTV startup-FLUSH A/B probe — 2026-09-22
@@ -476,3 +476,30 @@ Runtime on Windows #606 with current libraop `dadcfcaa26d988cdd3e3501ddf8286c224
 Source comparison with pyatv showed a concrete startup-timeline difference: pyatv sends FLUSH with RTP-Info immediately after RECORD before the first audio packet, while libraop transitions from RAOP_FLUSHED to streaming without that startup RTSP FLUSH.
 
 A strictly isolated A/B probe is enabled only for embedded AppleTV-class legacy receivers with pk present, no stored secret and no explicit PIN/legacy-pairing status flags. The helper receives `SAIRPLAY_STARTUP_FLUSH=1`; the build-time diagnostic patch then sends one RTSP FLUSH using the same startup seq/rtptime as RECORD. Native AirPlay 2 and all other legacy receivers are unchanged.
+
+
+## 18. Clean baseline after embedded-TV investigation — 2026-09-23
+
+The embedded-TV compatibility investigation is closed for the production branch baseline.
+
+Removed from active code/build:
+- startup FLUSH probe;
+- L16/SDP probe;
+- RTP SSRC experiment;
+- relative-RTP-clock experiment;
+- one-shot legacy packet diagnostics;
+- build-time patching of upstream `libraop`.
+
+The Windows legacy helper is now built directly from pinned upstream
+`philippe44/libraop@dadcfcaa26d988cdd3e3501ddf8286c224f1b494` with no
+SAirplay2 protocol patch applied after checkout.
+
+Retained because they are general production behavior rather than TV probes:
+- source-built legacy RAOP transport;
+- explicit status-flag based pairing handling;
+- source-paced stdin backpressure;
+- graceful helper shutdown plus anti-hang watchdog;
+- current GUI fixes and native AirPlay 2 engine.
+
+The historical TV sections above are retained only as investigation provenance.
+They do not describe active compatibility overrides.
