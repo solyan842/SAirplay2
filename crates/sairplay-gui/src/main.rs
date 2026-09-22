@@ -4,7 +4,7 @@ use eframe::egui;
 use sairplay_engine::{
     DeviceCatalog, DeviceRecord, DiscoveredService, DiscoveryEvent, LegacyGroupSession,
     LegacyMemberConfig, MdnsBrowser, NativeGroupMemberConfig, NativeGroupSession,
-    NativeSession, NativeSessionConfig, RetransmitStats, Route, ServiceKind, VolumeSetResult,
+    NativeSession, NativeSessionConfig, Route, ServiceKind, VolumeSetResult,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -52,43 +52,11 @@ impl ActiveSession {
         }
     }
 
-    fn audio_discontinuities(&self) -> u64 {
-        match self {
-            Self::Single(session) => session.audio_discontinuities(),
-            Self::Group(session) => session.audio_discontinuities(),
-            Self::Legacy(session) => session.discontinuity_count(),
-        }
-    }
-
-    fn audio_last_discontinuity_frame(&self) -> Option<u64> {
-        match self {
-            Self::Single(session) => session.audio_last_discontinuity_frame(),
-            Self::Group(session) => session.audio_last_discontinuity_frame(),
-            Self::Legacy(session) => session.last_discontinuity_frame(),
-        }
-    }
-
-    fn audio_first_non_silent_frame(&self) -> Option<u64> {
-        match self {
-            Self::Single(session) => session.audio_first_non_silent_frame(),
-            Self::Group(session) => session.audio_first_non_silent_frame(),
-            Self::Legacy(session) => session.first_non_silent_frame(),
-        }
-    }
-
     fn drain_startup_events(&self) -> Vec<String> {
         match self {
             Self::Single(session) => session.drain_startup_events(),
             Self::Group(session) => session.drain_startup_events(),
             Self::Legacy(session) => session.drain_startup_events(),
-        }
-    }
-
-    fn retransmit_stats(&self) -> RetransmitStats {
-        match self {
-            Self::Single(session) => session.retransmit_stats(),
-            Self::Group(session) => session.retransmit_stats(),
-            Self::Legacy(_) => RetransmitStats::default(),
         }
     }
 
@@ -260,8 +228,6 @@ struct SairplayApp {
     pairing_pin_sent: bool,
     pairing_retry_start: bool,
     native_retry_available: bool,
-    last_audio_discontinuities: u64,
-    last_rtx: (u64, u64, u64),
     language: UiLanguage,
     multiroom_enabled: bool,
     activation_open: bool,
@@ -323,8 +289,6 @@ impl Default for SairplayApp {
             pairing_pin_sent: false,
             pairing_retry_start: false,
             native_retry_available: true,
-            last_audio_discontinuities: 0,
-            last_rtx: (0, 0, 0),
             language: UiLanguage::Vi,
             multiroom_enabled: false,
             activation_open: false,
@@ -353,15 +317,11 @@ impl SairplayApp {
                     };
                     if service.kind == ServiceKind::AirPlay {
                         self.log.push(format!(
-                            "mDNS {kind}: {} @ {}:{} · model={} · features=0x{:016X} · flags=0x{:X} · PTP={} · buffered={}",
+                            "mDNS {kind}: {} @ {}:{} · model={}",
                             service.display_name,
                             service.host,
                             service.port,
                             service.txt.model.as_deref().unwrap_or("-"),
-                            service.txt.features,
-                            service.txt.flags,
-                            service.txt.supports_ptp(),
-                            service.txt.supports_buffered_audio(),
                         ));
                     } else {
                         self.log.push(format!(
@@ -383,22 +343,6 @@ impl SairplayApp {
                     }
                     self.active_fullnames.remove(&fullname);
                     self.log.push(format!("mDNS removed: {fullname}"));
-                }
-                DiscoveryEvent::ControlPresence {
-                    kind,
-                    fullname,
-                    host,
-                    port,
-                    addresses,
-                } => {
-                    self.log.push(format!(
-                        "mDNS {kind} presence: {fullname} @ {host}:{port} · addresses={}",
-                        if addresses.is_empty() {
-                            "-".to_owned()
-                        } else {
-                            addresses.join(",")
-                        }
-                    ));
                 }
                 DiscoveryEvent::Error(err) => {
                     self.log.push(format!("mDNS error: {err}"));
@@ -1048,36 +992,8 @@ impl SairplayApp {
             return;
         };
 
-        let audio_discontinuities = session.audio_discontinuities();
-        let rtx = session.retransmit_stats();
         for event in session.drain_startup_events() {
             self.log.push(event);
-        }
-
-        if audio_discontinuities > self.last_audio_discontinuities {
-            let at_frame = session.audio_last_discontinuity_frame();
-            let first_audio = session.audio_first_non_silent_frame();
-            let at_ms = at_frame.map(|f| (f as f64 * 1000.0 / 44_100.0));
-            let first_audio_ms = first_audio.map(|f| (f as f64 * 1000.0 / 44_100.0));
-            self.log.push(format!(
-                "Diagnostic: WASAPI discontinuity count {} -> {} · at-frame={:?} (~{:.1?} ms) · first-non-silent={:?} (~{:.1?} ms).",
-                self.last_audio_discontinuities,
-                audio_discontinuities,
-                at_frame,
-                at_ms,
-                first_audio,
-                first_audio_ms,
-            ));
-            self.last_audio_discontinuities = audio_discontinuities;
-        }
-
-        let rtx_now = (rtx.requested, rtx.answered, rtx.expired);
-        if rtx_now != self.last_rtx {
-            self.log.push(format!(
-                "Diagnostic: RTX requested={} answered={} expired={}.",
-                rtx.requested, rtx.answered, rtx.expired
-            ));
-            self.last_rtx = rtx_now;
         }
 
         if let Some(error) = session.audio_error() {
@@ -1265,8 +1181,6 @@ impl SairplayApp {
         self.playback = PlaybackUiState::Connecting(label.clone());
         self.session = None;
         self.active_fullnames.clear();
-        self.last_audio_discontinuities = 0;
-        self.last_rtx = (0, 0, 0);
         self.last_feedback_error = None;
 
         if all_native {
@@ -1283,15 +1197,6 @@ impl SairplayApp {
                 config.receiver_name = device.display_name.clone();
                 config.initial_volume = initial_volume;
 
-                self.log.push(format!(
-                    "{}: native preflight on {}:{} · model={} · PTP={} · follow-clock={}.",
-                    device.display_name,
-                    host,
-                    service.port,
-                    service.txt.model.as_deref().unwrap_or("-"),
-                    service.txt.supports_ptp(),
-                    service.txt.follows_receiver_clock(),
-                ));
                 configs.push(NativeGroupMemberConfig::new(
                     service.fullname.clone(),
                     config,
@@ -1323,17 +1228,6 @@ impl SairplayApp {
                     .map(String::as_str);
                 match legacy_config_for_device(device, initial_volume, secret) {
                     Ok(config) => {
-                        self.log.push(format!(
-                            "{}: source libraop route {:?} on {}:{} · et={} · md={} · am={} · pk={}.",
-                            device.display_name,
-                            device.route(false, false),
-                            config.host,
-                            config.port,
-                            config.et,
-                            config.md,
-                            if config.am.is_empty() { "-" } else { &config.am },
-                            if config.pk.is_empty() { "-" } else { "present" },
-                        ));
                         configs.push(config);
                     }
                     Err(message) => {
@@ -1372,8 +1266,6 @@ impl SairplayApp {
         self.membership_pending.clear();
         self.membership_rx = None;
         self.playback = PlaybackUiState::Idle;
-        self.last_audio_discontinuities = 0;
-        self.last_rtx = (0, 0, 0);
         self.native_retry_available = true;
     }
 

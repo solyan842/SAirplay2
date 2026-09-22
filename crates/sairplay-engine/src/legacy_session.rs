@@ -129,10 +129,7 @@ impl LegacyGroupSession {
         let discontinuities = Arc::new(AtomicU64::new(0));
         let last_discontinuity_frame = Arc::new(AtomicU64::new(u64::MAX));
         let first_non_silent_frame = Arc::new(AtomicU64::new(u64::MAX));
-        let startup_events = Arc::new(Mutex::new(vec![format!(
-            "Legacy transport: pinned libraop {} · shared audible START +{} ms · source-style PCM backpressure.",
-            LIBRAOP_PINNED_COMMIT, RAOP_GROUP_START_LEAD_MS
-        )]));
+        let startup_events = Arc::new(Mutex::new(Vec::new()));
         let active_members = Arc::new(AtomicU64::new(configs.len() as u64));
 
         let mut spawned = Vec::<SpawnedMember>::with_capacity(configs.len());
@@ -178,13 +175,6 @@ impl LegacyGroupSession {
                 let _ = member.writer.join();
             }
             return Err(LegacyGroupError::Connect { name, error });
-        }
-
-        if let Ok(mut events) = startup_events.lock() {
-            events.push(format!(
-                "Legacy transport: all {} receiver(s) connected before WASAPI start.",
-                spawned.len()
-            ));
         }
 
         let running_thread = Arc::clone(&running);
@@ -256,14 +246,6 @@ impl LegacyGroupSession {
                         return;
                     }
                 };
-
-                if let Ok(mut events) = events_thread.lock() {
-                    let now_ntp = system_time_to_ntp(SystemTime::now()).unwrap_or(start_ntp);
-                    events.push(format!(
-                        "Legacy transport: WASAPI source opened with ~{} ms remaining to the shared audible anchor.",
-                        ntp_delta_to_ms(start_ntp.saturating_sub(now_ntp))
-                    ));
-                }
 
                 let mut chunker = Pcm352Chunker::new();
                 let mut captured_frames_total = 0u64;
