@@ -33,27 +33,50 @@ function Replace-Once {
 $cliraop = Join-Path $SourceRoot "src/cliraop.c"
 $raop = Join-Path $SourceRoot "src/raop_client.c"
 
-Replace-Once -Path $raop -Label "isolated startup FLUSH probe" -Old @'
+Replace-Once -Path $raop -Label "RECORD RTP timeline diagnostic" -Old @'
 	if (!rtspcl_record(p->rtspcl, p->seq_number + 1, NTP2TS(raopcl_get_ntp(NULL), p->sample_rate), kd)) goto erexit;
-
-	if (kd_lookup(kd, "Audio-Latency")) {
 '@ -New @'
 	{
-		uint16_t sairplay_start_seq = p->seq_number + 1;
-		uint32_t sairplay_start_ts = NTP2TS(raopcl_get_ntp(NULL), p->sample_rate);
-
+		uint16_t sairplay_record_seq = p->seq_number + 1;
+		uint32_t sairplay_record_ts = NTP2TS(raopcl_get_ntp(NULL), p->sample_rate);
 		LOG_INFO("[SAIRPLAY-DIAG] record_rtp seq=%u rtptime=%u",
-				 sairplay_start_seq, sairplay_start_ts);
-		if (!rtspcl_record(p->rtspcl, sairplay_start_seq, sairplay_start_ts, kd)) goto erexit;
-
-		if (getenv("SAIRPLAY_STARTUP_FLUSH") && *getenv("SAIRPLAY_STARTUP_FLUSH")) {
-			LOG_INFO("[SAIRPLAY-DIAG] startup_flush seq=%u rtptime=%u",
-					 sairplay_start_seq, sairplay_start_ts);
-			if (!rtspcl_flush(p->rtspcl, sairplay_start_seq, sairplay_start_ts)) goto erexit;
-		}
+				 sairplay_record_seq, sairplay_record_ts);
+		if (!rtspcl_record(p->rtspcl, sairplay_record_seq, sairplay_record_ts, kd)) goto erexit;
 	}
+'@
 
-	if (kd_lookup(kd, "Audio-Latency")) {
+Replace-Once -Path $raop -Label "pyatv-compatible PCM L16 fmtp" -Old @'
+		case RAOP_PCM: {
+			char buf[256];
+
+			sprintf(buf,
+					"m=audio 0 RTP/AVP 96\r\n"
+					"a=rtpmap:96 L%d/%d/%d\r\n",
+					p->sample_size, p->sample_rate, p->channels);
+			strcat(sdp, buf);
+			break;
+		}
+'@ -New @'
+		case RAOP_PCM: {
+			char buf[256];
+
+			if (getenv("SAIRPLAY_PCM_L16_FMTP") && *getenv("SAIRPLAY_PCM_L16_FMTP")) {
+				sprintf(buf,
+						"m=audio 0 RTP/AVP 96\r\n"
+						"a=rtpmap:96 L%d/%d/%d\r\n"
+						"a=fmtp:96 %d 0 %d 40 10 14 %d 255 0 0 %d\r\n",
+						p->sample_size, p->sample_rate, p->channels,
+						p->chunk_len, p->sample_size, p->channels, p->sample_rate);
+				LOG_INFO("[SAIRPLAY-DIAG] pcm_l16_sdp=pyatv-compatible");
+			} else {
+				sprintf(buf,
+						"m=audio 0 RTP/AVP 96\r\n"
+						"a=rtpmap:96 L%d/%d/%d\r\n",
+						p->sample_size, p->sample_rate, p->channels);
+			}
+			strcat(sdp, buf);
+			break;
+		}
 '@
 
 Replace-Once -Path $cliraop -Label "cliraop first accepted/read PCM" -Old @'
