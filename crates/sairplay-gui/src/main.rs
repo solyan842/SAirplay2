@@ -3307,20 +3307,6 @@ fn legacy_config_for_device(
             .any(|value| value.trim() == "1");
     }
 
-    // Temporary A/B diagnostic for embedded receivers that clone an AppleTV
-    // identity/public key but advertise no PIN/legacy-pairing requirement and
-    // have no stored pairing secret. The compressed-ALAC path is proven to
-    // reach the first UDP audio packet and immediately precede this receiver's
-    // AirPlay service restart. Keep RTSP, timing, RTP framing and all native
-    // AirPlay 2 paths unchanged; vary only the legacy ALAC payload encoding.
-    let embedded_appletv_probe = config.am.to_ascii_lowercase().contains("appletv")
-        && !config.pk.trim().is_empty()
-        && config.secret.is_none()
-        && !pairing_required;
-    if embedded_appletv_probe {
-        config.compressed_alac = false;
-    }
-
     Ok(config)
 }
 
