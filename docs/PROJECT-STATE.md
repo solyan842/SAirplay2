@@ -356,3 +356,42 @@ Result of this audit:
 - No transport code was changed.
 - No encryption patch is warranted.
 - The next single investigation should be whether the unified `cliairplay` RAOP path can be built and run on Windows in isolation for this legacy-TV route, and whether its AppleTV guard must be adapted for embedded receivers before any migration is attempted.
+
+
+## 14. Unified `cliairplay` Windows feasibility audit — 2026-09-22
+
+Compared against `music-assistant/airplay-cli@431c5c582eef9307c4e39c50a0ea65e970bc1128`.
+
+Finding: **the current upstream unified `cliairplay` is not a drop-in Windows helper.**
+
+Evidence from the pinned source/build system:
+
+- The upstream GitHub Actions matrix builds only:
+  - Linux x86_64,
+  - Linux aarch64,
+  - macOS arm64,
+  - macOS x86_64.
+- Release assets likewise contain only those Linux/macOS binaries; there is no Windows artifact.
+- The Makefile's native host detection only handles Darwin vs Linux.
+- The executable links against POSIX-oriented facilities such as `pthread`, `dl`, and on Linux `rt`.
+- `cliairplay.c` directly includes/uses POSIX APIs including:
+  - `unistd.h`,
+  - `poll.h`,
+  - POSIX file/stat APIs,
+  - `mkfifo()` for the command pipe,
+  - pthread-based synchronization/threading.
+- The unified process contract requires a POSIX-style `--cmdpipe` FIFO in addition to PCM on stdin.
+
+Implication for SAirplay2:
+
+- Replacing the existing Windows `cliraop.exe` with upstream `cliairplay` would **not** be a minimal helper swap.
+- It would require a real Windows port/adaptation layer for process control, command pipe IPC, polling/thread primitives, and likely build/dependency packaging.
+- Such a port would materially widen the scope and create regression risk for a problem currently isolated to one legacy TV receiver.
+- Therefore do **not** migrate the legacy TV path to `cliairplay` at this stage.
+- Preserve the current Windows `cliraop` helper and continue diagnosis at the RAOP/libraop behavior level.
+
+Next single investigation:
+
+- Trace the pinned old `cliraop/libraop` path from stdin consumption through `raopcl_accept_frames()` to `raopcl_send_chunk()`, and compare the exact state/timing conditions with the TV session that connects successfully but remains silent.
+- Prefer instrumentation or source-proven checks that are isolated to the legacy-TV path.
+- Do not alter HomePod/native, MultiRoom, Stereo Pair, or the stable branch.
