@@ -1381,16 +1381,13 @@ impl SairplayApp {
     }
 
     fn render_controls(&mut self, ui: &mut egui::Ui) {
-        const CARD_INNER_W: f32 = 286.0;
-        const CARD_INNER_H: f32 = 42.0;
         const CARD_OUTER_W: f32 = 306.0;
         const CARD_OUTER_H: f32 = 58.0;
+        const CARD_INNER_W: f32 = 286.0;
+        const CARD_INNER_H: f32 = 42.0;
         const CARD_GAP: f32 = 7.0;
 
-        ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), CARD_OUTER_H),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
+        let card_frame = || {
             egui::Frame::new()
                 .fill(UiTheme::surface())
                 .stroke(egui::Stroke::new(1.0, UiTheme::border()))
@@ -1402,19 +1399,16 @@ impl SairplayApp {
                     color: egui::Color32::from_black_alpha(14),
                 })
                 .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.set_min_width(CARD_INNER_W);
-                    ui.set_max_width(CARD_INNER_W);
-                    ui.set_min_height(CARD_INNER_H);
-                    ui.set_max_height(CARD_INNER_H);
-                    ui.set_min_width(CARD_INNER_W);
-                    ui.set_max_width(CARD_INNER_W);
-                    ui.set_min_height(CARD_INNER_H);
-                    ui.set_max_height(CARD_INNER_H);
-                    ui.set_min_width(CARD_INNER_W);
-                    ui.set_max_width(CARD_INNER_W);
-                    ui.set_min_height(CARD_INNER_H);
-                    ui.set_max_height(CARD_INNER_H);
+        };
+
+        ui.horizontal(|ui| {
+            let (volume_rect, _) =
+                ui.allocate_exact_size(egui::vec2(CARD_OUTER_W, CARD_OUTER_H), egui::Sense::hover());
+            ui.allocate_ui_at_rect(volume_rect, |ui| {
+                card_frame().show(ui, |ui| {
+                    ui.set_min_size(egui::vec2(CARD_INNER_W, CARD_INNER_H));
+                    ui.set_max_size(egui::vec2(CARD_INNER_W, CARD_INNER_H));
+
                     ui.allocate_ui_with_layout(
                         egui::vec2(CARD_INNER_W, CARD_INNER_H),
                         egui::Layout::left_to_right(egui::Align::Center),
@@ -1444,43 +1438,38 @@ impl SairplayApp {
                                         self.apply_volume_value(volume);
                                     }
 
-                                    egui::Frame::new()
-                                        .fill(egui::Color32::from_rgb(242, 246, 251))
-                                        .corner_radius(egui::CornerRadius::same(6))
-                                        .inner_margin(egui::Margin::symmetric(7, 3))
-                                        .show(ui, |ui| {
-                                            ui.label(
-                                                egui::RichText::new(format!("{volume}%"))
-                                                    .size(11.0)
-                                                    .strong()
-                                                    .color(UiTheme::text_soft()),
-                                            );
-                                        });
-
-                                    // Intentionally no activity spinner here: volume RTSP
-                                    // updates are asynchronous, but changing the child count/width
-                                    // while the pointer drags used to make all three control cards
-                                    // reflow and visibly flash.
+                                    let (badge_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(42.0, 22.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(
+                                        badge_rect,
+                                        egui::CornerRadius::same(6),
+                                        egui::Color32::from_rgb(242, 246, 251),
+                                    );
+                                    ui.painter().text(
+                                        badge_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        format!("{volume}%"),
+                                        egui::FontId::proportional(11.0),
+                                        UiTheme::text_soft(),
+                                    );
                                 });
                             });
                         },
                     );
                 });
+            });
 
             ui.add_space(CARD_GAP);
 
-            egui::Frame::new()
-                .fill(UiTheme::surface())
-                .stroke(egui::Stroke::new(1.0, UiTheme::border()))
-                .corner_radius(egui::CornerRadius::same(13))
-                .shadow(egui::epaint::Shadow {
-                    offset: [0, 2],
-                    blur: 9,
-                    spread: 0,
-                    color: egui::Color32::from_black_alpha(14),
-                })
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
+            let (actions_rect, _) =
+                ui.allocate_exact_size(egui::vec2(CARD_OUTER_W, CARD_OUTER_H), egui::Sense::hover());
+            ui.allocate_ui_at_rect(actions_rect, |ui| {
+                card_frame().show(ui, |ui| {
+                    ui.set_min_size(egui::vec2(CARD_INNER_W, CARD_INNER_H));
+                    ui.set_max_size(egui::vec2(CARD_INNER_W, CARD_INNER_H));
+
                     ui.allocate_ui_with_layout(
                         egui::vec2(CARD_INNER_W, CARD_INNER_H),
                         egui::Layout::left_to_right(egui::Align::Center)
@@ -1521,21 +1510,17 @@ impl SairplayApp {
                         },
                     );
                 });
+            });
 
             ui.add_space(CARD_GAP);
 
-            egui::Frame::new()
-                .fill(UiTheme::surface())
-                .stroke(egui::Stroke::new(1.0, UiTheme::border()))
-                .corner_radius(egui::CornerRadius::same(13))
-                .shadow(egui::epaint::Shadow {
-                    offset: [0, 2],
-                    blur: 9,
-                    spread: 0,
-                    color: egui::Color32::from_black_alpha(14),
-                })
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
+            let (airplay_rect, _) =
+                ui.allocate_exact_size(egui::vec2(CARD_OUTER_W, CARD_OUTER_H), egui::Sense::hover());
+            ui.allocate_ui_at_rect(airplay_rect, |ui| {
+                card_frame().show(ui, |ui| {
+                    ui.set_min_size(egui::vec2(CARD_INNER_W, CARD_INNER_H));
+                    ui.set_max_size(egui::vec2(CARD_INNER_W, CARD_INNER_H));
+
                     ui.allocate_ui_with_layout(
                         egui::vec2(CARD_INNER_W, CARD_INNER_H),
                         egui::Layout::left_to_right(egui::Align::Center),
@@ -1584,9 +1569,8 @@ impl SairplayApp {
                         },
                     );
                 });
-            },
-        );
-        let _ = CARD_OUTER_W;
+            });
+        });
     }
 
     fn render_trial_row(&mut self, ui: &mut egui::Ui) {
