@@ -1,6 +1,6 @@
 use crate::{
     NativeSession, NativeSessionConfig, NativeVolumeControl, PtpEngine, RetransmitStats,
-    WindowsMultiroomAudioError, WindowsMultiroomAudioWorker,
+    WindowsMultiroomAudioError, WindowsMultiroomAudioWorker, WindowsMultiroomJoinHandle,
 };
 use std::fmt;
 use std::sync::Arc;
@@ -22,7 +22,7 @@ impl NativeGroupMemberConfig {
 
 #[derive(Debug)]
 pub enum NativeGroupError {
-    TooFewMembers,
+    EmptyGroup,
     Member { name: String, error: String },
     Audio(WindowsMultiroomAudioError),
 }
@@ -30,7 +30,7 @@ pub enum NativeGroupError {
 impl fmt::Display for NativeGroupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TooFewMembers => write!(f, "MultiRoom requires at least two native receivers"),
+            Self::EmptyGroup => write!(f, "AirPlay session requires at least one receiver"),
             Self::Member { name, error } => write!(f, "{name}: {error}"),
             Self::Audio(error) => write!(f, "{error}"),
         }
@@ -39,21 +39,76 @@ impl fmt::Display for NativeGroupError {
 
 impl std::error::Error for NativeGroupError {}
 
+#[derive(Clone)]
+pub struct NativeGroupJoinHandle {
+    shared_ptp: Option<Arc<PtpEngine>>,
+    use_ptp: bool,
+    audio: WindowsMultiroomJoinHandle,
+}
+
+impl NativeGroupJoinHandle {
+    pub fn connect_member(
+        &self,
+        name: impl Into<String>,
+        mut config: NativeSessionConfig,
+    ) -> Result<(String, NativeSession), NativeGroupError> {
+        let name = name.into();
+
+        // Timing mode is a session-wide decision upstream. A late joiner never
+        // introduces a second PTP daemon or changes an existing NTP group.
+        let result = if self.use_ptp {
+            config.follow_receiver_clock = false;
+            if let Some(engine) = self.shared_ptp.as_ref() {
+                NativeSession::connect_with_shared_ptp(&config, Some(Arc::clone(engine)))
+            } else {
+                config.supports_ptp = false;
+                NativeSession::connect(&config)
+            }
+        } else {
+            config.supports_ptp = false;
+            config.follow_receiver_clock = false;
+            NativeSession::connect(&config)
+        };
+
+        let mut session = result.map_err(|error| NativeGroupError::Member {
+            name: name.clone(),
+            error: error.to_string(),
+        })?;
+        let target = session
+            .take_windows_audio_target(name.clone())
+            .map_err(|error| NativeGroupError::Member {
+                name: name.clone(),
+                error: error.to_string(),
+            })?;
+        self.audio
+            .add_target(target)
+            .map_err(NativeGroupError::Audio)?;
+        Ok((name, session))
+    }
+
+    pub fn remove_audio_member(&self, name: impl Into<String>) -> Result<(), NativeGroupError> {
+        self.audio
+            .remove_target(name.into())
+            .map_err(NativeGroupError::Audio)
+    }
+}
+
 pub struct NativeGroupSession {
     members: Vec<(String, NativeSession)>,
     audio_worker: Option<WindowsMultiroomAudioWorker>,
+    shared_ptp: Option<Arc<PtpEngine>>,
+    use_ptp: bool,
 }
 
 impl NativeGroupSession {
     pub fn connect(mut configs: Vec<NativeGroupMemberConfig>) -> Result<Self, NativeGroupError> {
-        if configs.len() < 2 {
-            return Err(NativeGroupError::TooFewMembers);
+        if configs.is_empty() {
+            return Err(NativeGroupError::EmptyGroup);
         }
 
-        // Source architecture: one shared PTP daemon owns 319/320 for all AP2
-        // members. Connect a PTP-capable member first so its engine becomes the
-        // shared clock. Grouped receivers never use the standalone HomePod
-        // follow-clock exception.
+        // Source architecture: one shared PTP daemon owns 319/320 for every
+        // native AirPlay 2 member. A one-member session uses the same object so
+        // later joiners can be added without restarting playback.
         if let Some(index) = configs.iter().position(|member| member.config.supports_ptp) {
             configs.swap(0, index);
         }
@@ -63,7 +118,7 @@ impl NativeGroupSession {
         let mut members = Vec::<(String, NativeSession)>::with_capacity(configs.len());
 
         for (index, mut member) in configs.into_iter().enumerate() {
-            if group_wants_ptp && member.config.supports_ptp {
+            if group_wants_ptp && member.config.supports_ptp && members.capacity() > 1 {
                 member.config.follow_receiver_clock = false;
             }
 
@@ -71,15 +126,14 @@ impl NativeGroupSession {
                 NativeSession::connect(&member.config)
             } else if member.config.supports_ptp {
                 if let Some(engine) = shared_ptp.as_ref() {
+                    member.config.follow_receiver_clock = false;
                     NativeSession::connect_with_shared_ptp(
                         &member.config,
                         Some(Arc::clone(engine)),
                     )
                 } else {
-                    // The first PTP candidate fell back because a PTP engine
-                    // could not be established. Keep the group timing decision
-                    // coherent and force later AP2 members onto NTP as well.
                     member.config.supports_ptp = false;
+                    member.config.follow_receiver_clock = false;
                     NativeSession::connect(&member.config)
                 }
             } else {
@@ -97,6 +151,7 @@ impl NativeGroupSession {
             members.push((member.name, session));
         }
 
+        let use_ptp = shared_ptp.is_some();
         let mut targets = Vec::with_capacity(members.len());
         for (name, session) in &mut members {
             let target = session
@@ -114,7 +169,38 @@ impl NativeGroupSession {
         Ok(Self {
             members,
             audio_worker: Some(audio_worker),
+            shared_ptp,
+            use_ptp,
         })
+    }
+
+    pub fn join_handle(&self) -> Option<NativeGroupJoinHandle> {
+        let audio = self.audio_worker.as_ref()?.join_handle();
+        Some(NativeGroupJoinHandle {
+            shared_ptp: self.shared_ptp.as_ref().map(Arc::clone),
+            use_ptp: self.use_ptp,
+            audio,
+        })
+    }
+
+    pub fn adopt_member(&mut self, name: String, session: NativeSession) {
+        if let Some(index) = self.members.iter().position(|(member, _)| member == &name) {
+            self.members.remove(index);
+        }
+        self.members.push((name, session));
+    }
+
+    pub fn remove_member(&mut self, name: &str) -> Result<(), NativeGroupError> {
+        if let Some(audio) = self.audio_worker.as_ref() {
+            audio
+                .join_handle()
+                .remove_target(name.to_owned())
+                .map_err(NativeGroupError::Audio)?;
+        }
+        if let Some(index) = self.members.iter().position(|(member, _)| member == name) {
+            self.members.remove(index);
+        }
+        Ok(())
     }
 
     pub fn member_count(&self) -> usize {
@@ -215,8 +301,6 @@ impl NativeGroupSession {
 
 impl Drop for NativeGroupSession {
     fn drop(&mut self) {
-        // Source disconnect order at the group level: stop the common producer
-        // first, then let each NativeSession close event/feedback/RTSP timing.
         self.stop_audio();
     }
 }
