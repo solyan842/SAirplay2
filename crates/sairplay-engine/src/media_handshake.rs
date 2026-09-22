@@ -1,6 +1,7 @@
 use crate::{
-    setup_realtime_stream, EncryptedRtspChannel, MediaTransport, MediaTransportError,
-    NativeConnectFlow, RealtimeStreamSetupConfig, StreamPorts, StreamSetupError,
+    setup_realtime_stream, Ap2AudioFormat, EncryptedRtspChannel, MediaTransport,
+    MediaTransportError, NativeConnectFlow, RealtimeStreamSetupConfig, StreamPorts,
+    StreamSetupError,
 };
 use std::net::IpAddr;
 
@@ -14,6 +15,7 @@ pub struct MediaHandshakeConfig {
     pub active_remote: String,
     pub audio_secret: [u8; 32],
     pub stream_connection_id: u32,
+    pub audio_format: Ap2AudioFormat,
 }
 
 #[derive(Debug)]
@@ -55,6 +57,7 @@ pub fn prepare_realtime_media(
         local_control_port: local.control_port,
         audio_secret: config.audio_secret,
         stream_connection_id: config.stream_connection_id,
+        audio_format: config.audio_format,
     };
     let setup_result = setup_realtime_stream(flow, channel, &setup)?;
     let remote_ports = setup_result.ports;
@@ -180,6 +183,7 @@ mod tests {
             active_remote: "123456789".into(),
             audio_secret: [0xAAu8; 32],
             stream_connection_id: 0x11223344,
+            audio_format: Ap2AudioFormat::ALAC_44100_16_STEREO,
         };
 
         let result = prepare_realtime_media(&mut flow, &mut channel, &config).unwrap();
@@ -231,6 +235,7 @@ mod tests {
             active_remote: "123456789".into(),
             audio_secret: [0xAAu8; 32],
             stream_connection_id: 0x11223344,
+            audio_format: Ap2AudioFormat::ALAC_44100_16_STEREO,
         };
 
         assert!(matches!(

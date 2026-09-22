@@ -1,13 +1,12 @@
 use crate::{
-    EncryptedRtspChannel, EncryptedRtspError, NativeConnectError, NativeConnectFlow, RtspRequest,
-    ALAC_44100_16_2,
+    Ap2AudioFormat, EncryptedRtspChannel, EncryptedRtspError, NativeConnectError,
+    NativeConnectFlow, RtspRequest,
 };
 use plist::{Dictionary, Value};
 use std::io::Cursor;
 
 pub const REALTIME_STREAM_TYPE: u64 = 96;
 pub const ALAC_CODEC_TYPE: u64 = 2;
-pub const SAMPLE_RATE: u64 = 44_100;
 pub const FRAMES_PER_PACKET: u64 = 352;
 pub const LATENCY_MIN_FRAMES: u64 = 11_025;
 pub const LATENCY_MAX_FRAMES: u64 = 88_200;
@@ -22,6 +21,7 @@ pub struct RealtimeStreamSetupConfig {
     pub local_control_port: u16,
     pub audio_secret: [u8; 32],
     pub stream_connection_id: u32,
+    pub audio_format: Ap2AudioFormat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,9 +67,13 @@ pub fn build_realtime_stream_plist(
     local_control_port: u16,
     audio_secret: &[u8; 32],
     stream_connection_id: u32,
+    audio_format: Ap2AudioFormat,
 ) -> Result<Vec<u8>, StreamSetupError> {
     let mut stream = Dictionary::new();
-    stream.insert("audioFormat".into(), Value::Integer(ALAC_44100_16_2.into()));
+    stream.insert(
+        "audioFormat".into(),
+        Value::Integer(audio_format.audio_format_code().into()),
+    );
     stream.insert("audioMode".into(), Value::String("default".into()));
     stream.insert("controlPort".into(), Value::Integer((local_control_port as u64).into()));
     stream.insert("ct".into(), Value::Integer(ALAC_CODEC_TYPE.into()));
@@ -79,7 +83,10 @@ pub fn build_realtime_stream_plist(
     stream.insert("latencyMin".into(), Value::Integer(LATENCY_MIN_FRAMES.into()));
     stream.insert("shk".into(), Value::Data(audio_secret.to_vec()));
     stream.insert("spf".into(), Value::Integer(FRAMES_PER_PACKET.into()));
-    stream.insert("sr".into(), Value::Integer(SAMPLE_RATE.into()));
+    stream.insert(
+        "sr".into(),
+        Value::Integer((audio_format.sample_rate as u64).into()),
+    );
     stream.insert(
         "streamConnectionID".into(),
         Value::Integer((stream_connection_id as u64).into()),
@@ -165,6 +172,7 @@ pub fn setup_realtime_stream(
         config.local_control_port,
         &config.audio_secret,
         config.stream_connection_id,
+        config.audio_format,
     )?;
 
     let request = RtspRequest {
@@ -251,15 +259,21 @@ mod tests {
     }
 
     #[test]
-    fn realtime_plist_is_locked_to_16_441_type96() {
+    fn realtime_plist_defaults_match_16_441_type96_contract() {
         let secret = [0xABu8; 32];
-        let body = build_realtime_stream_plist(50000, 50001, &secret, 0x12345678).unwrap();
+        let body = build_realtime_stream_plist(
+            50000,
+            50001,
+            &secret,
+            0x12345678,
+            Ap2AudioFormat::ALAC_44100_16_STEREO,
+        ).unwrap();
         let value = Value::from_reader(Cursor::new(&body)).unwrap();
         let root = value.as_dictionary().unwrap();
         let stream = root.get("streams").unwrap().as_array().unwrap()[0]
             .as_dictionary().unwrap();
 
-        assert_eq!(stream.get("audioFormat").and_then(Value::as_unsigned_integer), Some(ALAC_44100_16_2));
+        assert_eq!(stream.get("audioFormat").and_then(Value::as_unsigned_integer), Some(crate::ALAC_44100_16_2));
         assert_eq!(stream.get("ct").and_then(Value::as_unsigned_integer), Some(2));
         assert_eq!(stream.get("type").and_then(Value::as_unsigned_integer), Some(96));
         assert_eq!(stream.get("sr").and_then(Value::as_unsigned_integer), Some(44_100));
@@ -271,6 +285,33 @@ mod tests {
         assert_eq!(stream.get("isMedia").and_then(Value::as_boolean), Some(true));
         assert_eq!(stream.get("supportsDynamicStreamID").and_then(Value::as_boolean), Some(false));
         assert_eq!(stream.get("shk").and_then(Value::as_data), Some(secret.as_slice()));
+    }
+
+    #[test]
+    fn realtime_plist_emits_source_24_48_audio_format() {
+        let secret = [0xCDu8; 32];
+        let body = build_realtime_stream_plist(
+            50000,
+            50001,
+            &secret,
+            0x12345678,
+            Ap2AudioFormat::ALAC_48000_24_STEREO,
+        ).unwrap();
+        let value = Value::from_reader(Cursor::new(&body)).unwrap();
+        let stream = value
+            .as_dictionary().unwrap()
+            .get("streams").unwrap().as_array().unwrap()[0]
+            .as_dictionary().unwrap();
+        assert_eq!(
+            stream.get("audioFormat").and_then(Value::as_unsigned_integer),
+            Some(crate::ALAC_48000_24_2)
+        );
+        assert_eq!(
+            stream.get("sr").and_then(Value::as_unsigned_integer),
+            Some(48_000)
+        );
+        assert_eq!(stream.get("spf").and_then(Value::as_unsigned_integer), Some(352));
+        assert_eq!(stream.get("ct").and_then(Value::as_unsigned_integer), Some(2));
     }
 
     #[test]
@@ -327,6 +368,7 @@ mod tests {
             local_control_port: 50001,
             audio_secret: [0xAAu8; 32],
             stream_connection_id: 0x12345678,
+            audio_format: Ap2AudioFormat::ALAC_44100_16_STEREO,
         };
 
         let result = setup_realtime_stream(&mut flow, &mut channel, &config).unwrap();

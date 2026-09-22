@@ -6,6 +6,72 @@ pub const ALAC_44100_24_2: u64 = 1u64 << 19;
 pub const ALAC_48000_16_2: u64 = 1u64 << 20;
 pub const ALAC_48000_24_2: u64 = 1u64 << 21;
 
+pub const AIRPLAY_HIRES_AUDIO_FORMATS: u64 = ALAC_44100_24_2 | ALAC_48000_24_2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ap2AudioFormat {
+    pub sample_rate: u32,
+    pub bit_depth: u16,
+    pub channels: u16,
+}
+
+impl Ap2AudioFormat {
+    pub const ALAC_44100_16_STEREO: Self = Self {
+        sample_rate: 44_100,
+        bit_depth: 16,
+        channels: 2,
+    };
+    pub const ALAC_44100_24_STEREO: Self = Self {
+        sample_rate: 44_100,
+        bit_depth: 24,
+        channels: 2,
+    };
+    pub const ALAC_48000_16_STEREO: Self = Self {
+        sample_rate: 48_000,
+        bit_depth: 16,
+        channels: 2,
+    };
+    pub const ALAC_48000_24_STEREO: Self = Self {
+        sample_rate: 48_000,
+        bit_depth: 24,
+        channels: 2,
+    };
+
+    pub const fn audio_format_code(self) -> u64 {
+        if self.bit_depth > 16 && self.sample_rate >= 48_000 {
+            ALAC_48000_24_2
+        } else if self.bit_depth > 16 {
+            ALAC_44100_24_2
+        } else if self.sample_rate >= 48_000 {
+            ALAC_48000_16_2
+        } else {
+            ALAC_44100_16_2
+        }
+    }
+
+    pub const fn input_bytes_per_sample(self) -> usize {
+        if self.bit_depth > 16 { 4 } else { 2 }
+    }
+
+    pub const fn alac_bytes_per_sample(self) -> usize {
+        if self.bit_depth > 16 { 3 } else { 2 }
+    }
+
+    pub const fn input_bytes_per_frame(self) -> usize {
+        self.input_bytes_per_sample() * self.channels as usize
+    }
+
+    pub const fn alac_bytes_per_frame(self) -> usize {
+        self.alac_bytes_per_sample() * self.channels as usize
+    }
+}
+
+impl Default for Ap2AudioFormat {
+    fn default() -> Self {
+        Self::ALAC_44100_16_STEREO
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AudioFormatCapability {
     pub mask: u64,
@@ -59,7 +125,19 @@ impl Ap2Info {
     }
 
     pub fn requested_first_stable_format() -> u64 {
-        ALAC_44100_16_2
+        Ap2AudioFormat::ALAC_44100_16_STEREO.audio_format_code()
+    }
+
+    /// Music Assistant treats the two /info stream tables as advisory evidence
+    /// and unions the formats from tables the receiver actually published.
+    pub fn advertised_formats(&self) -> u64 {
+        let realtime = if self.realtime.known { self.realtime.mask } else { 0 };
+        let buffered = if self.buffered.known { self.buffered.mask } else { 0 };
+        realtime | buffered
+    }
+
+    pub fn advertises_hires(&self) -> bool {
+        self.advertised_formats() & AIRPLAY_HIRES_AUDIO_FORMATS != 0
     }
 }
 
@@ -187,5 +265,36 @@ mod tests {
     #[test]
     fn first_stable_target_is_44100_16_stereo_alac() {
         assert_eq!(Ap2Info::requested_first_stable_format(), 0x40000);
+    }
+
+    #[test]
+    fn source_audio_format_codes_cover_all_four_native_alac_formats() {
+        assert_eq!(Ap2AudioFormat::ALAC_44100_16_STEREO.audio_format_code(), ALAC_44100_16_2);
+        assert_eq!(Ap2AudioFormat::ALAC_44100_24_STEREO.audio_format_code(), ALAC_44100_24_2);
+        assert_eq!(Ap2AudioFormat::ALAC_48000_16_STEREO.audio_format_code(), ALAC_48000_16_2);
+        assert_eq!(Ap2AudioFormat::ALAC_48000_24_STEREO.audio_format_code(), ALAC_48000_24_2);
+        assert_eq!(Ap2AudioFormat::ALAC_48000_24_STEREO.input_bytes_per_frame(), 8);
+        assert_eq!(Ap2AudioFormat::ALAC_48000_24_STEREO.alac_bytes_per_frame(), 6);
+    }
+
+    #[test]
+    fn advertised_formats_union_only_published_tables() {
+        let info = Ap2Info {
+            realtime: AudioFormatCapability {
+                mask: ALAC_44100_16_2,
+                known: true,
+                extended: false,
+            },
+            buffered: AudioFormatCapability {
+                mask: ALAC_48000_24_2,
+                known: true,
+                extended: true,
+            },
+        };
+        assert_eq!(
+            info.advertised_formats(),
+            ALAC_44100_16_2 | ALAC_48000_24_2
+        );
+        assert!(info.advertises_hires());
     }
 }

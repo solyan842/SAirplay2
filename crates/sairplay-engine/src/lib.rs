@@ -48,7 +48,11 @@ pub mod native_group;
 pub mod legacy_session;
 pub mod alac_encoder;
 
-pub use ap2_info::{Ap2Info, Ap2InfoError, AudioFormatCapability, ALAC_44100_16_2};
+pub use ap2_info::{
+    Ap2AudioFormat, Ap2Info, Ap2InfoError, AudioFormatCapability,
+    AIRPLAY_HIRES_AUDIO_FORMATS, ALAC_44100_16_2, ALAC_44100_24_2,
+    ALAC_48000_16_2, ALAC_48000_24_2,
+};
 pub use catalog::{DeviceCatalog, DeviceRecord};
 pub use discovery::{AirPlayTxt, DiscoveryError};
 pub use hap_crypto::{derive_control_keys, HapControlCipher, HapCryptoError};

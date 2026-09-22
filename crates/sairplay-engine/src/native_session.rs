@@ -4,7 +4,8 @@ use crate::{
     EventChannel, FeedbackWorker, MediaHandshakeConfig, NativeConnectFlow, NativePhase,
     NtpSessionSetupConfig, NtpTimingResponder, PairingError, PreflightError, PtpEngine,
     PtpSessionSetupConfig, RealtimeMediaSender, RecordConfig, RetransmitRing,
-    NativeVolumeControl, RetransmitStats, RetransmitWorker, RtpState, SetPeersConfig, TransientPairingClient,
+    Ap2AudioFormat, NativeVolumeControl, RetransmitStats, RetransmitWorker, RtpState,
+    SetPeersConfig, TransientPairingClient,
     VolumeSetResult, set_native_volume,
 };
 use rand::RngCore;
@@ -32,6 +33,7 @@ pub struct NativeSessionConfig {
     pub apple_model: bool,
     pub receiver_name: String,
     pub initial_volume: Option<u8>,
+    pub audio_format: Ap2AudioFormat,
 }
 
 impl NativeSessionConfig {
@@ -48,6 +50,7 @@ impl NativeSessionConfig {
             apple_model: false,
             receiver_name: "SAirplay2 Receiver".into(),
             initial_volume: None,
+            audio_format: Ap2AudioFormat::ALAC_44100_16_STEREO,
         }
     }
 }
@@ -138,12 +141,6 @@ impl NativeSession {
             .map_err(|e| NativeSessionError::Flow(format!("{e:?}")))?;
         flow.info_loaded()
             .map_err(|e| NativeSessionError::Flow(format!("{e:?}")))?;
-
-        if info.info.realtime.known && !info.info.realtime.advertises(crate::ALAC_44100_16_2) {
-            return Err(NativeSessionError::Flow(
-                "receiver explicitly does not advertise ALAC 16/44.1 stereo realtime".into(),
-            ));
-        }
 
         let local_addr = stream.local_addr().map_err(NativeSessionError::LocalAddress)?;
         let receiver_ip = info.peer.ip();
@@ -313,6 +310,7 @@ impl NativeSession {
             active_remote: config.active_remote.clone(),
             audio_secret,
             stream_connection_id: session_id,
+            audio_format: config.audio_format,
         };
         let media = prepare_realtime_media(&mut flow, &mut control, &media)
             .map_err(|e| NativeSessionError::Media(format!("{e:?}")))?;
