@@ -240,6 +240,10 @@ impl RealtimeMediaSender {
         self.splice_pad_frames = 0;
     }
 
+    pub fn add_splice_pad(&mut self, frames: u32) {
+        self.splice_pad_frames = self.splice_pad_frames.saturating_add(frames);
+    }
+
     pub fn consume_splice_pad(&mut self, frames: u32) {
         self.splice_pad_frames = self.splice_pad_frames.saturating_sub(frames);
     }

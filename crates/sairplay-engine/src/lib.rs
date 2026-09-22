@@ -39,6 +39,10 @@ pub mod pcm_chunker;
 pub mod wasapi_loopback;
 #[cfg(windows)]
 pub mod windows_audio_worker;
+#[cfg(windows)]
+pub mod windows_multiroom_worker;
+#[cfg(windows)]
+pub mod native_group;
 pub mod alac_encoder;
 
 pub use ap2_info::{Ap2Info, Ap2InfoError, AudioFormatCapability, ALAC_44100_16_2};
@@ -81,6 +85,13 @@ pub use pcm_chunker::{Pcm352Chunker, PCM352_PACKET_BYTES};
 pub use wasapi_loopback::{WasapiDrainReport, WasapiLoopbackCapture, WasapiLoopbackError};
 #[cfg(windows)]
 pub use windows_audio_worker::{WindowsAudioWorker, WindowsAudioWorkerError};
+#[cfg(windows)]
+pub use windows_multiroom_worker::{
+    WindowsAudioTarget, WindowsMultiroomAudioError, WindowsMultiroomAudioWorker,
+    AIRPLAY_COLD_GROUP_START_LEAD_MS,
+};
+#[cfg(windows)]
+pub use native_group::{NativeGroupError, NativeGroupMemberConfig, NativeGroupSession};
 pub use native_session::{NativeSession, NativeSessionConfig, NativeSessionError};
 pub use ptp_engine::{PtpClock, PtpEngine, PtpEngineError, PtpExchange};
 pub use ptp_session_setup::{build_ptp_session_plist, setup_ptp_session, PtpSessionSetupConfig, PtpSessionSetupError, PtpSessionSetupResult};

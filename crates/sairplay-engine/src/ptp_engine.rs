@@ -314,6 +314,22 @@ impl PtpEngine {
         }
     }
 
+    /// Register additional receivers on an already-running PTP engine.
+    /// The primary source uses one host-wide shared PTP daemon for multi-room;
+    /// adding a member must not evict peers that are already synchronized.
+    pub fn add_peers(&self, peers: &[IpAddr]) {
+        if let Ok(mut slot) = self.peers.lock() {
+            for peer in peers {
+                if let IpAddr::V4(ip) = peer {
+                    if !slot.contains(ip) {
+                        slot.push(*ip);
+                    }
+                }
+            }
+            self.peer_kick.store(!slot.is_empty(), Ordering::SeqCst);
+        }
+    }
+
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         if let Some(worker) = self.worker.take() {

@@ -17,7 +17,7 @@ use std::sync::{
 use std::time::Duration;
 
 #[cfg(windows)]
-use crate::{WindowsAudioWorker, WindowsAudioWorkerError};
+use crate::{WindowsAudioTarget, WindowsAudioWorker, WindowsAudioWorkerError};
 
 #[derive(Debug, Clone)]
 pub struct NativeSessionConfig {
@@ -98,7 +98,7 @@ pub struct NativeSession {
     feedback: FeedbackWorker,
     retransmit: Option<RetransmitWorker>,
     _ntp_timing: Option<NtpTimingResponder>,
-    _ptp_timing: Option<PtpEngine>,
+    _ptp_timing: Option<Arc<PtpEngine>>,
     event: Option<EventChannel>,
     sender: Option<RealtimeMediaSender>,
     session_uri: String,
@@ -115,6 +115,13 @@ pub struct NativeSession {
 
 impl NativeSession {
     pub fn connect(config: &NativeSessionConfig) -> Result<Self, NativeSessionError> {
+        Self::connect_with_shared_ptp(config, None)
+    }
+
+    pub fn connect_with_shared_ptp(
+        config: &NativeSessionConfig,
+        shared_ptp: Option<Arc<PtpEngine>>,
+    ) -> Result<Self, NativeSessionError> {
         let mut flow = NativeConnectFlow::default();
 
         // 1) One TCP connection: plaintext /info, then HAP, then encrypted RTSP.
@@ -176,18 +183,29 @@ impl NativeSession {
         })?;
 
         let mut ntp_timing = None;
-        let mut ptp_timing = None;
+        let mut ptp_timing: Option<Arc<PtpEngine>> = None;
         let event_port;
 
         if config.supports_ptp {
-            match PtpEngine::start(
-                receiver_ip,
-                local_addr.ip(),
-                clock_id,
-                config.follow_receiver_clock,
-            ) {
+            let engine_result = if let Some(engine) = shared_ptp.as_ref() {
+                Ok(Arc::clone(engine))
+            } else {
+                PtpEngine::start(
+                    receiver_ip,
+                    local_addr.ip(),
+                    clock_id,
+                    config.follow_receiver_clock,
+                )
+                .map(Arc::new)
+            };
+
+            match engine_result {
                 Ok(engine) => {
-                    // Match source settle window before publishing timingPeerInfo.
+                    // Source multi-room uses one shared PTP daemon/clock for all
+                    // native members. Single-device sessions still create the
+                    // same in-process engine, then keep it behind Arc so a group
+                    // can attach additional receivers without binding 319/320
+                    // again.
                     engine.settle(Duration::from_millis(400));
                     flow.timing_ready()
                         .map_err(|e| NativeSessionError::Flow(format!("{e:?}")))?;
@@ -316,7 +334,7 @@ impl NativeSession {
             };
             send_setpeers(&mut control, &setpeers)
                 .map_err(|e| NativeSessionError::Media(format!("SETPEERS failed: {e:?}")))?;
-            engine.set_peers(&[receiver_ip, local_addr.ip()]);
+            engine.add_peers(&[receiver_ip, local_addr.ip()]);
             5
         } else {
             4
@@ -436,6 +454,38 @@ impl NativeSession {
 
     pub fn next_control_cseq(&self) -> u32 {
         self.next_cseq.load(Ordering::SeqCst)
+    }
+
+    pub fn shared_ptp_engine(&self) -> Option<Arc<PtpEngine>> {
+        self._ptp_timing.as_ref().map(Arc::clone)
+    }
+
+    #[cfg(windows)]
+    pub fn take_windows_audio_target(
+        &mut self,
+        name: impl Into<String>,
+    ) -> Result<WindowsAudioTarget, NativeSessionError> {
+        if !self.is_ready() {
+            return Err(NativeSessionError::Flow(
+                "audio target cannot be extracted before native transport is Ready".into(),
+            ));
+        }
+        if self.audio_worker.as_ref().is_some_and(|worker| worker.is_running()) {
+            return Err(NativeSessionError::Flow(
+                "audio target cannot be extracted while single-device capture is running".into(),
+            ));
+        }
+        let sender = self.sender.take().ok_or_else(|| {
+            NativeSessionError::Flow("realtime sender is already owned by an audio worker".into())
+        })?;
+        Ok(WindowsAudioTarget {
+            name: name.into(),
+            sender,
+            lead_frames: self.lead_frames,
+            latency_max: self.latency_max,
+            rtp_offset: self.rtp_offset,
+            cold_start_delay_ms: self.cold_start_delay_ms,
+        })
     }
 
     #[cfg(windows)]
