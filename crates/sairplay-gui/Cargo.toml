@@ -11,3 +11,8 @@ egui_extras = { version = "0.31", features = ["svg", "image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 sairplay-engine = { path = "../sairplay-engine" }
 
+
+
+[build-dependencies]
+ico = "0.3"
+winres = "0.1"

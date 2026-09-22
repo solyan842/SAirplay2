@@ -1359,7 +1359,7 @@ impl SairplayApp {
                                         ui.add_space(((scroll_height - 80.0) * 0.36).max(48.0));
                                         let text = if stereo_pair {
                                             self.t(
-                                                "Chưa phát hiện cặp HomePod đã ghép nối",
+                                                "Chưa phát hiện cặp HomePod Stereo",
                                                 "No HomePod stereo pair detected",
                                             )
                                         } else {
@@ -1780,9 +1780,10 @@ impl eframe::App for SairplayApp {
                                 );
                                 ui.add_space(1.0);
                                 ui.label(
-                                    egui::RichText::new(
+                                    egui::RichText::new(self.t(
+                                        "Giao thức truyền tải âm thanh không dây lossless của Apple sử dụng ALAC",
                                         "Native AirPlay — Apple's lossless wireless audio transport using ALAC",
-                                    )
+                                    ))
                                     .size(13.0)
                                     .color(UiTheme::text_soft()),
                                 );
@@ -1846,7 +1847,7 @@ impl eframe::App for SairplayApp {
                 // Consume the vertical space that was previously left blank
                 // under the trial row. Reserve only the fixed controls/trial
                 // block below the two device panels.
-                const LOWER_CONTROLS_RESERVE: f32 = 107.0;
+                const LOWER_CONTROLS_RESERVE: f32 = 105.0;
                 const PANEL_FRAME_VERTICAL_MARGIN: f32 = 22.0;
                 let panel_content_height = (
                     ui.available_height()
@@ -3085,6 +3086,78 @@ mod gui_tests {
     }
 }
 
+fn app_icon_rgba(size: u32) -> Vec<u8> {
+    let mut rgba = vec![0u8; (size * size * 4) as usize];
+    let n = size as f32;
+
+    for y in 0..size {
+        for x in 0..size {
+            let fx = (x as f32 + 0.5) / n;
+            let fy = (y as f32 + 0.5) / n;
+
+            // Rounded-square iOS-style body.
+            let margin = 0.055;
+            let radius = 0.215;
+            let left = margin;
+            let right = 1.0 - margin;
+            let top = margin;
+            let bottom = 1.0 - margin;
+
+            let qx = if fx < left + radius {
+                left + radius - fx
+            } else if fx > right - radius {
+                fx - (right - radius)
+            } else {
+                0.0
+            };
+            let qy = if fy < top + radius {
+                top + radius - fy
+            } else if fy > bottom - radius {
+                fy - (bottom - radius)
+            } else {
+                0.0
+            };
+            let inside = if qx > 0.0 && qy > 0.0 {
+                qx * qx + qy * qy <= radius * radius
+            } else {
+                fx >= left && fx <= right && fy >= top && fy <= bottom
+            };
+            if !inside {
+                continue;
+            }
+
+            let t = ((fx + fy) * 0.5).clamp(0.0, 1.0);
+            let blue_r = (47.0 * (1.0 - t) + 16.0 * t).round() as u8;
+            let blue_g = (145.0 * (1.0 - t) + 103.0 * t).round() as u8;
+            let blue_b = (255.0 * (1.0 - t) + 242.0 * t).round() as u8;
+
+            let nx = fx - 0.5;
+            let ny = fy - 0.49;
+            let dist = (nx * nx + ny * ny).sqrt();
+            let outer_arc = ny <= 0.15 && (dist - 0.285).abs() <= 0.018;
+            let inner_arc = ny <= 0.11 && (dist - 0.185).abs() <= 0.014;
+            let stem = nx.abs() <= 0.014 && fy >= 0.27 && fy <= 0.665;
+            let dot_dx = fx - 0.5;
+            let dot_dy = fy - 0.685;
+            let dot = dot_dx * dot_dx + dot_dy * dot_dy <= 0.046 * 0.046;
+
+            let (r, g, b) = if outer_arc || inner_arc || stem || dot {
+                (255, 255, 255)
+            } else {
+                (blue_r, blue_g, blue_b)
+            };
+
+            let i = ((y * size + x) * 4) as usize;
+            rgba[i] = r;
+            rgba[i + 1] = g;
+            rgba[i + 2] = b;
+            rgba[i + 3] = 255;
+        }
+    }
+
+    rgba
+}
+
 fn install_windows_ui_font(ctx: &egui::Context) {
     #[cfg(windows)]
     {
@@ -3116,6 +3189,11 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("SAirplay2")
+            .with_icon(egui::IconData {
+                rgba: app_icon_rgba(256),
+                width: 256,
+                height: 256,
+            })
             .with_inner_size([960.0, 620.0])
             .with_min_inner_size([960.0, 620.0])
             .with_max_inner_size([960.0, 620.0])
