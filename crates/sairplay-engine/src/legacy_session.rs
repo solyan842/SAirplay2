@@ -33,6 +33,7 @@ pub struct LegacyMemberConfig {
     pub md: String,
     pub am: String,
     pub pk: String,
+    pub secret: Option<String>,
     pub compressed_alac: bool,
     pub mfi_auth: bool,
 }
@@ -48,6 +49,7 @@ impl LegacyMemberConfig {
             md: "0,1,2".into(),
             am: String::new(),
             pk: String::new(),
+            secret: None,
             compressed_alac: true,
             mfi_auth: false,
         }
@@ -435,6 +437,11 @@ fn spawn_member(
     }
     if config.mfi_auth {
         command.arg("-u");
+    }
+    if let Some(secret) = config.secret.as_deref() {
+        if !secret.trim().is_empty() {
+            command.arg("-s").arg(secret);
+        }
     }
 
     command
