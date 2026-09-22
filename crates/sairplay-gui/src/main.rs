@@ -1788,11 +1788,19 @@ impl SairplayApp {
     }
 
     fn render_controls(&mut self, ui: &mut egui::Ui) {
-        const CARD_OUTER_W: f32 = 306.0;
         const CARD_OUTER_H: f32 = 58.0;
-        const CARD_INNER_W: f32 = 286.0;
         const CARD_INNER_H: f32 = 42.0;
         const CARD_GAP: f32 = 7.0;
+        const CARD_HORIZONTAL_MARGIN: f32 = 20.0;
+
+        // The lower control row must follow the exact live width of the device
+        // panels above. Fixed 306 px cards looked correct at one viewport/DPI
+        // only, then drifted or clipped when Windows resized/scaled the window.
+        // Divide the available row width into three equal cards so both outer
+        // edges remain aligned with the two device panels at every size.
+        let controls_width = ui.available_width();
+        let card_outer_w = ((controls_width - CARD_GAP * 2.0) / 3.0).max(220.0);
+        let card_inner_w = (card_outer_w - CARD_HORIZONTAL_MARGIN).max(200.0);
 
         let card_frame = || {
             egui::Frame::new()
@@ -1810,14 +1818,14 @@ impl SairplayApp {
 
         ui.horizontal(|ui| {
             let (volume_rect, _) =
-                ui.allocate_exact_size(egui::vec2(CARD_OUTER_W, CARD_OUTER_H), egui::Sense::hover());
+                ui.allocate_exact_size(egui::vec2(card_outer_w, CARD_OUTER_H), egui::Sense::hover());
             ui.allocate_ui_at_rect(volume_rect, |ui| {
                 card_frame().show(ui, |ui| {
-                    ui.set_min_size(egui::vec2(CARD_INNER_W, CARD_INNER_H));
-                    ui.set_max_size(egui::vec2(CARD_INNER_W, CARD_INNER_H));
+                    ui.set_min_size(egui::vec2(card_inner_w, CARD_INNER_H));
+                    ui.set_max_size(egui::vec2(card_inner_w, CARD_INNER_H));
 
                     ui.allocate_ui_with_layout(
-                        egui::vec2(CARD_INNER_W, CARD_INNER_H),
+                        egui::vec2(card_inner_w, CARD_INNER_H),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             draw_speaker_icon(ui, egui::vec2(25.0, 25.0));
@@ -1871,14 +1879,14 @@ impl SairplayApp {
             ui.add_space(CARD_GAP);
 
             let (actions_rect, _) =
-                ui.allocate_exact_size(egui::vec2(CARD_OUTER_W, CARD_OUTER_H), egui::Sense::hover());
+                ui.allocate_exact_size(egui::vec2(card_outer_w, CARD_OUTER_H), egui::Sense::hover());
             ui.allocate_ui_at_rect(actions_rect, |ui| {
                 card_frame().show(ui, |ui| {
-                    ui.set_min_size(egui::vec2(CARD_INNER_W, CARD_INNER_H));
-                    ui.set_max_size(egui::vec2(CARD_INNER_W, CARD_INNER_H));
+                    ui.set_min_size(egui::vec2(card_inner_w, CARD_INNER_H));
+                    ui.set_max_size(egui::vec2(card_inner_w, CARD_INNER_H));
 
                     ui.allocate_ui_with_layout(
-                        egui::vec2(CARD_INNER_W, CARD_INNER_H),
+                        egui::vec2(card_inner_w, CARD_INNER_H),
                         egui::Layout::left_to_right(egui::Align::Center)
                             .with_main_align(egui::Align::Center),
                         |ui| {
@@ -1922,14 +1930,14 @@ impl SairplayApp {
             ui.add_space(CARD_GAP);
 
             let (airplay_rect, _) =
-                ui.allocate_exact_size(egui::vec2(CARD_OUTER_W, CARD_OUTER_H), egui::Sense::hover());
+                ui.allocate_exact_size(egui::vec2(card_outer_w, CARD_OUTER_H), egui::Sense::hover());
             ui.allocate_ui_at_rect(airplay_rect, |ui| {
                 card_frame().show(ui, |ui| {
-                    ui.set_min_size(egui::vec2(CARD_INNER_W, CARD_INNER_H));
-                    ui.set_max_size(egui::vec2(CARD_INNER_W, CARD_INNER_H));
+                    ui.set_min_size(egui::vec2(card_inner_w, CARD_INNER_H));
+                    ui.set_max_size(egui::vec2(card_inner_w, CARD_INNER_H));
 
                     ui.allocate_ui_with_layout(
-                        egui::vec2(CARD_INNER_W, CARD_INNER_H),
+                        egui::vec2(card_inner_w, CARD_INNER_H),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             draw_airplay_wave_icon(ui, egui::vec2(34.0, 34.0));
