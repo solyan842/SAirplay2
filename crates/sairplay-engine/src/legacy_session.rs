@@ -32,6 +32,7 @@ pub struct LegacyMemberConfig {
     pub et: String,
     pub md: String,
     pub am: String,
+    pub pk: String,
     pub compressed_alac: bool,
     pub mfi_auth: bool,
 }
@@ -46,6 +47,7 @@ impl LegacyMemberConfig {
             et: "0,4".into(),
             md: "0,1,2".into(),
             am: String::new(),
+            pk: String::new(),
             compressed_alac: true,
             mfi_auth: false,
         }
@@ -145,7 +147,12 @@ impl LegacyGroupSession {
         // transport health is proven before the state flips to playing.
         let mut readiness_error: Option<(String, String)> = None;
         for member in &spawned {
-            match member.connected_rx.recv_timeout(Duration::from_secs(8)) {
+            // Source-aligned readiness: wait for the helper's actual
+            // raopcl_connect() result. The pinned RTSP layer uses a 10 s
+            // response timeout per exchange; an outer 8 s timeout was shorter
+            // than the source contract and caused false failures on TV-class
+            // receivers.
+            match member.connected_rx.recv() {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     readiness_error = Some((member.name.clone(), error));
@@ -459,28 +466,38 @@ fn spawn_member(
         .name("sairplay-libraop-log".into())
         .spawn(move || {
             let mut connected = false;
+            let mut last_detail: Option<String> = None;
             for line in BufReader::new(stderr).lines() {
                 let Ok(line) = line else { break };
                 let lower = line.to_ascii_lowercase();
-                if !connected && lower.contains("connected to") {
-                    connected = true;
-                    let _ = connected_tx.send(Ok(()));
-                    if let Ok(mut events) = reader_events.lock() {
-                        events.push(format!("{reader_name}: libraop connected."));
-                    }
-                } else if lower.contains("error")
-                    || lower.contains("failed")
-                    || lower.contains("cannot connect")
-                {
-                    if let Ok(mut events) = reader_events.lock() {
+
+                // Keep the actual source diagnostics while connecting. They are
+                // invaluable for TV/receiver interoperability and replace the
+                // previous opaque "timed out waiting on channel" wrapper error.
+                if let Ok(mut events) = reader_events.lock() {
+                    if !connected || lower.contains("error") || lower.contains("failed") {
                         events.push(format!("{reader_name}: {line}"));
                     }
                 }
+
+                if !connected && lower.contains("connected to") {
+                    connected = true;
+                    let _ = connected_tx.send(Ok(()));
+                } else if lower.contains("cannot connect to airplay device")
+                    || lower.contains("request failed")
+                    || lower.contains("auth-setup failed")
+                    || lower.contains("pair again")
+                    || lower.contains("no session in response")
+                    || lower.contains("missing a rtp port")
+                {
+                    last_detail = Some(line);
+                }
             }
             if !connected {
-                let _ = connected_tx.send(Err(
-                    "helper exited before reporting raopcl_connect readiness".into(),
-                ));
+                let detail = last_detail.unwrap_or_else(|| {
+                    "helper exited before reporting raopcl_connect readiness".into()
+                });
+                let _ = connected_tx.send(Err(detail));
             }
         })
         .map_err(|error| LegacyGroupError::Spawn {
