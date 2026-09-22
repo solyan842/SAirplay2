@@ -861,7 +861,7 @@ impl SairplayApp {
                 match legacy_config_for_device(device, initial_volume) {
                     Ok(config) => {
                         self.log.push(format!(
-                            "{}: source libraop route {:?} on {}:{} · et={} · md={} · am={}.",
+                            "{}: source libraop route {:?} on {}:{} · et={} · md={} · am={} · pk={}.",
                             device.display_name,
                             device.route(false, false),
                             config.host,
@@ -869,6 +869,7 @@ impl SairplayApp {
                             config.et,
                             config.md,
                             if config.am.is_empty() { "-" } else { &config.am },
+                            if config.pk.is_empty() { "-" } else { "present" },
                         ));
                         configs.push(config);
                     }
@@ -2843,6 +2844,25 @@ fn legacy_config_for_device(
         .or(props.txt.fields.get("model"))
         .cloned()
         .unwrap_or_default();
+    config.pk = props
+        .txt
+        .fields
+        .get("pk")
+        .cloned()
+        .unwrap_or_default();
+
+    // Primary-source behavior: an AppleTV-class RAOP receiver that publishes
+    // a public key needs the stored AppleTV pairing secret. SAirplay2 does not
+    // yet have that secret in the legacy credential store, so report the real
+    // requirement instead of entering a doomed RAOP connect attempt.
+    if config.am.to_ascii_lowercase().contains("appletv")
+        && !config.pk.trim().is_empty()
+    {
+        return Err(format!(
+            "{} requires AppleTV/TV AirPlay pairing credentials before RAOP playback (pk advertised).",
+            device.display_name
+        ));
+    }
     config.mfi_auth = config.am.to_ascii_lowercase().contains("airport");
 
     if let Some(cn) = props.txt.fields.get("cn") {
