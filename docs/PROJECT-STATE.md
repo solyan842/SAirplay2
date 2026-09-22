@@ -38,7 +38,7 @@ Pinned references currently used for comparison:
 
 - `music-assistant/airplay-cli@431c5c582eef9307c4e39c50a0ea65e970bc1128`
 - `music-assistant/server@9e311eb84aba0a940bdfbf7433d5a29c07bab1b6`
-- `philippe44/libraop@81c2182649da8645ac2a58b78e9f370c79a4165b`
+- `philippe44/libraop@dadcfcaa26d988cdd3e3501ddf8286c224f1b494`
 
 Do not silently replace these references while diagnosing the current legacy-TV issue. If a newer upstream commit is intentionally adopted, record the exact SHA and reason here.
 
@@ -299,7 +299,7 @@ When a new stable milestone is confirmed by runtime testing, update this file wi
 
 Compared directly against:
 
-- `philippe44/libraop@81c2182649da8645ac2a58b78e9f370c79a4165b` — `src/cliraop.c`
+- `philippe44/libraop@dadcfcaa26d988cdd3e3501ddf8286c224f1b494` — `src/cliraop.c`
 - `music-assistant/airplay-cli@431c5c582eef9307c4e39c50a0ea65e970bc1128` — `src/cliairplay.c`
 - `music-assistant/server@9e311eb84aba0a940bdfbf7433d5a29c07bab1b6` — AirPlay `stream.py`
 
@@ -399,7 +399,7 @@ Next single investigation:
 
 ## 15. Legacy PCM-to-RTP source trace — 2026-09-22
 
-Compared directly against pinned `philippe44/libraop@81c2182649da8645ac2a58b78e9f370c79a4165b`.
+Compared directly against pinned `philippe44/libraop@dadcfcaa26d988cdd3e3501ddf8286c224f1b494`.
 
 Trace:
 
@@ -444,3 +444,26 @@ Next single action:
 - Keep diagnostics one-shot / first-event focused to avoid log spam.
 - Build through GitHub Actions first, then run one TV test.
 - Remove the diagnostics once the failing stage is identified.
+
+
+## 16. Legacy helper upstream refresh — 2026-09-22
+
+User explicitly requested moving the Windows legacy helper to the current upstream libraop rather than retaining the December 2025 pin.
+
+Adopted exact upstream SHA:
+
+```
+dadcfcaa26d988cdd3e3501ddf8286c224f1b494
+```
+
+Reason:
+- previous pin dated 2025-12-17;
+- current upstream master dated 2026-09-16;
+- Windows `cliraop.exe` is still built by upstream;
+- refresh is isolated to the legacy helper path;
+- locked stable `a7cb24b1...` and native HomePod/AirPlay 2 engine remain untouched.
+
+Important:
+- build remains reproducible by pinning the exact adopted SHA;
+- do not float against `master` implicitly;
+- temporary one-shot diagnostic patch is still applied after checkout until the TV failure is isolated.
