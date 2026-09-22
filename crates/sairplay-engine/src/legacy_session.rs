@@ -17,7 +17,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
-pub const LIBRAOP_PINNED_COMMIT: &str = "81c2182649da8645ac2a58b78e9f370c79a4165b";
+pub const LIBRAOP_PINNED_COMMIT: &str = "dadcfcaa26d988cdd3e3501ddf8286c224f1b494";
 const RAOP_CONFIGURED_LATENCY_FRAMES: u32 = 44_100;
 const RAOP_FIXED_LATENCY_FRAMES: u32 = 11_025;
 const RAOP_GROUP_START_LEAD_MS: u64 = 5_000;
@@ -41,6 +41,7 @@ pub struct LegacyMemberConfig {
     pub secret: Option<String>,
     pub compressed_alac: bool,
     pub mfi_auth: bool,
+    pub startup_flush_probe: bool,
 }
 
 impl LegacyMemberConfig {
@@ -58,6 +59,7 @@ impl LegacyMemberConfig {
             secret: None,
             compressed_alac: true,
             mfi_auth: false,
+            startup_flush_probe: false,
         }
     }
 }
@@ -474,6 +476,12 @@ fn spawn_member(
     }
 
     let mut command = Command::new(helper);
+    if config.startup_flush_probe {
+        command.env("SAIRPLAY_STARTUP_FLUSH", "1");
+        if let Ok(mut events) = startup_events.lock() {
+            events.push(format!("{}: [SAIRPLAY-DIAG] startup_flush_probe=enabled", config.name));
+        }
+    }
     command
         .arg("-p")
         .arg(config.port.to_string())

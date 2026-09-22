@@ -33,6 +33,27 @@ function Replace-Once {
 $cliraop = Join-Path $SourceRoot "src/cliraop.c"
 $raop = Join-Path $SourceRoot "src/raop_client.c"
 
+Replace-Once -Path $raop -Label "isolated startup FLUSH probe" -Old @'
+	if (!rtspcl_record(p->rtspcl, p->seq_number + 1, NTP2TS(raopcl_get_ntp(NULL), p->sample_rate), kd)) goto erexit;
+
+	if (kd_lookup(kd, "Audio-Latency")) {
+'@ -New @'
+	{
+		uint16_t sairplay_start_seq = p->seq_number + 1;
+		uint32_t sairplay_start_ts = NTP2TS(raopcl_get_ntp(NULL), p->sample_rate);
+
+		if (!rtspcl_record(p->rtspcl, sairplay_start_seq, sairplay_start_ts, kd)) goto erexit;
+
+		if (getenv("SAIRPLAY_STARTUP_FLUSH") && *getenv("SAIRPLAY_STARTUP_FLUSH")) {
+			LOG_INFO("[SAIRPLAY-DIAG] startup_flush seq=%u rtptime=%u",
+					 sairplay_start_seq, sairplay_start_ts);
+			if (!rtspcl_flush(p->rtspcl, sairplay_start_seq, sairplay_start_ts)) goto erexit;
+		}
+	}
+
+	if (kd_lookup(kd, "Audio-Latency")) {
+'@
+
 Replace-Once -Path $cliraop -Label "cliraop first accepted/read PCM" -Old @'
 		if (status == PLAYING && raopcl_accept_frames(raopcl)) {
 			n = read(infile, buf, DEFAULT_FRAMES_PER_CHUNK * 4);

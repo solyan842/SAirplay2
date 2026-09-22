@@ -3294,6 +3294,15 @@ fn legacy_config_for_device(
     // explicit pairing_required check above is authoritative for blocking.
     config.mfi_auth = config.am.to_ascii_lowercase().contains("airport");
 
+    // Isolated A/B probe for embedded AppleTV-class receivers that advertise a
+    // public key but no PIN/legacy-pairing requirement and have no stored secret.
+    // This changes only the legacy helper startup timeline via an environment
+    // switch; native AirPlay 2 and other legacy receivers remain untouched.
+    config.startup_flush_probe = config.am.to_ascii_lowercase().contains("appletv")
+        && !config.pk.trim().is_empty()
+        && config.secret.is_none()
+        && !pairing_required;
+
     config.cn = props
         .txt
         .fields

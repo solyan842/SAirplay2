@@ -467,3 +467,12 @@ Important:
 - build remains reproducible by pinning the exact adopted SHA;
 - do not float against `master` implicitly;
 - temporary one-shot diagnostic patch is still applied after checkout until the TV failure is isolated.
+
+
+## 17. Embedded AppleTV startup-FLUSH A/B probe — 2026-09-22
+
+Runtime on Windows #606 with current libraop `dadcfcaa26d988cdd3e3501ddf8286c224f1b494` confirmed that the embedded TV still completes SETUP/RECORD, accepts PCM, enters streaming and successfully sends the first UDP audio datagram before the TV AirPlay service re-advertises under a new instance. Upstream refresh therefore did not remove the failure.
+
+Source comparison with pyatv showed a concrete startup-timeline difference: pyatv sends FLUSH with RTP-Info immediately after RECORD before the first audio packet, while libraop transitions from RAOP_FLUSHED to streaming without that startup RTSP FLUSH.
+
+A strictly isolated A/B probe is enabled only for embedded AppleTV-class legacy receivers with pk present, no stored secret and no explicit PIN/legacy-pairing status flags. The helper receives `SAIRPLAY_STARTUP_FLUSH=1`; the build-time diagnostic patch then sends one RTSP FLUSH using the same startup seq/rtptime as RECORD. Native AirPlay 2 and all other legacy receivers are unchanged.
