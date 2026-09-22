@@ -15,4 +15,5 @@ sairplay-engine = { path = "../sairplay-engine" }
 
 [build-dependencies]
 ico = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
 winres = "0.1"
