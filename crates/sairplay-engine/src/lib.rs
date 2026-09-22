@@ -88,10 +88,13 @@ pub use windows_audio_worker::{WindowsAudioWorker, WindowsAudioWorkerError};
 #[cfg(windows)]
 pub use windows_multiroom_worker::{
     WindowsAudioTarget, WindowsMultiroomAudioError, WindowsMultiroomAudioWorker,
-    AIRPLAY_COLD_GROUP_START_LEAD_MS,
+    WindowsMultiroomJoinHandle, AIRPLAY_COLD_GROUP_START_LEAD_MS,
+    AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS, AIRPLAY_START_LEAD_MS,
 };
 #[cfg(windows)]
-pub use native_group::{NativeGroupError, NativeGroupMemberConfig, NativeGroupSession};
+pub use native_group::{
+    NativeGroupError, NativeGroupJoinHandle, NativeGroupMemberConfig, NativeGroupSession,
+};
 pub use native_session::{NativeSession, NativeSessionConfig, NativeSessionError};
 pub use ptp_engine::{PtpClock, PtpEngine, PtpEngineError, PtpExchange};
 pub use ptp_session_setup::{build_ptp_session_plist, setup_ptp_session, PtpSessionSetupConfig, PtpSessionSetupError, PtpSessionSetupResult};
