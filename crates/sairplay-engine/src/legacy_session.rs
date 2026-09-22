@@ -21,7 +21,17 @@ pub const LIBRAOP_PINNED_COMMIT: &str = "81c2182649da8645ac2a58b78e9f370c79a4165
 const RAOP_CONFIGURED_LATENCY_FRAMES: u32 = 44_100;
 const RAOP_FIXED_LATENCY_FRAMES: u32 = 11_025;
 const RAOP_GROUP_START_LEAD_MS: u64 = 5_000;
-const WRITER_QUEUE_PACKETS: usize = 96;
+// cliraop is deliberately pull-paced by raopcl_accept_frames(): it does not
+// read stdin until the receiver's RAOP timeline can accept the next 352-frame
+// chunk. A 96-packet queue is only ~766 ms at 44.1 kHz and can therefore fill
+// during a completely normal receiver FLUSH/start transition. Treat that as
+// backpressure, not as a dead writer. Keep ~12 s of per-member headroom; a
+// truly dead helper still disconnects its pipe immediately, while a genuinely
+// stalled live helper is evicted only after this much accumulated PCM.
+const RAOP_PACKETS_PER_SECOND_CEIL: usize = (44_100 + 352 - 1) / 352;
+const WRITER_QUEUE_SECONDS: usize = 12;
+const WRITER_QUEUE_PACKETS: usize =
+    RAOP_PACKETS_PER_SECOND_CEIL * WRITER_QUEUE_SECONDS;
 
 #[derive(Debug, Clone)]
 pub struct LegacyMemberConfig {
@@ -126,8 +136,8 @@ impl LegacyGroupSession {
         let last_discontinuity_frame = Arc::new(AtomicU64::new(u64::MAX));
         let first_non_silent_frame = Arc::new(AtomicU64::new(u64::MAX));
         let startup_events = Arc::new(Mutex::new(vec![format!(
-            "Legacy transport: pinned libraop {} · shared audible START +{} ms.",
-            LIBRAOP_PINNED_COMMIT, RAOP_GROUP_START_LEAD_MS
+            "Legacy transport: pinned libraop {} · shared audible START +{} ms · writer headroom ~{} s.",
+            LIBRAOP_PINNED_COMMIT, RAOP_GROUP_START_LEAD_MS, WRITER_QUEUE_SECONDS
         )]));
         let active_members = Arc::new(AtomicU64::new(configs.len() as u64));
 
@@ -316,7 +326,8 @@ impl LegacyGroupSession {
                                 Err(TrySendError::Full(_)) => {
                                     if let Ok(mut events) = events_thread.lock() {
                                         events.push(format!(
-                                            "{name}: libraop writer queue overrun; removed instead of dropping PCM."
+                                            "{name}: libraop writer queue stalled for ~{} s; removed instead of dropping PCM.",
+                                            WRITER_QUEUE_SECONDS
                                         ));
                                     }
                                     senders.remove(index);
