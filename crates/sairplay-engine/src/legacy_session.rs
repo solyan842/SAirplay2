@@ -143,33 +143,28 @@ impl LegacyGroupSession {
         // Source/controller contract: a group is not Running until every member
         // has completed raopcl_connect(). This also matches the GUI rule that
         // transport health is proven before the state flips to playing.
+        let mut readiness_error: Option<(String, String)> = None;
         for member in &spawned {
             match member.connected_rx.recv_timeout(Duration::from_secs(8)) {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    running.store(false, Ordering::SeqCst);
-                    for member in spawned {
-                        drop(member.pcm_tx);
-                        let _ = member.writer.join();
-                    }
-                    return Err(LegacyGroupError::Connect {
-                        name: member.name.clone(),
-                        error,
-                    });
+                    readiness_error = Some((member.name.clone(), error));
+                    break;
                 }
                 Err(error) => {
-                    let name = member.name.clone();
-                    running.store(false, Ordering::SeqCst);
-                    for member in spawned {
-                        drop(member.pcm_tx);
-                        let _ = member.writer.join();
-                    }
-                    return Err(LegacyGroupError::Connect {
-                        name,
-                        error: error.to_string(),
-                    });
+                    readiness_error = Some((member.name.clone(), error.to_string()));
+                    break;
                 }
             }
+        }
+
+        if let Some((name, error)) = readiness_error {
+            running.store(false, Ordering::SeqCst);
+            for member in spawned {
+                drop(member.pcm_tx);
+                let _ = member.writer.join();
+            }
+            return Err(LegacyGroupError::Connect { name, error });
         }
 
         if let Ok(mut events) = startup_events.lock() {
