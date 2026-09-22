@@ -95,6 +95,7 @@ impl std::error::Error for LegacyGroupError {}
 
 struct SpawnedMember {
     name: String,
+    pid: u32,
     pcm_tx: SyncSender<[u8; PCM352_PACKET_BYTES]>,
     connected_rx: Receiver<Result<(), String>>,
     writer: JoinHandle<()>,
@@ -102,6 +103,7 @@ struct SpawnedMember {
 
 pub struct LegacyGroupSession {
     running: Arc<AtomicBool>,
+    helper_pids: Vec<u32>,
     worker: Option<JoinHandle<()>>,
     last_error: Arc<Mutex<Option<String>>>,
     discontinuities: Arc<AtomicU64>,
@@ -170,6 +172,9 @@ impl LegacyGroupSession {
 
         if let Some((name, error)) = readiness_error {
             running.store(false, Ordering::SeqCst);
+            for member in &spawned {
+                kill_helper_tree(member.pid);
+            }
             for member in spawned {
                 drop(member.pcm_tx);
                 let _ = member.writer.join();
@@ -185,6 +190,7 @@ impl LegacyGroupSession {
         let events_thread = Arc::clone(&startup_events);
         let active_thread = Arc::clone(&active_members);
 
+        let helper_pids = spawned.iter().map(|member| member.pid).collect::<Vec<_>>();
         let mut senders = spawned
             .iter()
             .map(|member| (member.name.clone(), member.pcm_tx.clone()))
@@ -354,6 +360,7 @@ impl LegacyGroupSession {
 
         Ok(Self {
             running,
+            helper_pids,
             worker: Some(worker),
             last_error,
             discontinuities,
@@ -404,6 +411,17 @@ impl LegacyGroupSession {
 
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+
+        // A cliraop helper can be blocked inside its stdin/RAOP pacing path.
+        // Joining the WASAPI worker before terminating the helper can therefore
+        // deadlock the GUI shutdown indefinitely. Stop the process tree first:
+        // closing the child side of the pipe immediately unblocks write_all(),
+        // then all Rust workers can join deterministically.
+        for &pid in &self.helper_pids {
+            kill_helper_tree(pid);
+        }
+        self.helper_pids.clear();
+
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -466,6 +484,7 @@ fn spawn_member(
         name: config.name.clone(),
         error: error.to_string(),
     })?;
+    let child_pid = child.id();
 
     let stdin = child.stdin.take().ok_or_else(|| LegacyGroupError::Spawn {
         name: config.name.clone(),
@@ -551,6 +570,7 @@ fn spawn_member(
 
     Ok(SpawnedMember {
         name: config.name,
+        pid: child_pid,
         pcm_tx,
         connected_rx,
         writer,
@@ -611,6 +631,17 @@ fn legacy_writer_loop(
         }
         running.store(false, Ordering::SeqCst);
     }
+}
+
+fn kill_helper_tree(pid: u32) {
+    // /T also terminates descendants created by the helper, /F guarantees a
+    // blocked RTSP/stdin helper cannot keep SAirplay2 alive after Stop/Exit.
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(0x08000000)
+        .status();
 }
 
 fn helper_path() -> Result<PathBuf, LegacyGroupError> {
