@@ -22,6 +22,13 @@ enum PlaybackUiState {
     Error(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaybackMode {
+    Single,
+    MultiRoom,
+    StereoPair,
+}
+
 enum ActiveSession {
     Single(NativeSession),
     Group(NativeGroupSession),
@@ -125,6 +132,7 @@ struct ConnectSuccess {
     session: ActiveSession,
     active_fullnames: BTreeSet<String>,
     label: String,
+    mode: PlaybackMode,
 }
 
 struct MembershipAdded {
@@ -232,7 +240,9 @@ struct SairplayApp {
     discovery: Option<MdnsBrowser>,
     discovery_rx: Option<Receiver<DiscoveryEvent>>,
     selected_fullnames: BTreeSet<String>,
+    selected_stereo_pair: Option<BTreeSet<String>>,
     active_fullnames: BTreeSet<String>,
+    active_mode: Option<PlaybackMode>,
     playback: PlaybackUiState,
     connect_rx: Option<Receiver<Result<ConnectSuccess, String>>>,
     membership_rx: Option<Receiver<Result<MembershipAdded, String>>>,
@@ -292,7 +302,9 @@ impl Default for SairplayApp {
             discovery,
             discovery_rx,
             selected_fullnames: BTreeSet::new(),
+            selected_stereo_pair: None,
             active_fullnames: BTreeSet::new(),
+            active_mode: None,
             playback: PlaybackUiState::Idle,
             connect_rx: None,
             membership_rx: None,
@@ -359,6 +371,13 @@ impl SairplayApp {
                 DiscoveryEvent::Removed { kind, fullname } => {
                     self.catalog.remove(kind, &fullname);
                     self.selected_fullnames.remove(&fullname);
+                    if self
+                        .selected_stereo_pair
+                        .as_ref()
+                        .is_some_and(|pair| pair.contains(&fullname))
+                    {
+                        self.selected_stereo_pair = None;
+                    }
                     self.active_fullnames.remove(&fullname);
                     self.log.push(format!("mDNS removed: {fullname}"));
                 }
@@ -374,6 +393,7 @@ impl SairplayApp {
         self.discovery_rx = None;
         self.catalog = DeviceCatalog::default();
         self.selected_fullnames.clear();
+        self.selected_stereo_pair = None;
         self.log.push("Manual rescan requested from app logo.".into());
 
         match MdnsBrowser::start() {
@@ -416,6 +436,7 @@ impl SairplayApp {
                         success.active_fullnames.len()
                     ));
                     self.active_fullnames = success.active_fullnames;
+                    self.active_mode = Some(success.mode);
                     self.playback = PlaybackUiState::Playing(success.label);
                     self.session = Some(success.session);
                 } else {
@@ -430,6 +451,7 @@ impl SairplayApp {
             Ok(Err(error)) => {
                 self.log.push(format!("Connect failed: {error}"));
                 self.active_fullnames.clear();
+                self.active_mode = None;
                 self.playback = PlaybackUiState::Error(error);
                 self.connect_rx = None;
             }
@@ -437,6 +459,7 @@ impl SairplayApp {
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.log.push("Connect worker ended unexpectedly.".into());
                 self.active_fullnames.clear();
+                self.active_mode = None;
                 self.playback =
                     PlaybackUiState::Error("Connect worker ended unexpectedly".into());
                 self.connect_rx = None;
@@ -1180,16 +1203,25 @@ impl SairplayApp {
             None
         };
 
-        let label = pair_name.unwrap_or_else(|| {
-            if member_count == 1 {
-                selected_devices[0].1.display_name.clone()
-            } else {
-                match self.language {
-                    UiLanguage::Vi => format!("MultiRoom · {member_count} thiết bị"),
-                    UiLanguage::En => format!("MultiRoom · {member_count} receivers"),
-                }
-            }
-        });
+        let requested_mode = if self.selected_stereo_pair.is_some() && member_count == 2 {
+            PlaybackMode::StereoPair
+        } else if self.multiroom_enabled && member_count > 1 {
+            PlaybackMode::MultiRoom
+        } else {
+            PlaybackMode::Single
+        };
+
+        let label = match requested_mode {
+            PlaybackMode::StereoPair => pair_name.unwrap_or_else(|| match self.language {
+                UiLanguage::Vi => "Cặp HomePod Stereo".to_owned(),
+                UiLanguage::En => "HomePod Stereo Pair".to_owned(),
+            }),
+            PlaybackMode::MultiRoom => match self.language {
+                UiLanguage::Vi => format!("MultiRoom · {member_count} thiết bị"),
+                UiLanguage::En => format!("MultiRoom · {member_count} receivers"),
+            },
+            PlaybackMode::Single => selected_devices[0].1.display_name.clone(),
+        };
 
         let (tx, rx) = mpsc::sync_channel(1);
         self.connect_rx = Some(rx);
@@ -1239,6 +1271,7 @@ impl SairplayApp {
                             session,
                             active_fullnames,
                             label,
+                            mode: requested_mode,
                         });
                     let _ = tx.send(result);
                 })
@@ -1285,6 +1318,7 @@ impl SairplayApp {
                             session,
                             active_fullnames,
                             label,
+                            mode: requested_mode,
                         });
                     let _ = tx.send(result);
                 })
@@ -1297,6 +1331,7 @@ impl SairplayApp {
             self.log.push("Playback stopped; AirPlay session resources released.".into());
         }
         self.active_fullnames.clear();
+        self.active_mode = None;
         self.membership_pending.clear();
         self.membership_rx = None;
         self.playback = PlaybackUiState::Idle;
@@ -1376,14 +1411,31 @@ impl SairplayApp {
 
     fn device_status(&self, device: &DeviceRecord, stereo_pair: bool) -> (&'static str, StatusTone) {
         let members = device_selection_members(device, stereo_pair);
-        let selected = !members.is_empty()
-            && members
-                .iter()
-                .all(|fullname| self.selected_fullnames.contains(fullname));
-        let active = !members.is_empty()
-            && members
-                .iter()
-                .all(|fullname| self.active_fullnames.contains(fullname));
+        let member_set = members.iter().cloned().collect::<BTreeSet<_>>();
+        let selected = if stereo_pair {
+            self.selected_stereo_pair
+                .as_ref()
+                .is_some_and(|pair| *pair == member_set)
+        } else if self.selected_stereo_pair.is_some() {
+            false
+        } else {
+            !members.is_empty()
+                && members
+                    .iter()
+                    .all(|fullname| self.selected_fullnames.contains(fullname))
+        };
+        let active = if stereo_pair {
+            self.active_mode == Some(PlaybackMode::StereoPair)
+                && !members.is_empty()
+                && members
+                    .iter()
+                    .all(|fullname| self.active_fullnames.contains(fullname))
+        } else {
+            !members.is_empty()
+                && members
+                    .iter()
+                    .all(|fullname| self.active_fullnames.contains(fullname))
+        };
         let pending = members
             .iter()
             .any(|fullname| self.membership_pending.contains(fullname));
@@ -1433,10 +1485,19 @@ impl SairplayApp {
 
         let route = device.route(false, false);
         let members = device_selection_members(device, stereo_pair);
-        let selected = !members.is_empty()
-            && members
-                .iter()
-                .all(|fullname| self.selected_fullnames.contains(fullname));
+        let member_set = members.iter().cloned().collect::<BTreeSet<_>>();
+        let selected = if stereo_pair {
+            self.selected_stereo_pair
+                .as_ref()
+                .is_some_and(|pair| *pair == member_set)
+        } else if self.selected_stereo_pair.is_some() {
+            false
+        } else {
+            !members.is_empty()
+                && members
+                    .iter()
+                    .all(|fullname| self.selected_fullnames.contains(fullname))
+        };
         let legacy_live = matches!(
             (&self.session, &self.playback),
             (Some(ActiveSession::Legacy(_)), PlaybackUiState::Playing(_))
@@ -1559,27 +1620,50 @@ impl SairplayApp {
                 .iter()
                 .all(|fullname| self.selected_fullnames.contains(fullname));
 
-            if self.multiroom_enabled {
-                if all_selected {
-                    for fullname in &members {
-                        self.selected_fullnames.remove(fullname);
-                    }
-                    if matches!(self.playback, PlaybackUiState::Playing(_)) {
-                        self.remove_live_members(&members);
-                    }
+            if stereo_pair {
+                // Pair and MultiRoom are mutually exclusive presentation modes.
+                // The pair still resolves to the same two physical endpoints
+                // internally, but the GUI keeps one logical selection identity.
+                if matches!(self.playback, PlaybackUiState::Playing(_)) {
+                    return;
+                }
+                self.multiroom_enabled = false;
+                self.selected_fullnames.clear();
+                if selected {
+                    self.selected_stereo_pair = None;
                 } else {
                     for fullname in &members {
                         self.selected_fullnames.insert(fullname.clone());
                     }
-                    if matches!(self.playback, PlaybackUiState::Playing(_)) {
-                        self.request_live_add(&members);
-                    }
+                    self.selected_stereo_pair =
+                        Some(members.iter().cloned().collect::<BTreeSet<_>>());
                 }
             } else {
-                self.selected_fullnames.clear();
-                if !all_selected || stereo_pair {
-                    for fullname in &members {
-                        self.selected_fullnames.insert(fullname.clone());
+                // Clicking an individual receiver exits Pair selection.
+                self.selected_stereo_pair = None;
+
+                if self.multiroom_enabled {
+                    if all_selected {
+                        for fullname in &members {
+                            self.selected_fullnames.remove(fullname);
+                        }
+                        if matches!(self.playback, PlaybackUiState::Playing(_)) {
+                            self.remove_live_members(&members);
+                        }
+                    } else {
+                        for fullname in &members {
+                            self.selected_fullnames.insert(fullname.clone());
+                        }
+                        if matches!(self.playback, PlaybackUiState::Playing(_)) {
+                            self.request_live_add(&members);
+                        }
+                    }
+                } else {
+                    self.selected_fullnames.clear();
+                    if !all_selected {
+                        for fullname in &members {
+                            self.selected_fullnames.insert(fullname.clone());
+                        }
                     }
                 }
             }
@@ -1663,6 +1747,9 @@ impl SairplayApp {
                                     .clicked()
                                     {
                                         self.multiroom_enabled = !self.multiroom_enabled;
+                                        if self.multiroom_enabled {
+                                            self.selected_stereo_pair = None;
+                                        }
                                         if !self.multiroom_enabled
                                             && self.selected_fullnames.len() > 1
                                             && !matches!(self.playback, PlaybackUiState::Playing(_))
@@ -1932,8 +2019,24 @@ impl SairplayApp {
                                     .color(UiTheme::text()),
                                 );
 
-                                let detail = if self.multiroom_enabled {
-                                    match self.language {
+                                let display_mode = self.active_mode.unwrap_or_else(|| {
+                                    if self.selected_stereo_pair.is_some() {
+                                        PlaybackMode::StereoPair
+                                    } else if self.multiroom_enabled
+                                        && self.selected_fullnames.len() > 1
+                                    {
+                                        PlaybackMode::MultiRoom
+                                    } else {
+                                        PlaybackMode::Single
+                                    }
+                                });
+
+                                let detail = match display_mode {
+                                    PlaybackMode::StereoPair => self.t(
+                                        "Stereo Pair · 2 HomePod",
+                                        "Stereo Pair · 2 HomePods",
+                                    ).to_owned(),
+                                    PlaybackMode::MultiRoom => match self.language {
                                         UiLanguage::Vi => format!(
                                             "MultiRoom · {} thiết bị đã chọn",
                                             self.selected_fullnames.len()
@@ -1942,16 +2045,11 @@ impl SairplayApp {
                                             "MultiRoom · {} receivers selected",
                                             self.selected_fullnames.len()
                                         ),
-                                    }
-                                } else if self.selected_fullnames.len() > 1 {
-                                    self.t(
-                                        "Stereo Pair · 2 HomePod",
-                                        "Stereo Pair · 2 HomePods",
-                                    )
-                                    .to_owned()
-                                } else {
-                                    self.t("Sẵn sàng truyền · ALAC", "Ready to stream · ALAC")
-                                        .to_owned()
+                                    },
+                                    PlaybackMode::Single => self.t(
+                                        "Sẵn sàng truyền · ALAC",
+                                        "Ready to stream · ALAC",
+                                    ).to_owned(),
                                 };
 
                                 ui.label(
