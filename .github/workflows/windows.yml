@@ -33,7 +33,8 @@ jobs:
           Invoke-WebRequest "$base/bin/cliraop.exe" -OutFile "$out/cliraop.exe"
           Invoke-WebRequest "$base/bin/libcrypto-1_1.dll" -OutFile "$out/libcrypto-1_1.dll"
           Invoke-WebRequest "$base/bin/libssl-1_1.dll" -OutFile "$out/libssl-1_1.dll"
-          Invoke-WebRequest "$base/LICENSE" -OutFile "$out/LIBRAOP-LICENSE"
+          Invoke-WebRequest "$base/README.md" -OutFile "$out/LIBRAOP-README.md"
+          Copy-Item "docs/LEGACY-TRANSPORT.md" "$out/LEGACY-TRANSPORT.md"
           Get-FileHash "$out/cliraop.exe" -Algorithm SHA256
           Get-ChildItem $out
       - name: Upload Windows GUI
