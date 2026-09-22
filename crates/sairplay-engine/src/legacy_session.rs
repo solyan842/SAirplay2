@@ -41,7 +41,7 @@ pub struct LegacyMemberConfig {
     pub secret: Option<String>,
     pub compressed_alac: bool,
     pub mfi_auth: bool,
-    pub startup_flush_probe: bool,
+    pub pcm_l16_probe: bool,
 }
 
 impl LegacyMemberConfig {
@@ -59,7 +59,7 @@ impl LegacyMemberConfig {
             secret: None,
             compressed_alac: true,
             mfi_auth: false,
-            startup_flush_probe: false,
+            pcm_l16_probe: false,
         }
     }
 }
@@ -470,16 +470,16 @@ fn spawn_member(
         events.push(format!(
             "{}: [SAIRPLAY-DIAG] codec={} cn={}",
             config.name,
-            if config.compressed_alac { "compressed-alac" } else { "alac-raw" },
+            if config.compressed_alac { "compressed-alac" } else { "pcm-l16" },
             if config.cn.trim().is_empty() { "<absent>" } else { config.cn.as_str() }
         ));
     }
 
     let mut command = Command::new(helper);
-    if config.startup_flush_probe {
-        command.env("SAIRPLAY_STARTUP_FLUSH", "1");
+    if config.pcm_l16_probe {
+        command.env("SAIRPLAY_PCM_L16_FMTP", "1");
         if let Ok(mut events) = startup_events.lock() {
-            events.push(format!("{}: [SAIRPLAY-DIAG] startup_flush_probe=enabled", config.name));
+            events.push(format!("{}: [SAIRPLAY-DIAG] codec=pcm-l16 pyatv-fmtp=enabled", config.name));
         }
     }
     command
