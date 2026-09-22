@@ -56,12 +56,12 @@ impl NativeGroupJoinHandle {
 
         // Timing mode is a session-wide decision upstream. A late joiner never
         // introduces a second PTP daemon or changes an existing NTP group.
-        let result = if self.use_ptp {
-            config.follow_receiver_clock = false;
+        let result = if self.use_ptp && config.supports_ptp {
             if let Some(engine) = self.shared_ptp.as_ref() {
                 NativeSession::connect_with_shared_ptp(&config, Some(Arc::clone(engine)))
             } else {
                 config.supports_ptp = false;
+                config.follow_receiver_clock = false;
                 NativeSession::connect(&config)
             }
         } else {
@@ -118,15 +118,10 @@ impl NativeGroupSession {
         let mut members = Vec::<(String, NativeSession)>::with_capacity(configs.len());
 
         for (index, mut member) in configs.into_iter().enumerate() {
-            if group_wants_ptp && member.config.supports_ptp && members.capacity() > 1 {
-                member.config.follow_receiver_clock = false;
-            }
-
             let session_result = if index == 0 {
                 NativeSession::connect(&member.config)
             } else if member.config.supports_ptp {
                 if let Some(engine) = shared_ptp.as_ref() {
-                    member.config.follow_receiver_clock = false;
                     NativeSession::connect_with_shared_ptp(
                         &member.config,
                         Some(Arc::clone(engine)),

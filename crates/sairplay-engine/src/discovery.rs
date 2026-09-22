@@ -112,8 +112,15 @@ impl AirPlayTxt {
     }
 
     pub fn follows_receiver_clock(&self) -> bool {
-        // Port of ap2_follow_receiver_clock() from the pinned primary source:
-        // standalone AudioAccessory group leader, no parent/stereo group, OS 27+.
+        // Port of ap2_follow_receiver_clock() from airplay-cli v0.5.4.
+        if let Some(enabled) = ptp_follow_override(
+            std::env::var("CLIAIRPLAY_PTP_FOLLOW").ok().as_deref(),
+        ) {
+            return enabled;
+        }
+
+        // Auto rule: standalone AudioAccessory group leader, no parent/stereo
+        // group, HomePod OS 27+.
         let model = self
             .fields
             .get("model")
@@ -145,6 +152,10 @@ impl AirPlayTxt {
             .and_then(|v| leading_version_major(v))
             .is_some_and(|major| major >= 980)
     }
+}
+
+fn ptp_follow_override(value: Option<&str>) -> Option<bool> {
+    value.map(|setting| !matches!(setting, "0" | "false" | "off"))
 }
 
 fn leading_version_major(value: &str) -> Option<u32> {
@@ -248,6 +259,16 @@ mod tests {
             ("srcvers", "980.1"),
         ]).unwrap();
         assert!(fallback.follows_receiver_clock());
+    }
+
+    #[test]
+    fn source_follow_override_matches_v054_semantics() {
+        assert_eq!(ptp_follow_override(None), None);
+        assert_eq!(ptp_follow_override(Some("0")), Some(false));
+        assert_eq!(ptp_follow_override(Some("false")), Some(false));
+        assert_eq!(ptp_follow_override(Some("off")), Some(false));
+        assert_eq!(ptp_follow_override(Some("1")), Some(true));
+        assert_eq!(ptp_follow_override(Some("anything")), Some(true));
     }
 
     #[test]

@@ -108,6 +108,7 @@ pub struct NativeSession {
     latency_max: Option<u32>,
     rtp_offset: u32,
     cold_start_delay_ms: u64,
+    ptp_receiver_ip: Option<IpAddr>,
     initial_volume_result: Option<VolumeSetResult>,
     #[cfg(windows)]
     audio_worker: Option<WindowsAudioWorker>,
@@ -184,6 +185,7 @@ impl NativeSession {
 
         let mut ntp_timing = None;
         let mut ptp_timing: Option<Arc<PtpEngine>> = None;
+        let mut ptp_clock = None;
         let event_port;
 
         if config.supports_ptp {
@@ -201,12 +203,19 @@ impl NativeSession {
 
             match engine_result {
                 Ok(engine) => {
-                    // Source multi-room uses one shared PTP daemon/clock for all
-                    // native members. Single-device sessions still create the
-                    // same in-process engine, then keep it behind Arc so a group
-                    // can attach additional receivers without binding 319/320
-                    // again.
-                    engine.settle(Duration::from_millis(400));
+                    // airplay-cli v0.5.4 parity: one host-wide engine can
+                    // follow a different receiver clock for each standalone
+                    // HomePod while serving our grandmaster to other peers.
+                    let clock = if shared_ptp.is_some() {
+                        engine
+                            .register_receiver(receiver_ip, config.follow_receiver_clock)
+                            .map_err(|e| NativeSessionError::Timing(e.to_string()))?
+                    } else {
+                        engine
+                            .clock_handle_for(receiver_ip)
+                            .map_err(|e| NativeSessionError::Timing(e.to_string()))?
+                    };
+                    engine.settle_receiver(receiver_ip, Duration::from_millis(400));
                     flow.timing_ready()
                         .map_err(|e| NativeSessionError::Flow(format!("{e:?}")))?;
 
@@ -220,13 +229,14 @@ impl NativeSession {
                         mac_address,
                         name: config.receiver_name.clone(),
                         local_address: local_addr.ip().to_string(),
-                        clock_id: engine.master_clock_id(),
+                        clock_id: clock.master_clock_id(),
                         dacp_id: config.dacp_id.clone(),
                         active_remote: config.active_remote.clone(),
                     };
                     let result = setup_ptp_session(&mut flow, &mut control, &setup)
                         .map_err(|e| NativeSessionError::SessionSetup(format!("{e:?}")))?;
                     event_port = result.event_port;
+                    ptp_clock = Some(clock);
                     ptp_timing = Some(engine);
                 }
                 Err(_) => {
@@ -379,8 +389,8 @@ impl NativeSession {
         // Preserve the source clock-readiness floor; only the absolute START
         // instant is deferred until PCM is actually buffered.
         let mut cold_start_delay_ms = 250u64;
-        if let Some(engine) = ptp_timing.as_ref() {
-            if let Some(exchange) = engine.peer_exchange() {
+        if let Some(clock) = ptp_clock.as_ref() {
+            if let Some(exchange) = clock.exchange() {
                 let readiness = clock_ready_delay_ms(exchange, config.apple_model);
                 cold_start_delay_ms = cold_start_delay_ms.max(readiness);
             }
@@ -395,7 +405,6 @@ impl NativeSession {
         let sequence = pid.wrapping_mul(40_503u32) as u16;
         let rtp_timestamp = rtp_offset;
 
-        let ptp_clock = ptp_timing.as_ref().map(|engine| engine.clock_handle());
         let ssrc = if ptp_clock.is_some() { 0 } else { session_id };
         let rtp = RtpState::new(sequence, rtp_timestamp, ssrc);
 
@@ -434,6 +443,7 @@ impl NativeSession {
             latency_max,
             rtp_offset,
             cold_start_delay_ms,
+            ptp_receiver_ip: ptp_timing.as_ref().map(|_| receiver_ip),
             initial_volume_result,
             #[cfg(windows)]
             audio_worker: None,
@@ -624,6 +634,14 @@ impl Drop for NativeSession {
             &self.dacp_id,
             &self.active_remote,
         );
+
+        // Shared-daemon source parity: a stream unregisters its receiver when
+        // its RTSP lifecycle ends, without stopping timing for other members.
+        if let (Some(engine), Some(receiver_ip)) =
+            (self._ptp_timing.as_ref(), self.ptp_receiver_ip)
+        {
+            engine.remove_receiver(receiver_ip);
+        }
     }
 }
 
