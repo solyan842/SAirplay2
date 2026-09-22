@@ -1388,11 +1388,7 @@ impl SairplayApp {
                 StatusTone::Red,
             ),
             _ if device.route(false, false) == Route::AirPlay2Native => {
-                if stereo_pair {
-                    (self.t("Sẵn sàng", "Ready"), StatusTone::Green)
-                } else {
-                    (self.t("Đang chờ", "Waiting"), StatusTone::Orange)
-                }
+                (self.t("Sẵn sàng", "Ready"), StatusTone::Green)
             }
             _ if matches!(
                 device.route(false, false),
@@ -3291,6 +3287,22 @@ fn legacy_config_for_device(
             device.display_name
         ));
     }
+
+    // Match the current cliairplay RAOP source contract exactly: an
+    // AppleTV-class receiver that advertises pk must not be streamed without
+    // a stored AppleTV pairing secret. Some embedded TV receivers clone an
+    // AppleTV model/pk but expose no usable PIN UI; probing them anyway can
+    // leave or restart their AirPlay service, so fail closed instead.
+    if config.am.to_ascii_lowercase().contains("appletv")
+        && !config.pk.trim().is_empty()
+        && config.secret.is_none()
+    {
+        return Err(format!(
+            "{} advertises AppleTV public-key authentication but no pairing secret is available; RAOP playback is blocked to protect the receiver.",
+            device.display_name
+        ));
+    }
+
     config.mfi_auth = config.am.to_ascii_lowercase().contains("airport");
 
     if let Some(cn) = props.txt.fields.get("cn") {

@@ -422,18 +422,27 @@ impl LegacyGroupSession {
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
 
-        // A cliraop helper can be blocked inside its stdin/RAOP pacing path.
-        // Joining the WASAPI worker before terminating the helper can therefore
-        // deadlock the GUI shutdown indefinitely. Stop the process tree first:
-        // closing the child side of the pipe immediately unblocks write_all(),
-        // then all Rust workers can join deterministically.
-        for &pid in &self.helper_pids {
-            kill_helper_tree(pid);
-        }
-        self.helper_pids.clear();
+        // Prefer the source's normal EOF -> drain -> raopcl_disconnect path.
+        // Keep the #594 anti-hang guarantee with a delayed watchdog: if a
+        // helper is still blocked in stdin/RTSP after two seconds, terminate
+        // that local process tree to unblock the Rust writer.
+        let helper_pids = std::mem::take(&mut self.helper_pids);
+        let watchdog = if helper_pids.is_empty() {
+            None
+        } else {
+            Some(thread::spawn(move || {
+                thread::sleep(Duration::from_secs(2));
+                for pid in helper_pids {
+                    kill_helper_tree(pid);
+                }
+            }))
+        };
 
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+        if let Some(watchdog) = watchdog {
+            let _ = watchdog.join();
         }
     }
 }
@@ -631,8 +640,25 @@ fn legacy_writer_loop(
     }
 
     drop(stdin);
-    let _ = child.kill();
-    let _ = child.wait();
+
+    // cliraop's source loop exits after stdin EOF once its buffered RAOP audio
+    // drains, then calls raopcl_disconnect()/raopcl_destroy(). Give that path
+    // time to complete so receivers see a normal FLUSH/TEARDOWN. The session
+    // watchdog above still guarantees a stuck helper cannot hang the app.
+    let graceful_deadline = std::time::Instant::now() + Duration::from_millis(1500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < graceful_deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+        }
+    }
 
     let previous = active_members.fetch_sub(1, Ordering::SeqCst);
     if previous <= 1 {
