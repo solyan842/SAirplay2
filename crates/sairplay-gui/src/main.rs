@@ -3324,10 +3324,10 @@ fn legacy_config_for_device(
             .any(|value| value.trim() == "1");
     }
 
-    // pyatv uses the same 32-bit session_id for SDP identity and RTP SSRC.
-    // Probe that exact relationship only on this embedded AppleTV-class
-    // receiver; keep the normal cn-driven compressed-ALAC codec unchanged.
-    config.match_ssrc_session_probe = config.am.to_ascii_lowercase().contains("appletv")
+    // pyatv keeps the NTP sync clock absolute but exposes a relative RTP clock
+    // on the wire. Probe that separation only on this embedded AppleTV-class
+    // receiver; keep codec, encryption and native AirPlay paths unchanged.
+    config.relative_rtp_clock_probe = config.am.to_ascii_lowercase().contains("appletv")
         && !config.pk.trim().is_empty()
         && config.secret.is_none()
         && !pairing_required;

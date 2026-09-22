@@ -45,34 +45,75 @@ Replace-Once -Path $raop -Label "RECORD RTP timeline diagnostic" -Old @'
 	}
 '@
 
-Replace-Once -Path $raop -Label "match RTP SSRC to SDP session id probe" -Old @'
-	RAND_bytes((uint8_t*) &p->ssrc, sizeof(p->ssrc));
-	VALGRIND_MAKE_MEM_DEFINED(&p->ssrc, sizeof(p->ssrc));
-
-	p->encrypt = (p->crypto != RAOP_CLEAR);
+Replace-Once -Path $raop -Label "relative RTP clock state" -Old @'
+	uint64_t head_ts, pause_ts, start_ts, first_ts;
 '@ -New @'
-	RAND_bytes((uint8_t*) &p->ssrc, sizeof(p->ssrc));
-	VALGRIND_MAKE_MEM_DEFINED(&p->ssrc, sizeof(p->ssrc));
-
-	p->encrypt = (p->crypto != RAOP_CLEAR);
+	uint64_t head_ts, pause_ts, start_ts, first_ts;
+	uint64_t sairplay_rtp_base;
 '@
 
-Replace-Once -Path $raop -Label "apply session id as RTP SSRC" -Old @'
-	sprintf(sid, "%010lu", (long unsigned int) seed.sid);
-	sprintf(sci, "%016llx", (long long int) seed.sci);
-
-	// RTSP misc setup
+Replace-Once -Path $raop -Label "relative RTP clock reset" -Old @'
+	p->head_ts = p->pause_ts = p->start_ts = p->first_ts = 0;
 '@ -New @'
-	sprintf(sid, "%010lu", (long unsigned int) seed.sid);
-	sprintf(sci, "%016llx", (long long int) seed.sci);
+	p->head_ts = p->pause_ts = p->start_ts = p->first_ts = 0;
+	p->sairplay_rtp_base = 0;
+'@
 
-	if (getenv("SAIRPLAY_MATCH_SSRC_SESSION") && *getenv("SAIRPLAY_MATCH_SSRC_SESSION")) {
-		p->ssrc = seed.sid;
-		LOG_INFO("[SAIRPLAY-DIAG] ssrc_matches_session session_id=%u ssrc=%u",
-				 seed.sid, (uint32_t) p->ssrc);
+Replace-Once -Path $raop -Label "relative RTP RECORD clock" -Old @'
+	{
+		uint16_t sairplay_record_seq = p->seq_number + 1;
+		uint32_t sairplay_record_ts = NTP2TS(raopcl_get_ntp(NULL), p->sample_rate);
+		LOG_INFO("[SAIRPLAY-DIAG] record_rtp seq=%u rtptime=%u",
+				 sairplay_record_seq, sairplay_record_ts);
+		if (!rtspcl_record(p->rtspcl, sairplay_record_seq, sairplay_record_ts, kd)) goto erexit;
 	}
+'@ -New @'
+	{
+		uint16_t sairplay_record_seq = p->seq_number + 1;
+		uint64_t sairplay_record_abs = NTP2TS(raopcl_get_ntp(NULL), p->sample_rate);
+		uint32_t sairplay_record_ts = (uint32_t) sairplay_record_abs;
 
-	// RTSP misc setup
+		if (getenv("SAIRPLAY_RELATIVE_RTP_CLOCK") && *getenv("SAIRPLAY_RELATIVE_RTP_CLOCK")) {
+			uint64_t latency = raopcl_latency(p);
+			p->sairplay_rtp_base = sairplay_record_abs > latency
+				? sairplay_record_abs - latency : 0;
+			sairplay_record_ts = (uint32_t) (sairplay_record_abs - p->sairplay_rtp_base);
+			LOG_INFO("[SAIRPLAY-DIAG] relative_rtp_base=%" PRIu64 " record_abs=%" PRIu64 " record_wire=%u",
+					 p->sairplay_rtp_base, sairplay_record_abs, sairplay_record_ts);
+		}
+
+		LOG_INFO("[SAIRPLAY-DIAG] record_rtp seq=%u rtptime=%u",
+				 sairplay_record_seq, sairplay_record_ts);
+		if (!rtspcl_record(p->rtspcl, sairplay_record_seq, sairplay_record_ts, kd)) goto erexit;
+	}
+'@
+
+Replace-Once -Path $raop -Label "relative RTP audio timestamp" -Old @'
+	packet->timestamp = htonl(p->head_ts);
+	packet->ssrc = htonl(p->ssrc);
+'@ -New @'
+	{
+		uint32_t sairplay_wire_ts = (uint32_t) p->head_ts;
+		if (p->sairplay_rtp_base) {
+			sairplay_wire_ts = (uint32_t) (p->head_ts - p->sairplay_rtp_base);
+		}
+		packet->timestamp = htonl(sairplay_wire_ts);
+	}
+	packet->ssrc = htonl(p->ssrc);
+'@
+
+Replace-Once -Path $raop -Label "relative RTP sync fields" -Old @'
+	rsp.rtp_timestamp = htonl(timestamp);
+	rsp.rtp_timestamp_latency = htonl(timestamp - raopcld->latency_frames);
+'@ -New @'
+	if (raopcld->sairplay_rtp_base) {
+		rsp.rtp_timestamp = htonl((uint32_t) (timestamp - raopcld->sairplay_rtp_base));
+		rsp.rtp_timestamp_latency = htonl((uint32_t) (
+			timestamp - raopcld->latency_frames - raopcld->sairplay_rtp_base));
+	} else {
+		rsp.rtp_timestamp = htonl(timestamp);
+		rsp.rtp_timestamp_latency = htonl(timestamp - raopcld->latency_frames);
+	}
 '@
 
 Replace-Once -Path $cliraop -Label "cliraop first accepted/read PCM" -Old @'
@@ -208,7 +249,7 @@ Replace-Once -Path $raop -Label "first RTP header timeline" -Old @'
 		static bool sairplay_diag_rtp_header_logged = false;
 		if (!sairplay_diag_rtp_header_logged) {
 			LOG_INFO("[SAIRPLAY-DIAG] first_rtp_header seq=%u rtptime=%u marker=%u payload=%d",
-					 p->seq_number, (uint32_t) p->head_ts,
+					 p->seq_number, ntohl(packet->timestamp),
 					 (unsigned) ((packet->hdr.type & 0x80) != 0), size);
 			sairplay_diag_rtp_header_logged = true;
 		}

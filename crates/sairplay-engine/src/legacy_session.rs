@@ -41,7 +41,7 @@ pub struct LegacyMemberConfig {
     pub secret: Option<String>,
     pub compressed_alac: bool,
     pub mfi_auth: bool,
-    pub match_ssrc_session_probe: bool,
+    pub relative_rtp_clock_probe: bool,
 }
 
 impl LegacyMemberConfig {
@@ -59,7 +59,7 @@ impl LegacyMemberConfig {
             secret: None,
             compressed_alac: true,
             mfi_auth: false,
-            match_ssrc_session_probe: false,
+            relative_rtp_clock_probe: false,
         }
     }
 }
@@ -476,10 +476,10 @@ fn spawn_member(
     }
 
     let mut command = Command::new(helper);
-    if config.match_ssrc_session_probe {
-        command.env("SAIRPLAY_MATCH_SSRC_SESSION", "1");
+    if config.relative_rtp_clock_probe {
+        command.env("SAIRPLAY_RELATIVE_RTP_CLOCK", "1");
         if let Ok(mut events) = startup_events.lock() {
-            events.push(format!("{}: [SAIRPLAY-DIAG] match_ssrc_session=enabled", config.name));
+            events.push(format!("{}: [SAIRPLAY-DIAG] relative_rtp_clock=enabled", config.name));
         }
     }
     command
