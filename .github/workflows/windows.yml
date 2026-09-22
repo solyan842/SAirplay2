@@ -21,6 +21,32 @@ jobs:
         run: cargo test --workspace --all-targets
       - name: Build GUI
         run: cargo build --release -p sairplay-gui
+      - name: Build source-aligned ALAC24 bridge
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $libraopPin = "81c2182649da8645ac2a58b78e9f370c79a4165b"
+          $src = "target/vendor/airplay-cli-libraop"
+          $build = "target/alac24-build"
+
+          if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+          if (Test-Path $build) { Remove-Item -Recurse -Force $build }
+
+          git clone --filter=blob:none https://github.com/philippe44/libraop.git $src
+          git -C $src checkout $libraopPin
+          git -C $src submodule update --init --recursive libcodecs
+
+          $alac = (Resolve-Path "$src/libcodecs/alac/codec").Path
+          cmake -S "native/alac24" -B $build -G "Visual Studio 17 2022" -A x64 "-DALAC_SOURCE=$alac"
+          if ($LASTEXITCODE -ne 0) { throw "ALAC24 CMake configure failed" }
+
+          cmake --build $build --config Release
+          if ($LASTEXITCODE -ne 0) { throw "ALAC24 build failed" }
+
+          $dll = "$build/Release/sairplay-alac24.dll"
+          if (-not (Test-Path $dll)) { throw "sairplay-alac24.dll missing" }
+          Get-FileHash $dll -Algorithm SHA256
+
       - name: Build current libraop helper from source
         shell: pwsh
         run: |
@@ -61,6 +87,7 @@ jobs:
           $out = "target/release/SAirplay2"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           Copy-Item "target/release/sairplay-gui.exe" "$out/sairplay-gui.exe"
+          Copy-Item "target/alac24-build/Release/sairplay-alac24.dll" "$out/sairplay-alac24.dll"
           Copy-Item "$src/bin/cliraop.exe" "$out/cliraop.exe"
           Invoke-WebRequest "$base/bin/libcrypto-1_1.dll" -OutFile "$out/libcrypto-1_1.dll"
           Invoke-WebRequest "$base/bin/libssl-1_1.dll" -OutFile "$out/libssl-1_1.dll"
