@@ -395,7 +395,7 @@ impl NativeSession {
         let sequence = pid.wrapping_mul(40_503u32) as u16;
         let rtp_timestamp = rtp_offset;
 
-        let ptp_clock = ptp_timing.as_ref().map(PtpEngine::clock_handle);
+        let ptp_clock = ptp_timing.as_ref().map(|engine| engine.clock_handle());
         let ssrc = if ptp_clock.is_some() { 0 } else { session_id };
         let rtp = RtpState::new(sequence, rtp_timestamp, ssrc);
 
