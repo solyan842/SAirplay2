@@ -21,16 +21,40 @@ jobs:
         run: cargo test --workspace --all-targets
       - name: Build GUI
         run: cargo build --release -p sairplay-gui
+      - name: Build pinned libraop helper from source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pin = "81c2182649da8645ac2a58b78e9f370c79a4165b"
+          $src = "target/vendor/libraop"
+          if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+          git clone --filter=blob:none https://github.com/philippe44/libraop.git $src
+          git -C $src checkout $pin
+          git -C $src submodule update --init --recursive
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe |
+            Select-Object -First 1
+          if (-not $msbuild) { throw "MSBuild not found" }
+
+          & $msbuild "$src/libraop.sln" /m /p:Configuration=Release /p:Platform=x86
+          if ($LASTEXITCODE -ne 0) { throw "Pinned libraop source build failed" }
+          if (-not (Test-Path "$src/bin/cliraop.exe")) { throw "Source-built cliraop.exe missing" }
+
+          & "$src/bin/cliraop.exe" --help | Out-String | Write-Host
+          Get-FileHash "$src/bin/cliraop.exe" -Algorithm SHA256
+
       - name: Bundle pinned libraop legacy transport
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $pin = "81c2182649da8645ac2a58b78e9f370c79a4165b"
           $base = "https://raw.githubusercontent.com/philippe44/libraop/$pin"
+          $src = "target/vendor/libraop"
           $out = "target/release/SAirplay2"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           Copy-Item "target/release/sairplay-gui.exe" "$out/sairplay-gui.exe"
-          Invoke-WebRequest "$base/bin/cliraop.exe" -OutFile "$out/cliraop.exe"
+          Copy-Item "$src/bin/cliraop.exe" "$out/cliraop.exe"
           Invoke-WebRequest "$base/bin/libcrypto-1_1.dll" -OutFile "$out/libcrypto-1_1.dll"
           Invoke-WebRequest "$base/bin/libssl-1_1.dll" -OutFile "$out/libssl-1_1.dll"
           Invoke-WebRequest "$base/README.md" -OutFile "$out/LIBRAOP-README.md"
