@@ -1,6 +1,6 @@
 use crate::{
-    system_time_to_ntp, Pcm352Chunker, RealtimeMediaSender, WasapiLoopbackCapture,
-    WasapiLoopbackError,
+    system_time_to_ntp, NativeMetadataControl, Pcm352Chunker, RealtimeMediaSender,
+    WasapiLoopbackCapture, WasapiLoopbackError,
 };
 use std::fmt;
 use std::sync::{
@@ -24,6 +24,7 @@ pub struct WindowsAudioTarget {
     pub(crate) latency_max: Option<u32>,
     pub(crate) rtp_offset: u32,
     pub(crate) cold_start_delay_ms: u64,
+    pub(crate) metadata: NativeMetadataControl,
 }
 
 #[derive(Debug)]
@@ -283,6 +284,34 @@ impl WindowsMultiroomAudioWorker {
                                 }
                                 running_thread.store(false, Ordering::SeqCst);
                                 return;
+                            }
+
+                            let rtp_timestamp = target.sender.state().timestamp;
+                            match target.metadata.send("SAirplay2", "", "", rtp_timestamp) {
+                                Ok(result) if (200..300).contains(&result.status) => {
+                                    if let Ok(mut events) = startup_events_thread.lock() {
+                                        events.push(format!(
+                                            "{}: initial DMAP metadata {} bytes · RTSP {}.",
+                                            target.name, result.bytes, result.status
+                                        ));
+                                    }
+                                }
+                                Ok(result) => {
+                                    if let Ok(mut events) = startup_events_thread.lock() {
+                                        events.push(format!(
+                                            "{}: initial DMAP metadata rejected · RTSP {}.",
+                                            target.name, result.status
+                                        ));
+                                    }
+                                }
+                                Err(error) => {
+                                    if let Ok(mut events) = startup_events_thread.lock() {
+                                        events.push(format!(
+                                            "{}: initial DMAP metadata failed: {error:?}.",
+                                            target.name
+                                        ));
+                                    }
+                                }
                             }
                         }
                         cold_armed = true;
@@ -620,6 +649,33 @@ fn handle_group_commands(
                     target.rtp_offset,
                 ) {
                     Ok(()) => {
+                        let rtp_timestamp = target.sender.state().timestamp;
+                        match target.metadata.send("SAirplay2", "", "", rtp_timestamp) {
+                            Ok(result) if (200..300).contains(&result.status) => {
+                                if let Ok(mut events) = startup_events.lock() {
+                                    events.push(format!(
+                                        "{}: late-join DMAP metadata {} bytes · RTSP {}.",
+                                        target.name, result.bytes, result.status
+                                    ));
+                                }
+                            }
+                            Ok(result) => {
+                                if let Ok(mut events) = startup_events.lock() {
+                                    events.push(format!(
+                                        "{}: late-join DMAP metadata rejected · RTSP {}.",
+                                        target.name, result.status
+                                    ));
+                                }
+                            }
+                            Err(error) => {
+                                if let Ok(mut events) = startup_events.lock() {
+                                    events.push(format!(
+                                        "{}: late-join DMAP metadata failed: {error:?}.",
+                                        target.name
+                                    ));
+                                }
+                            }
+                        }
                         if let Ok(mut events) = startup_events.lock() {
                             events.push(format!(
                                 "{}: late join armed for packet #{} with {} ms minimum headroom.",

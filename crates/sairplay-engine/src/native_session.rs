@@ -17,7 +17,7 @@ use std::sync::{
 use std::time::Duration;
 
 #[cfg(windows)]
-use crate::{WindowsAudioTarget, WindowsAudioWorker, WindowsAudioWorkerError};
+use crate::{NativeMetadataControl, WindowsAudioTarget, WindowsAudioWorker, WindowsAudioWorkerError};
 
 #[derive(Debug, Clone)]
 pub struct NativeSessionConfig {
@@ -485,6 +485,13 @@ impl NativeSession {
             latency_max: self.latency_max,
             rtp_offset: self.rtp_offset,
             cold_start_delay_ms: self.cold_start_delay_ms,
+            metadata: NativeMetadataControl::new(
+                Arc::clone(&self.control),
+                Arc::clone(&self.next_cseq),
+                self.session_uri.clone(),
+                self.dacp_id.clone(),
+                self.active_remote.clone(),
+            ),
         })
     }
 

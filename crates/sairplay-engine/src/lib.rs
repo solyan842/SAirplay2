@@ -34,6 +34,7 @@ pub mod media_sender;
 pub mod retransmit;
 pub mod teardown;
 pub mod volume;
+pub mod native_metadata;
 pub mod pcm_chunker;
 #[cfg(windows)]
 pub mod wasapi_loopback;
@@ -79,6 +80,7 @@ pub use media_sender::{RealtimeMediaSender, MediaSendError, MediaSendResult};
 pub use retransmit::{RetransmitRing, RetransmitStats, RetransmitWorker, RTX_RING_SLOTS};
 pub use teardown::{send_teardown, TeardownError};
 pub use volume::{set_native_volume, volume_percent_to_db, NativeVolumeControl, VolumeError, VolumeSetResult};
+pub use native_metadata::{build_dmap_metadata, send_native_metadata, MetadataError, MetadataSetResult, NativeMetadataControl};
 pub use alac_encoder::{encode_alac_16_stereo_352, AlacEncodeError, ALAC_PCM_BYTES_PER_FRAME, ALAC_PCM_PACKET_BYTES, ALAC_FRAMES_PER_PACKET};
 pub use pcm_chunker::{Pcm352Chunker, PCM352_PACKET_BYTES};
 #[cfg(windows)]
