@@ -426,6 +426,7 @@ impl NativeSession {
         if retransmit.is_some() {
             sender.set_retransmit_ring(rtx_ring);
         }
+        let ptp_receiver_ip = ptp_timing.as_ref().map(|_| receiver_ip);
         Ok(Self {
             flow,
             control,
@@ -443,7 +444,7 @@ impl NativeSession {
             latency_max,
             rtp_offset,
             cold_start_delay_ms,
-            ptp_receiver_ip: ptp_timing.as_ref().map(|_| receiver_ip),
+            ptp_receiver_ip,
             initial_volume_result,
             #[cfg(windows)]
             audio_worker: None,
