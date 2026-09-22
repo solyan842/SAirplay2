@@ -2,10 +2,11 @@
 
 use eframe::egui;
 use sairplay_engine::{
-    DeviceCatalog, DeviceRecord, DiscoveredService, DiscoveryEvent, MdnsBrowser, NativeSession,
-    NativeSessionConfig, Route, ServiceKind, VolumeSetResult,
+    DeviceCatalog, DeviceRecord, DiscoveredService, DiscoveryEvent, MdnsBrowser,
+    NativeGroupMemberConfig, NativeGroupSession, NativeSession, NativeSessionConfig,
+    RetransmitStats, Route, ServiceKind, VolumeSetResult,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -16,6 +17,99 @@ enum PlaybackUiState {
     Connecting(String),
     Playing(String),
     Error(String),
+}
+
+enum ActiveSession {
+    Single(NativeSession),
+    Group(NativeGroupSession),
+}
+
+impl ActiveSession {
+    fn audio_running(&self) -> bool {
+        match self {
+            Self::Single(session) => session.audio_running(),
+            Self::Group(session) => session.audio_running(),
+        }
+    }
+
+    fn audio_error(&self) -> Option<String> {
+        match self {
+            Self::Single(session) => session.audio_error(),
+            Self::Group(session) => session.audio_error(),
+        }
+    }
+
+    fn audio_discontinuities(&self) -> u64 {
+        match self {
+            Self::Single(session) => session.audio_discontinuities(),
+            Self::Group(session) => session.audio_discontinuities(),
+        }
+    }
+
+    fn audio_last_discontinuity_frame(&self) -> Option<u64> {
+        match self {
+            Self::Single(session) => session.audio_last_discontinuity_frame(),
+            Self::Group(session) => session.audio_last_discontinuity_frame(),
+        }
+    }
+
+    fn audio_first_non_silent_frame(&self) -> Option<u64> {
+        match self {
+            Self::Single(session) => session.audio_first_non_silent_frame(),
+            Self::Group(session) => session.audio_first_non_silent_frame(),
+        }
+    }
+
+    fn drain_startup_events(&self) -> Vec<String> {
+        match self {
+            Self::Single(session) => session.drain_startup_events(),
+            Self::Group(session) => session.drain_startup_events(),
+        }
+    }
+
+    fn retransmit_stats(&self) -> RetransmitStats {
+        match self {
+            Self::Single(session) => session.retransmit_stats(),
+            Self::Group(session) => session.retransmit_stats(),
+        }
+    }
+
+    fn feedback_running(&self) -> bool {
+        match self {
+            Self::Single(session) => session.feedback_running(),
+            Self::Group(session) => session.feedback_running(),
+        }
+    }
+
+    fn feedback_error(&self) -> Option<String> {
+        match self {
+            Self::Single(session) => session.feedback_error(),
+            Self::Group(session) => session.feedback_error(),
+        }
+    }
+
+    fn volume_controls(&self) -> Vec<sairplay_engine::NativeVolumeControl> {
+        match self {
+            Self::Single(session) => vec![session.volume_control()],
+            Self::Group(session) => session.volume_controls(),
+        }
+    }
+
+    fn initial_volume_results(&self) -> Vec<(String, VolumeSetResult)> {
+        match self {
+            Self::Single(session) => session
+                .initial_volume_result()
+                .map(|result| vec![("receiver".to_owned(), result)])
+                .unwrap_or_default(),
+            Self::Group(session) => session.initial_volume_results(),
+        }
+    }
+}
+
+struct ConnectSuccess {
+    session: ActiveSession,
+    active_fullnames: BTreeSet<String>,
+    label: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,12 +199,13 @@ struct SairplayApp {
     catalog: DeviceCatalog,
     discovery: Option<MdnsBrowser>,
     discovery_rx: Option<Receiver<DiscoveryEvent>>,
-    selected_fullname: Option<String>,
+    selected_fullnames: BTreeSet<String>,
+    active_fullnames: BTreeSet<String>,
     playback: PlaybackUiState,
-    connect_rx: Option<Receiver<Result<NativeSession, String>>>,
-    session: Option<NativeSession>,
+    connect_rx: Option<Receiver<Result<ConnectSuccess, String>>>,
+    session: Option<ActiveSession>,
     initial_volume_text: String,
-    volume_rx: Option<Receiver<Result<VolumeSetResult, String>>>,
+    volume_rx: Option<Receiver<Result<Vec<VolumeSetResult>, String>>>,
     pending_volume: Option<u8>,
     last_audio_discontinuities: u64,
     last_rtx: (u64, u64, u64),
@@ -154,7 +249,8 @@ impl Default for SairplayApp {
             catalog: DeviceCatalog::default(),
             discovery,
             discovery_rx,
-            selected_fullname: None,
+            selected_fullnames: BTreeSet::new(),
+            active_fullnames: BTreeSet::new(),
             playback: PlaybackUiState::Idle,
             connect_rx: None,
             session: None,
@@ -210,9 +306,8 @@ impl SairplayApp {
                 }
                 DiscoveryEvent::Removed { kind, fullname } => {
                     self.catalog.remove(kind, &fullname);
-                    if self.selected_fullname.as_deref() == Some(fullname.as_str()) {
-                        self.selected_fullname = None;
-                    }
+                    self.selected_fullnames.remove(&fullname);
+                    self.active_fullnames.remove(&fullname);
                     self.log.push(format!("mDNS removed: {fullname}"));
                 }
                 DiscoveryEvent::Error(err) => {
@@ -226,7 +321,7 @@ impl SairplayApp {
         self.discovery.take();
         self.discovery_rx = None;
         self.catalog = DeviceCatalog::default();
-        self.selected_fullname = None;
+        self.selected_fullnames.clear();
         self.log.push("Manual rescan requested from app logo.".into());
 
         match MdnsBrowser::start() {
@@ -254,40 +349,42 @@ impl SairplayApp {
         };
 
         match rx.try_recv() {
-            Ok(Ok(session)) => {
-                let name = match &self.playback {
-                    PlaybackUiState::Connecting(name) => name.clone(),
-                    _ => "receiver".into(),
-                };
-
-                if let Some(volume) = session.initial_volume_result() {
+            Ok(Ok(success)) => {
+                for (member, volume) in success.session.initial_volume_results() {
                     self.log.push(format!(
-                        "{name}: receiver volume {}% = {:.2} dB · RTSP {}.",
+                        "{member}: receiver volume {}% = {:.2} dB · RTSP {}.",
                         volume.percent, volume.db, volume.status
                     ));
                 }
 
-                if session.is_ready() && session.audio_running() {
-                    self.log.push(format!("{name}: transport Ready, Windows audio running."));
-                    self.playback = PlaybackUiState::Playing(name);
-                    self.session = Some(session);
+                if success.session.audio_running() {
+                    self.log.push(format!(
+                        "{}: transport Ready, Windows audio running on {} receiver(s).",
+                        success.label,
+                        success.active_fullnames.len()
+                    ));
+                    self.active_fullnames = success.active_fullnames;
+                    self.playback = PlaybackUiState::Playing(success.label);
+                    self.session = Some(success.session);
                 } else {
-                    let message = format!(
-                        "{name}: session returned without full Ready/audio state"
-                    );
+                    let message =
+                        "native transport returned without a running Windows audio path".to_owned();
                     self.log.push(message.clone());
+                    self.active_fullnames.clear();
                     self.playback = PlaybackUiState::Error(message);
                 }
                 self.connect_rx = None;
             }
             Ok(Err(error)) => {
                 self.log.push(format!("Connect failed: {error}"));
+                self.active_fullnames.clear();
                 self.playback = PlaybackUiState::Error(error);
                 self.connect_rx = None;
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.log.push("Connect worker ended unexpectedly.".into());
+                self.active_fullnames.clear();
                 self.playback =
                     PlaybackUiState::Error("Connect worker ended unexpectedly".into());
                 self.connect_rx = None;
@@ -301,11 +398,13 @@ impl SairplayApp {
         };
 
         let finished = match rx.try_recv() {
-            Ok(Ok(result)) => {
-                self.log.push(format!(
-                    "Receiver volume {}% = {:.2} dB · RTSP {}.",
-                    result.percent, result.db, result.status
-                ));
+            Ok(Ok(results)) => {
+                for result in results {
+                    self.log.push(format!(
+                        "Receiver volume {}% = {:.2} dB · RTSP {}.",
+                        result.percent, result.db, result.status
+                    ));
+                }
                 true
             }
             Ok(Err(error)) => {
@@ -336,13 +435,16 @@ impl SairplayApp {
             return;
         };
 
-        let control = session.volume_control();
+        let controls = session.volume_controls();
         let (tx, rx) = mpsc::sync_channel(1);
         self.volume_rx = Some(rx);
         thread::Builder::new()
             .name("sairplay-volume".into())
             .spawn(move || {
-                let result = control.set(volume).map_err(|e| format!("{e:?}"));
+                let result = controls
+                    .into_iter()
+                    .map(|control| control.set(volume).map_err(|e| format!("{e:?}")))
+                    .collect::<Result<Vec<_>, _>>();
                 let _ = tx.send(result);
             })
             .expect("failed to spawn volume worker");
@@ -426,38 +528,11 @@ impl SairplayApp {
             return;
         }
 
-        let devices = self.catalog.devices().to_vec();
-        let selected = self.selected_fullname.as_deref();
-
-        let Some(device) = devices.iter().find(|device| {
-            device
-                .airplay
-                .as_ref()
-                .is_some_and(|service| Some(service.fullname.as_str()) == selected)
-        }) else {
-            self.playback = PlaybackUiState::Error("Select an AirPlay 2 receiver first".into());
-            return;
-        };
-
-        let route = device.route(false, false);
-        if route != Route::AirPlay2Native {
-            let message = format!(
-                "{} currently resolves to {route:?}; this alpha path only starts native AirPlay 2",
-                device.display_name
-            );
-            self.log.push(message.clone());
-            self.playback = PlaybackUiState::Error(message);
+        if self.selected_fullnames.is_empty() {
+            self.playback =
+                PlaybackUiState::Error("Select at least one AirPlay 2 receiver first".into());
             return;
         }
-
-        let Some(service) = device.airplay.as_ref() else {
-            self.playback = PlaybackUiState::Error("Selected receiver has no AirPlay service".into());
-            return;
-        };
-
-        let host = preferred_service_address(service);
-        let name = device.display_name.clone();
-        let port = service.port;
 
         let initial_volume = match parse_volume_text(&self.initial_volume_text) {
             Ok(volume) => volume,
@@ -468,65 +543,153 @@ impl SairplayApp {
             }
         };
 
-        let mut config = NativeSessionConfig::new(host.clone(), port);
-        // Fixed app identity for the clean alpha path; credentials remain absent
-        // unless a later UI explicitly supplies them.
-        config.dacp_id = "A1B2C3D4E5F60708".into();
-        config.active_remote = "123456789".into();
-        config.supports_ptp = service.txt.supports_ptp();
-        config.follow_receiver_clock = service.txt.follows_receiver_clock();
-        config.apple_model = service.txt.is_apple_model();
-        config.receiver_name = name.clone();
-        config.initial_volume = initial_volume;
+        let devices = self.catalog.devices().to_vec();
+        let selected_devices: Vec<(String, DeviceRecord)> = devices
+            .into_iter()
+            .filter_map(|device| {
+                let fullname = device.airplay.as_ref()?.fullname.clone();
+                self.selected_fullnames
+                    .contains(&fullname)
+                    .then_some((fullname, device))
+            })
+            .collect();
+
+        if selected_devices.len() != self.selected_fullnames.len() {
+            let message =
+                "One or more selected AirPlay receivers disappeared; rescan and select again"
+                    .to_owned();
+            self.log.push(message.clone());
+            self.playback = PlaybackUiState::Error(message);
+            return;
+        }
+
+        if let Some((_, device)) = selected_devices
+            .iter()
+            .find(|(_, device)| device.route(false, false) != Route::AirPlay2Native)
+        {
+            let route = device.route(false, false);
+            let message = format!(
+                "{} currently resolves to {route:?}; native AirPlay 2 is required",
+                device.display_name
+            );
+            self.log.push(message.clone());
+            self.playback = PlaybackUiState::Error(message);
+            return;
+        }
+
+        let active_fullnames: BTreeSet<String> =
+            selected_devices.iter().map(|(fullname, _)| fullname.clone()).collect();
+        let member_count = selected_devices.len();
+
+        let pair_name = if member_count == 2 {
+            let mut tsids = selected_devices.iter().filter_map(|(_, device)| {
+                device
+                    .airplay
+                    .as_ref()
+                    .and_then(|service| service.txt.fields.get("tsid"))
+            });
+            let first = tsids.next().cloned();
+            let second = tsids.next().cloned();
+            if first.is_some() && first == second {
+                selected_devices
+                    .iter()
+                    .filter_map(|(_, device)| {
+                        device
+                            .airplay
+                            .as_ref()
+                            .and_then(|service| service.txt.fields.get("gpn"))
+                    })
+                    .find(|name| !name.trim().is_empty())
+                    .cloned()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let label = pair_name.unwrap_or_else(|| {
+            if member_count == 1 {
+                selected_devices[0].1.display_name.clone()
+            } else {
+                match self.language {
+                    UiLanguage::Vi => format!("MultiRoom · {member_count} thiết bị"),
+                    UiLanguage::En => format!("MultiRoom · {member_count} receivers"),
+                }
+            }
+        });
+
+        let mut configs = Vec::<NativeGroupMemberConfig>::with_capacity(member_count);
+        for (_, device) in &selected_devices {
+            let service = device.airplay.as_ref().expect("selected AirPlay service");
+            let host = preferred_service_address(service);
+            let mut config = NativeSessionConfig::new(host.clone(), service.port);
+            config.dacp_id = "A1B2C3D4E5F60708".into();
+            config.active_remote = "123456789".into();
+            config.supports_ptp = service.txt.supports_ptp();
+            config.follow_receiver_clock = service.txt.follows_receiver_clock();
+            config.apple_model = service.txt.is_apple_model();
+            config.receiver_name = device.display_name.clone();
+            config.initial_volume = initial_volume;
+
+            self.log.push(format!(
+                "{}: group preflight on {}:{} · model={} · PTP={} · follow-clock={} · igl={} · pgid={} · tsid={} · tsm={} · gpn={}.",
+                device.display_name,
+                host,
+                service.port,
+                service.txt.model.as_deref().unwrap_or("-"),
+                service.txt.supports_ptp(),
+                service.txt.follows_receiver_clock(),
+                service.txt.fields.get("igl").map(String::as_str).unwrap_or("-"),
+                service.txt.fields.get("pgid").map(String::as_str).unwrap_or("-"),
+                service.txt.fields.get("tsid").map(String::as_str).unwrap_or("-"),
+                service.txt.fields.get("tsm").map(String::as_str).unwrap_or("-"),
+                service.txt.fields.get("gpn").map(String::as_str).unwrap_or("-"),
+            ));
+            configs.push(NativeGroupMemberConfig::new(
+                device.display_name.clone(),
+                config,
+            ));
+        }
 
         let (tx, rx) = mpsc::sync_channel(1);
         self.connect_rx = Some(rx);
-        self.playback = PlaybackUiState::Connecting(name.clone());
+        self.playback = PlaybackUiState::Connecting(label.clone());
         self.session = None;
+        self.active_fullnames.clear();
         self.last_audio_discontinuities = 0;
         self.last_rtx = (0, 0, 0);
         self.last_feedback_error = None;
-        self.log.push(format!(
-            "{name}: preflight starting on {host}:{port} · model={} · features=0x{:016X} · PTP={} · follow-clock={} · initial-volume={} · Playing waits for Ready + audio.",
-            service.txt.model.as_deref().unwrap_or("-"),
-            service.txt.features,
-            service.txt.supports_ptp(),
-            service.txt.follows_receiver_clock(),
-            initial_volume
-                .map(|v| format!("{v}%"))
-                .unwrap_or_else(|| "unchanged".into()),
-        ));
-        self.log.push(format!(
-            "{name}: HomePod/group TXT · igl={} · pgid={} · tsid={} · tsm={} · gpn={} · osvers={} · srcvers={}.",
-            service.txt.fields.get("igl").map(String::as_str).unwrap_or("-"),
-            service.txt.fields.get("pgid").map(String::as_str).unwrap_or("-"),
-            service.txt.fields.get("tsid").map(String::as_str).unwrap_or("-"),
-            service.txt.fields.get("tsm").map(String::as_str).unwrap_or("-"),
-            service.txt.fields.get("gpn").map(String::as_str).unwrap_or("-"),
-            service.txt.fields.get("osvers").map(String::as_str).unwrap_or("-"),
-            service.txt.fields
-                .get("srcvers")
-                .or_else(|| service.txt.fields.get("vs"))
-                .map(String::as_str)
-                .unwrap_or("-"),
-        ));
 
         thread::Builder::new()
             .name("sairplay-native-connect".into())
             .spawn(move || {
-                let result = (|| -> Result<NativeSession, String> {
-                    let mut session =
-                        NativeSession::connect(&config).map_err(|e| e.to_string())?;
-                    session
-                        .start_windows_audio()
-                        .map_err(|e| e.to_string())?;
-                    if !session.is_ready() || !session.audio_running() {
-                        return Err(
-                            "native transport or Windows capture did not reach ready state".into(),
-                        );
-                    }
-                    Ok(session)
-                })();
+                let result = if configs.len() == 1 {
+                    let member = configs.into_iter().next().expect("one config");
+                    (|| -> Result<ActiveSession, String> {
+                        let mut session =
+                            NativeSession::connect(&member.config).map_err(|e| e.to_string())?;
+                        session
+                            .start_windows_audio()
+                            .map_err(|e| e.to_string())?;
+                        if !session.is_ready() || !session.audio_running() {
+                            return Err(
+                                "native transport or Windows capture did not reach ready state"
+                                    .into(),
+                            );
+                        }
+                        Ok(ActiveSession::Single(session))
+                    })()
+                } else {
+                    NativeGroupSession::connect(configs)
+                        .map(ActiveSession::Group)
+                        .map_err(|e| e.to_string())
+                }
+                .map(|session| ConnectSuccess {
+                    session,
+                    active_fullnames,
+                    label,
+                });
                 let _ = tx.send(result);
             })
             .expect("failed to spawn native connect worker");
@@ -536,6 +699,7 @@ impl SairplayApp {
         if self.session.take().is_some() {
             self.log.push("Playback stopped; native session resources released.".into());
         }
+        self.active_fullnames.clear();
         self.playback = PlaybackUiState::Idle;
         self.last_audio_discontinuities = 0;
         self.last_rtx = (0, 0, 0);
@@ -612,17 +776,22 @@ impl SairplayApp {
     }
 
     fn device_status(&self, device: &DeviceRecord, stereo_pair: bool) -> (&'static str, StatusTone) {
-        let selected = device
-            .airplay
-            .as_ref()
-            .is_some_and(|s| self.selected_fullname.as_deref() == Some(s.fullname.as_str()));
+        let members = device_selection_members(device, stereo_pair);
+        let selected = !members.is_empty()
+            && members
+                .iter()
+                .all(|fullname| self.selected_fullnames.contains(fullname));
+        let active = !members.is_empty()
+            && members
+                .iter()
+                .all(|fullname| self.active_fullnames.contains(fullname));
 
         match &self.playback {
-            PlaybackUiState::Connecting(name) if name == &device.display_name => (
+            PlaybackUiState::Connecting(_) if selected => (
                 self.t("Đang kết nối", "Connecting"),
                 StatusTone::Orange,
             ),
-            PlaybackUiState::Playing(name) if name == &device.display_name => (
+            PlaybackUiState::Playing(_) if active => (
                 self.t("Đang chạy", "Running"),
                 StatusTone::Green,
             ),
@@ -653,12 +822,13 @@ impl SairplayApp {
         const STATUS_W: f32 = 126.0;
 
         let route = device.route(false, false);
-        let fullname = device.airplay.as_ref().map(|s| s.fullname.clone());
-        let selected = fullname
-            .as_deref()
-            .is_some_and(|name| self.selected_fullname.as_deref() == Some(name));
+        let members = device_selection_members(device, stereo_pair);
+        let selected = !members.is_empty()
+            && members
+                .iter()
+                .all(|fullname| self.selected_fullnames.contains(fullname));
         let selectable = route == Route::AirPlay2Native
-            && fullname.is_some()
+            && !members.is_empty()
             && !matches!(self.playback, PlaybackUiState::Connecting(_));
 
         let address = device
@@ -775,7 +945,29 @@ impl SairplayApp {
         });
 
         if response.clicked() && selectable {
-            self.selected_fullname = fullname;
+            let all_selected = members
+                .iter()
+                .all(|fullname| self.selected_fullnames.contains(fullname));
+
+            if self.multiroom_enabled {
+                if all_selected {
+                    for fullname in &members {
+                        self.selected_fullnames.remove(fullname);
+                    }
+                } else {
+                    for fullname in &members {
+                        self.selected_fullnames.insert(fullname.clone());
+                    }
+                }
+            } else {
+                self.selected_fullnames.clear();
+                if !all_selected || stereo_pair {
+                    for fullname in &members {
+                        self.selected_fullnames.insert(fullname.clone());
+                    }
+                }
+            }
+
             if matches!(self.playback, PlaybackUiState::Error(_)) {
                 self.playback = PlaybackUiState::Idle;
             }
@@ -854,9 +1046,17 @@ impl SairplayApp {
                                     .clicked()
                                     {
                                         self.multiroom_enabled = !self.multiroom_enabled;
+                                        if !self.multiroom_enabled && self.selected_fullnames.len() > 1 {
+                                            let keep = self.selected_fullnames.iter().next().cloned();
+                                            self.selected_fullnames.clear();
+                                            if let Some(fullname) = keep {
+                                                self.selected_fullnames.insert(fullname);
+                                            }
+                                        }
                                         self.log.push(format!(
-                                            "MultiRoom GUI mode {}. Transport wiring is intentionally unchanged.",
-                                            if self.multiroom_enabled { "enabled" } else { "disabled" }
+                                            "MultiRoom {} · {} receiver(s) selected.",
+                                            if self.multiroom_enabled { "enabled" } else { "disabled" },
+                                            self.selected_fullnames.len()
                                         ));
                                     }
 
@@ -1038,8 +1238,7 @@ impl SairplayApp {
                         egui::Layout::left_to_right(egui::Align::Center)
                             .with_main_align(egui::Align::Center),
                         |ui| {
-                            let start_enabled = self.selected_fullname.is_some()
-                                && !self.multiroom_enabled
+                            let start_enabled = !self.selected_fullnames.is_empty()
                                 && matches!(
                                     self.playback,
                                     PlaybackUiState::Idle | PlaybackUiState::Error(_)
@@ -1107,12 +1306,25 @@ impl SairplayApp {
                                 );
 
                                 let detail = if self.multiroom_enabled {
+                                    match self.language {
+                                        UiLanguage::Vi => format!(
+                                            "MultiRoom · {} thiết bị đã chọn",
+                                            self.selected_fullnames.len()
+                                        ),
+                                        UiLanguage::En => format!(
+                                            "MultiRoom · {} receivers selected",
+                                            self.selected_fullnames.len()
+                                        ),
+                                    }
+                                } else if self.selected_fullnames.len() > 1 {
                                     self.t(
-                                        "MultiRoom · giao diện đã sẵn sàng",
-                                        "MultiRoom · UI prepared",
+                                        "Stereo Pair · 2 HomePod",
+                                        "Stereo Pair · 2 HomePods",
                                     )
+                                    .to_owned()
                                 } else {
                                     self.t("Sẵn sàng truyền · ALAC", "Ready to stream · ALAC")
+                                        .to_owned()
                                 };
 
                                 ui.label(
@@ -1746,6 +1958,11 @@ fn build_homepod_stereo_pairs(devices: &[DeviceRecord]) -> Vec<DeviceRecord> {
             .unwrap_or_else(|| "HomePod Stereo Pair".to_owned());
 
         let pair_art = classify_homepod_pair_artwork(&distinct);
+        let pair_members = distinct
+            .iter()
+            .filter_map(|device| device.airplay.as_ref().map(|service| service.fullname.clone()))
+            .collect::<Vec<_>>()
+            .join("\u{1f}");
 
         let mut pair = representative.clone();
         pair.display_name = pair_name;
@@ -1754,11 +1971,36 @@ fn build_homepod_stereo_pairs(devices: &[DeviceRecord]) -> Vec<DeviceRecord> {
                 .txt
                 .fields
                 .insert("sairplay-pair-art".to_owned(), pair_art.to_owned());
+            service
+                .txt
+                .fields
+                .insert("sairplay-pair-members".to_owned(), pair_members);
         }
         pairs.push(pair);
     }
 
     pairs
+}
+
+fn device_selection_members(device: &DeviceRecord, stereo_pair: bool) -> Vec<String> {
+    let Some(service) = device.airplay.as_ref() else {
+        return Vec::new();
+    };
+
+    if stereo_pair {
+        if let Some(value) = service.txt.fields.get("sairplay-pair-members") {
+            let members: Vec<String> = value
+                .split('\u{1f}')
+                .filter(|member| !member.trim().is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+            if !members.is_empty() {
+                return members;
+            }
+        }
+    }
+
+    vec![service.fullname.clone()]
 }
 
 fn device_model(device: &DeviceRecord) -> String {
