@@ -112,6 +112,11 @@ struct ConnectSuccess {
     label: String,
 }
 
+struct MembershipAdded {
+    members: Vec<(String, NativeSession)>,
+}
+
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiLanguage {
     Vi,
@@ -203,6 +208,8 @@ struct SairplayApp {
     active_fullnames: BTreeSet<String>,
     playback: PlaybackUiState,
     connect_rx: Option<Receiver<Result<ConnectSuccess, String>>>,
+    membership_rx: Option<Receiver<Result<MembershipAdded, String>>>,
+    membership_pending: BTreeSet<String>,
     session: Option<ActiveSession>,
     initial_volume_text: String,
     volume_rx: Option<Receiver<Result<Vec<VolumeSetResult>, String>>>,
@@ -253,6 +260,8 @@ impl Default for SairplayApp {
             active_fullnames: BTreeSet::new(),
             playback: PlaybackUiState::Idle,
             connect_rx: None,
+            membership_rx: None,
+            membership_pending: BTreeSet::new(),
             session: None,
             initial_volume_text: "50".into(),
             volume_rx: None,
@@ -388,6 +397,165 @@ impl SairplayApp {
                 self.playback =
                     PlaybackUiState::Error("Connect worker ended unexpectedly".into());
                 self.connect_rx = None;
+            }
+        }
+    }
+
+    fn pump_membership_result(&mut self) {
+        let Some(rx) = &self.membership_rx else {
+            return;
+        };
+
+        match rx.try_recv() {
+            Ok(Ok(added)) => {
+                let mut adopted = 0usize;
+                if let Some(ActiveSession::Group(group)) = self.session.as_mut() {
+                    for (fullname, session) in added.members {
+                        group.adopt_member(fullname.clone(), session);
+                        self.active_fullnames.insert(fullname.clone());
+                        self.selected_fullnames.insert(fullname);
+                        adopted += 1;
+                    }
+                }
+                self.log.push(format!(
+                    "MultiRoom live join complete: {adopted} receiver(s) added without stopping the running group."
+                ));
+                self.membership_pending.clear();
+                self.membership_rx = None;
+            }
+            Ok(Err(error)) => {
+                self.log.push(format!("MultiRoom live join failed: {error}"));
+                for fullname in std::mem::take(&mut self.membership_pending) {
+                    self.selected_fullnames.remove(&fullname);
+                }
+                self.membership_rx = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.log.push("MultiRoom membership worker ended unexpectedly.".into());
+                for fullname in std::mem::take(&mut self.membership_pending) {
+                    self.selected_fullnames.remove(&fullname);
+                }
+                self.membership_rx = None;
+            }
+        }
+    }
+
+    fn request_live_add(&mut self, members: &[String]) {
+        if self.membership_rx.is_some() {
+            return;
+        }
+        let Some(ActiveSession::Group(group)) = self.session.as_ref() else {
+            return;
+        };
+        let Some(join_handle) = group.join_handle() else {
+            self.log.push("MultiRoom live join unavailable: audio worker is not running.".into());
+            return;
+        };
+
+        let initial_volume = match parse_volume_text(&self.initial_volume_text) {
+            Ok(volume) => volume,
+            Err(message) => {
+                self.log.push(message);
+                return;
+            }
+        };
+
+        let devices = self.catalog.devices().to_vec();
+        let mut requests = Vec::<(String, NativeSessionConfig)>::new();
+        for fullname in members {
+            if self.active_fullnames.contains(fullname) {
+                continue;
+            }
+            let Some(device) = devices.iter().find(|device| {
+                device
+                    .airplay
+                    .as_ref()
+                    .is_some_and(|service| service.fullname == *fullname)
+            }) else {
+                self.log.push(format!("Live join skipped: {fullname} is no longer discovered."));
+                continue;
+            };
+            if device.route(false, false) != Route::AirPlay2Native {
+                self.log.push(format!(
+                    "Live join skipped: {} is not a native AirPlay 2 route.",
+                    device.display_name
+                ));
+                continue;
+            }
+            match native_config_for_device(device, initial_volume) {
+                Ok(config) => requests.push((fullname.clone(), config)),
+                Err(error) => self.log.push(error),
+            }
+        }
+
+        if requests.is_empty() {
+            return;
+        }
+
+        self.membership_pending = requests
+            .iter()
+            .map(|(fullname, _)| fullname.clone())
+            .collect();
+        self.log.push(format!(
+            "MultiRoom live join: connecting {} receiver(s) while the current group keeps playing.",
+            requests.len()
+        ));
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.membership_rx = Some(rx);
+        thread::Builder::new()
+            .name("sairplay-live-join".into())
+            .spawn(move || {
+                let mut added = Vec::<(String, NativeSession)>::new();
+                for (fullname, config) in requests {
+                    match join_handle.connect_member(fullname.clone(), config) {
+                        Ok(member) => added.push(member),
+                        Err(error) => {
+                            for (joined, _) in &added {
+                                let _ = join_handle.remove_audio_member(joined.clone());
+                            }
+                            let _ = tx.send(Err(error.to_string()));
+                            return;
+                        }
+                    }
+                }
+                let _ = tx.send(Ok(MembershipAdded { members: added }));
+            })
+            .expect("failed to spawn MultiRoom live-join worker");
+    }
+
+    fn remove_live_members(&mut self, members: &[String]) {
+        let active_to_remove: Vec<String> = members
+            .iter()
+            .filter(|fullname| self.active_fullnames.contains(*fullname))
+            .cloned()
+            .collect();
+        if active_to_remove.is_empty() {
+            return;
+        }
+
+        if active_to_remove.len() >= self.active_fullnames.len() {
+            self.stop_playback();
+            return;
+        }
+
+        let Some(ActiveSession::Group(group)) = self.session.as_mut() else {
+            return;
+        };
+
+        for fullname in active_to_remove {
+            match group.remove_member(&fullname) {
+                Ok(()) => {
+                    self.active_fullnames.remove(&fullname);
+                    self.log.push(format!(
+                        "{fullname}: removed from MultiRoom while the remaining receivers keep playing."
+                    ));
+                }
+                Err(error) => {
+                    self.log.push(format!("{fullname}: remove from MultiRoom failed: {error}"));
+                    self.selected_fullnames.insert(fullname);
+                }
             }
         }
     }
@@ -646,10 +814,13 @@ impl SairplayApp {
                 service.txt.fields.get("tsm").map(String::as_str).unwrap_or("-"),
                 service.txt.fields.get("gpn").map(String::as_str).unwrap_or("-"),
             ));
-            configs.push(NativeGroupMemberConfig::new(
-                device.display_name.clone(),
-                config,
-            ));
+            let fullname = device
+                .airplay
+                .as_ref()
+                .expect("selected AirPlay service")
+                .fullname
+                .clone();
+            configs.push(NativeGroupMemberConfig::new(fullname, config));
         }
 
         let (tx, rx) = mpsc::sync_channel(1);
@@ -664,28 +835,10 @@ impl SairplayApp {
         thread::Builder::new()
             .name("sairplay-native-connect".into())
             .spawn(move || {
-                let result = if configs.len() == 1 {
-                    let member = configs.into_iter().next().expect("one config");
-                    (|| -> Result<ActiveSession, String> {
-                        let mut session =
-                            NativeSession::connect(&member.config).map_err(|e| e.to_string())?;
-                        session
-                            .start_windows_audio()
-                            .map_err(|e| e.to_string())?;
-                        if !session.is_ready() || !session.audio_running() {
-                            return Err(
-                                "native transport or Windows capture did not reach ready state"
-                                    .into(),
-                            );
-                        }
-                        Ok(ActiveSession::Single(session))
-                    })()
-                } else {
-                    NativeGroupSession::connect(configs)
-                        .map(ActiveSession::Group)
-                        .map_err(|e| e.to_string())
-                }
-                .map(|session| ConnectSuccess {
+                let result = NativeGroupSession::connect(configs)
+                    .map(ActiveSession::Group)
+                    .map_err(|e| e.to_string())
+                    .map(|session| ConnectSuccess {
                     session,
                     active_fullnames,
                     label,
@@ -700,6 +853,8 @@ impl SairplayApp {
             self.log.push("Playback stopped; native session resources released.".into());
         }
         self.active_fullnames.clear();
+        self.membership_pending.clear();
+        self.membership_rx = None;
         self.playback = PlaybackUiState::Idle;
         self.last_audio_discontinuities = 0;
         self.last_rtx = (0, 0, 0);
@@ -785,6 +940,13 @@ impl SairplayApp {
             && members
                 .iter()
                 .all(|fullname| self.active_fullnames.contains(fullname));
+        let pending = members
+            .iter()
+            .any(|fullname| self.membership_pending.contains(fullname));
+
+        if pending {
+            return (self.t("Đang kết nối", "Connecting"), StatusTone::Orange);
+        }
 
         match &self.playback {
             PlaybackUiState::Connecting(_) if selected => (
@@ -829,7 +991,8 @@ impl SairplayApp {
                 .all(|fullname| self.selected_fullnames.contains(fullname));
         let selectable = route == Route::AirPlay2Native
             && !members.is_empty()
-            && !matches!(self.playback, PlaybackUiState::Connecting(_));
+            && !matches!(self.playback, PlaybackUiState::Connecting(_))
+            && self.membership_rx.is_none();
 
         let address = device
             .airplay
@@ -954,9 +1117,15 @@ impl SairplayApp {
                     for fullname in &members {
                         self.selected_fullnames.remove(fullname);
                     }
+                    if matches!(self.playback, PlaybackUiState::Playing(_)) {
+                        self.remove_live_members(&members);
+                    }
                 } else {
                     for fullname in &members {
                         self.selected_fullnames.insert(fullname.clone());
+                    }
+                    if matches!(self.playback, PlaybackUiState::Playing(_)) {
+                        self.request_live_add(&members);
                     }
                 }
             } else {
@@ -1046,7 +1215,10 @@ impl SairplayApp {
                                     .clicked()
                                     {
                                         self.multiroom_enabled = !self.multiroom_enabled;
-                                        if !self.multiroom_enabled && self.selected_fullnames.len() > 1 {
+                                        if !self.multiroom_enabled
+                                            && self.selected_fullnames.len() > 1
+                                            && !matches!(self.playback, PlaybackUiState::Playing(_))
+                                        {
                                             let keep = self.selected_fullnames.iter().next().cloned();
                                             self.selected_fullnames.clear();
                                             if let Some(fullname) = keep {
@@ -1446,6 +1618,7 @@ impl eframe::App for SairplayApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_discovery();
         self.pump_connect_result();
+        self.pump_membership_result();
         self.pump_volume_result();
         self.monitor_running_session();
 
@@ -2535,6 +2708,26 @@ fn draw_device_art(
             put_svg!(egui::include_image!("../assets/sairplay_bookshelf_speaker_filled.svg"), right, dark);
         }
     }
+}
+
+fn native_config_for_device(
+    device: &DeviceRecord,
+    initial_volume: Option<u8>,
+) -> Result<NativeSessionConfig, String> {
+    let service = device
+        .airplay
+        .as_ref()
+        .ok_or_else(|| format!("{} has no AirPlay service", device.display_name))?;
+    let host = preferred_service_address(service);
+    let mut config = NativeSessionConfig::new(host, service.port);
+    config.dacp_id = "A1B2C3D4E5F60708".into();
+    config.active_remote = "123456789".into();
+    config.supports_ptp = service.txt.supports_ptp();
+    config.follow_receiver_clock = service.txt.follows_receiver_clock();
+    config.apple_model = service.txt.is_apple_model();
+    config.receiver_name = device.display_name.clone();
+    config.initial_volume = initial_volume;
+    Ok(config)
 }
 
 fn parse_volume_text(value: &str) -> Result<Option<u8>, String> {
