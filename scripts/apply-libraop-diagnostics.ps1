@@ -237,12 +237,24 @@ Replace-Once -Path $raop -Label "first UDP send outcome" -Old @'
 '@
 
 Replace-Once -Path $raop -Label "first RTP header timeline" -Old @'
-	packet->timestamp = htonl(p->head_ts);
+	{
+		uint32_t sairplay_wire_ts = (uint32_t) p->head_ts;
+		if (p->sairplay_rtp_base) {
+			sairplay_wire_ts = (uint32_t) (p->head_ts - p->sairplay_rtp_base);
+		}
+		packet->timestamp = htonl(sairplay_wire_ts);
+	}
 	packet->ssrc = htonl(p->ssrc);
 
 	memcpy((uint8_t*) packet + sizeof(rtp_audio_pkt_t), encoded, size);
 '@ -New @'
-	packet->timestamp = htonl(p->head_ts);
+	{
+		uint32_t sairplay_wire_ts = (uint32_t) p->head_ts;
+		if (p->sairplay_rtp_base) {
+			sairplay_wire_ts = (uint32_t) (p->head_ts - p->sairplay_rtp_base);
+		}
+		packet->timestamp = htonl(sairplay_wire_ts);
+	}
 	packet->ssrc = htonl(p->ssrc);
 
 	{
