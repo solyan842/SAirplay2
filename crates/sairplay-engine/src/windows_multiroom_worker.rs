@@ -5,14 +5,17 @@ use crate::{
 use std::fmt;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc::{self, Receiver, Sender},
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
-/// Source value used by Music Assistant for a cold multi-room group start.
-/// All members connect first, then one shared audible instant is armed.
+/// Upstream Music Assistant constants, kept explicit so the Windows engine
+/// follows the same synchronization policy.
+pub const AIRPLAY_START_LEAD_MS: u64 = 400;
 pub const AIRPLAY_COLD_GROUP_START_LEAD_MS: u64 = 2_500;
+pub const AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS: u64 = 2_500;
 
 pub struct WindowsAudioTarget {
     pub(crate) name: String,
@@ -29,20 +32,88 @@ pub enum WindowsMultiroomAudioError {
     Capture(WasapiLoopbackError),
     Media(String),
     Time(String),
+    Command(String),
 }
 
 impl fmt::Display for WindowsMultiroomAudioError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyGroup => write!(f, "multi-room group has no audio targets"),
+            Self::EmptyGroup => write!(f, "multi-room session has no audio targets"),
             Self::Capture(e) => write!(f, "{e}"),
-            Self::Media(e) => write!(f, "{e}"),
-            Self::Time(e) => write!(f, "{e}"),
+            Self::Media(e) | Self::Time(e) | Self::Command(e) => write!(f, "{e}"),
         }
     }
 }
 
 impl std::error::Error for WindowsMultiroomAudioError {}
+
+enum GroupAudioCommand {
+    Add {
+        target: WindowsAudioTarget,
+        reply: Sender<Result<(), String>>,
+    },
+    Remove {
+        name: String,
+        reply: Sender<Result<(), String>>,
+    },
+}
+
+struct PendingJoin {
+    target: WindowsAudioTarget,
+    start_packet: u64,
+    reply: Sender<Result<(), String>>,
+}
+
+#[derive(Clone)]
+pub struct WindowsMultiroomJoinHandle {
+    command_tx: Sender<GroupAudioCommand>,
+}
+
+impl WindowsMultiroomJoinHandle {
+    pub fn add_target(&self, target: WindowsAudioTarget) -> Result<(), WindowsMultiroomAudioError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.command_tx
+            .send(GroupAudioCommand::Add {
+                target,
+                reply: reply_tx,
+            })
+            .map_err(|_| {
+                WindowsMultiroomAudioError::Command(
+                    "multi-room audio worker is not accepting new members".into(),
+                )
+            })?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(12))
+            .map_err(|error| {
+                WindowsMultiroomAudioError::Command(format!(
+                    "late join timed out waiting for the shared timeline: {error}"
+                ))
+            })?
+            .map_err(WindowsMultiroomAudioError::Command)
+    }
+
+    pub fn remove_target(&self, name: impl Into<String>) -> Result<(), WindowsMultiroomAudioError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.command_tx
+            .send(GroupAudioCommand::Remove {
+                name: name.into(),
+                reply: reply_tx,
+            })
+            .map_err(|_| {
+                WindowsMultiroomAudioError::Command(
+                    "multi-room audio worker is not accepting membership changes".into(),
+                )
+            })?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(3))
+            .map_err(|error| {
+                WindowsMultiroomAudioError::Command(format!(
+                    "member removal timed out: {error}"
+                ))
+            })?
+            .map_err(WindowsMultiroomAudioError::Command)
+    }
+}
 
 pub struct WindowsMultiroomAudioWorker {
     running: Arc<AtomicBool>,
@@ -53,6 +124,7 @@ pub struct WindowsMultiroomAudioWorker {
     first_non_silent_frame: Arc<AtomicU64>,
     startup_events: Arc<Mutex<Vec<String>>>,
     active_members: Arc<AtomicU64>,
+    join_handle: WindowsMultiroomJoinHandle,
 }
 
 impl WindowsMultiroomAudioWorker {
@@ -75,7 +147,11 @@ impl WindowsMultiroomAudioWorker {
         let startup_events_thread = Arc::clone(&startup_events);
         let active_members = Arc::new(AtomicU64::new(targets.len() as u64));
         let active_members_thread = Arc::clone(&active_members);
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (command_tx, command_rx) = mpsc::channel::<GroupAudioCommand>();
+        let join_handle = WindowsMultiroomJoinHandle {
+            command_tx: command_tx.clone(),
+        };
 
         let worker = thread::Builder::new()
             .name("sairplay-multiroom-audio".into())
@@ -100,10 +176,23 @@ impl WindowsMultiroomAudioWorker {
                 let mut captured_frames_total = 0u64;
                 let mut source_present = false;
                 let mut cold_armed = false;
+                let mut group_start_ntp: Option<u64> = None;
                 let mut input_starved_since: Option<Instant> = None;
                 let mut packet_index = 0u64;
+                let mut pending_joins = Vec::<PendingJoin>::new();
 
                 while running_thread.load(Ordering::SeqCst) {
+                    handle_group_commands(
+                        &command_rx,
+                        &mut targets,
+                        &mut pending_joins,
+                        cold_armed,
+                        group_start_ntp,
+                        packet_index,
+                        &active_members_thread,
+                        &startup_events_thread,
+                    );
+
                     let report = match capture.drain_into(&mut chunker) {
                         Ok(report) => report,
                         Err(error) => {
@@ -136,7 +225,9 @@ impl WindowsMultiroomAudioWorker {
                     let frames = report.frames;
                     captured_frames_total = captured_frames_total.saturating_add(frames as u64);
 
-                    // Before START, shared-mode engine silence is "no source".
+                    // Before START, source silence is not content. This mirrors
+                    // the upstream readiness gate: connect members, prove audio
+                    // is flowing, then choose one shared audible anchor.
                     if !source_present {
                         if report.first_non_silent_frame_offset.is_some() {
                             source_present = true;
@@ -147,9 +238,6 @@ impl WindowsMultiroomAudioWorker {
                         }
                     }
 
-                    // Source contract: every group member is connected before a
-                    // single shared cold START. The cold group lead is 2500 ms,
-                    // further extended if one receiver still needs clock settle.
                     if !cold_armed {
                         if !chunker.has_packet() {
                             if frames == 0 {
@@ -167,12 +255,17 @@ impl WindowsMultiroomAudioWorker {
                                 return;
                             }
                         };
+                        let source_lead = if targets.len() > 1 {
+                            AIRPLAY_COLD_GROUP_START_LEAD_MS
+                        } else {
+                            AIRPLAY_START_LEAD_MS
+                        };
                         let settle_ms = targets
                             .iter()
                             .map(|target| target.cold_start_delay_ms)
                             .max()
                             .unwrap_or(0);
-                        let delay_ms = AIRPLAY_COLD_GROUP_START_LEAD_MS.max(settle_ms);
+                        let delay_ms = source_lead.max(settle_ms);
                         let start_ntp = now_ntp.saturating_add(ms_to_ntp(delay_ms));
 
                         for target in &mut targets {
@@ -184,7 +277,7 @@ impl WindowsMultiroomAudioWorker {
                             ) {
                                 if let Ok(mut slot) = last_error_thread.lock() {
                                     *slot = Some(format!(
-                                        "{} cold group START failed: {error:?}",
+                                        "{} cold session START failed: {error:?}",
                                         target.name
                                     ));
                                 }
@@ -193,9 +286,10 @@ impl WindowsMultiroomAudioWorker {
                             }
                         }
                         cold_armed = true;
+                        group_start_ntp = Some(start_ntp);
                         if let Ok(mut events) = startup_events_thread.lock() {
                             events.push(format!(
-                                "MultiRoom: {} members ready · shared cold START={} ms · one WASAPI source.",
+                                "AirPlay session: {} member(s) ready · shared START={} ms · one WASAPI source.",
                                 targets.len(),
                                 delay_ms
                             ));
@@ -213,8 +307,6 @@ impl WindowsMultiroomAudioWorker {
                         }
                     };
 
-                    // Keep recovery debt identical across members so the same
-                    // source frame lands at the same content position everywhere.
                     if chunker.has_packet() {
                         input_starved_since = None;
                         for target in &mut targets {
@@ -239,12 +331,38 @@ impl WindowsMultiroomAudioWorker {
                     }
 
                     loop {
-                        if targets.is_empty() {
+                        if targets.is_empty() && pending_joins.is_empty() {
                             if let Ok(mut slot) = last_error_thread.lock() {
-                                *slot = Some("all MultiRoom members stopped".into());
+                                *slot = Some("all AirPlay session members stopped".into());
                             }
                             running_thread.store(false, Ordering::SeqCst);
                             return;
+                        }
+
+                        // A late joiner was armed ahead of time. Attach it
+                        // exactly when the live feed reaches the content sample
+                        // mapped to that shared group instant. No old source is
+                        // replayed and the running members are never paused.
+                        let mut index = 0usize;
+                        while index < pending_joins.len() {
+                            if pending_joins[index].start_packet <= packet_index {
+                                let pending = pending_joins.remove(index);
+                                let name = pending.target.name.clone();
+                                targets.push(pending.target);
+                                active_members_thread.store(targets.len() as u64, Ordering::SeqCst);
+                                let _ = pending.reply.send(Ok(()));
+                                if let Ok(mut events) = startup_events_thread.lock() {
+                                    events.push(format!(
+                                        "Late joiner {name}: attached at shared content packet #{packet_index}."
+                                    ));
+                                }
+                            } else {
+                                index += 1;
+                            }
+                        }
+
+                        if targets.is_empty() {
+                            break;
                         }
 
                         align_splice_pad(&mut targets);
@@ -271,9 +389,6 @@ impl WindowsMultiroomAudioWorker {
                             }
                         };
 
-                        // All members share one source. Gate the release with the
-                        // tightest receiver buffer window; larger windows are safe
-                        // whenever the smallest one can accept a packet.
                         let gate_index = targets
                             .iter()
                             .enumerate()
@@ -309,7 +424,7 @@ impl WindowsMultiroomAudioWorker {
                         if !failed.is_empty() {
                             for (index, message) in failed.into_iter().rev() {
                                 if let Ok(mut events) = startup_events_thread.lock() {
-                                    events.push(format!("MultiRoom member removed: {message}"));
+                                    events.push(format!("AirPlay member removed: {message}"));
                                 }
                                 targets.remove(index);
                             }
@@ -319,7 +434,7 @@ impl WindowsMultiroomAudioWorker {
                         if packet_index <= 8 {
                             if let Ok(mut events) = startup_events_thread.lock() {
                                 events.push(format!(
-                                    "MultiRoom: packet #{} fan-out to {} members · gate_lead_frames={} · pad={}.",
+                                    "AirPlay session: packet #{} fan-out to {} member(s) · gate_lead_frames={} · pad={}.",
                                     packet_index,
                                     targets.len(),
                                     gate_lead,
@@ -332,6 +447,12 @@ impl WindowsMultiroomAudioWorker {
                     if frames == 0 {
                         thread::sleep(Duration::from_millis(1));
                     }
+                }
+
+                for pending in pending_joins {
+                    let _ = pending.reply.send(Err(
+                        "multi-room audio worker stopped before late join completed".into(),
+                    ));
                 }
             })
             .map_err(|e| {
@@ -350,6 +471,7 @@ impl WindowsMultiroomAudioWorker {
                 first_non_silent_frame,
                 startup_events,
                 active_members,
+                join_handle,
             }),
             Ok(Err(message)) => {
                 let _ = worker.join();
@@ -367,6 +489,10 @@ impl WindowsMultiroomAudioWorker {
                 ))
             }
         }
+    }
+
+    pub fn join_handle(&self) -> WindowsMultiroomJoinHandle {
+        self.join_handle.clone()
     }
 
     pub fn is_running(&self) -> bool {
@@ -420,6 +546,130 @@ impl Drop for WindowsMultiroomAudioWorker {
     }
 }
 
+fn handle_group_commands(
+    command_rx: &Receiver<GroupAudioCommand>,
+    targets: &mut Vec<WindowsAudioTarget>,
+    pending_joins: &mut Vec<PendingJoin>,
+    cold_armed: bool,
+    group_start_ntp: Option<u64>,
+    packet_index: u64,
+    active_members: &AtomicU64,
+    startup_events: &Mutex<Vec<String>>,
+) {
+    while let Ok(command) = command_rx.try_recv() {
+        match command {
+            GroupAudioCommand::Add { mut target, reply } => {
+                if targets.iter().any(|item| item.name == target.name)
+                    || pending_joins.iter().any(|item| item.target.name == target.name)
+                {
+                    let _ = reply.send(Err(format!(
+                        "{} is already in the AirPlay session",
+                        target.name
+                    )));
+                    continue;
+                }
+
+                if !cold_armed {
+                    let name = target.name.clone();
+                    targets.push(target);
+                    active_members.store(targets.len() as u64, Ordering::SeqCst);
+                    let _ = reply.send(Ok(()));
+                    if let Ok(mut events) = startup_events.lock() {
+                        events.push(format!("{name}: joined before the initial shared START."));
+                    }
+                    continue;
+                }
+
+                let Some(base_start) = group_start_ntp else {
+                    let _ = reply.send(Err("shared group timeline is unavailable".into()));
+                    continue;
+                };
+                let now_ntp = match system_time_to_ntp(SystemTime::now()) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = reply.send(Err(format!(
+                            "late-join clock conversion failed: {error:?}"
+                        )));
+                        continue;
+                    }
+                };
+
+                // Match upstream late-join semantics: map the joiner's first
+                // sample onto the group's effective timeline, including any
+                // accumulated starvation/re-anchor shift of the reference member.
+                let shift_frames = targets
+                    .first()
+                    .map(|item| item.sender.reanchor_shifted_frames())
+                    .unwrap_or(0);
+                let effective_start = base_start.saturating_add(frames_to_ntp(shift_frames));
+                let join_floor =
+                    now_ntp.saturating_add(ms_to_ntp(AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS));
+                let required_frames = ntp_delta_to_frames_ceil(
+                    join_floor.saturating_sub(effective_start),
+                );
+                let required_packet = required_frames.div_ceil(352);
+                let start_packet = packet_index.max(required_packet);
+                let start_ntp = effective_start.saturating_add(frames_to_ntp(
+                    start_packet.saturating_mul(352),
+                ));
+
+                match target.sender.arm_cold_start(
+                    start_ntp,
+                    target.latency_max,
+                    target.lead_frames,
+                    target.rtp_offset,
+                ) {
+                    Ok(()) => {
+                        if let Ok(mut events) = startup_events.lock() {
+                            events.push(format!(
+                                "{}: late join armed for packet #{} with {} ms minimum headroom.",
+                                target.name,
+                                start_packet,
+                                AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS
+                            ));
+                        }
+                        pending_joins.push(PendingJoin {
+                            target,
+                            start_packet,
+                            reply,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(format!(
+                            "{} late-join START failed: {error:?}",
+                            target.name
+                        )));
+                    }
+                }
+            }
+            GroupAudioCommand::Remove { name, reply } => {
+                if let Some(index) = pending_joins
+                    .iter()
+                    .position(|item| item.target.name == name)
+                {
+                    let pending = pending_joins.remove(index);
+                    let _ = pending
+                        .reply
+                        .send(Err(format!("{name}: late join cancelled by removal")));
+                    let _ = reply.send(Ok(()));
+                    continue;
+                }
+
+                if let Some(index) = targets.iter().position(|item| item.name == name) {
+                    targets.remove(index);
+                    active_members.store(targets.len() as u64, Ordering::SeqCst);
+                    let _ = reply.send(Ok(()));
+                    if let Ok(mut events) = startup_events.lock() {
+                        events.push(format!("{name}: removed from live AirPlay session."));
+                    }
+                } else {
+                    let _ = reply.send(Err(format!("{name} is not in the AirPlay session")));
+                }
+            }
+        }
+    }
+}
+
 fn align_splice_pad(targets: &mut [WindowsAudioTarget]) {
     let max_pad = targets
         .iter()
@@ -436,4 +686,12 @@ fn align_splice_pad(targets: &mut [WindowsAudioTarget]) {
 
 fn ms_to_ntp(ms: u64) -> u64 {
     ((ms as u128) << 32).div_ceil(1000) as u64
+}
+
+fn frames_to_ntp(frames: u64) -> u64 {
+    ((frames as u128) << 32).div_ceil(44_100) as u64
+}
+
+fn ntp_delta_to_frames_ceil(delta: u64) -> u64 {
+    ((delta as u128) * 44_100u128).div_ceil(1u128 << 32) as u64
 }
