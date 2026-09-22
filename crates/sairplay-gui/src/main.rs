@@ -3311,15 +3311,6 @@ fn legacy_config_for_device(
     // explicit pairing_required check above is authoritative for blocking.
     config.mfi_auth = config.am.to_ascii_lowercase().contains("airport");
 
-    // Isolated A/B probe for embedded AppleTV-class receivers that advertise a
-    // public key but no PIN/legacy-pairing requirement and have no stored secret.
-    // This changes only the legacy helper startup timeline via an environment
-    // switch; native AirPlay 2 and other legacy receivers remain untouched.
-    config.startup_flush_probe = config.am.to_ascii_lowercase().contains("appletv")
-        && !config.pk.trim().is_empty()
-        && config.secret.is_none()
-        && !pairing_required;
-
     config.cn = props
         .txt
         .fields
@@ -3331,6 +3322,17 @@ fn legacy_config_for_device(
             .cn
             .split(',')
             .any(|value| value.trim() == "1");
+    }
+
+    // pyatv's AirPlay-v1 sender uses L16/44100/2 PCM and includes the
+    // Apple-style fmtp line even for L16. Reproduce that exact wire contract
+    // only for this embedded AppleTV-class receiver.
+    config.pcm_l16_probe = config.am.to_ascii_lowercase().contains("appletv")
+        && !config.pk.trim().is_empty()
+        && config.secret.is_none()
+        && !pairing_required;
+    if config.pcm_l16_probe {
+        config.compressed_alac = false;
     }
 
     Ok(config)
