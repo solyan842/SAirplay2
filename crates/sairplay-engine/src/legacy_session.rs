@@ -37,6 +37,7 @@ pub struct LegacyMemberConfig {
     pub md: String,
     pub am: String,
     pub pk: String,
+    pub cn: String,
     pub secret: Option<String>,
     pub compressed_alac: bool,
     pub mfi_auth: bool,
@@ -53,6 +54,7 @@ impl LegacyMemberConfig {
             md: "0,1,2".into(),
             am: String::new(),
             pk: String::new(),
+            cn: String::new(),
             secret: None,
             compressed_alac: true,
             mfi_auth: false,
@@ -462,6 +464,15 @@ fn spawn_member(
     startup_events: Arc<Mutex<Vec<String>>>,
     active_members: Arc<AtomicU64>,
 ) -> Result<SpawnedMember, LegacyGroupError> {
+    if let Ok(mut events) = startup_events.lock() {
+        events.push(format!(
+            "{}: [SAIRPLAY-DIAG] codec={} cn={}",
+            config.name,
+            if config.compressed_alac { "compressed-alac" } else { "alac-raw" },
+            if config.cn.trim().is_empty() { "<absent>" } else { config.cn.as_str() }
+        ));
+    }
+
     let mut command = Command::new(helper);
     command
         .arg("-p")

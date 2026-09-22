@@ -3294,8 +3294,17 @@ fn legacy_config_for_device(
     // explicit pairing_required check above is authoritative for blocking.
     config.mfi_auth = config.am.to_ascii_lowercase().contains("airport");
 
-    if let Some(cn) = props.txt.fields.get("cn") {
-        config.compressed_alac = cn.split(',').any(|value| value.trim() == "1");
+    config.cn = props
+        .txt
+        .fields
+        .get("cn")
+        .cloned()
+        .unwrap_or_default();
+    if !config.cn.is_empty() {
+        config.compressed_alac = config
+            .cn
+            .split(',')
+            .any(|value| value.trim() == "1");
     }
 
     Ok(config)
