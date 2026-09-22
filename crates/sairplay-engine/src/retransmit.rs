@@ -8,7 +8,11 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 pub const RTX_RING_SLOTS: usize = 512;
-const RTX_POLL: Duration = Duration::from_millis(200);
+// Upstream blocks in poll(..., 200 ms), which wakes immediately when a D5
+// retransmit request arrives. A plain sleep(200 ms) is not equivalent and can
+// delay the response by the full 200 ms, so keep the nonblocking loop but use
+// a short idle sleep to preserve effectively-immediate request service.
+const RTX_POLL: Duration = Duration::from_millis(5);
 
 #[derive(Clone)]
 pub struct RetransmitRing {

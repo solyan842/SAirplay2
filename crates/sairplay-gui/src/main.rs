@@ -1101,67 +1101,62 @@ impl SairplayApp {
         }
 
         let content = body.shrink2(egui::vec2(10.0, 5.0));
-        ui.allocate_ui_at_rect(content, |ui| {
-            ui.horizontal_centered(|ui| {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(SELECTOR_W, 44.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        draw_selector(ui, selected, selectable);
-                    },
+        let row_y = content.center().y;
+        let selector_rect = egui::Rect::from_min_size(
+            egui::pos2(content.left(), row_y - 22.0),
+            egui::vec2(SELECTOR_W, 44.0),
+        );
+        let art_rect = egui::Rect::from_min_size(
+            egui::pos2(selector_rect.right() + 8.0, row_y - 22.0),
+            egui::vec2(ART_W, 44.0),
+        );
+        let status_rect = egui::Rect::from_min_size(
+            egui::pos2(content.right() - STATUS_W, row_y - 22.0),
+            egui::vec2(STATUS_W, 44.0),
+        );
+        let text_left = art_rect.right() + 12.0;
+        let text_right = (status_rect.left() - 8.0).max(text_left + 110.0);
+        let text_rect = egui::Rect::from_min_max(
+            egui::pos2(text_left, row_y - 22.0),
+            egui::pos2(text_right, row_y + 22.0),
+        );
+
+        ui.allocate_ui_at_rect(selector_rect, |ui| {
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                draw_selector(ui, selected, selectable);
+            });
+        });
+        ui.allocate_ui_at_rect(art_rect, |ui| {
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                draw_device_art(ui, artwork, stereo_pair, egui::vec2(54.0, 54.0));
+            });
+        });
+        ui.allocate_ui_at_rect(text_rect, |ui| {
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.add_space(3.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&device.display_name)
+                            .size(14.0)
+                            .strong()
+                            .color(UiTheme::text()),
+                    )
+                    .truncate(),
                 );
-
-                ui.add_space(8.0);
-
-                ui.allocate_ui_with_layout(
-                    egui::vec2(ART_W, 44.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        draw_device_art(
-                            ui,
-                            artwork,
-                            stereo_pair,
-                            egui::vec2(54.0, 54.0),
-                        );
-                    },
+                ui.add_space(1.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(address)
+                            .size(11.5)
+                            .color(UiTheme::text_soft()),
+                    )
+                    .truncate(),
                 );
-
-                ui.add_space(12.0);
-
-                let text_width = (ui.available_width() - STATUS_W - 14.0).max(110.0);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(text_width, 44.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        ui.add_space(3.0);
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(&device.display_name)
-                                    .size(14.0)
-                                    .strong()
-                                    .color(UiTheme::text()),
-                            )
-                            .truncate(),
-                        );
-                        ui.add_space(1.0);
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(address)
-                                    .size(11.5)
-                                    .color(UiTheme::text_soft()),
-                            )
-                            .truncate(),
-                        );
-                    },
-                );
-
-                ui.add_space(8.0);
-
-                ui.allocate_ui_with_layout(
-                    egui::vec2(STATUS_W, 44.0),
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| draw_status_badge(ui, status, status_tone),
-                );
+            });
+        });
+        ui.allocate_ui_at_rect(status_rect, |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                draw_status_badge(ui, status, status_tone);
             });
         });
 
@@ -1388,9 +1383,14 @@ impl SairplayApp {
     fn render_controls(&mut self, ui: &mut egui::Ui) {
         const CARD_INNER_W: f32 = 286.0;
         const CARD_INNER_H: f32 = 42.0;
+        const CARD_OUTER_W: f32 = 306.0;
+        const CARD_OUTER_H: f32 = 58.0;
         const CARD_GAP: f32 = 7.0;
 
-        ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), CARD_OUTER_H),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
             egui::Frame::new()
                 .fill(UiTheme::surface())
                 .stroke(egui::Stroke::new(1.0, UiTheme::border()))
@@ -1403,6 +1403,18 @@ impl SairplayApp {
                 })
                 .inner_margin(egui::Margin::symmetric(10, 8))
                 .show(ui, |ui| {
+                    ui.set_min_width(CARD_INNER_W);
+                    ui.set_max_width(CARD_INNER_W);
+                    ui.set_min_height(CARD_INNER_H);
+                    ui.set_max_height(CARD_INNER_H);
+                    ui.set_min_width(CARD_INNER_W);
+                    ui.set_max_width(CARD_INNER_W);
+                    ui.set_min_height(CARD_INNER_H);
+                    ui.set_max_height(CARD_INNER_H);
+                    ui.set_min_width(CARD_INNER_W);
+                    ui.set_max_width(CARD_INNER_W);
+                    ui.set_min_height(CARD_INNER_H);
+                    ui.set_max_height(CARD_INNER_H);
                     ui.allocate_ui_with_layout(
                         egui::vec2(CARD_INNER_W, CARD_INNER_H),
                         egui::Layout::left_to_right(egui::Align::Center),
@@ -1445,9 +1457,10 @@ impl SairplayApp {
                                             );
                                         });
 
-                                    if self.volume_rx.is_some() {
-                                        ui.spinner();
-                                    }
+                                    // Intentionally no activity spinner here: volume RTSP
+                                    // updates are asynchronous, but changing the child count/width
+                                    // while the pointer drags used to make all three control cards
+                                    // reflow and visibly flash.
                                 });
                             });
                         },
@@ -1571,7 +1584,9 @@ impl SairplayApp {
                         },
                     );
                 });
-        });
+            },
+        );
+        let _ = CARD_OUTER_W;
     }
 
     fn render_trial_row(&mut self, ui: &mut egui::Ui) {
@@ -2481,6 +2496,7 @@ fn draw_app_logo(ui: &mut egui::Ui, size: egui::Vec2) -> egui::Response {
         rect,
         egui::Image::new(egui::include_image!("../assets/sairplay2-logo.png"))
             .fit_to_exact_size(size)
+            .corner_radius(egui::CornerRadius::same(18))
             .sense(egui::Sense::click()),
     );
 
@@ -3064,6 +3080,55 @@ mod gui_tests {
     }
 }
 
+fn approved_app_icon_data() -> egui::IconData {
+    let decoded = image::load_from_memory(include_bytes!("../assets/sairplay2-logo.png"))
+        .expect("decode approved SAirplay2 logo")
+        .resize_exact(256, 256, image::imageops::FilterType::Lanczos3)
+        .into_rgba8();
+    let mut rgba = decoded.into_raw();
+    apply_round_alpha_mask(&mut rgba, 256, 256, 0.205);
+    egui::IconData {
+        rgba,
+        width: 256,
+        height: 256,
+    }
+}
+
+fn apply_round_alpha_mask(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    radius_fraction: f32,
+) {
+    let radius = width.min(height) as f32 * radius_fraction;
+    let max_x = width as f32 - 1.0;
+    let max_y = height as f32 - 1.0;
+
+    for y in 0..height {
+        for x in 0..width {
+            let fx = x as f32;
+            let fy = y as f32;
+            let dx = if fx < radius {
+                radius - fx
+            } else if fx > max_x - radius {
+                fx - (max_x - radius)
+            } else {
+                0.0
+            };
+            let dy = if fy < radius {
+                radius - fy
+            } else if fy > max_y - radius {
+                fy - (max_y - radius)
+            } else {
+                0.0
+            };
+            if dx > 0.0 && dy > 0.0 && dx * dx + dy * dy > radius * radius {
+                rgba[((y * width + x) * 4 + 3) as usize] = 0;
+            }
+        }
+    }
+}
+
 fn install_windows_ui_font(ctx: &egui::Context) {
     #[cfg(windows)]
     {
@@ -3095,12 +3160,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("SAirplay2")
-            .with_icon(
-                eframe::icon_data::from_png_bytes(
-                    include_bytes!("../assets/sairplay2-logo.png"),
-                )
-                .expect("approved SAirplay2 PNG logo"),
-            )
+            .with_icon(approved_app_icon_data())
             .with_inner_size([960.0, 620.0])
             .with_min_inner_size([960.0, 620.0])
             .with_max_inner_size([960.0, 620.0])

@@ -368,16 +368,23 @@ impl RealtimeMediaSender {
         let timestamp_sent = self.state.timestamp;
         let first_marker = self.state.first_packet;
         let packet = build_encrypted_realtime_packet(&self.state, alac_payload, &self.audio_key)?;
+
+        // Keep every sequence that enters the wire timeline in retransmit
+        // history, including the rare Windows local-UDP deadline drop. The
+        // source advances sequence/timestamp after a transient local drop; if
+        // the next packet arrives, the receiver asks for this missing seq.
+        // Retaining the already-built encrypted packet lets D5/D6 repair that
+        // exact hole instead of expiring the request (the long-run crackle
+        // signature observed in the field log).
+        if let Some(ring) = &self.retransmit {
+            ring.store(sequence_sent, &packet);
+        }
+
         let audio_delivered = match self
             .transport
             .send_data_deadline(&packet, Duration::from_millis(20))?
         {
-            DatagramSendOutcome::Sent(_) => {
-                if let Some(ring) = &self.retransmit {
-                    ring.store(sequence_sent, &packet);
-                }
-                true
-            }
+            DatagramSendOutcome::Sent(_) => true,
             DatagramSendOutcome::Dropped => false,
         };
 
