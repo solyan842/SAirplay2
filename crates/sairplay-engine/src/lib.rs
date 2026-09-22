@@ -44,6 +44,8 @@ pub mod windows_audio_worker;
 pub mod windows_multiroom_worker;
 #[cfg(windows)]
 pub mod native_group;
+#[cfg(windows)]
+pub mod legacy_session;
 pub mod alac_encoder;
 
 pub use ap2_info::{Ap2Info, Ap2InfoError, AudioFormatCapability, ALAC_44100_16_2};
@@ -96,6 +98,10 @@ pub use windows_multiroom_worker::{
 #[cfg(windows)]
 pub use native_group::{
     NativeGroupError, NativeGroupJoinHandle, NativeGroupMemberConfig, NativeGroupSession,
+};
+#[cfg(windows)]
+pub use legacy_session::{
+    LegacyGroupError, LegacyGroupSession, LegacyMemberConfig, LIBRAOP_PINNED_COMMIT,
 };
 pub use native_session::{NativeSession, NativeSessionConfig, NativeSessionError};
 pub use ptp_engine::{PtpClock, PtpEngine, PtpEngineError, PtpExchange};

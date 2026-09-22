@@ -2,9 +2,9 @@
 
 use eframe::egui;
 use sairplay_engine::{
-    DeviceCatalog, DeviceRecord, DiscoveredService, DiscoveryEvent, MdnsBrowser,
-    NativeGroupMemberConfig, NativeGroupSession, NativeSession, NativeSessionConfig,
-    RetransmitStats, Route, ServiceKind, VolumeSetResult,
+    DeviceCatalog, DeviceRecord, DiscoveredService, DiscoveryEvent, LegacyGroupSession,
+    LegacyMemberConfig, MdnsBrowser, NativeGroupMemberConfig, NativeGroupSession,
+    NativeSession, NativeSessionConfig, RetransmitStats, Route, ServiceKind, VolumeSetResult,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
@@ -22,6 +22,7 @@ enum PlaybackUiState {
 enum ActiveSession {
     Single(NativeSession),
     Group(NativeGroupSession),
+    Legacy(LegacyGroupSession),
 }
 
 impl ActiveSession {
@@ -29,6 +30,7 @@ impl ActiveSession {
         match self {
             Self::Single(session) => session.audio_running(),
             Self::Group(session) => session.audio_running(),
+            Self::Legacy(session) => session.is_running(),
         }
     }
 
@@ -36,6 +38,7 @@ impl ActiveSession {
         match self {
             Self::Single(session) => session.audio_error(),
             Self::Group(session) => session.audio_error(),
+            Self::Legacy(session) => session.last_error(),
         }
     }
 
@@ -43,6 +46,7 @@ impl ActiveSession {
         match self {
             Self::Single(session) => session.audio_discontinuities(),
             Self::Group(session) => session.audio_discontinuities(),
+            Self::Legacy(session) => session.discontinuity_count(),
         }
     }
 
@@ -50,6 +54,7 @@ impl ActiveSession {
         match self {
             Self::Single(session) => session.audio_last_discontinuity_frame(),
             Self::Group(session) => session.audio_last_discontinuity_frame(),
+            Self::Legacy(session) => session.last_discontinuity_frame(),
         }
     }
 
@@ -57,6 +62,7 @@ impl ActiveSession {
         match self {
             Self::Single(session) => session.audio_first_non_silent_frame(),
             Self::Group(session) => session.audio_first_non_silent_frame(),
+            Self::Legacy(session) => session.first_non_silent_frame(),
         }
     }
 
@@ -64,6 +70,7 @@ impl ActiveSession {
         match self {
             Self::Single(session) => session.drain_startup_events(),
             Self::Group(session) => session.drain_startup_events(),
+            Self::Legacy(session) => session.drain_startup_events(),
         }
     }
 
@@ -71,6 +78,7 @@ impl ActiveSession {
         match self {
             Self::Single(session) => session.retransmit_stats(),
             Self::Group(session) => session.retransmit_stats(),
+            Self::Legacy(_) => RetransmitStats::default(),
         }
     }
 
@@ -78,6 +86,7 @@ impl ActiveSession {
         match self {
             Self::Single(session) => session.feedback_running(),
             Self::Group(session) => session.feedback_running(),
+            Self::Legacy(session) => session.is_running(),
         }
     }
 
@@ -85,6 +94,7 @@ impl ActiveSession {
         match self {
             Self::Single(session) => session.feedback_error(),
             Self::Group(session) => session.feedback_error(),
+            Self::Legacy(_) => None,
         }
     }
 
@@ -92,6 +102,7 @@ impl ActiveSession {
         match self {
             Self::Single(session) => vec![session.volume_control()],
             Self::Group(session) => session.volume_controls(),
+            Self::Legacy(_) => Vec::new(),
         }
     }
 
@@ -102,6 +113,7 @@ impl ActiveSession {
                 .map(|result| vec![("receiver".to_owned(), result)])
                 .unwrap_or_default(),
             Self::Group(session) => session.initial_volume_results(),
+            Self::Legacy(_) => Vec::new(),
         }
     }
 }
@@ -715,7 +727,7 @@ impl SairplayApp {
         let selected_devices: Vec<(String, DeviceRecord)> = devices
             .into_iter()
             .filter_map(|device| {
-                let fullname = device.airplay.as_ref()?.fullname.clone();
+                let fullname = device_primary_fullname(&device)?;
                 self.selected_fullnames
                     .contains(&fullname)
                     .then_some((fullname, device))
@@ -731,15 +743,19 @@ impl SairplayApp {
             return;
         }
 
-        if let Some((_, device)) = selected_devices
+        let routes = selected_devices
             .iter()
-            .find(|(_, device)| device.route(false, false) != Route::AirPlay2Native)
-        {
-            let route = device.route(false, false);
-            let message = format!(
-                "{} currently resolves to {route:?}; native AirPlay 2 is required",
-                device.display_name
-            );
+            .map(|(_, device)| device.route(false, false))
+            .collect::<Vec<_>>();
+        let all_native = routes
+            .iter()
+            .all(|route| *route == Route::AirPlay2Native);
+        let all_legacy = routes
+            .iter()
+            .all(|route| matches!(route, Route::Raop | Route::AirPlay2Compat));
+
+        if !all_native && !all_legacy {
+            let message = "Mixed native AirPlay 2 + RAOP groups need one shared cross-transport timeline; select receivers from the same transport family for this build.".to_owned();
             self.log.push(message.clone());
             self.playback = PlaybackUiState::Error(message);
             return;
@@ -749,7 +765,7 @@ impl SairplayApp {
             selected_devices.iter().map(|(fullname, _)| fullname.clone()).collect();
         let member_count = selected_devices.len();
 
-        let pair_name = if member_count == 2 {
+        let pair_name = if all_native && member_count == 2 {
             let mut tsids = selected_devices.iter().filter_map(|(_, device)| {
                 device
                     .airplay
@@ -787,42 +803,6 @@ impl SairplayApp {
             }
         });
 
-        let mut configs = Vec::<NativeGroupMemberConfig>::with_capacity(member_count);
-        for (_, device) in &selected_devices {
-            let service = device.airplay.as_ref().expect("selected AirPlay service");
-            let host = preferred_service_address(service);
-            let mut config = NativeSessionConfig::new(host.clone(), service.port);
-            config.dacp_id = "A1B2C3D4E5F60708".into();
-            config.active_remote = "123456789".into();
-            config.supports_ptp = service.txt.supports_ptp();
-            config.follow_receiver_clock = service.txt.follows_receiver_clock();
-            config.apple_model = service.txt.is_apple_model();
-            config.receiver_name = device.display_name.clone();
-            config.initial_volume = initial_volume;
-
-            self.log.push(format!(
-                "{}: group preflight on {}:{} · model={} · PTP={} · follow-clock={} · igl={} · pgid={} · tsid={} · tsm={} · gpn={}.",
-                device.display_name,
-                host,
-                service.port,
-                service.txt.model.as_deref().unwrap_or("-"),
-                service.txt.supports_ptp(),
-                service.txt.follows_receiver_clock(),
-                service.txt.fields.get("igl").map(String::as_str).unwrap_or("-"),
-                service.txt.fields.get("pgid").map(String::as_str).unwrap_or("-"),
-                service.txt.fields.get("tsid").map(String::as_str).unwrap_or("-"),
-                service.txt.fields.get("tsm").map(String::as_str).unwrap_or("-"),
-                service.txt.fields.get("gpn").map(String::as_str).unwrap_or("-"),
-            ));
-            let fullname = device
-                .airplay
-                .as_ref()
-                .expect("selected AirPlay service")
-                .fullname
-                .clone();
-            configs.push(NativeGroupMemberConfig::new(fullname, config));
-        }
-
         let (tx, rx) = mpsc::sync_channel(1);
         self.connect_rx = Some(rx);
         self.playback = PlaybackUiState::Connecting(label.clone());
@@ -832,25 +812,95 @@ impl SairplayApp {
         self.last_rtx = (0, 0, 0);
         self.last_feedback_error = None;
 
-        thread::Builder::new()
-            .name("sairplay-native-connect".into())
-            .spawn(move || {
-                let result = NativeGroupSession::connect(configs)
-                    .map(ActiveSession::Group)
-                    .map_err(|e| e.to_string())
-                    .map(|session| ConnectSuccess {
-                    session,
-                    active_fullnames,
-                    label,
-                });
-                let _ = tx.send(result);
-            })
-            .expect("failed to spawn native connect worker");
+        if all_native {
+            let mut configs = Vec::<NativeGroupMemberConfig>::with_capacity(member_count);
+            for (_, device) in &selected_devices {
+                let service = device.airplay.as_ref().expect("selected AirPlay service");
+                let host = preferred_service_address(service);
+                let mut config = NativeSessionConfig::new(host.clone(), service.port);
+                config.dacp_id = "A1B2C3D4E5F60708".into();
+                config.active_remote = "123456789".into();
+                config.supports_ptp = service.txt.supports_ptp();
+                config.follow_receiver_clock = service.txt.follows_receiver_clock();
+                config.apple_model = service.txt.is_apple_model();
+                config.receiver_name = device.display_name.clone();
+                config.initial_volume = initial_volume;
+
+                self.log.push(format!(
+                    "{}: native preflight on {}:{} · model={} · PTP={} · follow-clock={}.",
+                    device.display_name,
+                    host,
+                    service.port,
+                    service.txt.model.as_deref().unwrap_or("-"),
+                    service.txt.supports_ptp(),
+                    service.txt.follows_receiver_clock(),
+                ));
+                configs.push(NativeGroupMemberConfig::new(
+                    service.fullname.clone(),
+                    config,
+                ));
+            }
+
+            thread::Builder::new()
+                .name("sairplay-native-connect".into())
+                .spawn(move || {
+                    let result = NativeGroupSession::connect(configs)
+                        .map(ActiveSession::Group)
+                        .map_err(|e| e.to_string())
+                        .map(|session| ConnectSuccess {
+                            session,
+                            active_fullnames,
+                            label,
+                        });
+                    let _ = tx.send(result);
+                })
+                .expect("failed to spawn native connect worker");
+        } else {
+            let mut configs = Vec::<LegacyMemberConfig>::with_capacity(member_count);
+            for (_, device) in &selected_devices {
+                match legacy_config_for_device(device, initial_volume) {
+                    Ok(config) => {
+                        self.log.push(format!(
+                            "{}: source libraop route {:?} on {}:{} · et={} · md={} · am={}.",
+                            device.display_name,
+                            device.route(false, false),
+                            config.host,
+                            config.port,
+                            config.et,
+                            config.md,
+                            if config.am.is_empty() { "-" } else { &config.am },
+                        ));
+                        configs.push(config);
+                    }
+                    Err(message) => {
+                        self.log.push(message.clone());
+                        self.playback = PlaybackUiState::Error(message);
+                        self.connect_rx = None;
+                        return;
+                    }
+                }
+            }
+
+            thread::Builder::new()
+                .name("sairplay-legacy-connect".into())
+                .spawn(move || {
+                    let result = LegacyGroupSession::connect(configs)
+                        .map(ActiveSession::Legacy)
+                        .map_err(|e| e.to_string())
+                        .map(|session| ConnectSuccess {
+                            session,
+                            active_fullnames,
+                            label,
+                        });
+                    let _ = tx.send(result);
+                })
+                .expect("failed to spawn legacy connect worker");
+        }
     }
 
     fn stop_playback(&mut self) {
         if self.session.take().is_some() {
-            self.log.push("Playback stopped; native session resources released.".into());
+            self.log.push("Playback stopped; AirPlay session resources released.".into());
         }
         self.active_fullnames.clear();
         self.membership_pending.clear();
@@ -968,6 +1018,10 @@ impl SairplayApp {
                     (self.t("Đang chờ", "Waiting"), StatusTone::Orange)
                 }
             }
+            _ if matches!(
+                device.route(false, false),
+                Route::Raop | Route::AirPlay2Compat
+            ) => (self.t("Sẵn sàng", "Ready"), StatusTone::Green),
             _ => (self.t("Chờ", "Standby"), StatusTone::Gray),
         }
     }
@@ -989,10 +1043,14 @@ impl SairplayApp {
             && members
                 .iter()
                 .all(|fullname| self.selected_fullnames.contains(fullname));
-        let selectable = route == Route::AirPlay2Native
-            && !members.is_empty()
+        let legacy_live = matches!(
+            (&self.session, &self.playback),
+            (Some(ActiveSession::Legacy(_)), PlaybackUiState::Playing(_))
+        );
+        let selectable = !members.is_empty()
             && !matches!(self.playback, PlaybackUiState::Connecting(_))
-            && self.membership_rx.is_none();
+            && self.membership_rx.is_none()
+            && !legacy_live;
 
         let address = device
             .airplay
@@ -2155,25 +2213,33 @@ fn build_homepod_stereo_pairs(devices: &[DeviceRecord]) -> Vec<DeviceRecord> {
     pairs
 }
 
-fn device_selection_members(device: &DeviceRecord, stereo_pair: bool) -> Vec<String> {
-    let Some(service) = device.airplay.as_ref() else {
-        return Vec::new();
-    };
+fn device_primary_fullname(device: &DeviceRecord) -> Option<String> {
+    let service = match device.route(false, false) {
+        Route::Raop => device.raop.as_ref().or(device.airplay.as_ref()),
+        Route::AirPlay2Compat | Route::AirPlay2Native => {
+            device.airplay.as_ref().or(device.raop.as_ref())
+        }
+    }?;
+    Some(service.fullname.clone())
+}
 
+fn device_selection_members(device: &DeviceRecord, stereo_pair: bool) -> Vec<String> {
     if stereo_pair {
-        if let Some(value) = service.txt.fields.get("sairplay-pair-members") {
-            let members: Vec<String> = value
-                .split('\u{1f}')
-                .filter(|member| !member.trim().is_empty())
-                .map(ToOwned::to_owned)
-                .collect();
-            if !members.is_empty() {
-                return members;
+        if let Some(service) = device.airplay.as_ref() {
+            if let Some(value) = service.txt.fields.get("sairplay-pair-members") {
+                let members: Vec<String> = value
+                    .split('\u{1f}')
+                    .filter(|member| !member.trim().is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect();
+                if !members.is_empty() {
+                    return members;
+                }
             }
         }
     }
 
-    vec![service.fullname.clone()]
+    device_primary_fullname(device).into_iter().collect()
 }
 
 fn device_model(device: &DeviceRecord) -> String {
@@ -2708,6 +2774,58 @@ fn draw_device_art(
             put_svg!(egui::include_image!("../assets/sairplay_bookshelf_speaker_filled.svg"), right, dark);
         }
     }
+}
+
+fn legacy_config_for_device(
+    device: &DeviceRecord,
+    initial_volume: Option<u8>,
+) -> Result<LegacyMemberConfig, String> {
+    let route = device.route(false, false);
+    if !matches!(route, Route::Raop | Route::AirPlay2Compat) {
+        return Err(format!(
+            "{} is not a source-compatible RAOP route",
+            device.display_name
+        ));
+    }
+
+    let service = device
+        .endpoint_for_route(route)
+        .ok_or_else(|| format!("{} has no endpoint for {route:?}", device.display_name))?;
+    let props = device.raop.as_ref().unwrap_or(service);
+    let host = preferred_service_address(service);
+
+    let mut config = LegacyMemberConfig::new(
+        device.display_name.clone(),
+        host,
+        service.port,
+    );
+    config.volume = initial_volume.unwrap_or(50).min(100);
+    config.et = props
+        .txt
+        .fields
+        .get("et")
+        .cloned()
+        .unwrap_or_else(|| "0,4".into());
+    config.md = props
+        .txt
+        .fields
+        .get("md")
+        .cloned()
+        .unwrap_or_else(|| "0,1,2".into());
+    config.am = props
+        .txt
+        .fields
+        .get("am")
+        .or(props.txt.fields.get("model"))
+        .cloned()
+        .unwrap_or_default();
+    config.mfi_auth = config.am.to_ascii_lowercase().contains("airport");
+
+    if let Some(cn) = props.txt.fields.get("cn") {
+        config.compressed_alac = cn.split(',').any(|value| value.trim() == "1");
+    }
+
+    Ok(config)
 }
 
 fn native_config_for_device(

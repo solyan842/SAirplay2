@@ -21,8 +21,23 @@ jobs:
         run: cargo test --workspace --all-targets
       - name: Build GUI
         run: cargo build --release -p sairplay-gui
+      - name: Bundle pinned libraop legacy transport
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pin = "81c2182649da8645ac2a58b78e9f370c79a4165b"
+          $base = "https://raw.githubusercontent.com/philippe44/libraop/$pin"
+          $out = "target/release/SAirplay2"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item "target/release/sairplay-gui.exe" "$out/sairplay-gui.exe"
+          Invoke-WebRequest "$base/bin/cliraop.exe" -OutFile "$out/cliraop.exe"
+          Invoke-WebRequest "$base/bin/libcrypto-1_1.dll" -OutFile "$out/libcrypto-1_1.dll"
+          Invoke-WebRequest "$base/bin/libssl-1_1.dll" -OutFile "$out/libssl-1_1.dll"
+          Invoke-WebRequest "$base/LICENSE" -OutFile "$out/LIBRAOP-LICENSE"
+          Get-FileHash "$out/cliraop.exe" -Algorithm SHA256
+          Get-ChildItem $out
       - name: Upload Windows GUI
         uses: actions/upload-artifact@v4
         with:
           name: SAirplay2-v0.1.0-Windows
-          path: target/release/sairplay-gui.exe
+          path: target/release/SAirplay2/*
