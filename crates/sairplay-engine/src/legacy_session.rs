@@ -532,7 +532,11 @@ fn spawn_member(
                 // invaluable for TV/receiver interoperability and replace the
                 // previous opaque "timed out waiting on channel" wrapper error.
                 if let Ok(mut events) = reader_events.lock() {
-                    if !connected || lower.contains("error") || lower.contains("failed") {
+                    if !connected
+                        || lower.contains("error")
+                        || lower.contains("failed")
+                        || lower.contains("[sairplay-diag]")
+                    {
                         events.push(format!("{reader_name}: {line}"));
                     }
                 }

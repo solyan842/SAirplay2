@@ -32,6 +32,10 @@ jobs:
           git -C $src checkout $pin
           git -C $src submodule update --init --recursive
 
+          & "$env:GITHUB_WORKSPACE/scripts/apply-libraop-diagnostics.ps1" -SourceRoot $src
+          if ($LASTEXITCODE -ne 0) { throw "libraop diagnostic patch failed" }
+          git -C $src diff --check
+
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe |
             Select-Object -First 1
