@@ -15,7 +15,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 pub const LIBRAOP_PINNED_COMMIT: &str = "81c2182649da8645ac2a58b78e9f370c79a4165b";
 const RAOP_CONFIGURED_LATENCY_FRAMES: u32 = 44_100;
@@ -57,6 +57,7 @@ pub enum LegacyGroupError {
     EmptyGroup,
     HelperMissing(PathBuf),
     Spawn { name: String, error: String },
+    Connect { name: String, error: String },
     Capture(WasapiLoopbackError),
     Time(String),
 }
@@ -73,6 +74,9 @@ impl fmt::Display for LegacyGroupError {
             Self::Spawn { name, error } => {
                 write!(f, "{name}: cannot start libraop helper: {error}")
             }
+            Self::Connect { name, error } => {
+                write!(f, "{name}: libraop did not reach connected state: {error}")
+            }
             Self::Capture(error) => write!(f, "{error}"),
             Self::Time(error) => write!(f, "{error}"),
         }
@@ -84,6 +88,7 @@ impl std::error::Error for LegacyGroupError {}
 struct SpawnedMember {
     name: String,
     pcm_tx: SyncSender<[u8; PCM352_PACKET_BYTES]>,
+    connected_rx: Receiver<Result<(), String>>,
     writer: JoinHandle<()>,
 }
 
@@ -135,6 +140,45 @@ impl LegacyGroupSession {
             )?);
         }
 
+        // Source/controller contract: a group is not Running until every member
+        // has completed raopcl_connect(). This also matches the GUI rule that
+        // transport health is proven before the state flips to playing.
+        for member in &spawned {
+            match member.connected_rx.recv_timeout(Duration::from_secs(8)) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    running.store(false, Ordering::SeqCst);
+                    for member in spawned {
+                        drop(member.pcm_tx);
+                        let _ = member.writer.join();
+                    }
+                    return Err(LegacyGroupError::Connect {
+                        name: member.name.clone(),
+                        error,
+                    });
+                }
+                Err(error) => {
+                    let name = member.name.clone();
+                    running.store(false, Ordering::SeqCst);
+                    for member in spawned {
+                        drop(member.pcm_tx);
+                        let _ = member.writer.join();
+                    }
+                    return Err(LegacyGroupError::Connect {
+                        name,
+                        error: error.to_string(),
+                    });
+                }
+            }
+        }
+
+        if let Ok(mut events) = startup_events.lock() {
+            events.push(format!(
+                "Legacy transport: all {} receiver(s) connected before WASAPI start.",
+                spawned.len()
+            ));
+        }
+
         let running_thread = Arc::clone(&running);
         let error_thread = Arc::clone(&last_error);
         let disc_thread = Arc::clone(&discontinuities);
@@ -152,17 +196,34 @@ impl LegacyGroupSession {
             .map(|member| member.writer)
             .collect::<Vec<_>>();
 
-        let feed_delay_ms = RAOP_GROUP_START_LEAD_MS.saturating_sub(
-            frames_to_ms(RAOP_CONFIGURED_LATENCY_FRAMES + RAOP_FIXED_LATENCY_FRAMES)
-                .saturating_add(100),
-        );
+        // cliraop -n receives the desired audible NTP instant and internally
+        // subtracts libraop's measured latency. Feed PCM when that internal
+        // send window opens, not a fixed delay after connection.
+        let total_latency_frames =
+            RAOP_CONFIGURED_LATENCY_FRAMES + RAOP_FIXED_LATENCY_FRAMES;
+        let feed_ntp = start_ntp.saturating_sub(frames_to_ntp(total_latency_frames));
 
         let worker = thread::Builder::new()
             .name("sairplay-legacy-audio".into())
             .spawn(move || {
-                let delay_until = Instant::now() + Duration::from_millis(feed_delay_ms);
-                while running_thread.load(Ordering::SeqCst) && Instant::now() < delay_until {
-                    thread::sleep(Duration::from_millis(10));
+                while running_thread.load(Ordering::SeqCst) {
+                    let now_ntp = match system_time_to_ntp(SystemTime::now()) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            if let Ok(mut slot) = error_thread.lock() {
+                                *slot = Some(format!(
+                                    "legacy feed clock conversion failed: {error:?}"
+                                ));
+                            }
+                            running_thread.store(false, Ordering::SeqCst);
+                            break;
+                        }
+                    };
+                    if now_ntp >= feed_ntp {
+                        break;
+                    }
+                    let remaining_ms = ntp_delta_to_ms(feed_ntp - now_ntp);
+                    thread::sleep(Duration::from_millis(remaining_ms.clamp(1, 10)));
                 }
 
                 if !running_thread.load(Ordering::SeqCst) {
@@ -189,9 +250,10 @@ impl LegacyGroupSession {
                 };
 
                 if let Ok(mut events) = events_thread.lock() {
+                    let now_ntp = system_time_to_ntp(SystemTime::now()).unwrap_or(start_ntp);
                     events.push(format!(
-                        "Legacy transport: WASAPI source opened {} ms before the shared audible anchor.",
-                        RAOP_GROUP_START_LEAD_MS.saturating_sub(feed_delay_ms)
+                        "Legacy transport: WASAPI source opened with ~{} ms remaining to the shared audible anchor.",
+                        ntp_delta_to_ms(start_ntp.saturating_sub(now_ntp))
                     ));
                 }
 
@@ -431,51 +493,6 @@ fn spawn_member(
             error: format!("cannot spawn helper log reader: {error}"),
         })?;
 
-    let gate_name = config.name.clone();
-    let gate_running = Arc::clone(&running);
-    let gate_error = Arc::clone(&last_error);
-    let gate_events = Arc::clone(&startup_events);
-    thread::Builder::new()
-        .name("sairplay-libraop-ready".into())
-        .spawn(move || match connected_rx.recv_timeout(Duration::from_secs(8)) {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                let message = format!("{gate_name}: {error}");
-                if let Ok(mut slot) = gate_error.lock() {
-                    *slot = Some(message.clone());
-                }
-                if let Ok(mut events) = gate_events.lock() {
-                    events.push(message);
-                }
-                gate_running.store(false, Ordering::SeqCst);
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let message =
-                    format!("{gate_name}: helper readiness channel disconnected");
-                if let Ok(mut slot) = gate_error.lock() {
-                    *slot = Some(message.clone());
-                }
-                if let Ok(mut events) = gate_events.lock() {
-                    events.push(message);
-                }
-                gate_running.store(false, Ordering::SeqCst);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let message = format!("{gate_name}: libraop connect readiness timed out");
-                if let Ok(mut slot) = gate_error.lock() {
-                    *slot = Some(message.clone());
-                }
-                if let Ok(mut events) = gate_events.lock() {
-                    events.push(message);
-                }
-                gate_running.store(false, Ordering::SeqCst);
-            }
-        })
-        .map_err(|error| LegacyGroupError::Spawn {
-            name: config.name.clone(),
-            error: format!("cannot spawn helper readiness gate: {error}"),
-        })?;
-
     let (pcm_tx, pcm_rx) =
         mpsc::sync_channel::<[u8; PCM352_PACKET_BYTES]>(WRITER_QUEUE_PACKETS);
     let writer_name = config.name.clone();
@@ -506,6 +523,7 @@ fn spawn_member(
     Ok(SpawnedMember {
         name: config.name,
         pcm_tx,
+        connected_rx,
         writer,
     })
 }
@@ -584,6 +602,10 @@ fn ms_to_ntp(ms: u64) -> u64 {
     ((ms as u128) << 32).div_ceil(1000) as u64
 }
 
-fn frames_to_ms(frames: u32) -> u64 {
-    (frames as u64 * 1000).div_ceil(44_100)
+fn frames_to_ntp(frames: u32) -> u64 {
+    ((frames as u128) << 32).div_ceil(44_100) as u64
+}
+
+fn ntp_delta_to_ms(delta: u64) -> u64 {
+    (((delta as u128) * 1000) >> 32) as u64
 }
