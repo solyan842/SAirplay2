@@ -1889,40 +1889,65 @@ fn draw_header_status_card(
     detail: &str,
     color: egui::Color32,
 ) {
-    egui::Frame::new()
-        .fill(UiTheme::surface())
-        .stroke(egui::Stroke::new(1.0, UiTheme::border()))
-        .corner_radius(egui::CornerRadius::same(26))
-        .shadow(egui::epaint::Shadow {
-            offset: [0, 2],
-            blur: 12,
-            spread: 0,
-            color: egui::Color32::from_black_alpha(16),
-        })
-        .inner_margin(egui::Margin::symmetric(14, 9))
-        .show(ui, |ui| {
-            ui.set_min_width(174.0);
-            ui.set_min_height(38.0);
-            ui.horizontal_centered(|ui| {
-                let (dot_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(17.0, 17.0), egui::Sense::hover());
-                ui.painter().circle_filled(dot_rect.center(), 7.0, color);
-                ui.add_space(7.0);
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new(status)
-                            .size(14.0)
-                            .strong()
-                            .color(UiTheme::text()),
-                    );
-                    ui.label(
-                        egui::RichText::new(detail)
-                            .size(10.5)
-                            .color(UiTheme::text_soft()),
+    // One compact, language-independent geometry for VI and EN.
+    // Do not let the right-to-left header layout stretch this card into the
+    // remaining header width.
+    const CARD_W: f32 = 286.0;
+    const CARD_H: f32 = 60.0;
+    const INNER_W: f32 = 258.0;
+    const INNER_H: f32 = 42.0;
+
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(CARD_W, CARD_H), egui::Sense::hover());
+
+    ui.allocate_ui_at_rect(rect, |ui| {
+        ui.set_min_size(egui::vec2(CARD_W, CARD_H));
+        ui.set_max_size(egui::vec2(CARD_W, CARD_H));
+
+        egui::Frame::new()
+            .fill(UiTheme::surface())
+            .stroke(egui::Stroke::new(1.0, UiTheme::border()))
+            .corner_radius(egui::CornerRadius::same(22))
+            .shadow(egui::epaint::Shadow {
+                offset: [0, 2],
+                blur: 10,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(14),
+            })
+            .inner_margin(egui::Margin::symmetric(14, 9))
+            .show(ui, |ui| {
+                ui.set_min_size(egui::vec2(INNER_W, INNER_H));
+                ui.set_max_size(egui::vec2(INNER_W, INNER_H));
+
+                ui.horizontal_centered(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(216.0);
+                        ui.label(
+                            egui::RichText::new(status)
+                                .size(13.5)
+                                .strong()
+                                .color(UiTheme::text()),
+                        );
+                        ui.label(
+                            egui::RichText::new(detail)
+                                .size(10.2)
+                                .color(UiTheme::text_soft()),
+                        );
+                    });
+
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let (dot_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(18.0, 18.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().circle_filled(dot_rect.center(), 7.0, color);
+                        },
                     );
                 });
             });
-        });
+    });
 }
 
 fn draw_volume_slider(ui: &mut egui::Ui, value: &mut u8, size: egui::Vec2) -> egui::Response {
