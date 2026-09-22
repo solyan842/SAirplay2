@@ -3288,21 +3288,10 @@ fn legacy_config_for_device(
         ));
     }
 
-    // Match the current cliairplay RAOP source contract exactly: an
-    // AppleTV-class receiver that advertises pk must not be streamed without
-    // a stored AppleTV pairing secret. Some embedded TV receivers clone an
-    // AppleTV model/pk but expose no usable PIN UI; probing them anyway can
-    // leave or restart their AirPlay service, so fail closed instead.
-    if config.am.to_ascii_lowercase().contains("appletv")
-        && !config.pk.trim().is_empty()
-        && config.secret.is_none()
-    {
-        return Err(format!(
-            "{} advertises AppleTV public-key authentication but no pairing secret is available; RAOP playback is blocked to protect the receiver.",
-            device.display_name
-        ));
-    }
-
+    // Do not infer PIN/pairing requirements from AppleTV model + pk alone.
+    // Embedded receivers can advertise AppleTV-class identity and a public key
+    // while exposing no PIN UI and no PIN/legacy-pairing status flags. Only the
+    // explicit pairing_required check above is authoritative for blocking.
     config.mfi_auth = config.am.to_ascii_lowercase().contains("airport");
 
     if let Some(cn) = props.txt.fields.get("cn") {
