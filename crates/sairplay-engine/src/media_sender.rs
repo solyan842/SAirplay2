@@ -1,6 +1,6 @@
 use crate::{
     build_encrypted_realtime_packet, build_ntp_sync_packet, build_ptp_sync_packet,
-    encode_alac_16_stereo_352, AlacEncodeError, DatagramSendOutcome, MediaTransport,
+    encode_alac_16_stereo_352, AlacEncodeError, Ap2AudioFormat, DatagramSendOutcome, MediaTransport,
     MediaTransportError, NtpSyncPacketArgs, PtpClock, PtpExchange, PtpSyncPacketArgs,
     RetransmitRing, RtpState,
     ALAC_PCM_PACKET_BYTES, FRAMES_PER_PACKET_44100,
@@ -54,10 +54,25 @@ pub struct RealtimeMediaSender {
     splice_pad_frames: u32,
     timeline_reanchors: u64,
     reanchor_shifted_frames: u64,
+    audio_format: Ap2AudioFormat,
 }
 
 impl RealtimeMediaSender {
     pub fn new(transport: MediaTransport, state: RtpState, audio_key: [u8; 32]) -> Self {
+        Self::new_with_format(
+            transport,
+            state,
+            audio_key,
+            Ap2AudioFormat::ALAC_44100_16_STEREO,
+        )
+    }
+
+    pub fn new_with_format(
+        transport: MediaTransport,
+        state: RtpState,
+        audio_key: [u8; 32],
+        audio_format: Ap2AudioFormat,
+    ) -> Self {
         Self {
             transport,
             state,
@@ -73,6 +88,7 @@ impl RealtimeMediaSender {
             splice_pad_frames: 0,
             timeline_reanchors: 0,
             reanchor_shifted_frames: 0,
+            audio_format,
         }
     }
 
@@ -81,6 +97,22 @@ impl RealtimeMediaSender {
         state: RtpState,
         audio_key: [u8; 32],
         clock_id: u64,
+    ) -> Self {
+        Self::new_ptp_with_format(
+            transport,
+            state,
+            audio_key,
+            clock_id,
+            Ap2AudioFormat::ALAC_44100_16_STEREO,
+        )
+    }
+
+    pub fn new_ptp_with_format(
+        transport: MediaTransport,
+        state: RtpState,
+        audio_key: [u8; 32],
+        clock_id: u64,
+        audio_format: Ap2AudioFormat,
     ) -> Self {
         Self {
             transport,
@@ -97,6 +129,7 @@ impl RealtimeMediaSender {
             splice_pad_frames: 0,
             timeline_reanchors: 0,
             reanchor_shifted_frames: 0,
+            audio_format,
         }
     }
 
@@ -105,6 +138,22 @@ impl RealtimeMediaSender {
         state: RtpState,
         audio_key: [u8; 32],
         clock: PtpClock,
+    ) -> Self {
+        Self::new_ptp_clock_with_format(
+            transport,
+            state,
+            audio_key,
+            clock,
+            Ap2AudioFormat::ALAC_44100_16_STEREO,
+        )
+    }
+
+    pub fn new_ptp_clock_with_format(
+        transport: MediaTransport,
+        state: RtpState,
+        audio_key: [u8; 32],
+        clock: PtpClock,
+        audio_format: Ap2AudioFormat,
     ) -> Self {
         Self {
             transport,
@@ -121,6 +170,7 @@ impl RealtimeMediaSender {
             splice_pad_frames: 0,
             timeline_reanchors: 0,
             reanchor_shifted_frames: 0,
+            audio_format,
         }
     }
 
@@ -135,24 +185,25 @@ impl RealtimeMediaSender {
         latency_max: Option<u32>,
         lead_frames: u32,
     ) {
-        const PACING_MARGIN_FRAMES: u64 = 11_025; // 250 ms @ 44.1 kHz
-        const DEFAULT_BUFFER_WINDOW: u64 = 77_175; // (2000 - 250) ms
-        const SPLICE_DEPTH_FRAMES: u64 = 26_460; // 600 ms
+        let sample_rate = self.audio_format.sample_rate as u64;
+        let pacing_margin_frames = ms_to_frames(250, sample_rate);
+        let default_buffer_window = ms_to_frames(1_750, sample_rate);
+        let splice_depth_frames = ms_to_frames(600, sample_rate);
 
         let reported = latency_max
             .map(|v| v as u64)
-            .filter(|v| *v > PACING_MARGIN_FRAMES);
+            .filter(|v| *v > pacing_margin_frames);
         let receiver_window = reported
-            .map(|v| v - PACING_MARGIN_FRAMES)
-            .unwrap_or(DEFAULT_BUFFER_WINDOW);
+            .map(|v| v - pacing_margin_frames)
+            .unwrap_or(default_buffer_window);
 
         self.head_ts = head_ts;
-        self.pacing_window_frames = receiver_window.min(SPLICE_DEPTH_FRAMES);
+        self.pacing_window_frames = receiver_window.min(splice_depth_frames);
         self.pace_last_release = None;
         self.pacing_enabled = true;
 
         if let RealtimeTiming::Ptp { clock } = &self.timing {
-            let lead_ns = frames_to_ns(lead_frames);
+            let lead_ns = frames_to_ns(lead_frames, self.audio_format.sample_rate as u64);
             let local_now = system_unix_ns();
             let master_now = clock.master_now_ns();
             let start_local = ntp_fixed_to_unix_ns(start_ntp) as i128;
@@ -174,7 +225,7 @@ impl RealtimeMediaSender {
         lead_frames: u32,
         rtp_offset: u32,
     ) -> Result<(), MediaSendError> {
-        let head_ts = ntp_to_frames(start_ntp, 44_100);
+        let head_ts = ntp_to_frames(start_ntp, self.audio_format.sample_rate as u64);
         self.state.timestamp = (head_ts as u32).wrapping_add(rtp_offset);
         self.state.first_packet = true;
         self.ptp_anchor_wall0 = None;
@@ -215,8 +266,8 @@ impl RealtimeMediaSender {
     }
 
     pub fn recover_input_gap(&mut self, now_ntp: u64, lead_frames: u32) -> Option<u32> {
-        let now_ts = ntp_to_frames(now_ntp, 44_100);
-        let floor = 11_025u64; // source: AP2_MIN_WARM_LEAD_MS = 250 ms
+        let now_ts = ntp_to_frames(now_ntp, self.audio_format.sample_rate as u64);
+        let floor = ms_to_frames(250, self.audio_format.sample_rate as u64); // source: AP2_MIN_WARM_LEAD_MS
         self.splice_pad_to_lead(
             now_ts,
             now_ts.saturating_add(floor),
@@ -225,7 +276,7 @@ impl RealtimeMediaSender {
     }
 
     pub fn recover_delivery_gap(&mut self, now_ntp: u64, lead_frames: u32) -> Option<u32> {
-        let now_ts = ntp_to_frames(now_ntp, 44_100);
+        let now_ts = ntp_to_frames(now_ntp, self.audio_format.sample_rate as u64);
         self.splice_pad_to_lead(now_ts, now_ts, lead_frames)
     }
 
@@ -261,7 +312,7 @@ impl RealtimeMediaSender {
     /// (hot); zero/negative means the line has lapsed and any real content
     /// sent without recovery would carry a past timestamp.
     pub fn timeline_head_delta_frames(&self, now_ntp: u64) -> i64 {
-        let now_ts = ntp_to_frames(now_ntp, 44_100);
+        let now_ts = ntp_to_frames(now_ntp, self.audio_format.sample_rate as u64);
         let effective_head = self
             .head_ts
             .saturating_add(self.splice_pad_frames as u64);
@@ -274,7 +325,7 @@ impl RealtimeMediaSender {
             return true;
         }
 
-        let now_ts = ntp_to_frames(now_ntp, 44_100);
+        let now_ts = ntp_to_frames(now_ntp, self.audio_format.sample_rate as u64);
         if now_ts.saturating_add(self.pacing_window_frames) < self.head_ts {
             return false;
         }
@@ -310,6 +361,10 @@ impl RealtimeMediaSender {
 
     pub fn state(&self) -> RtpState {
         self.state
+    }
+
+    pub fn audio_format(&self) -> Ap2AudioFormat {
+        self.audio_format
     }
 
     /// Receiver PTP probe streak (Delay_Req/Pdelay_Req) observed by the timing
@@ -436,9 +491,10 @@ impl RealtimeMediaSender {
                 }
 
                 let wall_delta_ns = wall_time_ns as i128 - wall0 as i128;
-                let lead_ns = frames_to_ns(lead_frames) as i128;
+                let lead_ns = frames_to_ns(lead_frames, self.audio_format.sample_rate as u64) as i128;
                 let elapsed_ns = wall_delta_ns - lead_ns;
-                let elapsed_frames = (elapsed_ns * 44_100i128) / 1_000_000_000i128;
+                let elapsed_frames =
+                    (elapsed_ns * self.audio_format.sample_rate as i128) / 1_000_000_000i128;
                 let play_pos = self.ptp_anchor_pos0.wrapping_add(elapsed_frames as u32);
 
                 let frame_1 = play_pos.wrapping_add(11_035);
@@ -469,8 +525,12 @@ fn system_unix_ns() -> u64 {
         .as_nanos() as u64
 }
 
-fn frames_to_ns(frames: u32) -> u64 {
-    ((frames as u128 * 1_000_000_000u128) / 44_100u128) as u64
+fn frames_to_ns(frames: u32, sample_rate: u64) -> u64 {
+    ((frames as u128 * 1_000_000_000u128) / sample_rate as u128) as u64
+}
+
+fn ms_to_frames(ms: u64, sample_rate: u64) -> u64 {
+    ((ms as u128 * sample_rate as u128) / 1_000u128) as u64
 }
 
 fn ntp_to_frames(ntp: u64, sample_rate: u64) -> u64 {

@@ -317,7 +317,9 @@ impl NativeSession {
 
         // Upstream clamps the configured lead into the receiver-reported
         // latency window immediately after Stream SETUP.
-        let requested_lead = config.lead_frames;
+        let requested_lead = ((config.lead_frames as u64
+            * config.audio_format.sample_rate as u64)
+            / 44_100) as u32;
         let min_frames = media.latency_min.unwrap_or(0);
         let max_frames = media.latency_max.unwrap_or(requested_lead);
         let effective_lead_frames = if requested_lead < min_frames {
@@ -417,9 +419,20 @@ impl NativeSession {
             .and_then(|socket| RetransmitWorker::start(socket, rtx_ring.clone()).ok());
 
         let mut sender = if let Some(clock) = ptp_clock.clone() {
-            RealtimeMediaSender::new_ptp_clock(media.transport, rtp, audio_secret, clock)
+            RealtimeMediaSender::new_ptp_clock_with_format(
+                media.transport,
+                rtp,
+                audio_secret,
+                clock,
+                config.audio_format,
+            )
         } else {
-            RealtimeMediaSender::new(media.transport, rtp, audio_secret)
+            RealtimeMediaSender::new_with_format(
+                media.transport,
+                rtp,
+                audio_secret,
+                config.audio_format,
+            )
         };
         if retransmit.is_some() {
             sender.set_retransmit_ring(rtx_ring);
