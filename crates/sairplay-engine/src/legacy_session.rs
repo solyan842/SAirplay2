@@ -21,17 +21,11 @@ pub const LIBRAOP_PINNED_COMMIT: &str = "81c2182649da8645ac2a58b78e9f370c79a4165
 const RAOP_CONFIGURED_LATENCY_FRAMES: u32 = 44_100;
 const RAOP_FIXED_LATENCY_FRAMES: u32 = 11_025;
 const RAOP_GROUP_START_LEAD_MS: u64 = 5_000;
-// cliraop is deliberately pull-paced by raopcl_accept_frames(): it does not
-// read stdin until the receiver's RAOP timeline can accept the next 352-frame
-// chunk. A 96-packet queue is only ~766 ms at 44.1 kHz and can therefore fill
-// during a completely normal receiver FLUSH/start transition. Treat that as
-// backpressure, not as a dead writer. Keep ~12 s of per-member headroom; a
-// truly dead helper still disconnects its pipe immediately, while a genuinely
-// stalled live helper is evicted only after this much accumulated PCM.
-const RAOP_PACKETS_PER_SECOND_CEIL: usize = (44_100 + 352 - 1) / 352;
-const WRITER_QUEUE_SECONDS: usize = 12;
-const WRITER_QUEUE_PACKETS: usize =
-    RAOP_PACKETS_PER_SECOND_CEIL * WRITER_QUEUE_SECONDS;
+const WRITER_QUEUE_PACKETS: usize = 96;
+// Music Assistant's current source treats a player that does not consume its
+// PCM feed for 35 s as a failed member. Do the same here, but preserve every
+// PCM packet until that deadline instead of guessing a larger queue.
+const WRITER_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(35);
 
 #[derive(Debug, Clone)]
 pub struct LegacyMemberConfig {
@@ -136,8 +130,8 @@ impl LegacyGroupSession {
         let last_discontinuity_frame = Arc::new(AtomicU64::new(u64::MAX));
         let first_non_silent_frame = Arc::new(AtomicU64::new(u64::MAX));
         let startup_events = Arc::new(Mutex::new(vec![format!(
-            "Legacy transport: pinned libraop {} · shared audible START +{} ms · writer headroom ~{} s.",
-            LIBRAOP_PINNED_COMMIT, RAOP_GROUP_START_LEAD_MS, WRITER_QUEUE_SECONDS
+            "Legacy transport: pinned libraop {} · shared audible START +{} ms · source-style PCM backpressure.",
+            LIBRAOP_PINNED_COMMIT, RAOP_GROUP_START_LEAD_MS
         )]));
         let active_members = Arc::new(AtomicU64::new(configs.len() as u64));
 
@@ -312,26 +306,49 @@ impl LegacyGroupSession {
                     while let Some(packet) = chunker.pop_packet() {
                         let mut index = 0usize;
                         while index < senders.len() {
-                            let (name, tx) = &senders[index];
-                            match tx.try_send(packet) {
-                                Ok(()) => index += 1,
-                                Err(TrySendError::Disconnected(_)) => {
-                                    if let Ok(mut events) = events_thread.lock() {
-                                        events.push(format!(
-                                            "{name}: libraop writer disconnected; removed from legacy group."
-                                        ));
+                            let stall_started = std::time::Instant::now();
+                            loop {
+                                let (name, tx) = &senders[index];
+                                match tx.try_send(packet) {
+                                    Ok(()) => {
+                                        index += 1;
+                                        break;
                                     }
-                                    senders.remove(index);
-                                }
-                                Err(TrySendError::Full(_)) => {
-                                    if let Ok(mut events) = events_thread.lock() {
-                                        events.push(format!(
-                                            "{name}: libraop writer queue stalled for ~{} s; removed instead of dropping PCM.",
-                                            WRITER_QUEUE_SECONDS
-                                        ));
+                                    Err(TrySendError::Disconnected(_)) => {
+                                        if let Ok(mut events) = events_thread.lock() {
+                                            events.push(format!(
+                                                "{name}: libraop writer disconnected; removed from legacy group."
+                                            ));
+                                        }
+                                        senders.remove(index);
+                                        break;
                                     }
-                                    senders.remove(index);
+                                    Err(TrySendError::Full(_)) => {
+                                        // cliraop/libraop is pull-paced by
+                                        // raopcl_accept_frames(). A full queue
+                                        // is therefore normal backpressure, not
+                                        // packet loss. Hold this exact packet
+                                        // until the source consumes it. Only
+                                        // evict after the same 35 s write
+                                        // timeout used by Music Assistant.
+                                        if !running_thread.load(Ordering::SeqCst) {
+                                            break;
+                                        }
+                                        if stall_started.elapsed() >= WRITER_BACKPRESSURE_TIMEOUT {
+                                            if let Ok(mut events) = events_thread.lock() {
+                                                events.push(format!(
+                                                    "{name}: stopped reading PCM for 35 s; removed from legacy group."
+                                                ));
+                                            }
+                                            senders.remove(index);
+                                            break;
+                                        }
+                                        thread::sleep(Duration::from_millis(1));
+                                    }
                                 }
+                            }
+                            if !running_thread.load(Ordering::SeqCst) {
+                                break;
                             }
                         }
                     }
