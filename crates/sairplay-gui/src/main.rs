@@ -384,6 +384,22 @@ impl SairplayApp {
                     self.active_fullnames.remove(&fullname);
                     self.log.push(format!("mDNS removed: {fullname}"));
                 }
+                DiscoveryEvent::ControlPresence {
+                    kind,
+                    fullname,
+                    host,
+                    port,
+                    addresses,
+                } => {
+                    self.log.push(format!(
+                        "mDNS {kind} presence: {fullname} @ {host}:{port} · addresses={}",
+                        if addresses.is_empty() {
+                            "-".to_owned()
+                        } else {
+                            addresses.join(",")
+                        }
+                    ));
+                }
                 DiscoveryEvent::Error(err) => {
                     self.log.push(format!("mDNS error: {err}"));
                 }
