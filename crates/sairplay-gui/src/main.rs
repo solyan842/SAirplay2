@@ -1207,6 +1207,7 @@ impl SairplayApp {
         title: &'static str,
         devices: &[DeviceRecord],
         stereo_pair: bool,
+        panel_content_height: f32,
     ) {
         egui::Frame::new()
             .fill(UiTheme::surface())
@@ -1220,7 +1221,7 @@ impl SairplayApp {
             })
             .inner_margin(egui::Margin::same(11))
             .show(ui, |ui| {
-                ui.set_min_height(286.0);
+                ui.set_min_height(panel_content_height);
 
                 ui.allocate_ui_with_layout(
                     egui::vec2(ui.available_width(), 36.0),
@@ -1230,7 +1231,7 @@ impl SairplayApp {
                         ui.add_space(5.0);
                         ui.label(
                             egui::RichText::new(title)
-                                .size(if stereo_pair { 16.5 } else { 19.0 })
+                                .size(18.0)
                                 .strong()
                                 .color(UiTheme::text()),
                         );
@@ -1264,7 +1265,7 @@ impl SairplayApp {
                                 } else {
                                     ui.add_space(5.0);
                                     let label =
-                                        self.t("Phát nhạc liên phòng", "MultiRoom");
+                                        self.t("Phát âm thanh đa vùng", "MultiRoom Audio");
                                     if draw_multiroom_toggle(
                                         ui,
                                         label,
@@ -1340,18 +1341,22 @@ impl SairplayApp {
                     style.visuals.widgets.active.corner_radius =
                         egui::CornerRadius::same(8);
 
+                    let scroll_height = (panel_content_height - 62.0).max(224.0);
                     egui::ScrollArea::vertical()
                         .id_salt(if stereo_pair { "pair_scroll" } else { "receiver_scroll" })
-                        .max_height(224.0)
-                        .min_scrolled_height(224.0)
+                        .max_height(scroll_height)
+                        .min_scrolled_height(scroll_height)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             if devices.is_empty() {
                                 ui.allocate_ui_with_layout(
-                                    egui::vec2(ui.available_width(), 190.0),
+                                    egui::vec2(
+                                        ui.available_width(),
+                                        (scroll_height - 18.0).max(190.0),
+                                    ),
                                     egui::Layout::top_down(egui::Align::Center),
                                     |ui| {
-                                        ui.add_space(48.0);
+                                        ui.add_space(((scroll_height - 80.0) * 0.36).max(48.0));
                                         let text = if stereo_pair {
                                             self.t(
                                                 "Chưa phát hiện cặp HomePod đã ghép nối",
@@ -1834,21 +1839,36 @@ impl eframe::App for SairplayApp {
                 let receivers: Vec<DeviceRecord> = all_devices.clone();
                 let stereo_pairs = build_homepod_stereo_pairs(&all_devices);
 
-                let receivers_title = self.t("Thiết Bị", "Receivers");
+                let receivers_title = self.t("THIẾT BỊ", "RECEIVERS");
                 let pairs_title =
-                    self.t("Cặp loa HomePod đã ghép nối", "Stereo Pair HomePod");
+                    self.t("CẶP LOA HOMEPOD STEREO", "HOMEPOD STEREO PAIRS");
+
+                // Consume the vertical space that was previously left blank
+                // under the trial row. Reserve only the fixed controls/trial
+                // block below the two device panels.
+                const LOWER_CONTROLS_RESERVE: f32 = 107.0;
+                const PANEL_FRAME_VERTICAL_MARGIN: f32 = 22.0;
+                let panel_content_height = (
+                    ui.available_height()
+                        - LOWER_CONTROLS_RESERVE
+                        - PANEL_FRAME_VERTICAL_MARGIN
+                )
+                    .max(286.0);
+
                 ui.columns(2, |columns| {
                     self.render_device_panel(
                         &mut columns[0],
                         receivers_title,
                         &receivers,
                         false,
+                        panel_content_height,
                     );
                     self.render_device_panel(
                         &mut columns[1],
                         pairs_title,
                         &stereo_pairs,
                         true,
+                        panel_content_height,
                     );
                 });
 
