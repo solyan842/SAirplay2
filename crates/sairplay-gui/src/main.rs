@@ -150,6 +150,7 @@ enum DeviceArtwork {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatusTone {
     Green,
+    Blue,
     Orange,
     Red,
     Gray,
@@ -162,6 +163,11 @@ impl StatusTone {
                 egui::Color32::from_rgb(223, 246, 232),
                 egui::Color32::from_rgb(34, 197, 94),
                 egui::Color32::from_rgb(22, 128, 60),
+            ),
+            Self::Blue => (
+                egui::Color32::from_rgb(224, 239, 255),
+                egui::Color32::from_rgb(22, 119, 255),
+                egui::Color32::from_rgb(15, 96, 210),
             ),
             Self::Orange => (
                 egui::Color32::from_rgb(252, 239, 216),
@@ -1284,7 +1290,7 @@ impl SairplayApp {
             PlaybackUiState::Playing(_) => (
                 self.t("Đang chạy", "Running"),
                 self.t("Đang truyền âm thanh qua AirPlay", "Streaming via AirPlay"),
-                UiTheme::green(),
+                UiTheme::blue(),
             ),
             PlaybackUiState::Error(_) => (
                 self.t("Lỗi kết nối", "Connection Error"),
@@ -1381,7 +1387,7 @@ impl SairplayApp {
             ),
             PlaybackUiState::Playing(_) if active => (
                 self.t("Đang chạy", "Running"),
-                StatusTone::Green,
+                StatusTone::Blue,
             ),
             PlaybackUiState::Error(_) if selected => (
                 self.t("Lỗi kết nối", "Connection Error"),
@@ -1793,14 +1799,29 @@ impl SairplayApp {
         const CARD_GAP: f32 = 7.0;
         const CARD_HORIZONTAL_MARGIN: f32 = 20.0;
 
-        // The lower control row must follow the exact live width of the device
-        // panels above. Fixed 306 px cards looked correct at one viewport/DPI
-        // only, then drifted or clipped when Windows resized/scaled the window.
-        // Divide the available row width into three equal cards so both outer
-        // edges remain aligned with the two device panels at every size.
+        // Own one exact full-width row and split it geometrically into three
+        // cards. Do not use horizontal() here: egui adds item_spacing between
+        // children, which previously made the second/third cards overflow even
+        // though their nominal widths summed to available_width().
         let controls_width = ui.available_width();
-        let card_outer_w = ((controls_width - CARD_GAP * 2.0) / 3.0).max(220.0);
-        let card_inner_w = (card_outer_w - CARD_HORIZONTAL_MARGIN).max(200.0);
+        let (controls_rect, _) = ui.allocate_exact_size(
+            egui::vec2(controls_width, CARD_OUTER_H),
+            egui::Sense::hover(),
+        );
+        let card_outer_w = ((controls_rect.width() - CARD_GAP * 2.0) / 3.0).max(1.0);
+        let card_inner_w = (card_outer_w - CARD_HORIZONTAL_MARGIN).max(1.0);
+        let volume_rect = egui::Rect::from_min_size(
+            controls_rect.min,
+            egui::vec2(card_outer_w, CARD_OUTER_H),
+        );
+        let actions_rect = egui::Rect::from_min_size(
+            egui::pos2(volume_rect.right() + CARD_GAP, controls_rect.top()),
+            egui::vec2(card_outer_w, CARD_OUTER_H),
+        );
+        let airplay_rect = egui::Rect::from_min_max(
+            egui::pos2(actions_rect.right() + CARD_GAP, controls_rect.top()),
+            controls_rect.max,
+        );
 
         let card_frame = || {
             egui::Frame::new()
@@ -1816,10 +1837,7 @@ impl SairplayApp {
                 .inner_margin(egui::Margin::symmetric(10, 8))
         };
 
-        ui.horizontal(|ui| {
-            let (volume_rect, _) =
-                ui.allocate_exact_size(egui::vec2(card_outer_w, CARD_OUTER_H), egui::Sense::hover());
-            ui.allocate_ui_at_rect(volume_rect, |ui| {
+        ui.allocate_ui_at_rect(volume_rect, |ui| {
                 card_frame().show(ui, |ui| {
                     ui.set_min_size(egui::vec2(card_inner_w, CARD_INNER_H));
                     ui.set_max_size(egui::vec2(card_inner_w, CARD_INNER_H));
@@ -1874,13 +1892,9 @@ impl SairplayApp {
                         },
                     );
                 });
-            });
+        });
 
-            ui.add_space(CARD_GAP);
-
-            let (actions_rect, _) =
-                ui.allocate_exact_size(egui::vec2(card_outer_w, CARD_OUTER_H), egui::Sense::hover());
-            ui.allocate_ui_at_rect(actions_rect, |ui| {
+        ui.allocate_ui_at_rect(actions_rect, |ui| {
                 card_frame().show(ui, |ui| {
                     ui.set_min_size(egui::vec2(card_inner_w, CARD_INNER_H));
                     ui.set_max_size(egui::vec2(card_inner_w, CARD_INNER_H));
@@ -1925,13 +1939,9 @@ impl SairplayApp {
                         },
                     );
                 });
-            });
+        });
 
-            ui.add_space(CARD_GAP);
-
-            let (airplay_rect, _) =
-                ui.allocate_exact_size(egui::vec2(card_outer_w, CARD_OUTER_H), egui::Sense::hover());
-            ui.allocate_ui_at_rect(airplay_rect, |ui| {
+        ui.allocate_ui_at_rect(airplay_rect, |ui| {
                 card_frame().show(ui, |ui| {
                     ui.set_min_size(egui::vec2(card_inner_w, CARD_INNER_H));
                     ui.set_max_size(egui::vec2(card_inner_w, CARD_INNER_H));
@@ -1995,7 +2005,6 @@ impl SairplayApp {
                         },
                     );
                 });
-            });
         });
     }
 
