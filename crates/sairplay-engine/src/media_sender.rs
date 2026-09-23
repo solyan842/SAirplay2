@@ -55,6 +55,8 @@ pub struct RealtimeMediaSender {
     timeline_reanchors: u64,
     reanchor_shifted_frames: u64,
     audio_format: Ap2AudioFormat,
+    #[cfg(windows)]
+    alac24: Option<crate::Alac24Encoder>,
 }
 
 impl RealtimeMediaSender {
@@ -89,6 +91,8 @@ impl RealtimeMediaSender {
             timeline_reanchors: 0,
             reanchor_shifted_frames: 0,
             audio_format,
+            #[cfg(windows)]
+            alac24: None,
         }
     }
 
@@ -130,6 +134,8 @@ impl RealtimeMediaSender {
             timeline_reanchors: 0,
             reanchor_shifted_frames: 0,
             audio_format,
+            #[cfg(windows)]
+            alac24: None,
         }
     }
 
@@ -171,6 +177,8 @@ impl RealtimeMediaSender {
             timeline_reanchors: 0,
             reanchor_shifted_frames: 0,
             audio_format,
+            #[cfg(windows)]
+            alac24: None,
         }
     }
 
@@ -391,17 +399,38 @@ impl RealtimeMediaSender {
         ntp_time: u64,
         lead_frames: u32,
     ) -> Result<MediaSendResult, MediaSendError> {
-        if pcm_le_stereo.len() != ALAC_PCM_PACKET_BYTES {
-            return Err(MediaSendError::Alac(if pcm_le_stereo.len() % 4 != 0 {
+        let bytes_per_frame = self.audio_format.input_bytes_per_frame();
+        let expected = crate::ALAC_FRAMES_PER_PACKET * bytes_per_frame;
+        if pcm_le_stereo.len() != expected {
+            return Err(MediaSendError::Alac(if pcm_le_stereo.len() % bytes_per_frame != 0 {
                 AlacEncodeError::MisalignedPcm
-            } else if pcm_le_stereo.len() > ALAC_PCM_PACKET_BYTES {
+            } else if pcm_le_stereo.len() > expected {
                 AlacEncodeError::TooManyFrames
             } else {
                 AlacEncodeError::Empty
             }));
         }
 
-        let alac = encode_alac_16_stereo_352(pcm_le_stereo)?;
+        let alac = if self.audio_format.bit_depth > 16 {
+            #[cfg(windows)]
+            {
+                if self.alac24.is_none() {
+                    self.alac24 = Some(crate::Alac24Encoder::open(self.audio_format.sample_rate)?);
+                }
+                self.alac24
+                    .as_mut()
+                    .expect("ALAC24 encoder initialized")
+                    .encode_s32le_352(pcm_le_stereo)?
+            }
+            #[cfg(not(windows))]
+            {
+                return Err(MediaSendError::Alac(
+                    AlacEncodeError::NativeBackendUnavailable,
+                ));
+            }
+        } else {
+            encode_alac_16_stereo_352(pcm_le_stereo)?
+        };
         self.send_alac_payload(&alac, ntp_time, lead_frames)
     }
 
