@@ -1202,6 +1202,12 @@ impl SairplayApp {
                 config.apple_model = service.txt.is_apple_model();
                 config.receiver_name = device.display_name.clone();
                 config.initial_volume = initial_volume;
+                config.hires_enabled = service.txt.default_hires_enabled();
+                // This app currently has one system-audio session clock. Until
+                // source-format negotiation is exposed by the Windows capture
+                // layer, keep the source baseline session rate rather than
+                // inventing a receiver-preferred 48 kHz clock.
+                config.session_sample_rate = 44_100;
 
                 configs.push(NativeGroupMemberConfig::new(
                     service.fullname.clone(),
