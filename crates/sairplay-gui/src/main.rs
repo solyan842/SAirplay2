@@ -2,8 +2,8 @@
 
 use eframe::egui;
 use sairplay_engine::{
-    DeviceCatalog, DeviceRecord, DiscoveredService, DiscoveryEvent, LegacyGroupSession,
-    LegacyMemberConfig, MdnsBrowser, NativeGroupMemberConfig, NativeGroupSession,
+    Ap2PreflightClient, DeviceCatalog, DeviceRecord, DiscoveredService, DiscoveryEvent,
+    LegacyGroupSession, LegacyMemberConfig, MdnsBrowser, NativeGroupMemberConfig, NativeGroupSession,
     NativeSession, NativeSessionConfig, Route, ServiceKind, VolumeSetResult,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -113,6 +113,11 @@ struct ConnectSuccess {
 
 struct MembershipAdded {
     members: Vec<(String, NativeSession)>,
+}
+
+struct HiresProbeResult {
+    fullname: String,
+    advertised: Option<bool>,
 }
 
 enum LegacyPairingResult {
@@ -235,6 +240,10 @@ struct SairplayApp {
     pending_volume: Option<u8>,
     legacy_secrets: BTreeMap<String, String>,
     hires_overrides: BTreeMap<String, bool>,
+    hires_capabilities: BTreeMap<String, bool>,
+    hires_probe_pending: BTreeSet<String>,
+    hires_probe_tx: mpsc::Sender<HiresProbeResult>,
+    hires_probe_rx: Receiver<HiresProbeResult>,
     pairing_rx: Option<Receiver<LegacyPairingResult>>,
     pairing_pin_tx: Option<SyncSender<String>>,
     pairing_open: bool,
@@ -275,6 +284,8 @@ impl Default for SairplayApp {
             ),
         };
 
+        let (hires_probe_tx, hires_probe_rx) = mpsc::channel();
+
         Self {
             log: {
                 log.shrink_to_fit();
@@ -297,6 +308,10 @@ impl Default for SairplayApp {
             pending_volume: None,
             legacy_secrets: BTreeMap::new(),
             hires_overrides: BTreeMap::new(),
+            hires_capabilities: BTreeMap::new(),
+            hires_probe_pending: BTreeSet::new(),
+            hires_probe_tx,
+            hires_probe_rx,
             pairing_rx: None,
             pairing_pin_tx: None,
             pairing_open: false,
@@ -319,6 +334,61 @@ impl Default for SairplayApp {
 }
 
 impl SairplayApp {
+    fn start_hires_probe(&mut self, service: &DiscoveredService) {
+        if service.kind != ServiceKind::AirPlay
+            || !service.txt.supports_airplay2()
+            || self.hires_capabilities.contains_key(&service.fullname)
+            || !self.hires_probe_pending.insert(service.fullname.clone())
+        {
+            return;
+        }
+
+        let fullname = service.fullname.clone();
+        let host = preferred_service_address(service);
+        let port = service.port;
+        let tx = self.hires_probe_tx.clone();
+
+        thread::Builder::new()
+            .name("sairplay-hires-probe".into())
+            .spawn(move || {
+                let result = Ap2PreflightClient::new(
+                    "A1B2C3D4E5F60708",
+                    "123456789",
+                )
+                .get_info(&host, port)
+                .map(|result| result.info.advertises_hires())
+                .ok();
+                let _ = tx.send(HiresProbeResult {
+                    fullname,
+                    advertised: result,
+                });
+            })
+            .expect("failed to spawn hi-res capability probe");
+    }
+
+    fn pump_hires_probes(&mut self) {
+        while let Ok(result) = self.hires_probe_rx.try_recv() {
+            self.hires_probe_pending.remove(&result.fullname);
+            match result.advertised {
+                Some(advertised) => {
+                    self.hires_capabilities
+                        .insert(result.fullname.clone(), advertised);
+                    self.log.push(format!(
+                        "{}: /info 24-bit capability = {}.",
+                        result.fullname,
+                        if advertised { "advertised" } else { "not advertised" }
+                    ));
+                }
+                None => {
+                    self.log.push(format!(
+                        "{}: /info capability probe unavailable; keeping baseline policy until next discovery.",
+                        result.fullname
+                    ));
+                }
+            }
+        }
+    }
+
     fn pump_discovery(&mut self) {
         let Some(rx) = &self.discovery_rx else {
             return;
@@ -345,10 +415,17 @@ impl SairplayApp {
                             service.display_name, service.host, service.port
                         ));
                     }
+                    if service.kind == ServiceKind::AirPlay {
+                        self.start_hires_probe(&service);
+                    }
                     self.catalog.upsert(service);
                 }
                 DiscoveryEvent::Removed { kind, fullname } => {
                     self.catalog.remove(kind, &fullname);
+                    if kind == ServiceKind::AirPlay {
+                        self.hires_capabilities.remove(&fullname);
+                        self.hires_probe_pending.remove(&fullname);
+                    }
                     self.selected_fullnames.remove(&fullname);
                     if self
                         .selected_stereo_pair
@@ -371,6 +448,8 @@ impl SairplayApp {
         self.discovery.take();
         self.discovery_rx = None;
         self.catalog = DeviceCatalog::default();
+        self.hires_capabilities.clear();
+        self.hires_probe_pending.clear();
         self.selected_fullnames.clear();
         self.selected_stereo_pair = None;
         self.log.push("Manual rescan requested from app logo.".into());
@@ -2141,6 +2220,7 @@ impl SairplayApp {
 impl eframe::App for SairplayApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_discovery();
+        self.pump_hires_probes();
         self.pump_connect_result();
         self.pump_membership_result();
         self.pump_volume_result();
