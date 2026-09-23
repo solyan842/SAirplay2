@@ -141,6 +141,23 @@ impl Ap2Info {
     }
 }
 
+
+pub fn select_native_stream_format(
+    info: &Ap2Info,
+    hires_enabled: bool,
+    session_sample_rate: u32,
+) -> Ap2AudioFormat {
+    if !hires_enabled || !info.advertises_hires() {
+        return Ap2AudioFormat::ALAC_44100_16_STEREO;
+    }
+
+    match session_sample_rate {
+        48_000 => Ap2AudioFormat::ALAC_48000_24_STEREO,
+        44_100 => Ap2AudioFormat::ALAC_44100_24_STEREO,
+        _ => Ap2AudioFormat::ALAC_44100_24_STEREO,
+    }
+}
+
 fn parse_stream_capability(
     root: &Dictionary,
     stream_key: &'static str,
@@ -275,6 +292,54 @@ mod tests {
         assert_eq!(Ap2AudioFormat::ALAC_48000_24_STEREO.audio_format_code(), ALAC_48000_24_2);
         assert_eq!(Ap2AudioFormat::ALAC_48000_24_STEREO.input_bytes_per_frame(), 8);
         assert_eq!(Ap2AudioFormat::ALAC_48000_24_STEREO.alac_bytes_per_frame(), 6);
+    }
+
+
+    #[test]
+    fn source_policy_selects_hires_only_when_enabled_and_advertised() {
+        let info = Ap2Info {
+            realtime: AudioFormatCapability {
+                mask: ALAC_44100_24_2,
+                known: true,
+                extended: false,
+            },
+            buffered: AudioFormatCapability::default(),
+        };
+
+        assert_eq!(
+            select_native_stream_format(&info, false, 48_000),
+            Ap2AudioFormat::ALAC_44100_16_STEREO
+        );
+        assert_eq!(
+            select_native_stream_format(&info, true, 48_000),
+            Ap2AudioFormat::ALAC_48000_24_STEREO
+        );
+        assert_eq!(
+            select_native_stream_format(&info, true, 96_000),
+            Ap2AudioFormat::ALAC_44100_24_STEREO
+        );
+    }
+
+    #[test]
+    fn source_policy_keeps_unknown_or_16bit_only_receivers_on_baseline() {
+        let unknown = Ap2Info::default();
+        assert_eq!(
+            select_native_stream_format(&unknown, true, 48_000),
+            Ap2AudioFormat::ALAC_44100_16_STEREO
+        );
+
+        let only_16 = Ap2Info {
+            realtime: AudioFormatCapability {
+                mask: ALAC_44100_16_2 | ALAC_48000_16_2,
+                known: true,
+                extended: false,
+            },
+            buffered: AudioFormatCapability::default(),
+        };
+        assert_eq!(
+            select_native_stream_format(&only_16, true, 48_000),
+            Ap2AudioFormat::ALAC_44100_16_STEREO
+        );
     }
 
     #[test]
