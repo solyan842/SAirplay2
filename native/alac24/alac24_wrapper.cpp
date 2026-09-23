@@ -1,6 +1,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 
 #include "ALACEncoder.h"
 #include "ALACBitUtilities.h"
