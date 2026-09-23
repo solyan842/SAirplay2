@@ -473,6 +473,20 @@ impl SairplayApp {
         }
     }
 
+    fn hires_enabled_for_fullname(&self, fullname: &str) -> bool {
+        if let Some(value) = self.hires_overrides.get(fullname) {
+            return *value;
+        }
+
+        self.catalog
+            .devices()
+            .iter()
+            .filter_map(|device| device.airplay.as_ref())
+            .find(|service| service.fullname == fullname)
+            .map(|service| service.txt.default_hires_enabled())
+            .unwrap_or(false)
+    }
+
     fn pump_connect_result(&mut self) {
         let Some(rx) = &self.connect_rx else {
             return;
@@ -1647,13 +1661,47 @@ impl SairplayApp {
                 );
             });
         });
+        let hires_available = !members.is_empty()
+            && members.iter().all(|fullname| {
+                self.hires_capabilities.get(fullname).copied() == Some(true)
+            });
+        let mut hires_enabled = hires_available
+            && members
+                .iter()
+                .all(|fullname| self.hires_enabled_for_fullname(fullname));
+        let hires_editable = hires_available
+            && !matches!(
+                self.playback,
+                PlaybackUiState::Connecting(_) | PlaybackUiState::Playing(_)
+            );
+        let mut hires_clicked = false;
+
         ui.allocate_ui_at_rect(status_rect, |ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
                 draw_status_badge(ui, status, status_tone);
+                if hires_available {
+                    ui.add_space(2.0);
+                    let response = ui.add_enabled(
+                        hires_editable,
+                        egui::Checkbox::new(&mut hires_enabled, "24-bit"),
+                    );
+                    hires_clicked = response.changed();
+                }
             });
         });
 
-        if response.clicked() && selectable {
+        if hires_clicked {
+            for fullname in &members {
+                self.hires_overrides.insert(fullname.clone(), hires_enabled);
+            }
+            self.log.push(format!(
+                "{}: 24-bit hi-res {} for next native session.",
+                device.display_name,
+                if hires_enabled { "enabled" } else { "disabled" }
+            ));
+        }
+
+        if response.clicked() && selectable && !hires_clicked {
             let all_selected = members
                 .iter()
                 .all(|fullname| self.selected_fullnames.contains(fullname));
