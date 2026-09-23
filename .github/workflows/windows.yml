@@ -37,7 +37,22 @@ jobs:
           git -C $src submodule update --init --recursive libcodecs
 
           $alac = (Resolve-Path "$src/libcodecs/alac/codec").Path
-          cmake -S "native/alac24" -B $build -G "Visual Studio 17 2022" -A x64 "-DALAC_SOURCE=$alac"
+
+          # windows-latest may move to a newer Visual Studio image before the
+          # workflow is updated. Resolve the newest VS CMake generator exposed
+          # by the runner instead of pinning a marketing version.
+          $cmakeHelp = cmake --help | Out-String
+          $vsGenerators = [regex]::Matches(
+            $cmakeHelp,
+            '(?m)^\*?\s*(Visual Studio \d+ \d{4})'
+          ) | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+          $vsGenerator = $vsGenerators |
+            Sort-Object { [int]([regex]::Match($_, 'Visual Studio (\d+)').Groups[1].Value) } -Descending |
+            Select-Object -First 1
+          if (-not $vsGenerator) { throw "No Visual Studio CMake generator found" }
+          Write-Host "Using CMake generator: $vsGenerator"
+
+          cmake -S "native/alac24" -B $build -G $vsGenerator -A x64 "-DALAC_SOURCE=$alac"
           if ($LASTEXITCODE -ne 0) { throw "ALAC24 CMake configure failed" }
 
           cmake --build $build --config Release
