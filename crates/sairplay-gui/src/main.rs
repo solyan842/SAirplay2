@@ -1593,7 +1593,7 @@ impl SairplayApp {
         device: &DeviceRecord,
         stereo_pair: bool,
     ) {
-        const ROW_H: f32 = 76.0;
+        const ROW_H: f32 = 84.0;
         const SELECTOR_W: f32 = 24.0;
         const ART_W: f32 = 70.0;
         const STATUS_W: f32 = 166.0;
@@ -1672,22 +1672,22 @@ impl SairplayApp {
         let content = body.shrink2(egui::vec2(10.0, 5.0));
         let row_y = content.center().y;
         let selector_rect = egui::Rect::from_min_size(
-            egui::pos2(content.left(), row_y - 26.0),
-            egui::vec2(SELECTOR_W, 52.0),
+            egui::pos2(content.left(), row_y - 24.0),
+            egui::vec2(SELECTOR_W, 48.0),
         );
         let art_rect = egui::Rect::from_min_size(
-            egui::pos2(selector_rect.right() + 8.0, row_y - 26.0),
-            egui::vec2(ART_W, 52.0),
+            egui::pos2(selector_rect.right() + 8.0, row_y - 24.0),
+            egui::vec2(ART_W, 48.0),
         );
         let status_rect = egui::Rect::from_min_size(
-            egui::pos2(content.right() - STATUS_W, row_y - 30.0),
-            egui::vec2(STATUS_W, 60.0),
+            egui::pos2(content.right() - STATUS_W, row_y - 25.0),
+            egui::vec2(STATUS_W, 50.0),
         );
         let text_left = art_rect.right() + 12.0;
         let text_right = (status_rect.left() - 8.0).max(text_left + 110.0);
         let text_rect = egui::Rect::from_min_max(
-            egui::pos2(text_left, row_y - 26.0),
-            egui::pos2(text_right, row_y + 26.0),
+            egui::pos2(text_left, row_y - 24.0),
+            egui::pos2(text_right, row_y + 24.0),
         );
 
         ui.allocate_ui_at_rect(selector_rect, |ui| {
@@ -1748,8 +1748,8 @@ impl SairplayApp {
             egui::vec2(110.0, 28.0),
         );
         let bit_rect = egui::Rect::from_min_size(
-            egui::pos2(status_rect.right() - 44.0, row_y - 23.0),
-            egui::vec2(44.0, 46.0),
+            egui::pos2(status_rect.right() - 44.0, row_y - 20.0),
+            egui::vec2(44.0, 40.0),
         );
 
         ui.allocate_ui_at_rect(badge_rect, |ui| {
