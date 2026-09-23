@@ -202,6 +202,14 @@ impl NativeGroupSession {
         self.members.len()
     }
 
+    pub fn audio_format(&self) -> Option<crate::Ap2AudioFormat> {
+        let first = self.members.first()?.1.audio_format();
+        self.members
+            .iter()
+            .all(|(_, session)| session.audio_format() == first)
+            .then_some(first)
+    }
+
     pub fn active_audio_members(&self) -> usize {
         self.audio_worker
             .as_ref()
