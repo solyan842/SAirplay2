@@ -156,12 +156,12 @@ impl WindowsAudioWorker {
                             last_ptp_probe_alive = Some(alive);
                         }
 
-                        // Windows has no explicit player FLUSH/START command pipe,
-                        // so a sustained all-zero interval is our local boundary
-                        // signal. Once it crosses 250 ms, mirror the SOURCE local
-                        // half of ap2_session_flush(): discard queued pre-boundary
-                        // PCM and old splice-pad debt, but never FLUSH/reset the
-                        // receiver, RTP sequence/timestamp, crypto or anchor line.
+                        // Windows has no explicit player FLUSH/START command pipe.
+                        // A sustained all-zero interval is therefore DIAGNOSTIC ONLY.
+                        // Do not synthesize ap2_session_flush() from silence: upstream
+                        // flushes only on an explicit session command. Treating ordinary
+                        // track-gap silence as FLUSH discards valid queued PCM and can
+                        // strand an otherwise healthy Apple realtime timeline.
                         if cold_armed {
                             if report.first_nonzero_frame_offset.is_some() {
                                 if let Some(gap_started) = nonzero_gap_started.take() {
@@ -279,16 +279,15 @@ impl WindowsAudioWorker {
                                         }
                                     }
 
-                                    // SOURCE-PARITY local warm FLUSH:
-                                    // ap2_session_flush() resets the sender-side ring
-                                    // while ap2cl_flush() on the splice path leaves the
-                                    // receiver queue and immutable wire line untouched.
-                                    chunker.clear();
-                                    sender.begin_warm_splice_boundary();
-
+                                    // Important source boundary:
+                                    // upstream's ap2_session_flush() is command-driven.
+                                    // Silence alone never authorizes us to drop the PCM
+                                    // ring or reset splice-pad debt. Keep the wire hot and
+                                    // preserve every queued sample exactly as the last
+                                    // known-good pre-hires worker did.
                                     if let Ok(mut events) = startup_events_thread.lock() {
                                         events.push(format!(
-                                            "Transition: boundary #{} local FLUSH · discarded_bytes={} · stale_nonzero_bytes={} · dropped_pad_frames={} · seq/timestamp/anchor preserved.",
+                                            "Transition: boundary #{} inferred from silence only · diagnostic, no FLUSH · pending_bytes={} · nonzero_bytes={} · pad_debt={} · seq/timestamp/anchor preserved.",
                                             transition_epoch,
                                             pending_before,
                                             pending_nonzero_before,
