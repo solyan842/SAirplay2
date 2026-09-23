@@ -2285,7 +2285,7 @@ impl eframe::App for SairplayApp {
                                 ui.add_space(10.0);
 
                                 let (status, detail, color) = self.header_status();
-                                draw_header_status_card(ui, status, detail, color);
+                                draw_header_status_card(ui, status, &detail, color);
                             },
                         );
                     },
