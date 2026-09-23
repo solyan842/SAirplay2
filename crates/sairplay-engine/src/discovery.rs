@@ -111,6 +111,20 @@ impl AirPlayTxt {
             .any(|prefix| model.starts_with(prefix))
     }
 
+    /// Port of Music Assistant's default_hires_enabled() family policy.
+    /// Raw AirPlay TXT identifies HomePod-family receivers as AudioAccessory.
+    /// They default to 16-bit on realtime UDP; other native AirPlay 2
+    /// receivers may enable 24-bit when /info advertises it.
+    pub fn default_hires_enabled(&self) -> bool {
+        let model = self
+            .fields
+            .get("model")
+            .or_else(|| self.fields.get("am"))
+            .map(String::as_str)
+            .unwrap_or("");
+        !model.starts_with("AudioAccessory")
+    }
+
     pub fn follows_receiver_clock(&self) -> bool {
         // Port of ap2_follow_receiver_clock() from airplay-cli v0.5.4.
         if let Some(enabled) = ptp_follow_override(
@@ -219,6 +233,21 @@ mod tests {
         assert!(txt.password_required);
         assert!(txt.supports_auth_setup());
         assert_eq!(txt.model.as_deref(), Some("AudioAccessory"));
+    }
+
+    #[test]
+    fn source_hires_default_disables_audioaccessory_only() {
+        let homepod = AirPlayTxt::parse([
+            ("model", "AudioAccessory5,1"),
+            ("features", "0x0"),
+        ]).unwrap();
+        assert!(!homepod.default_hires_enabled());
+
+        let apple_tv = AirPlayTxt::parse([
+            ("model", "AppleTV14,1"),
+            ("features", "0x0"),
+        ]).unwrap();
+        assert!(apple_tv.default_hires_enabled());
     }
 
     #[test]
