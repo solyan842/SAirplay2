@@ -7,8 +7,118 @@ pub enum AlacEncodeError {
     Empty,
     TooManyFrames,
     MisalignedPcm,
+    NativeBackendUnavailable,
+    NativeBackendCreateFailed,
+    NativeBackendEncodeFailed(i32),
 }
 
+
+
+#[cfg(windows)]
+mod native24 {
+    use super::{truncate_s32le_to_s24le, AlacEncodeError, ALAC_FRAMES_PER_PACKET};
+    use libloading::Library;
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
+
+    type CreateFn = unsafe extern "C" fn(i32) -> *mut c_void;
+    type EncodeFn = unsafe extern "C" fn(
+        *mut c_void,
+        *const u8,
+        i32,
+        *mut u8,
+        i32,
+    ) -> i32;
+    type DestroyFn = unsafe extern "C" fn(*mut c_void);
+
+    pub struct Alac24Encoder {
+        _library: Library,
+        encoder: NonNull<c_void>,
+        encode: EncodeFn,
+        destroy: DestroyFn,
+    }
+
+    // The encoder is created, used, and destroyed on one audio worker thread.
+    // Moving ownership between threads is safe; concurrent access is not exposed.
+    unsafe impl Send for Alac24Encoder {}
+
+    impl Alac24Encoder {
+        pub fn open(sample_rate: u32) -> Result<Self, AlacEncodeError> {
+            if sample_rate != 44_100 && sample_rate != 48_000 {
+                return Err(AlacEncodeError::NativeBackendCreateFailed);
+            }
+
+            let library = unsafe {
+                Library::new("sairplay-alac24.dll")
+                    .map_err(|_| AlacEncodeError::NativeBackendUnavailable)?
+            };
+            let create: CreateFn = unsafe {
+                *library
+                    .get::<CreateFn>(b"sairplay_alac24_create\0")
+                    .map_err(|_| AlacEncodeError::NativeBackendUnavailable)?
+            };
+            let encode: EncodeFn = unsafe {
+                *library
+                    .get::<EncodeFn>(b"sairplay_alac24_encode_352\0")
+                    .map_err(|_| AlacEncodeError::NativeBackendUnavailable)?
+            };
+            let destroy: DestroyFn = unsafe {
+                *library
+                    .get::<DestroyFn>(b"sairplay_alac24_destroy\0")
+                    .map_err(|_| AlacEncodeError::NativeBackendUnavailable)?
+            };
+
+            let encoder = NonNull::new(unsafe { create(sample_rate as i32) })
+                .ok_or(AlacEncodeError::NativeBackendCreateFailed)?;
+
+            Ok(Self {
+                _library: library,
+                encoder,
+                encode,
+                destroy,
+            })
+        }
+
+        pub fn encode_s32le_352(&mut self, pcm_s32le: &[u8]) -> Result<Vec<u8>, AlacEncodeError> {
+            const INPUT_BYTES: usize = ALAC_FRAMES_PER_PACKET * 2 * 4;
+            if pcm_s32le.len() != INPUT_BYTES {
+                return Err(if pcm_s32le.len() % 8 != 0 {
+                    AlacEncodeError::MisalignedPcm
+                } else if pcm_s32le.len() > INPUT_BYTES {
+                    AlacEncodeError::TooManyFrames
+                } else {
+                    AlacEncodeError::Empty
+                });
+            }
+
+            let packed = truncate_s32le_to_s24le(pcm_s32le)?;
+            let mut output = vec![0u8; 8192];
+            let encoded = unsafe {
+                (self.encode)(
+                    self.encoder.as_ptr(),
+                    packed.as_ptr(),
+                    packed.len() as i32,
+                    output.as_mut_ptr(),
+                    output.len() as i32,
+                )
+            };
+            if encoded <= 0 {
+                return Err(AlacEncodeError::NativeBackendEncodeFailed(encoded));
+            }
+            output.truncate(encoded as usize);
+            Ok(output)
+        }
+    }
+
+    impl Drop for Alac24Encoder {
+        fn drop(&mut self) {
+            unsafe { (self.destroy)(self.encoder.as_ptr()) };
+        }
+    }
+}
+
+#[cfg(windows)]
+pub use native24::Alac24Encoder;
 
 /// Exact port of airplay-cli's truncate_32to24 helper.
 ///
