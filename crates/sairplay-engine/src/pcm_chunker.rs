@@ -2,21 +2,50 @@ use std::collections::VecDeque;
 
 pub const PCM352_PACKET_BYTES: usize = 352 * 2 * 2;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Pcm352Chunker {
     pending: VecDeque<u8>,
+    bytes_per_frame: usize,
+    packet_bytes: usize,
+    #[test]
+    fn supports_source_24bit_s32le_carrier_packets() {
+        let mut c = Pcm352Chunker::new_with_bytes_per_frame(8);
+        assert_eq!(c.packet_bytes(), 352 * 8);
+        c.push(&vec![0x44; 352 * 8]);
+        let out = c.pop_packet().unwrap();
+        assert_eq!(out.len(), 352 * 8);
+        assert!(out.iter().all(|b| *b == 0x44));
+    }
+
+}
+
+impl Default for Pcm352Chunker {
+    fn default() -> Self {
+        Self::new_with_bytes_per_frame(4)
+    }
 }
 
 impl Pcm352Chunker {
     pub fn new() -> Self { Self::default() }
 
+    pub fn new_with_bytes_per_frame(bytes_per_frame: usize) -> Self {
+        assert!(bytes_per_frame > 0);
+        Self {
+            pending: VecDeque::new(),
+            bytes_per_frame,
+            packet_bytes: 352 * bytes_per_frame,
+        }
+    }
+
+    pub fn bytes_per_frame(&self) -> usize { self.bytes_per_frame }
+    pub fn packet_bytes(&self) -> usize { self.packet_bytes }
     pub fn pending_bytes(&self) -> usize { self.pending.len() }
 
     pub fn pending_nonzero_bytes(&self) -> usize {
         self.pending.iter().filter(|byte| **byte != 0).count()
     }
 
-    pub fn has_packet(&self) -> bool { self.pending.len() >= PCM352_PACKET_BYTES }
+    pub fn has_packet(&self) -> bool { self.pending.len() >= self.packet_bytes }
 
     pub fn clear(&mut self) { self.pending.clear(); }
 
@@ -24,8 +53,8 @@ impl Pcm352Chunker {
         self.pending.extend(pcm_le_stereo_16.iter().copied());
     }
 
-    pub fn pop_packet_padded_silence(&mut self) -> [u8; PCM352_PACKET_BYTES] {
-        let mut out = [0u8; PCM352_PACKET_BYTES];
+    pub fn pop_packet_padded_silence(&mut self) -> Vec<u8> {
+        let mut out = vec![0u8; self.packet_bytes];
         for byte in &mut out {
             match self.pending.pop_front() {
                 Some(value) => *byte = value,
@@ -38,26 +67,26 @@ impl Pcm352Chunker {
     pub fn pop_packet_with_silence_prefix(
         &mut self,
         pad_frames: u32,
-    ) -> Option<[u8; PCM352_PACKET_BYTES]> {
+    ) -> Option<Vec<u8>> {
         let pad_frames = pad_frames.min(352) as usize;
-        let pad_bytes = pad_frames * 4;
-        let want = PCM352_PACKET_BYTES - pad_bytes;
+        let pad_bytes = pad_frames * self.bytes_per_frame;
+        let want = self.packet_bytes - pad_bytes;
         if self.pending.len() < want {
             return None;
         }
 
-        let mut out = [0u8; PCM352_PACKET_BYTES];
+        let mut out = vec![0u8; self.packet_bytes];
         for byte in &mut out[pad_bytes..] {
             *byte = self.pending.pop_front().expect("length checked");
         }
         Some(out)
     }
 
-    pub fn pop_packet(&mut self) -> Option<[u8; PCM352_PACKET_BYTES]> {
-        if self.pending.len() < PCM352_PACKET_BYTES {
+    pub fn pop_packet(&mut self) -> Option<Vec<u8>> {
+        if self.pending.len() < self.packet_bytes {
             return None;
         }
-        let mut out = [0u8; PCM352_PACKET_BYTES];
+        let mut out = vec![0u8; self.packet_bytes];
         for byte in &mut out {
             *byte = self.pending.pop_front().unwrap();
         }
