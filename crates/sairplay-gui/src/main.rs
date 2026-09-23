@@ -4,7 +4,7 @@ use eframe::egui;
 use sairplay_engine::{
     Ap2PreflightClient, DeviceCatalog, DeviceRecord, DiscoveredService, DiscoveryEvent,
     LegacyGroupSession, LegacyMemberConfig, MdnsBrowser, NativeGroupMemberConfig, NativeGroupSession,
-    NativeSession, NativeSessionConfig, Route, ServiceKind, VolumeSetResult,
+    NativeSession, NativeSessionConfig, RetransmitStats, Route, ServiceKind, VolumeSetResult,
     WasapiLoopbackCapture, ALAC_44100_16_2, ALAC_44100_24_2, ALAC_48000_16_2,
     ALAC_48000_24_2,
 };
@@ -68,6 +68,14 @@ impl ActiveSession {
             Self::Single(session) => session.drain_startup_events(),
             Self::Group(session) => session.drain_startup_events(),
             Self::Legacy(session) => session.drain_startup_events(),
+        }
+    }
+
+    fn retransmit_stats(&self) -> RetransmitStats {
+        match self {
+            Self::Single(session) => session.retransmit_stats(),
+            Self::Group(session) => session.retransmit_stats(),
+            Self::Legacy(_) => RetransmitStats::default(),
         }
     }
 
@@ -262,6 +270,7 @@ struct SairplayApp {
     activation_open: bool,
     activation_key: String,
     last_feedback_error: Option<String>,
+    last_retransmit_stats: RetransmitStats,
     show_multiroom_info: bool,
     show_pair_info: bool,
     device_textures: HashMap<DeviceArtwork, egui::TextureHandle>,
@@ -333,6 +342,7 @@ impl Default for SairplayApp {
             activation_open: false,
             activation_key: String::new(),
             last_feedback_error: None,
+            last_retransmit_stats: RetransmitStats::default(),
             show_multiroom_info: false,
             show_pair_info: false,
             device_textures: HashMap::new(),
@@ -571,6 +581,7 @@ impl SairplayApp {
                         success.label,
                         success.active_fullnames.len()
                     ));
+                    self.last_retransmit_stats = success.session.retransmit_stats();
                     self.active_fullnames = success.active_fullnames;
                     self.active_mode = Some(success.mode);
                     self.playback = PlaybackUiState::Playing(success.label);
@@ -1170,6 +1181,26 @@ impl SairplayApp {
             self.log.push(event);
         }
 
+        let rtx = session.retransmit_stats();
+        if rtx != self.last_retransmit_stats {
+            let prev = self.last_retransmit_stats;
+            let requested_delta = rtx.requested.saturating_sub(prev.requested);
+            let answered_delta = rtx.answered.saturating_sub(prev.answered);
+            let expired_delta = rtx.expired.saturating_sub(prev.expired);
+            if requested_delta != 0 || expired_delta != 0 {
+                self.log.push(format!(
+                    "Diagnostic: retransmit activity · requested +{} (total {}) · answered +{} (total {}) · expired +{} (total {}).",
+                    requested_delta,
+                    rtx.requested,
+                    answered_delta,
+                    rtx.answered,
+                    expired_delta,
+                    rtx.expired
+                ));
+            }
+            self.last_retransmit_stats = rtx;
+        }
+
         if let Some(error) = session.audio_error() {
             self.log.push(format!("Audio worker stopped: {error}"));
             self.playback = PlaybackUiState::Error(error);
@@ -1444,6 +1475,7 @@ impl SairplayApp {
         self.membership_rx = None;
         self.playback = PlaybackUiState::Idle;
         self.native_retry_available = true;
+        self.last_retransmit_stats = RetransmitStats::default();
     }
 
     fn header_status(&self) -> (&'static str, String, egui::Color32) {
