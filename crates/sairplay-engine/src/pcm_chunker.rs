@@ -7,16 +7,6 @@ pub struct Pcm352Chunker {
     pending: VecDeque<u8>,
     bytes_per_frame: usize,
     packet_bytes: usize,
-    #[test]
-    fn supports_source_24bit_s32le_carrier_packets() {
-        let mut c = Pcm352Chunker::new_with_bytes_per_frame(8);
-        assert_eq!(c.packet_bytes(), 352 * 8);
-        c.push(&vec![0x44; 352 * 8]);
-        let out = c.pop_packet().unwrap();
-        assert_eq!(out.len(), 352 * 8);
-        assert!(out.iter().all(|b| *b == 0x44));
-    }
-
 }
 
 impl Default for Pcm352Chunker {
@@ -151,6 +141,16 @@ mod tests {
         assert!(c.pop_packet().is_some());
         assert_eq!(c.pending_bytes(), 17);
         assert!(c.pop_packet().is_none());
+    }
+
+    #[test]
+    fn supports_source_24bit_s32le_carrier_packets() {
+        let mut c = Pcm352Chunker::new_with_bytes_per_frame(8);
+        assert_eq!(c.packet_bytes(), 352 * 8);
+        c.push(&vec![0x44; 352 * 8]);
+        let out = c.pop_packet().unwrap();
+        assert_eq!(out.len(), 352 * 8);
+        assert!(out.iter().all(|b| *b == 0x44));
     }
 
     #[test]
