@@ -304,6 +304,14 @@ impl LegacyGroupSession {
                         captured_frames_total.saturating_add(report.frames as u64);
 
                     while let Some(packet) = chunker.pop_packet() {
+                        // Legacy RAOP remains locked to the 16-bit / 44.1 kHz
+                        // 1408-byte packet contract. The format-aware native
+                        // chunker returns Vec<u8>, so convert back to the fixed
+                        // legacy packet shape here and keep the RAOP writer
+                        // pipeline unchanged.
+                        let packet: [u8; PCM352_PACKET_BYTES] = packet
+                            .try_into()
+                            .expect("legacy chunker is fixed to 16-bit stereo");
                         let mut index = 0usize;
                         while index < senders.len() {
                             let stall_started = std::time::Instant::now();
