@@ -1593,7 +1593,7 @@ impl SairplayApp {
         device: &DeviceRecord,
         stereo_pair: bool,
     ) {
-        const ROW_H: f32 = 84.0;
+        const ROW_H: f32 = 72.0;
         const SELECTOR_W: f32 = 24.0;
         const ART_W: f32 = 70.0;
         const STATUS_W: f32 = 166.0;
@@ -1633,7 +1633,9 @@ impl SairplayApp {
         let sense = if selectable { egui::Sense::click() } else { egui::Sense::hover() };
         let (row_rect, response) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), sense);
-        let body = row_rect.shrink2(egui::vec2(2.0, 2.0));
+        // Keep a real vertical gutter between adjacent rows so selected/hover
+        // rounded cards can never visually overlap the next receiver.
+        let body = row_rect.shrink2(egui::vec2(2.0, 5.0));
 
         if selected {
             ui.painter().rect_filled(
@@ -1650,14 +1652,8 @@ impl SairplayApp {
         } else if response.hovered() {
             ui.painter().rect_filled(
                 body,
-                egui::CornerRadius::same(11),
+                egui::CornerRadius::same(10),
                 egui::Color32::from_rgb(247, 251, 255),
-            );
-            ui.painter().rect_stroke(
-                body,
-                egui::CornerRadius::same(11),
-                egui::Stroke::new(1.0, UiTheme::border_hover()),
-                egui::StrokeKind::Inside,
             );
         } else {
             ui.painter().line_segment(
@@ -1672,22 +1668,22 @@ impl SairplayApp {
         let content = body.shrink2(egui::vec2(10.0, 5.0));
         let row_y = content.center().y;
         let selector_rect = egui::Rect::from_min_size(
-            egui::pos2(content.left(), row_y - 24.0),
-            egui::vec2(SELECTOR_W, 48.0),
+            egui::pos2(content.left(), row_y - 21.0),
+            egui::vec2(SELECTOR_W, 42.0),
         );
         let art_rect = egui::Rect::from_min_size(
-            egui::pos2(selector_rect.right() + 8.0, row_y - 24.0),
-            egui::vec2(ART_W, 48.0),
+            egui::pos2(selector_rect.right() + 8.0, row_y - 21.0),
+            egui::vec2(ART_W, 42.0),
         );
         let status_rect = egui::Rect::from_min_size(
-            egui::pos2(content.right() - STATUS_W, row_y - 25.0),
-            egui::vec2(STATUS_W, 50.0),
+            egui::pos2(content.right() - STATUS_W, row_y - 22.0),
+            egui::vec2(STATUS_W, 44.0),
         );
         let text_left = art_rect.right() + 12.0;
         let text_right = (status_rect.left() - 8.0).max(text_left + 110.0);
         let text_rect = egui::Rect::from_min_max(
-            egui::pos2(text_left, row_y - 24.0),
-            egui::pos2(text_right, row_y + 24.0),
+            egui::pos2(text_left, row_y - 21.0),
+            egui::pos2(text_right, row_y + 21.0),
         );
 
         ui.allocate_ui_at_rect(selector_rect, |ui| {
@@ -1744,12 +1740,12 @@ impl SairplayApp {
         ).to_owned();
 
         let badge_rect = egui::Rect::from_min_size(
-            egui::pos2(status_rect.left(), row_y - 14.0),
-            egui::vec2(110.0, 28.0),
+            egui::pos2(status_rect.left(), row_y - 13.0),
+            egui::vec2(110.0, 26.0),
         );
         let bit_rect = egui::Rect::from_min_size(
-            egui::pos2(status_rect.right() - 44.0, row_y - 20.0),
-            egui::vec2(44.0, 40.0),
+            egui::pos2(status_rect.right() - 44.0, row_y - 19.0),
+            egui::vec2(44.0, 38.0),
         );
 
         ui.allocate_ui_at_rect(badge_rect, |ui| {
