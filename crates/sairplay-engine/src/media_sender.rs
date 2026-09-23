@@ -3,7 +3,7 @@ use crate::{
     encode_alac_16_stereo_352, AlacEncodeError, Ap2AudioFormat, DatagramSendOutcome, MediaTransport,
     MediaTransportError, NtpSyncPacketArgs, PtpClock, PtpExchange, PtpSyncPacketArgs,
     RetransmitRing, RtpState,
-    ALAC_PCM_PACKET_BYTES, FRAMES_PER_PACKET_44100,
+    FRAMES_PER_PACKET_44100,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
