@@ -1535,7 +1535,7 @@ impl SairplayApp {
         device: &DeviceRecord,
         stereo_pair: bool,
     ) {
-        const ROW_H: f32 = 64.0;
+        const ROW_H: f32 = 76.0;
         const SELECTOR_W: f32 = 24.0;
         const ART_W: f32 = 70.0;
         const STATUS_W: f32 = 126.0;
@@ -1614,22 +1614,22 @@ impl SairplayApp {
         let content = body.shrink2(egui::vec2(10.0, 5.0));
         let row_y = content.center().y;
         let selector_rect = egui::Rect::from_min_size(
-            egui::pos2(content.left(), row_y - 22.0),
-            egui::vec2(SELECTOR_W, 44.0),
+            egui::pos2(content.left(), row_y - 26.0),
+            egui::vec2(SELECTOR_W, 52.0),
         );
         let art_rect = egui::Rect::from_min_size(
-            egui::pos2(selector_rect.right() + 8.0, row_y - 22.0),
-            egui::vec2(ART_W, 44.0),
+            egui::pos2(selector_rect.right() + 8.0, row_y - 26.0),
+            egui::vec2(ART_W, 52.0),
         );
         let status_rect = egui::Rect::from_min_size(
-            egui::pos2(content.right() - STATUS_W, row_y - 22.0),
-            egui::vec2(STATUS_W, 44.0),
+            egui::pos2(content.right() - STATUS_W, row_y - 32.0),
+            egui::vec2(STATUS_W, 64.0),
         );
         let text_left = art_rect.right() + 12.0;
         let text_right = (status_rect.left() - 8.0).max(text_left + 110.0);
         let text_rect = egui::Rect::from_min_max(
-            egui::pos2(text_left, row_y - 22.0),
-            egui::pos2(text_right, row_y + 22.0),
+            egui::pos2(text_left, row_y - 26.0),
+            egui::pos2(text_right, row_y + 26.0),
         );
 
         ui.allocate_ui_at_rect(selector_rect, |ui| {
@@ -1679,17 +1679,33 @@ impl SairplayApp {
                 PlaybackUiState::Connecting(_) | PlaybackUiState::Playing(_)
             );
         let mut hires_clicked = false;
+        let tooltip_title = self.t("Phát nhạc 24-bit", "24-bit Playback").to_owned();
+        let tooltip_body = self.t(
+            "Bật để ưu tiên phát 24-bit trên thiết bị hỗ trợ. Chế độ này có thể gây lách tách, mất tiếng ngắt quãng hoặc lỗi đa vùng trên một số thiết bị / mạng Wi‑Fi. Nếu có lỗi, hãy tắt 24-bit và phát lại.",
+            "Enable to prefer 24-bit playback on supported receivers. This mode may cause crackling, brief dropouts, or multi-room issues on some devices or Wi-Fi networks. If problems occur, turn off 24-bit and start playback again.",
+        ).to_owned();
 
         ui.allocate_ui_at_rect(status_rect, |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
                 draw_status_badge(ui, status, status_tone);
+                ui.add_space(1.0);
                 if hires_available {
-                    ui.add_space(2.0);
-                    let response = ui.add_enabled(
-                        hires_editable,
-                        egui::Checkbox::new(&mut hires_enabled, "24-bit"),
+                    let label = ui.label(
+                        egui::RichText::new("24-bit")
+                            .size(10.5)
+                            .color(UiTheme::text_soft()),
                     );
-                    hires_clicked = response.changed();
+                    show_hires_tooltip(label, &tooltip_title, &tooltip_body);
+                    ui.add_space(1.0);
+                    let toggle = draw_compact_switch(ui, &mut hires_enabled, hires_editable);
+                    hires_clicked = toggle.clicked();
+                    show_hires_tooltip(toggle, &tooltip_title, &tooltip_body);
+                } else {
+                    ui.label(
+                        egui::RichText::new("16-bit")
+                            .size(10.5)
+                            .color(UiTheme::text_soft()),
+                    );
                 }
             });
         });
@@ -1764,6 +1780,123 @@ impl SairplayApp {
         }
     }
 
+    fn render_empty_device_state(
+        &self,
+        ui: &mut egui::Ui,
+        stereo_pair: bool,
+        height: f32,
+    ) {
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), height),
+            egui::Layout::top_down(egui::Align::Center),
+            |ui| {
+                ui.add_space(((height - 250.0) * 0.34).max(26.0));
+
+                let (art_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(190.0, 150.0), egui::Sense::hover());
+                let center = art_rect.center() + egui::vec2(0.0, -2.0);
+                ui.painter().circle_filled(
+                    center,
+                    72.0,
+                    egui::Color32::from_rgb(239, 246, 255),
+                );
+
+                if stereo_pair {
+                    let left = egui::Rect::from_center_size(
+                        center + egui::vec2(-31.0, 3.0),
+                        egui::vec2(58.0, 58.0),
+                    );
+                    let right = egui::Rect::from_center_size(
+                        center + egui::vec2(31.0, 3.0),
+                        egui::vec2(58.0, 58.0),
+                    );
+                    ui.put(
+                        left,
+                        egui::Image::new(egui::include_image!("../assets/mingcute_homepod_mini_filled.svg"))
+                            .fit_to_exact_size(left.size())
+                            .tint(egui::Color32::from_rgb(45, 52, 64)),
+                    );
+                    ui.put(
+                        right,
+                        egui::Image::new(egui::include_image!("../assets/mingcute_homepod_mini_filled.svg"))
+                            .fit_to_exact_size(right.size())
+                            .tint(egui::Color32::from_rgb(150, 160, 176)),
+                    );
+                } else {
+                    let laptop = egui::Rect::from_center_size(
+                        center + egui::vec2(-14.0, 4.0),
+                        egui::vec2(92.0, 92.0),
+                    );
+                    ui.put(
+                        laptop,
+                        egui::Image::new(egui::include_image!("../assets/mingcute_laptop_filled.svg"))
+                            .fit_to_exact_size(laptop.size())
+                            .tint(egui::Color32::from_rgb(111, 137, 176)),
+                    );
+                    let phone = egui::Rect::from_center_size(
+                        center + egui::vec2(42.0, 16.0),
+                        egui::vec2(30.0, 56.0),
+                    );
+                    ui.painter().rect_filled(
+                        phone,
+                        egui::CornerRadius::same(6),
+                        egui::Color32::from_rgb(247, 250, 255),
+                    );
+                    ui.painter().rect_stroke(
+                        phone,
+                        egui::CornerRadius::same(6),
+                        egui::Stroke::new(3.0, egui::Color32::from_rgb(111, 137, 176)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+
+                let search_center = center + egui::vec2(56.0, 48.0);
+                ui.painter().circle_filled(
+                    search_center,
+                    21.0,
+                    egui::Color32::from_rgb(45, 137, 255),
+                );
+                ui.painter().circle_stroke(
+                    search_center + egui::vec2(-3.0, -3.0),
+                    7.5,
+                    egui::Stroke::new(2.6, egui::Color32::WHITE),
+                );
+                ui.painter().line_segment(
+                    [
+                        search_center + egui::vec2(3.0, 3.0),
+                        search_center + egui::vec2(10.0, 10.0),
+                    ],
+                    egui::Stroke::new(2.6, egui::Color32::WHITE),
+                );
+
+                ui.add_space(7.0);
+                let title = if stereo_pair {
+                    self.t(
+                        "Chưa phát hiện cặp HomePod Stereo",
+                        "No HomePod stereo pair detected",
+                    )
+                } else {
+                    self.t("Chưa phát hiện thiết bị", "No devices detected")
+                };
+                ui.label(
+                    egui::RichText::new(title)
+                        .size(16.0)
+                        .strong()
+                        .color(UiTheme::text()),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(self.t(
+                        "Ấn vào biểu tượng / logo ứng dụng để quét lại thiết bị.",
+                        "Click the app icon / logo to scan for devices again.",
+                    ))
+                    .size(11.8)
+                    .color(UiTheme::text_soft()),
+                );
+            },
+        );
+    }
+
     fn render_device_panel(
         &mut self,
         ui: &mut egui::Ui,
@@ -1825,7 +1958,7 @@ impl SairplayApp {
                                             ),
                                         );
                                     }
-                                } else {
+                                } else if !devices.is_empty() {
                                     ui.add_space(5.0);
                                     let label =
                                         self.t("Phát âm thanh đa vùng", "MultiRoom Audio");
@@ -1915,31 +2048,10 @@ impl SairplayApp {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             if devices.is_empty() {
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(
-                                        ui.available_width(),
-                                        (scroll_height - 18.0).max(190.0),
-                                    ),
-                                    egui::Layout::top_down(egui::Align::Center),
-                                    |ui| {
-                                        ui.add_space(((scroll_height - 80.0) * 0.36).max(48.0));
-                                        let text = if stereo_pair {
-                                            self.t(
-                                                "Chưa phát hiện cặp HomePod Stereo",
-                                                "No HomePod stereo pair detected",
-                                            )
-                                        } else {
-                                            self.t(
-                                                "Đang quét thiết bị AirPlay...",
-                                                "Scanning AirPlay receivers...",
-                                            )
-                                        };
-                                        ui.label(
-                                            egui::RichText::new(text)
-                                                .size(12.5)
-                                                .color(UiTheme::text_soft()),
-                                        );
-                                    },
+                                self.render_empty_device_state(
+                                    ui,
+                                    stereo_pair,
+                                    (scroll_height - 18.0).max(190.0),
                                 );
                             } else {
                                 for device in devices {
@@ -3194,6 +3306,64 @@ fn draw_multiroom_toggle(ui: &mut egui::Ui, label: &str, selected: bool) -> egui
         UiTheme::text(),
     );
     response
+}
+
+fn draw_compact_switch(
+    ui: &mut egui::Ui,
+    value: &mut bool,
+    enabled: bool,
+) -> egui::Response {
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(34.0, 17.0), sense);
+    if enabled && response.clicked() {
+        *value = !*value;
+    }
+
+    let track = if *value {
+        UiTheme::blue()
+    } else {
+        egui::Color32::from_rgb(198, 209, 225)
+    };
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(9), track);
+    let knob_x = if *value {
+        rect.right() - 8.5
+    } else {
+        rect.left() + 8.5
+    };
+    ui.painter().circle_filled(
+        egui::pos2(knob_x, rect.center().y),
+        6.3,
+        egui::Color32::WHITE,
+    );
+
+    response
+}
+
+fn show_hires_tooltip(
+    response: egui::Response,
+    title: &str,
+    body: &str,
+) -> egui::Response {
+    response.on_hover_ui(|ui| {
+        ui.set_max_width(330.0);
+        ui.label(
+            egui::RichText::new(title)
+                .size(13.0)
+                .strong()
+                .color(UiTheme::text()),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(body)
+                .size(11.5)
+                .color(UiTheme::text_soft()),
+        );
+    })
 }
 
 fn draw_info_button(ui: &mut egui::Ui) -> egui::Response {
