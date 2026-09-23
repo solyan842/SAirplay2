@@ -1,4 +1,4 @@
-use crate::Pcm352Chunker;
+use crate::{Ap2AudioFormat, Pcm352Chunker};
 use std::fmt;
 use std::ptr::null_mut;
 use windows::Win32::Media::Audio::{
@@ -11,11 +11,7 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
 
-const SAMPLE_RATE: u32 = 44_100;
 const CHANNELS: u16 = 2;
-const BITS_PER_SAMPLE: u16 = 16;
-const BLOCK_ALIGN: u16 = CHANNELS * (BITS_PER_SAMPLE / 8);
-const AVG_BYTES_PER_SEC: u32 = SAMPLE_RATE * BLOCK_ALIGN as u32;
 const BUFFER_DURATION_100NS: i64 = 1_000_000; // 100 ms
 
 #[derive(Debug)]
@@ -61,8 +57,10 @@ impl Drop for ComGuard {
 /// Full-system WASAPI loopback capture from the default Windows render endpoint.
 ///
 /// The stream is opened in shared mode and asks the Windows audio engine to
-/// convert the endpoint mix to the exact SAirplay2 baseline:
-/// PCM signed 16-bit, stereo, 44.1 kHz.
+/// convert the endpoint mix to the exact transport format selected for the
+/// native AirPlay 2 session. 16-bit uses s16le; 24-bit follows airplay-cli's
+/// contract and uses an s32le carrier which is truncated to packed s24le
+/// immediately before the ALAC encoder.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WasapiDrainReport {
     pub frames: usize,
@@ -75,13 +73,24 @@ pub struct WasapiDrainReport {
 pub struct WasapiLoopbackCapture {
     audio_client: IAudioClient,
     capture_client: IAudioCaptureClient,
+    bytes_per_frame: usize,
     // Must be dropped after COM interfaces so CoUninitialize runs last.
     _com: ComGuard,
 }
 
 impl WasapiLoopbackCapture {
     pub fn open_default() -> Result<Self, WasapiLoopbackError> {
+        Self::open_default_for_format(Ap2AudioFormat::ALAC_44100_16_STEREO)
+    }
+
+    pub fn open_default_for_format(
+        audio_format: Ap2AudioFormat,
+    ) -> Result<Self, WasapiLoopbackError> {
         let com = ComGuard::enter()?;
+
+        let container_bits: u16 = if audio_format.bit_depth > 16 { 32 } else { 16 };
+        let block_align: u16 = CHANNELS * (container_bits / 8);
+        let avg_bytes_per_sec: u32 = audio_format.sample_rate * block_align as u32;
 
         unsafe {
             let enumerator: IMMDeviceEnumerator =
@@ -105,10 +114,10 @@ impl WasapiLoopbackCapture {
             let format = WAVEFORMATEX {
                 wFormatTag: WAVE_FORMAT_PCM as u16,
                 nChannels: CHANNELS,
-                nSamplesPerSec: SAMPLE_RATE,
-                nAvgBytesPerSec: AVG_BYTES_PER_SEC,
-                nBlockAlign: BLOCK_ALIGN,
-                wBitsPerSample: BITS_PER_SAMPLE,
+                nSamplesPerSec: audio_format.sample_rate,
+                nAvgBytesPerSec: avg_bytes_per_sec,
+                nBlockAlign: block_align,
+                wBitsPerSample: container_bits,
                 cbSize: 0,
             };
 
@@ -144,6 +153,7 @@ impl WasapiLoopbackCapture {
             Ok(Self {
                 audio_client,
                 capture_client,
+                bytes_per_frame: block_align as usize,
                 _com: com,
             })
         }
@@ -195,7 +205,7 @@ impl WasapiLoopbackCapture {
                     report.first_non_silent_frame_offset = Some(drained_before);
                 }
 
-                let byte_len = frames as usize * BLOCK_ALIGN as usize;
+                let byte_len = frames as usize * self.bytes_per_frame;
                 if silent {
                     chunker.push(&vec![0u8; byte_len]);
                 } else {
@@ -205,7 +215,7 @@ impl WasapiLoopbackCapture {
                     }
                     let bytes = std::slice::from_raw_parts(data as *const u8, byte_len);
                     if report.first_nonzero_frame_offset.is_none() {
-                        for (frame_index, frame) in bytes.chunks_exact(BLOCK_ALIGN as usize).enumerate() {
+                        for (frame_index, frame) in bytes.chunks_exact(self.bytes_per_frame).enumerate() {
                             if frame.iter().any(|byte| *byte != 0) {
                                 report.first_nonzero_frame_offset =
                                     Some(drained_before.saturating_add(frame_index as u64));
