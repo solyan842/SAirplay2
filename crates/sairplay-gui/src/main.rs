@@ -1538,7 +1538,7 @@ impl SairplayApp {
         const ROW_H: f32 = 76.0;
         const SELECTOR_W: f32 = 24.0;
         const ART_W: f32 = 70.0;
-        const STATUS_W: f32 = 126.0;
+        const STATUS_W: f32 = 186.0;
 
         let members = device_selection_members(device, stereo_pair);
         let member_set = members.iter().cloned().collect::<BTreeSet<_>>();
@@ -1622,8 +1622,8 @@ impl SairplayApp {
             egui::vec2(ART_W, 52.0),
         );
         let status_rect = egui::Rect::from_min_size(
-            egui::pos2(content.right() - STATUS_W, row_y - 32.0),
-            egui::vec2(STATUS_W, 64.0),
+            egui::pos2(content.right() - STATUS_W, row_y - 30.0),
+            egui::vec2(STATUS_W, 60.0),
         );
         let text_left = art_rect.right() + 12.0;
         let text_right = (status_rect.left() - 8.0).max(text_left + 110.0);
@@ -1685,10 +1685,21 @@ impl SairplayApp {
             "Enable to prefer 24-bit playback on supported receivers. This mode may cause crackling, brief dropouts, or multi-room issues on some devices or Wi-Fi networks. If problems occur, turn off 24-bit and start playback again.",
         ).to_owned();
 
-        ui.allocate_ui_at_rect(status_rect, |ui| {
-            ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
-                draw_status_badge(ui, status, status_tone);
-                ui.add_space(1.0);
+        let badge_rect = egui::Rect::from_min_size(
+            egui::pos2(status_rect.left(), row_y - 15.0),
+            egui::vec2(122.0, 30.0),
+        );
+        let bit_rect = egui::Rect::from_min_size(
+            egui::pos2(status_rect.right() - 48.0, row_y - 24.0),
+            egui::vec2(48.0, 48.0),
+        );
+
+        ui.allocate_ui_at_rect(badge_rect, |ui| {
+            draw_status_badge(ui, status, status_tone);
+        });
+
+        ui.allocate_ui_at_rect(bit_rect, |ui| {
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                 if hires_available {
                     let label = ui.label(
                         egui::RichText::new("24-bit")
@@ -1696,11 +1707,12 @@ impl SairplayApp {
                             .color(UiTheme::text_soft()),
                     );
                     show_hires_tooltip(label, &tooltip_title, &tooltip_body);
-                    ui.add_space(1.0);
+                    ui.add_space(2.0);
                     let toggle = draw_compact_switch(ui, &mut hires_enabled, hires_editable);
                     hires_clicked = toggle.clicked();
                     show_hires_tooltip(toggle, &tooltip_title, &tooltip_body);
                 } else {
+                    ui.add_space(12.0);
                     ui.label(
                         egui::RichText::new("16-bit")
                             .size(10.5)
@@ -1790,86 +1802,34 @@ impl SairplayApp {
             egui::vec2(ui.available_width(), height),
             egui::Layout::top_down(egui::Align::Center),
             |ui| {
-                ui.add_space(((height - 250.0) * 0.34).max(26.0));
+                // Fixed-size group keeps icon and text from ever overlapping
+                // regardless of panel height or window scaling.
+                let block_h = 126.0;
+                ui.add_space(((height - block_h) * 0.46).max(24.0));
 
-                let (art_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(190.0, 150.0), egui::Sense::hover());
-                let center = art_rect.center() + egui::vec2(0.0, -2.0);
+                let (icon_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(54.0, 54.0), egui::Sense::hover());
+                let center = icon_rect.center();
+
                 ui.painter().circle_filled(
                     center,
-                    72.0,
-                    egui::Color32::from_rgb(239, 246, 255),
-                );
-
-                if stereo_pair {
-                    let left = egui::Rect::from_center_size(
-                        center + egui::vec2(-31.0, 3.0),
-                        egui::vec2(58.0, 58.0),
-                    );
-                    let right = egui::Rect::from_center_size(
-                        center + egui::vec2(31.0, 3.0),
-                        egui::vec2(58.0, 58.0),
-                    );
-                    ui.put(
-                        left,
-                        egui::Image::new(egui::include_image!("../assets/mingcute_homepod_mini_filled.svg"))
-                            .fit_to_exact_size(left.size())
-                            .tint(egui::Color32::from_rgb(45, 52, 64)),
-                    );
-                    ui.put(
-                        right,
-                        egui::Image::new(egui::include_image!("../assets/mingcute_homepod_mini_filled.svg"))
-                            .fit_to_exact_size(right.size())
-                            .tint(egui::Color32::from_rgb(150, 160, 176)),
-                    );
-                } else {
-                    let laptop = egui::Rect::from_center_size(
-                        center + egui::vec2(-14.0, 4.0),
-                        egui::vec2(92.0, 92.0),
-                    );
-                    ui.put(
-                        laptop,
-                        egui::Image::new(egui::include_image!("../assets/mingcute_laptop_filled.svg"))
-                            .fit_to_exact_size(laptop.size())
-                            .tint(egui::Color32::from_rgb(111, 137, 176)),
-                    );
-                    let phone = egui::Rect::from_center_size(
-                        center + egui::vec2(42.0, 16.0),
-                        egui::vec2(30.0, 56.0),
-                    );
-                    ui.painter().rect_filled(
-                        phone,
-                        egui::CornerRadius::same(6),
-                        egui::Color32::from_rgb(247, 250, 255),
-                    );
-                    ui.painter().rect_stroke(
-                        phone,
-                        egui::CornerRadius::same(6),
-                        egui::Stroke::new(3.0, egui::Color32::from_rgb(111, 137, 176)),
-                        egui::StrokeKind::Inside,
-                    );
-                }
-
-                let search_center = center + egui::vec2(56.0, 48.0);
-                ui.painter().circle_filled(
-                    search_center,
-                    21.0,
+                    26.0,
                     egui::Color32::from_rgb(45, 137, 255),
                 );
                 ui.painter().circle_stroke(
-                    search_center + egui::vec2(-3.0, -3.0),
-                    7.5,
-                    egui::Stroke::new(2.6, egui::Color32::WHITE),
+                    center + egui::vec2(-3.5, -3.5),
+                    9.0,
+                    egui::Stroke::new(2.8, egui::Color32::WHITE),
                 );
                 ui.painter().line_segment(
                     [
-                        search_center + egui::vec2(3.0, 3.0),
-                        search_center + egui::vec2(10.0, 10.0),
+                        center + egui::vec2(3.0, 3.0),
+                        center + egui::vec2(11.0, 11.0),
                     ],
-                    egui::Stroke::new(2.6, egui::Color32::WHITE),
+                    egui::Stroke::new(2.8, egui::Color32::WHITE),
                 );
 
-                ui.add_space(7.0);
+                ui.add_space(14.0);
                 let title = if stereo_pair {
                     self.t(
                         "Chưa phát hiện cặp HomePod Stereo",
@@ -1884,7 +1844,8 @@ impl SairplayApp {
                         .strong()
                         .color(UiTheme::text()),
                 );
-                ui.add_space(4.0);
+
+                ui.add_space(5.0);
                 ui.label(
                     egui::RichText::new(self.t(
                         "Ấn vào biểu tượng / logo ứng dụng để quét lại thiết bị.",
@@ -3318,7 +3279,7 @@ fn draw_compact_switch(
     } else {
         egui::Sense::hover()
     };
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(34.0, 17.0), sense);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(38.0, 18.0), sense);
     if enabled && response.clicked() {
         *value = !*value;
     }
@@ -3326,7 +3287,7 @@ fn draw_compact_switch(
     let track = if *value {
         UiTheme::blue()
     } else {
-        egui::Color32::from_rgb(198, 209, 225)
+        egui::Color32::from_rgb(202, 212, 226)
     };
     ui.painter()
         .rect_filled(rect, egui::CornerRadius::same(9), track);
