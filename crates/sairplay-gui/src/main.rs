@@ -5,7 +5,8 @@ use sairplay_engine::{
     Ap2PreflightClient, DeviceCatalog, DeviceRecord, DiscoveredService, DiscoveryEvent,
     LegacyGroupSession, LegacyMemberConfig, MdnsBrowser, NativeGroupMemberConfig, NativeGroupSession,
     NativeSession, NativeSessionConfig, Route, ServiceKind, VolumeSetResult,
-    ALAC_44100_16_2, ALAC_44100_24_2, ALAC_48000_16_2, ALAC_48000_24_2,
+    WasapiLoopbackCapture, ALAC_44100_16_2, ALAC_44100_24_2, ALAC_48000_16_2,
+    ALAC_48000_24_2,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -3692,10 +3693,26 @@ fn native_config_for_device(
     config.receiver_name = device.display_name.clone();
     config.initial_volume = initial_volume;
     config.hires_enabled = hires_override.unwrap_or(false);
-    // Until the Windows system-audio source exposes a trustworthy source
-    // sample-rate clock, use the current 44.1 kHz session baseline. The native
-    // selector still gates 24-bit on the receiver's /info advertisement.
-    config.session_sample_rate = 44_100;
+
+    // Source-aligned rate policy ported from Music Assistant:
+    // - non-hi-res AirPlay stays at the 44.1/16 baseline;
+    // - a hi-res AirPlay 2 stream follows the shared/source session rate when
+    //   that rate is one of the supported 44.1/48 kHz rates;
+    // - any other source rate falls back to 44.1 kHz.
+    //
+    // SAirplay2's source is Windows system audio, so the shared-mode render
+    // engine mix rate is the Windows equivalent of MA's session PCM rate.
+    let source_mix_rate = WasapiLoopbackCapture::default_render_mix_sample_rate()
+        .unwrap_or(44_100);
+    config.session_sample_rate = if config.hires_enabled {
+        match source_mix_rate {
+            44_100 | 48_000 => source_mix_rate,
+            _ => 44_100,
+        }
+    } else {
+        44_100
+    };
+
     Ok(config)
 }
 
