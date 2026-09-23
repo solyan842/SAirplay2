@@ -66,9 +66,11 @@ impl WindowsAudioWorker {
         let startup_events_thread = Arc::clone(&startup_events);
 
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let audio_format = sender.audio_format();
+        let bytes_per_frame = audio_format.input_bytes_per_frame();
 
         let worker = thread::spawn(move || {
-            let capture = match WasapiLoopbackCapture::open_default() {
+            let capture = match WasapiLoopbackCapture::open_default_for_format(audio_format) {
                 Ok(capture) => {
                     let _ = ready_tx.send(Ok(()));
                     capture
@@ -84,7 +86,7 @@ impl WindowsAudioWorker {
                 }
             };
 
-            let mut chunker = Pcm352Chunker::new();
+            let mut chunker = Pcm352Chunker::new_with_bytes_per_frame(bytes_per_frame);
             let mut captured_frames_total = 0u64;
             let mut source_present = false;
             let mut cold_armed = false;
@@ -184,7 +186,7 @@ impl WindowsAudioWorker {
                                         let state = sender.state();
                                         let head_delta = sender.timeline_head_delta_frames(now_ntp);
                                         let head_delta_ms =
-                                            head_delta as f64 * 1000.0 / 44_100.0;
+                                            head_delta as f64 * 1000.0 / audio_format.sample_rate as f64;
                                         if let Ok(mut events) = startup_events_thread.lock() {
                                             events.push(format!(
                                                 "Transition: boundary #{} resume · head_delta_frames={} ({:.1} ms) · seq={} ts={} · pending_bytes={} · pad_debt={} · reanchors={} · {}.",
@@ -242,7 +244,7 @@ impl WindowsAudioWorker {
                                         let state = sender.state();
                                         let head_delta = sender.timeline_head_delta_frames(now_ntp);
                                         let head_delta_ms =
-                                            head_delta as f64 * 1000.0 / 44_100.0;
+                                            head_delta as f64 * 1000.0 / audio_format.sample_rate as f64;
                                         if let Ok(mut events) = startup_events_thread.lock() {
                                             events.push(format!(
                                                 "Transition: boundary #{} inferred · head_delta_frames={} ({:.1} ms) · seq={} ts={} · pending_bytes={} ({} frames) · pending_nonzero_bytes={} · pad_debt={} · reanchors={} · {}.",
@@ -440,7 +442,7 @@ impl WindowsAudioWorker {
                                 }
                             };
                             if sender.can_accept_frames(ntp) {
-                                let silence = [0u8; crate::PCM352_PACKET_BYTES];
+                                let silence = vec![0u8; crate::ALAC_FRAMES_PER_PACKET * bytes_per_frame];
                                 match sender.send_pcm_352(&silence, ntp, lead_frames) {
                                     Ok(result) => {
                                         let expected_sync =
@@ -488,7 +490,7 @@ impl WindowsAudioWorker {
                         loop {
                             let pad_now = sender.splice_pad_frames().min(352);
                             let real_frames_needed = 352usize - pad_now as usize;
-                            let real_bytes_needed = real_frames_needed * 4;
+                            let real_bytes_needed = real_frames_needed * bytes_per_frame;
 
                             if chunker.pending_bytes() < real_bytes_needed {
                                 break;
