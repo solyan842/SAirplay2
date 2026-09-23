@@ -9,6 +9,7 @@ use sairplay_engine::{
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -285,6 +286,9 @@ impl Default for SairplayApp {
         };
 
         let (hires_probe_tx, hires_probe_rx) = mpsc::channel();
+        let initial_volume_text = load_saved_volume()
+            .map(|volume| volume.to_string())
+            .unwrap_or_else(|| "50".to_owned());
 
         Self {
             log: {
@@ -303,7 +307,7 @@ impl Default for SairplayApp {
             membership_rx: None,
             membership_pending: BTreeSet::new(),
             session: None,
-            initial_volume_text: "50".into(),
+            initial_volume_text,
             volume_rx: None,
             pending_volume: None,
             legacy_secrets: BTreeMap::new(),
@@ -482,17 +486,10 @@ impl SairplayApp {
     }
 
     fn hires_enabled_for_fullname(&self, fullname: &str) -> bool {
-        if let Some(value) = self.hires_overrides.get(fullname) {
-            return *value;
-        }
-
-        self.catalog
-            .devices()
-            .iter()
-            .filter_map(|device| device.airplay.as_ref())
-            .find(|service| service.fullname == fullname)
-            .map(|service| service.txt.default_hires_enabled())
-            .unwrap_or(false)
+        // Product policy: 24-bit is explicit opt-in for every receiver.
+        // Capability controls whether the switch is offered; capability alone
+        // never enables the high-resolution path.
+        self.hires_overrides.get(fullname).copied().unwrap_or(false)
     }
 
     fn pump_connect_result(&mut self) {
@@ -2029,6 +2026,7 @@ impl SairplayApp {
 
                                     if response.changed() {
                                         self.initial_volume_text = volume.to_string();
+                                        save_volume(volume);
                                         self.apply_volume_value(volume);
                                     }
 
@@ -2379,7 +2377,7 @@ impl eframe::App for SairplayApp {
                                 ui.label(
                                     egui::RichText::new(self.t(
                                         "Giao thức truyền tải âm thanh không dây của Apple",
-                                        "Native AirPlay — Apple's lossless wireless audio transport using ALAC",
+                                        "Native AirPlay — Apple's lossless wireless audio transport",
                                     ))
                                     .size(13.0)
                                     .color(UiTheme::text_soft()),
@@ -3507,12 +3505,44 @@ fn native_config_for_device(
     config.apple_model = service.txt.is_apple_model();
     config.receiver_name = device.display_name.clone();
     config.initial_volume = initial_volume;
-    config.hires_enabled = hires_override.unwrap_or_else(|| service.txt.default_hires_enabled());
+    config.hires_enabled = hires_override.unwrap_or(false);
     // Until the Windows system-audio source exposes a trustworthy source
     // sample-rate clock, use the current 44.1 kHz session baseline. The native
     // selector still gates 24-bit on the receiver's /info advertisement.
     config.session_sample_rate = 44_100;
     Ok(config)
+}
+
+fn volume_settings_path() -> Option<PathBuf> {
+    let base = std::env::var_os("APPDATA")?;
+    Some(
+        PathBuf::from(base)
+            .join("SolYan")
+            .join("SAirplay2")
+            .join("settings.txt"),
+    )
+}
+
+fn load_saved_volume() -> Option<u8> {
+    let path = volume_settings_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines().find_map(|line| {
+        let value = line.strip_prefix("volume=")?.trim().parse::<u8>().ok()?;
+        (value <= 100).then_some(value)
+    })
+}
+
+fn save_volume(volume: u8) {
+    let Some(path) = volume_settings_path() else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let _ = std::fs::write(path, format!("volume={}\n", volume.min(100)));
 }
 
 fn parse_volume_text(value: &str) -> Result<Option<u8>, String> {
