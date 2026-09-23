@@ -8,7 +8,8 @@ use windows::Win32::Media::Audio::{
     WAVE_FORMAT_PCM,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
+    COINIT_MULTITHREADED,
 };
 
 const CHANNELS: u16 = 2;
@@ -79,6 +80,46 @@ pub struct WasapiLoopbackCapture {
 }
 
 impl WasapiLoopbackCapture {
+    /// Return the Windows shared-mode render-engine mix sample rate.
+    ///
+    /// This is the closest Windows equivalent of Music Assistant's shared
+    /// session PCM rate: the source/session clock is chosen first, and an
+    /// AirPlay 2 hi-res receiver follows it when that rate is one of the
+    /// supported 44.1/48 kHz rates.
+    pub fn default_render_mix_sample_rate() -> Result<u32, WasapiLoopbackError> {
+        let _com = ComGuard::enter()?;
+
+        unsafe {
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                    .map_err(|e| WasapiLoopbackError::Windows(format!(
+                        "MMDeviceEnumerator failed: {e}"
+                    )))?;
+
+            let endpoint = enumerator
+                .GetDefaultAudioEndpoint(eRender, eConsole)
+                .map_err(|e| WasapiLoopbackError::Windows(format!(
+                    "default render endpoint failed: {e}"
+                )))?;
+
+            let audio_client: IAudioClient = endpoint
+                .Activate(CLSCTX_ALL, None)
+                .map_err(|e| WasapiLoopbackError::Windows(format!(
+                    "IAudioClient activation failed: {e}"
+                )))?;
+
+            let mix_format = audio_client
+                .GetMixFormat()
+                .map_err(|e| WasapiLoopbackError::Windows(format!(
+                    "IAudioClient GetMixFormat failed: {e}"
+                )))?;
+
+            let sample_rate = (*mix_format).nSamplesPerSec;
+            CoTaskMemFree(Some(mix_format.cast()));
+            Ok(sample_rate)
+        }
+    }
+
     pub fn open_default() -> Result<Self, WasapiLoopbackError> {
         Self::open_default_for_format(Ap2AudioFormat::ALAC_44100_16_STEREO)
     }
