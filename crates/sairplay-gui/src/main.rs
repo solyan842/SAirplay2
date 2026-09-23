@@ -5,6 +5,7 @@ use sairplay_engine::{
     Ap2PreflightClient, DeviceCatalog, DeviceRecord, DiscoveredService, DiscoveryEvent,
     LegacyGroupSession, LegacyMemberConfig, MdnsBrowser, NativeGroupMemberConfig, NativeGroupSession,
     NativeSession, NativeSessionConfig, Route, ServiceKind, VolumeSetResult,
+    ALAC_44100_16_2, ALAC_44100_24_2, ALAC_48000_16_2, ALAC_48000_24_2,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -119,6 +120,8 @@ struct MembershipAdded {
 struct HiresProbeResult {
     fullname: String,
     advertised: Option<bool>,
+    realtime_mask: Option<u64>,
+    buffered_mask: Option<u64>,
 }
 
 enum LegacyPairingResult {
@@ -360,11 +363,23 @@ impl SairplayApp {
                     "123456789",
                 )
                 .get_info(&host, port)
-                .map(|result| result.info.advertises_hires())
                 .ok();
+
+                let advertised = result
+                    .as_ref()
+                    .map(|result| result.info.advertises_hires());
+                let realtime_mask = result
+                    .as_ref()
+                    .and_then(|result| result.info.realtime.known.then_some(result.info.realtime.mask));
+                let buffered_mask = result
+                    .as_ref()
+                    .and_then(|result| result.info.buffered.known.then_some(result.info.buffered.mask));
+
                 let _ = tx.send(HiresProbeResult {
                     fullname,
-                    advertised: result,
+                    advertised,
+                    realtime_mask,
+                    buffered_mask,
                 });
             })
             .expect("failed to spawn hi-res capability probe");
@@ -377,6 +392,36 @@ impl SairplayApp {
                 Some(advertised) => {
                     self.hires_capabilities
                         .insert(result.fullname.clone(), advertised);
+
+                    let union_mask =
+                        result.realtime_mask.unwrap_or(0) | result.buffered_mask.unwrap_or(0);
+                    let formats = [
+                        ("44.1/16", ALAC_44100_16_2),
+                        ("44.1/24", ALAC_44100_24_2),
+                        ("48/16", ALAC_48000_16_2),
+                        ("48/24", ALAC_48000_24_2),
+                    ]
+                    .into_iter()
+                    .filter_map(|(name, bit)| ((union_mask & bit) != 0).then_some(name))
+                    .collect::<Vec<_>>();
+
+                    self.log.push(format!(
+                        "{}: /info formats = {} · realtime_mask={} · buffered_mask={}.",
+                        result.fullname,
+                        if formats.is_empty() {
+                            "none of 44.1/16, 44.1/24, 48/16, 48/24".to_owned()
+                        } else {
+                            formats.join(", ")
+                        },
+                        result
+                            .realtime_mask
+                            .map(|mask| format!("0x{mask:016X}"))
+                            .unwrap_or_else(|| "unknown".into()),
+                        result
+                            .buffered_mask
+                            .map(|mask| format!("0x{mask:016X}"))
+                            .unwrap_or_else(|| "unknown".into()),
+                    ));
                     self.log.push(format!(
                         "{}: /info 24-bit capability = {}.",
                         result.fullname,
@@ -507,6 +552,19 @@ impl SairplayApp {
                 }
 
                 if success.session.audio_running() {
+                    if let Some(format) = success.session.audio_format() {
+                        let rate = if format.sample_rate == 44_100 {
+                            "44.1".to_owned()
+                        } else {
+                            format.sample_rate.to_string()
+                        };
+                        self.log.push(format!(
+                            "{}: negotiated stream format = ALAC {}-bit / {} kHz.",
+                            success.label,
+                            format.bit_depth,
+                            rate
+                        ));
+                    }
                     self.log.push(format!(
                         "{}: transport Ready, Windows audio running on {} receiver(s).",
                         success.label,
@@ -1538,7 +1596,7 @@ impl SairplayApp {
         const ROW_H: f32 = 76.0;
         const SELECTOR_W: f32 = 24.0;
         const ART_W: f32 = 70.0;
-        const STATUS_W: f32 = 186.0;
+        const STATUS_W: f32 = 166.0;
 
         let members = device_selection_members(device, stereo_pair);
         let member_set = members.iter().cloned().collect::<BTreeSet<_>>();
@@ -1686,12 +1744,12 @@ impl SairplayApp {
         ).to_owned();
 
         let badge_rect = egui::Rect::from_min_size(
-            egui::pos2(status_rect.left(), row_y - 15.0),
-            egui::vec2(122.0, 30.0),
+            egui::pos2(status_rect.left(), row_y - 14.0),
+            egui::vec2(110.0, 28.0),
         );
         let bit_rect = egui::Rect::from_min_size(
-            egui::pos2(status_rect.right() - 48.0, row_y - 24.0),
-            egui::vec2(48.0, 48.0),
+            egui::pos2(status_rect.right() - 44.0, row_y - 23.0),
+            egui::vec2(44.0, 46.0),
         );
 
         ui.allocate_ui_at_rect(badge_rect, |ui| {
@@ -3398,19 +3456,20 @@ fn draw_info_popover(
 
 fn draw_status_badge(ui: &mut egui::Ui, text: &str, tone: StatusTone) {
     let (bg, dot, text_color) = tone.colors();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(122.0, 30.0), egui::Sense::hover());
+    let width = ui.available_width().clamp(104.0, 122.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::hover());
 
     ui.painter()
-        .rect_filled(rect, egui::CornerRadius::same(15), bg);
+        .rect_filled(rect, egui::CornerRadius::same(14), bg);
 
-    let dot_center = egui::pos2(rect.left() + 16.0, rect.center().y);
-    ui.painter().circle_filled(dot_center, 5.0, dot);
+    let dot_center = egui::pos2(rect.left() + 14.0, rect.center().y);
+    ui.painter().circle_filled(dot_center, 4.5, dot);
 
     ui.painter().text(
-        egui::pos2(rect.left() + 28.0, rect.center().y),
+        egui::pos2(rect.left() + 25.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         text,
-        egui::FontId::proportional(12.5),
+        egui::FontId::proportional(12.0),
         text_color,
     );
 }
