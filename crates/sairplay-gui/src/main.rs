@@ -271,6 +271,9 @@ struct SairplayApp {
     activation_key: String,
     last_feedback_error: Option<String>,
     last_retransmit_stats: RetransmitStats,
+    hires_quality_warning_open: bool,
+    hires_quality_warning_shown: bool,
+    hires_quality_warning_text: String,
     show_multiroom_info: bool,
     show_pair_info: bool,
     device_textures: HashMap<DeviceArtwork, egui::TextureHandle>,
@@ -343,6 +346,9 @@ impl Default for SairplayApp {
             activation_key: String::new(),
             last_feedback_error: None,
             last_retransmit_stats: RetransmitStats::default(),
+            hires_quality_warning_open: false,
+            hires_quality_warning_shown: false,
+            hires_quality_warning_text: String::new(),
             show_multiroom_info: false,
             show_pair_info: false,
             device_textures: HashMap::new(),
@@ -582,6 +588,9 @@ impl SairplayApp {
                         success.active_fullnames.len()
                     ));
                     self.last_retransmit_stats = success.session.retransmit_stats();
+                    self.hires_quality_warning_open = false;
+                    self.hires_quality_warning_shown = false;
+                    self.hires_quality_warning_text.clear();
                     self.active_fullnames = success.active_fullnames;
                     self.active_mode = Some(success.mode);
                     self.playback = PlaybackUiState::Playing(success.label);
@@ -1092,6 +1101,51 @@ impl SairplayApp {
         }
     }
 
+    fn render_hires_quality_warning(&mut self, ctx: &egui::Context) {
+        if !self.hires_quality_warning_open {
+            return;
+        }
+
+        let title = self.t("Cảnh báo chất lượng 24-bit", "24-bit Quality Warning");
+        let close_label = self.t("Đã hiểu", "Got it");
+        let mut open = self.hires_quality_warning_open;
+
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(430.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(self.t(
+                        "Phát hiện mất gói không thể khôi phục",
+                        "Unrecoverable packet loss detected",
+                    ))
+                    .size(15.0)
+                    .strong()
+                    .color(UiTheme::amber()),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(&self.hires_quality_warning_text)
+                        .size(12.5)
+                        .color(UiTheme::text()),
+                );
+                ui.add_space(12.0);
+                if ui
+                    .add(
+                        egui::Button::new(close_label)
+                            .min_size(egui::vec2(96.0, 32.0)),
+                    )
+                    .clicked()
+                {
+                    self.hires_quality_warning_open = false;
+                }
+            });
+
+        self.hires_quality_warning_open &= open;
+    }
+
     fn render_pairing_window(&mut self, ctx: &egui::Context) {
         if !self.pairing_open {
             return;
@@ -1194,6 +1248,36 @@ impl SairplayApp {
                     rtx.requested,
                     answered_delta,
                     rtx.answered,
+                    expired_delta,
+                    rtx.expired
+                ));
+            }
+
+            // A retransmit request by itself is recoverable and is not enough
+            // to call the 24-bit path unhealthy. "expired" is the objective
+            // failure signal we already measure: the receiver requested an RTP
+            // packet that had fallen out of the retransmit ring and could not
+            // be recovered. Warn once per 24-bit session; never auto-downgrade.
+            let is_hires_24 = session
+                .audio_format()
+                .is_some_and(|format| format.bit_depth > 16);
+            if is_hires_24 && expired_delta > 0 && !self.hires_quality_warning_shown {
+                self.hires_quality_warning_shown = true;
+                self.hires_quality_warning_open = true;
+                self.hires_quality_warning_text = match self.language {
+                    UiLanguage::Vi => format!(
+                        "Đường truyền 24-bit đang không đạt độ ổn định cần thiết. HomePod/receiver đã yêu cầu truyền lại nhưng có {} gói RTP không còn trong bộ đệm để khôi phục (tổng {}).\n\nBạn có thể tiếp tục nghe, nhưng nếu có mất tiếng, rè hoặc ngắt quãng thì nên chuyển thiết bị này về 16-bit.",
+                        expired_delta,
+                        rtx.expired
+                    ),
+                    UiLanguage::En => format!(
+                        "The 24-bit path is not meeting the required stability. The HomePod/receiver requested retransmission, but {} RTP packet(s) were no longer available for recovery ({} total).\n\nYou can keep listening, but if you hear dropouts, crackle, or silence, switch this receiver back to 16-bit.",
+                        expired_delta,
+                        rtx.expired
+                    ),
+                };
+                self.log.push(format!(
+                    "24-bit quality warning: unrecoverable retransmit loss detected · expired +{} (total {}).",
                     expired_delta,
                     rtx.expired
                 ));
@@ -2636,6 +2720,7 @@ impl eframe::App for SairplayApp {
 
         self.render_pairing_window(ctx);
         self.render_activation_window(ctx);
+        self.render_hires_quality_warning(ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 }
