@@ -4,7 +4,7 @@ use crate::{
     EventChannel, FeedbackWorker, MediaHandshakeConfig, NativeConnectFlow, NativePhase,
     NtpSessionSetupConfig, NtpTimingResponder, PairingError, PreflightError, PtpEngine,
     PtpSessionSetupConfig, RealtimeMediaSender, RecordConfig, RetransmitRing,
-    Ap2AudioFormat, NativeVolumeControl, RetransmitStats, RetransmitWorker, RtpState,
+    select_native_stream_format, Ap2AudioFormat, NativeVolumeControl, RetransmitStats, RetransmitWorker, RtpState,
     SetPeersConfig, TransientPairingClient,
     VolumeSetResult, set_native_volume,
 };
@@ -33,7 +33,13 @@ pub struct NativeSessionConfig {
     pub apple_model: bool,
     pub receiver_name: String,
     pub initial_volume: Option<u8>,
-    pub audio_format: Ap2AudioFormat,
+    /// Mirrors Music Assistant's per-device 24-bit toggle. Capability alone
+    /// never enables hi-res; callers opt in after applying their device-family
+    /// default (HomePod is off by default upstream).
+    pub hires_enabled: bool,
+    /// Sample rate of the shared/source PCM session. Upstream keeps 44.1/48 kHz
+    /// when supported and falls back to 44.1 kHz for any other source rate.
+    pub session_sample_rate: u32,
 }
 
 impl NativeSessionConfig {
@@ -50,7 +56,8 @@ impl NativeSessionConfig {
             apple_model: false,
             receiver_name: "SAirplay2 Receiver".into(),
             initial_volume: None,
-            audio_format: Ap2AudioFormat::ALAC_44100_16_STEREO,
+            hires_enabled: false,
+            session_sample_rate: 44_100,
         }
     }
 }
@@ -113,6 +120,7 @@ pub struct NativeSession {
     cold_start_delay_ms: u64,
     ptp_receiver_ip: Option<IpAddr>,
     initial_volume_result: Option<VolumeSetResult>,
+    audio_format: Ap2AudioFormat,
     #[cfg(windows)]
     audio_worker: Option<WindowsAudioWorker>,
 }
@@ -144,6 +152,11 @@ impl NativeSession {
 
         let local_addr = stream.local_addr().map_err(NativeSessionError::LocalAddress)?;
         let receiver_ip = info.peer.ip();
+        let audio_format = select_native_stream_format(
+            &info.info,
+            config.hires_enabled,
+            config.session_sample_rate,
+        );
 
         let pairing_client = TransientPairingClient::default();
         let pairing = pairing_client
@@ -310,7 +323,7 @@ impl NativeSession {
             active_remote: config.active_remote.clone(),
             audio_secret,
             stream_connection_id: session_id,
-            audio_format: config.audio_format,
+            audio_format,
         };
         let media = prepare_realtime_media(&mut flow, &mut control, &media)
             .map_err(|e| NativeSessionError::Media(format!("{e:?}")))?;
@@ -318,7 +331,7 @@ impl NativeSession {
         // Upstream clamps the configured lead into the receiver-reported
         // latency window immediately after Stream SETUP.
         let requested_lead = ((config.lead_frames as u64
-            * config.audio_format.sample_rate as u64)
+            * audio_format.sample_rate as u64)
             / 44_100) as u32;
         let min_frames = media.latency_min.unwrap_or(0);
         let max_frames = media.latency_max.unwrap_or(requested_lead);
@@ -424,14 +437,14 @@ impl NativeSession {
                 rtp,
                 audio_secret,
                 clock,
-                config.audio_format,
+                audio_format,
             )
         } else {
             RealtimeMediaSender::new_with_format(
                 media.transport,
                 rtp,
                 audio_secret,
-                config.audio_format,
+                audio_format,
             )
         };
         if retransmit.is_some() {
@@ -457,6 +470,7 @@ impl NativeSession {
             cold_start_delay_ms,
             ptp_receiver_ip,
             initial_volume_result,
+            audio_format,
             #[cfg(windows)]
             audio_worker: None,
         })
@@ -468,6 +482,10 @@ impl NativeSession {
 
     pub fn is_ready(&self) -> bool {
         self.flow.phase() == NativePhase::Ready
+    }
+
+    pub fn audio_format(&self) -> Ap2AudioFormat {
+        self.audio_format
     }
 
     pub fn control_channel(&self) -> crate::SharedRtspControl {
