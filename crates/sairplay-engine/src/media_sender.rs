@@ -695,7 +695,7 @@ mod tests {
         let state = RtpState::new(0x0102, 50_000, 0x10203040);
         let mut sender = RealtimeMediaSender::new(transport, state, [0x55u8; 32]);
 
-        let pcm = vec![0u8; ALAC_PCM_PACKET_BYTES];
+        let pcm = vec![0u8; crate::ALAC_PCM_PACKET_BYTES];
         let result = sender.send_pcm_352(&pcm, 0x0102030405060708, 11_025).unwrap();
 
         assert!(result.sync_sent);
@@ -782,7 +782,7 @@ mod tests {
         let state = RtpState::new(1, 0, 1);
         let mut sender = RealtimeMediaSender::new(transport, state, [0x11u8; 32]);
 
-        let err = sender.send_pcm_352(&vec![0u8; ALAC_PCM_PACKET_BYTES - 4], 0, 0);
+        let err = sender.send_pcm_352(&vec![0u8; crate::ALAC_PCM_PACKET_BYTES - 4], 0, 0);
         assert!(matches!(err, Err(MediaSendError::Alac(_))));
         assert_eq!(sender.state(), state);
     }
