@@ -1,5 +1,5 @@
 use crate::{
-    system_time_to_ntp, NativeMetadataControl, Pcm352Chunker, RealtimeMediaSender,
+    system_time_to_ntp, Ap2AudioFormat, NativeMetadataControl, Pcm352Chunker, RealtimeMediaSender,
     WasapiLoopbackCapture, WasapiLoopbackError,
 };
 use std::fmt;
@@ -134,16 +134,35 @@ impl WindowsMultiroomAudioWorker {
             return Err(WindowsMultiroomAudioError::EmptyGroup);
         }
 
-        let audio_format = targets[0].sender.audio_format();
+        let sample_rate = targets[0].sender.audio_format().sample_rate;
         if targets
             .iter()
-            .any(|target| target.sender.audio_format() != audio_format)
+            .any(|target| target.sender.audio_format().sample_rate != sample_rate)
         {
             return Err(WindowsMultiroomAudioError::Media(
-                "multi-room targets must share one common PCM/ALAC format".into(),
+                "multi-room per-member sample-rate conversion is not available yet".into(),
             ));
         }
-        let bytes_per_frame = audio_format.input_bytes_per_frame();
+
+        // Upstream AirPlay groups own one shared source PCM stream and then
+        // convert per member before each cliairplay stdin. Mirror that shape:
+        // capture the richest bit depth required by the current group, then
+        // derive each member's exact handoff format independently.
+        let source_format = if targets
+            .iter()
+            .any(|target| target.sender.audio_format().bit_depth > 16)
+        {
+            if sample_rate == 48_000 {
+                Ap2AudioFormat::ALAC_48000_24_STEREO
+            } else {
+                Ap2AudioFormat::ALAC_44100_24_STEREO
+            }
+        } else if sample_rate == 48_000 {
+            Ap2AudioFormat::ALAC_48000_16_STEREO
+        } else {
+            Ap2AudioFormat::ALAC_44100_16_STEREO
+        };
+        let bytes_per_frame = source_format.input_bytes_per_frame();
 
         let running = Arc::new(AtomicBool::new(true));
         let running_thread = Arc::clone(&running);
@@ -168,7 +187,7 @@ impl WindowsMultiroomAudioWorker {
         let worker = thread::Builder::new()
             .name("sairplay-multiroom-audio".into())
             .spawn(move || {
-                let capture = match WasapiLoopbackCapture::open_default_for_format(audio_format) {
+                let capture = match WasapiLoopbackCapture::open_default_for_format(source_format) {
                     Ok(capture) => {
                         let _ = ready_tx.send(Ok(()));
                         capture
@@ -203,6 +222,7 @@ impl WindowsMultiroomAudioWorker {
                         packet_index,
                         &active_members_thread,
                         &startup_events_thread,
+                        source_format,
                     );
 
                     let report = match capture.drain_into(&mut chunker) {
@@ -447,7 +467,23 @@ impl WindowsMultiroomAudioWorker {
                         let mut failed = Vec::<(usize, String)>::new();
 
                         for (index, target) in targets.iter_mut().enumerate() {
-                            match target.sender.send_pcm_352(&packet, ntp, target.lead_frames) {
+                            let target_format = target.sender.audio_format();
+                            let target_packet = match adapt_group_pcm_packet(
+                                &packet,
+                                source_format,
+                                target_format,
+                            ) {
+                                Ok(packet) => packet,
+                                Err(error) => {
+                                    failed.push((index, format!("{} media format failed: {error}", target.name)));
+                                    continue;
+                                }
+                            };
+                            match target.sender.send_pcm_352(
+                                &target_packet,
+                                ntp,
+                                target.lead_frames,
+                            ) {
                                 Ok(_) => {}
                                 Err(error) => failed.push((
                                     index,
@@ -586,6 +622,35 @@ impl Drop for WindowsMultiroomAudioWorker {
     }
 }
 
+fn adapt_group_pcm_packet(
+    packet: &[u8],
+    source: Ap2AudioFormat,
+    target: Ap2AudioFormat,
+) -> Result<Vec<u8>, String> {
+    if source.sample_rate != target.sample_rate || source.channels != target.channels {
+        return Err("sample-rate/channel conversion is not available".into());
+    }
+    if source.bit_depth == target.bit_depth {
+        return Ok(packet.to_vec());
+    }
+
+    // The upstream 24-bit handoff is s32le with the useful sample in the upper
+    // 24 bits. A 16-bit member receives the upper 16 bits of that same sample,
+    // exactly the per-member depth reduction needed before its 16-bit ALAC path.
+    if source.bit_depth > 16 && target.bit_depth == 16 {
+        if packet.len() % 4 != 0 {
+            return Err("misaligned s32le shared PCM".into());
+        }
+        let mut out = Vec::with_capacity(packet.len() / 2);
+        for sample in packet.chunks_exact(4) {
+            out.extend_from_slice(&sample[2..4]);
+        }
+        return Ok(out);
+    }
+
+    Err("unsupported shared PCM conversion".into())
+}
+
 fn handle_group_commands(
     command_rx: &Receiver<GroupAudioCommand>,
     targets: &mut Vec<WindowsAudioTarget>,
@@ -595,10 +660,26 @@ fn handle_group_commands(
     packet_index: u64,
     active_members: &AtomicU64,
     startup_events: &Mutex<Vec<String>>,
+    source_format: Ap2AudioFormat,
 ) {
     while let Ok(command) = command_rx.try_recv() {
         match command {
             GroupAudioCommand::Add { mut target, reply } => {
+                let target_format = target.sender.audio_format();
+                if target_format.sample_rate != source_format.sample_rate
+                    || (target_format.bit_depth > source_format.bit_depth)
+                {
+                    let _ = reply.send(Err(format!(
+                        "{} requires {}-bit/{} Hz but the live shared source is {}-bit/{} Hz; restart the group so the shared source can be renegotiated",
+                        target.name,
+                        target_format.bit_depth,
+                        target_format.sample_rate,
+                        source_format.bit_depth,
+                        source_format.sample_rate,
+                    )));
+                    continue;
+                }
+
                 if targets.iter().any(|item| item.name == target.name)
                     || pending_joins.iter().any(|item| item.target.name == target.name)
                 {
@@ -761,4 +842,36 @@ fn frames_to_ntp(frames: u64) -> u64 {
 
 fn ntp_delta_to_frames_ceil(delta: u64) -> u64 {
     ((delta as u128) * 44_100u128).div_ceil(1u128 << 32) as u64
+}
+
+#[cfg(test)]
+mod mixed_format_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_depth_group_downconverts_s32le_to_s16le() {
+        let input = vec![
+            0x11, 0x22, 0x33, 0x44,
+            0x55, 0x66, 0x77, 0x88,
+        ];
+        let out = adapt_group_pcm_packet(
+            &input,
+            Ap2AudioFormat::ALAC_44100_24_STEREO,
+            Ap2AudioFormat::ALAC_44100_16_STEREO,
+        )
+        .unwrap();
+        assert_eq!(out, vec![0x33, 0x44, 0x77, 0x88]);
+    }
+
+    #[test]
+    fn mixed_depth_group_preserves_same_format() {
+        let input = vec![1, 2, 3, 4];
+        let out = adapt_group_pcm_packet(
+            &input,
+            Ap2AudioFormat::ALAC_44100_16_STEREO,
+            Ap2AudioFormat::ALAC_44100_16_STEREO,
+        )
+        .unwrap();
+        assert_eq!(out, input);
+    }
 }
