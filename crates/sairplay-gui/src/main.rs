@@ -394,7 +394,15 @@ impl SairplayApp {
             return;
         };
 
+        // Drain first so processing an event may mutate other app state
+        // (including starting an async /info capability probe) without holding
+        // an immutable borrow of discovery_rx across the loop body.
+        let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+
+        for event in events {
             match event {
                 DiscoveryEvent::Upsert(service) => {
                     let kind = match service.kind {
@@ -1535,7 +1543,6 @@ impl SairplayApp {
         const ART_W: f32 = 70.0;
         const STATUS_W: f32 = 126.0;
 
-        let route = device.route(false, false);
         let members = device_selection_members(device, stereo_pair);
         let member_set = members.iter().cloned().collect::<BTreeSet<_>>();
         let selected = if stereo_pair {
