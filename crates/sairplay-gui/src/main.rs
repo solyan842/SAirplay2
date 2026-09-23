@@ -52,6 +52,14 @@ impl ActiveSession {
         }
     }
 
+    fn audio_format(&self) -> Option<sairplay_engine::Ap2AudioFormat> {
+        match self {
+            Self::Single(session) => Some(session.audio_format()),
+            Self::Group(session) => session.audio_format(),
+            Self::Legacy(_) => None,
+        }
+    }
+
     fn drain_startup_events(&self) -> Vec<String> {
         match self {
             Self::Single(session) => session.drain_startup_events(),
@@ -1281,26 +1289,39 @@ impl SairplayApp {
         self.native_retry_available = true;
     }
 
-    fn header_status(&self) -> (&'static str, &'static str, egui::Color32) {
+    fn header_status(&self) -> (&'static str, String, egui::Color32) {
         match &self.playback {
             PlaybackUiState::Idle => (
                 self.t("Sẵn sàng", "Ready"),
-                self.t("Đang chờ phát nhạc...", "Waiting for playback..."),
+                self.t("Đang chờ phát nhạc...", "Waiting for playback...").to_owned(),
                 UiTheme::green(),
             ),
             PlaybackUiState::Connecting(_) => (
                 self.t("Đang kết nối", "Connecting"),
-                self.t("Đang chuẩn bị thiết bị...", "Preparing receiver..."),
+                self.t("Đang chuẩn bị thiết bị...", "Preparing receiver...").to_owned(),
                 UiTheme::amber(),
             ),
-            PlaybackUiState::Playing(_) => (
-                self.t("Đang chạy", "Running"),
-                self.t("Đang truyền âm thanh qua AirPlay", "Streaming via AirPlay"),
-                UiTheme::blue(),
-            ),
+            PlaybackUiState::Playing(_) => {
+                let detail = match self.session.as_ref().and_then(ActiveSession::audio_format) {
+                    Some(format) => format!(
+                        "AirPlay 2 · ALAC · {}-bit / {} kHz",
+                        format.bit_depth,
+                        if format.sample_rate == 44_100 { "44.1".to_owned() } else { (format.sample_rate / 1000).to_string() }
+                    ),
+                    None => self.t(
+                        "Đang truyền âm thanh qua AirPlay",
+                        "Streaming via AirPlay",
+                    ).to_owned(),
+                };
+                (
+                    self.t("Đang chạy", "Running"),
+                    detail,
+                    UiTheme::blue(),
+                )
+            },
             PlaybackUiState::Error(_) => (
                 self.t("Lỗi kết nối", "Connection Error"),
-                self.t("Xem Log để kiểm tra", "Open Log for details"),
+                self.t("Xem Log để kiểm tra", "Open Log for details").to_owned(),
                 UiTheme::red(),
             ),
         }
@@ -2222,7 +2243,7 @@ impl eframe::App for SairplayApp {
                                 ui.add_space(1.0);
                                 ui.label(
                                     egui::RichText::new(self.t(
-                                        "Giao thức truyền tải âm thanh không dây lossless của Apple sử dụng ALAC",
+                                        "Giao thức truyền tải âm thanh không dây của Apple",
                                         "Native AirPlay — Apple's lossless wireless audio transport using ALAC",
                                     ))
                                     .size(13.0)
