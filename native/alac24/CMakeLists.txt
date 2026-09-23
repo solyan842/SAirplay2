@@ -10,6 +10,7 @@ add_library(sairplay-alac24 SHARED
   "${ALAC_SOURCE}/EndianPortable.c"
   "${ALAC_SOURCE}/ALACBitUtilities.c"
   "${ALAC_SOURCE}/ALACEncoder.cpp"
+  "${ALAC_SOURCE}/ag_dec.c"
   "${ALAC_SOURCE}/ag_enc.c"
   "${ALAC_SOURCE}/dp_enc.c"
   "${ALAC_SOURCE}/matrix_enc.c"
