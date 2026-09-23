@@ -134,6 +134,17 @@ impl WindowsMultiroomAudioWorker {
             return Err(WindowsMultiroomAudioError::EmptyGroup);
         }
 
+        let audio_format = targets[0].sender.audio_format();
+        if targets
+            .iter()
+            .any(|target| target.sender.audio_format() != audio_format)
+        {
+            return Err(WindowsMultiroomAudioError::Media(
+                "multi-room targets must share one common PCM/ALAC format".into(),
+            ));
+        }
+        let bytes_per_frame = audio_format.input_bytes_per_frame();
+
         let running = Arc::new(AtomicBool::new(true));
         let running_thread = Arc::clone(&running);
         let last_error = Arc::new(Mutex::new(None));
@@ -157,7 +168,7 @@ impl WindowsMultiroomAudioWorker {
         let worker = thread::Builder::new()
             .name("sairplay-multiroom-audio".into())
             .spawn(move || {
-                let capture = match WasapiLoopbackCapture::open_default() {
+                let capture = match WasapiLoopbackCapture::open_default_for_format(audio_format) {
                     Ok(capture) => {
                         let _ = ready_tx.send(Ok(()));
                         capture
@@ -173,7 +184,7 @@ impl WindowsMultiroomAudioWorker {
                     }
                 };
 
-                let mut chunker = Pcm352Chunker::new();
+                let mut chunker = Pcm352Chunker::new_with_bytes_per_frame(bytes_per_frame);
                 let mut captured_frames_total = 0u64;
                 let mut source_present = false;
                 let mut cold_armed = false;
@@ -402,7 +413,7 @@ impl WindowsMultiroomAudioWorker {
                             .unwrap_or(0)
                             .min(352);
                         let real_frames_needed = 352usize - pad_now as usize;
-                        let real_bytes_needed = real_frames_needed * 4;
+                        let real_bytes_needed = real_frames_needed * bytes_per_frame;
                         if chunker.pending_bytes() < real_bytes_needed {
                             break;
                         }
