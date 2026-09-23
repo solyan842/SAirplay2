@@ -234,6 +234,7 @@ struct SairplayApp {
     volume_rx: Option<Receiver<Result<Vec<VolumeSetResult>, String>>>,
     pending_volume: Option<u8>,
     legacy_secrets: BTreeMap<String, String>,
+    hires_overrides: BTreeMap<String, bool>,
     pairing_rx: Option<Receiver<LegacyPairingResult>>,
     pairing_pin_tx: Option<SyncSender<String>>,
     pairing_open: bool,
@@ -295,6 +296,7 @@ impl Default for SairplayApp {
             volume_rx: None,
             pending_volume: None,
             legacy_secrets: BTreeMap::new(),
+            hires_overrides: BTreeMap::new(),
             pairing_rx: None,
             pairing_pin_tx: None,
             pairing_open: false,
@@ -526,7 +528,8 @@ impl SairplayApp {
                 ));
                 continue;
             }
-            match native_config_for_device(device, initial_volume) {
+            let hires_override = self.hires_overrides.get(fullname).copied();
+            match native_config_for_device(device, initial_volume, hires_override) {
                 Ok(config) => requests.push((fullname.clone(), config)),
                 Err(error) => self.log.push(error),
             }
@@ -1199,26 +1202,23 @@ impl SairplayApp {
 
         if all_native {
             let mut configs = Vec::<NativeGroupMemberConfig>::with_capacity(member_count);
-            for (_, device) in &selected_devices {
-                let service = device.airplay.as_ref().expect("selected AirPlay service");
-                let host = preferred_service_address(service);
-                let mut config = NativeSessionConfig::new(host.clone(), service.port);
-                config.dacp_id = "A1B2C3D4E5F60708".into();
-                config.active_remote = "123456789".into();
-                config.supports_ptp = service.txt.supports_ptp();
-                config.follow_receiver_clock = service.txt.follows_receiver_clock();
-                config.apple_model = service.txt.is_apple_model();
-                config.receiver_name = device.display_name.clone();
-                config.initial_volume = initial_volume;
-                config.hires_enabled = service.txt.default_hires_enabled();
-                // This app currently has one system-audio session clock. Until
-                // source-format negotiation is exposed by the Windows capture
-                // layer, keep the source baseline session rate rather than
-                // inventing a receiver-preferred 48 kHz clock.
-                config.session_sample_rate = 44_100;
-
+            for (fullname, device) in &selected_devices {
+                let hires_override = self.hires_overrides.get(fullname).copied();
+                let config = match native_config_for_device(
+                    device,
+                    initial_volume,
+                    hires_override,
+                ) {
+                    Ok(config) => config,
+                    Err(message) => {
+                        self.log.push(message.clone());
+                        self.playback = PlaybackUiState::Error(message);
+                        self.connect_rx = None;
+                        return;
+                    }
+                };
                 configs.push(NativeGroupMemberConfig::new(
-                    service.fullname.clone(),
+                    fullname.clone(),
                     config,
                 ));
             }
@@ -3357,6 +3357,7 @@ fn legacy_config_for_device(
 fn native_config_for_device(
     device: &DeviceRecord,
     initial_volume: Option<u8>,
+    hires_override: Option<bool>,
 ) -> Result<NativeSessionConfig, String> {
     let service = device
         .airplay
@@ -3371,6 +3372,11 @@ fn native_config_for_device(
     config.apple_model = service.txt.is_apple_model();
     config.receiver_name = device.display_name.clone();
     config.initial_volume = initial_volume;
+    config.hires_enabled = hires_override.unwrap_or_else(|| service.txt.default_hires_enabled());
+    // Until the Windows system-audio source exposes a trustworthy source
+    // sample-rate clock, use the current 44.1 kHz session baseline. The native
+    // selector still gates 24-bit on the receiver's /info advertisement.
+    config.session_sample_rate = 44_100;
     Ok(config)
 }
 
