@@ -87,7 +87,12 @@ pub use retransmit::{RetransmitRing, RetransmitStats, RetransmitWorker, RTX_RING
 pub use teardown::{send_teardown, TeardownError};
 pub use volume::{set_native_volume, volume_percent_to_db, NativeVolumeControl, VolumeError, VolumeSetResult};
 pub use native_metadata::{build_dmap_metadata, send_native_metadata, MetadataError, MetadataSetResult, NativeMetadataControl};
-pub use alac_encoder::{encode_alac_16_stereo_352, AlacEncodeError, ALAC_PCM_BYTES_PER_FRAME, ALAC_PCM_PACKET_BYTES, ALAC_FRAMES_PER_PACKET};
+pub use alac_encoder::{
+    encode_alac_16_stereo_352, truncate_s32le_to_s24le, AlacEncodeError,
+    ALAC_PCM_BYTES_PER_FRAME, ALAC_PCM_PACKET_BYTES, ALAC_FRAMES_PER_PACKET,
+};
+#[cfg(windows)]
+pub use alac_encoder::Alac24Encoder;
 pub use pcm_chunker::{Pcm352Chunker, PCM352_PACKET_BYTES};
 #[cfg(windows)]
 pub use wasapi_loopback::{WasapiDrainReport, WasapiLoopbackCapture, WasapiLoopbackError};
