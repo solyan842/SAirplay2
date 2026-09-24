@@ -459,17 +459,6 @@ impl RealtimeMediaSender {
         let alac_payload_len = alac_payload.len();
         let wire_packet_len = packet.len();
 
-        // Keep every sequence that enters the wire timeline in retransmit
-        // history, including the rare Windows local-UDP deadline drop. The
-        // source advances sequence/timestamp after a transient local drop; if
-        // the next packet arrives, the receiver asks for this missing seq.
-        // Retaining the already-built encrypted packet lets D5/D6 repair that
-        // exact hole instead of expiring the request (the long-run crackle
-        // signature observed in the field log).
-        if let Some(ring) = &self.retransmit {
-            ring.store(sequence_sent, &packet);
-        }
-
         let audio_delivered = match self
             .transport
             .send_data_deadline(&packet, Duration::from_millis(20))?
@@ -477,6 +466,15 @@ impl RealtimeMediaSender {
             DatagramSendOutcome::Sent(_) => true,
             DatagramSendOutcome::Dropped => false,
         };
+
+        // MSA parity: only packets accepted by the local UDP socket enter the
+        // retransmit ring. A local send drop still advances the RTP timeline,
+        // but there is no original wire packet to advertise as recoverable.
+        if audio_delivered {
+            if let Some(ring) = &self.retransmit {
+                ring.store(sequence_sent, &packet);
+            }
+        }
 
         // Upstream advances the media timeline even on a transient local UDP
         // drop; retrying an old timestamp late is worse than exposing a gap.
