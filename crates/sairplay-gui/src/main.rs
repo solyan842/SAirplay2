@@ -1270,13 +1270,15 @@ impl SairplayApp {
             let expired_delta = rtx.expired.saturating_sub(prev.expired);
             if requested_delta != 0 || expired_delta != 0 {
                 self.log.push(format!(
-                    "Diagnostic: retransmit activity · requested +{} (total {}) · answered +{} (total {}) · expired +{} (total {}).",
+                    "Diagnostic: retransmit activity · requested +{} (total {}) · answered +{} (total {}) · expired +{} (total {}) · requested_wire>1472={} · max_requested_wire={} B.",
                     requested_delta,
                     rtx.requested,
                     answered_delta,
                     rtx.answered,
                     expired_delta,
-                    rtx.expired
+                    rtx.expired,
+                    rtx.requested_over_1472,
+                    rtx.max_requested_wire_len
                 ));
             }
 

@@ -95,6 +95,10 @@ pub struct RetransmitStats {
     pub requested: u64,
     pub answered: u64,
     pub expired: u64,
+    /// Requested original packets whose UDP payload exceeds the common
+    /// IPv4/Ethernet non-fragmenting payload ceiling (1500 MTU - 20 IP - 8 UDP).
+    pub requested_over_1472: u64,
+    pub max_requested_wire_len: u64,
 }
 
 pub struct RetransmitWorker {
@@ -103,6 +107,8 @@ pub struct RetransmitWorker {
     requested: Arc<AtomicU64>,
     answered: Arc<AtomicU64>,
     expired: Arc<AtomicU64>,
+    requested_over_1472: Arc<AtomicU64>,
+    max_requested_wire_len: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -117,9 +123,13 @@ impl RetransmitWorker {
         let requested = Arc::new(AtomicU64::new(0));
         let answered = Arc::new(AtomicU64::new(0));
         let expired = Arc::new(AtomicU64::new(0));
+        let requested_over_1472 = Arc::new(AtomicU64::new(0));
+        let max_requested_wire_len = Arc::new(AtomicU64::new(0));
         let requested_thread = Arc::clone(&requested);
         let answered_thread = Arc::clone(&answered);
         let expired_thread = Arc::clone(&expired);
+        let requested_over_1472_thread = Arc::clone(&requested_over_1472);
+        let max_requested_wire_len_thread = Arc::clone(&max_requested_wire_len);
 
         let worker = thread::Builder::new()
             .name("sairplay-rtx".into())
@@ -164,6 +174,11 @@ impl RetransmitWorker {
                                 expired_thread.fetch_add(1, Ordering::SeqCst);
                                 continue;
                             };
+                            let wire_len = packet.len() as u64;
+                            if wire_len > 1472 {
+                                requested_over_1472_thread.fetch_add(1, Ordering::SeqCst);
+                            }
+                            max_requested_wire_len_thread.fetch_max(wire_len, Ordering::SeqCst);
                             let mut out = Vec::with_capacity(4 + packet.len());
                             out.extend_from_slice(&[
                                 0x80,
@@ -188,6 +203,8 @@ impl RetransmitWorker {
             requested,
             answered,
             expired,
+            requested_over_1472,
+            max_requested_wire_len,
             worker: Some(worker),
         })
     }
@@ -201,6 +218,8 @@ impl RetransmitWorker {
             requested: self.requested.load(Ordering::SeqCst),
             answered: self.answered.load(Ordering::SeqCst),
             expired: self.expired.load(Ordering::SeqCst),
+            requested_over_1472: self.requested_over_1472.load(Ordering::SeqCst),
+            max_requested_wire_len: self.max_requested_wire_len.load(Ordering::SeqCst),
         }
     }
 
