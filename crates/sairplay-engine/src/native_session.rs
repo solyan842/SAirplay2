@@ -1,10 +1,11 @@
 use crate::{
-    open_event_channel, prepare_realtime_media, send_record, setup_ntp_session,
+    open_event_channel, prepare_buffered_media, prepare_realtime_media, send_record, setup_ntp_session,
     send_setpeers, send_teardown, setup_ptp_session, start_ntp_timing_gate, Ap2PreflightClient,
     EventChannel, FeedbackWorker, MediaHandshakeConfig, NativeConnectFlow, NativePhase,
     NtpSessionSetupConfig, NtpTimingResponder, PairingError, PreflightError, PtpEngine,
     PtpSessionSetupConfig, RealtimeMediaSender, RecordConfig, RetransmitRing,
-    Ap2AudioFormat, NativeVolumeControl, RetransmitStats, RetransmitWorker, RtpState,
+    Ap2AudioFormat, BufferedMediaSender, MediaTransport, NativeVolumeControl,
+    ReceiverCapabilities, RetransmitStats, RetransmitWorker, Route, RouteResolver, RtpState,
     SetPeersConfig, TransientPairingClient,
     VolumeSetResult, set_native_volume,
 };
@@ -29,6 +30,10 @@ pub struct NativeSessionConfig {
     pub active_remote: String,
     pub lead_frames: u32,
     pub supports_ptp: bool,
+    pub supports_buffered_audio: bool,
+    /// Auto-select type 103 only when the caller has enabled this routing
+    /// surface. Groups leave it off until mixed type96/type103 handoff lands.
+    pub buffered_auto_enabled: bool,
     pub follow_receiver_clock: bool,
     pub apple_model: bool,
     pub receiver_name: String,
@@ -52,6 +57,8 @@ impl NativeSessionConfig {
             active_remote: "123456789".into(),
             lead_frames: 11_025,
             supports_ptp: false,
+            supports_buffered_audio: false,
+            buffered_auto_enabled: false,
             follow_receiver_clock: false,
             apple_model: false,
             receiver_name: "SAirplay2 Receiver".into(),
@@ -111,6 +118,10 @@ pub struct NativeSession {
     _ptp_timing: Option<Arc<PtpEngine>>,
     event: Option<EventChannel>,
     sender: Option<RealtimeMediaSender>,
+    buffered_sender: Option<BufferedMediaSender>,
+    _buffered_control_transport: Option<MediaTransport>,
+    buffered_clock: Option<crate::PtpClock>,
+    use_buffered: bool,
     session_uri: String,
     dacp_id: String,
     active_remote: String,
@@ -153,11 +164,35 @@ impl NativeSession {
 
         let local_addr = stream.local_addr().map_err(NativeSessionError::LocalAddress)?;
         let receiver_ip = info.peer.ip();
-        let audio_format = crate::select_native_realtime_stream_format(
-            &info.info,
-            config.hires_enabled,
-            config.session_sample_rate,
-        );
+
+        // Pinned MSA auto policy is transport routing, not a format-union hint.
+        // The GUI enables this only for Single sessions for now; native groups
+        // stay realtime until the mixed type96/type103 worker is implemented.
+        let buffered_auto_requested = config.buffered_auto_enabled
+            && RouteResolver::buffered_auto_eligible(
+                Route::AirPlay2Native,
+                ReceiverCapabilities {
+                    supports_airplay2: true,
+                    supports_ptp: config.supports_ptp,
+                    supports_buffered_audio: config.supports_buffered_audio,
+                    is_apple_model: config.apple_model,
+                    ..Default::default()
+                },
+            );
+
+        let mut audio_format = if buffered_auto_requested {
+            crate::select_native_buffered_stream_format(
+                &info.info,
+                config.hires_enabled,
+                config.session_sample_rate,
+            )
+        } else {
+            crate::select_native_realtime_stream_format(
+                &info.info,
+                config.hires_enabled,
+                config.session_sample_rate,
+            )
+        };
 
         let pairing_client = TransientPairingClient::default();
         let pairing = pairing_client
@@ -294,6 +329,19 @@ impl NativeSession {
             ntp_timing = Some(timing);
         }
 
+        // Buffered type 103 is PTP-only upstream. If PTP startup fell back to
+        // NTP, fall back to realtime type 96 and its stream-specific format
+        // selector rather than carrying buffered capability into the wrong
+        // transport.
+        let use_buffered = buffered_auto_requested && ptp_clock.is_some();
+        if !use_buffered {
+            audio_format = crate::select_native_realtime_stream_format(
+                &info.info,
+                config.hires_enabled,
+                config.session_sample_rate,
+            );
+        }
+
         // 3) Keep-open reverse event TCP.
         let event = open_event_channel(
             &mut flow,
@@ -314,8 +362,10 @@ impl NativeSession {
         send_record(&mut flow, &mut control, &record)
             .map_err(|e| NativeSessionError::Record(format!("{e:?}")))?;
 
-        // 5) Bind live UDP ports, advertise them, parse receiver ports, attach.
-        let media = MediaHandshakeConfig {
+        // 5) Stream SETUP. Realtime advertises live UDP data/control ports;
+        // buffered advertises only controlPort and then connects TCP to the
+        // receiver-assigned dataPort.
+        let media_config = MediaHandshakeConfig {
             bind_ip: local_addr.ip(),
             receiver_ip,
             cseq: 3,
@@ -326,20 +376,37 @@ impl NativeSession {
             stream_connection_id: session_id,
             audio_format,
         };
-        let media = prepare_realtime_media(&mut flow, &mut control, &media)
-            .map_err(|e| NativeSessionError::Media(format!("{e:?}")))?;
+        let mut realtime_media = None;
+        let mut buffered_media = None;
+        if use_buffered {
+            buffered_media = Some(
+                prepare_buffered_media(&mut flow, &mut control, &media_config)
+                    .map_err(|e| NativeSessionError::Media(format!("{e:?}")))?,
+            );
+        } else {
+            realtime_media = Some(
+                prepare_realtime_media(&mut flow, &mut control, &media_config)
+                    .map_err(|e| NativeSessionError::Media(format!("{e:?}")))?,
+            );
+        }
 
-        // Upstream clamps the configured lead into the receiver-reported
-        // latency window immediately after Stream SETUP.
+        // Realtime clamps configured lead to receiver latencyMin/Max. Buffered
+        // omits those fields by design and schedules playback entirely by the
+        // PTP rate anchor, so there is no receiver latency window to clamp.
         let requested_lead = ((config.lead_frames as u64
             * audio_format.sample_rate as u64)
             / 44_100) as u32;
-        let min_frames = media.latency_min.unwrap_or(0);
-        let max_frames = media.latency_max.unwrap_or(requested_lead);
-        let effective_lead_frames = if requested_lead < min_frames {
-            min_frames
-        } else if requested_lead > max_frames {
-            max_frames
+        let latency_max = realtime_media.as_ref().and_then(|media| media.latency_max);
+        let effective_lead_frames = if let Some(media) = realtime_media.as_ref() {
+            let min_frames = media.latency_min.unwrap_or(0);
+            let max_frames = media.latency_max.unwrap_or(requested_lead);
+            if requested_lead < min_frames {
+                min_frames
+            } else if requested_lead > max_frames {
+                max_frames
+            } else {
+                requested_lead
+            }
         } else {
             requested_lead
         };
@@ -422,34 +489,58 @@ impl NativeSession {
         let ssrc = if ptp_clock.is_some() { 0 } else { session_id };
         let rtp = RtpState::new(sequence, rtp_timestamp, ssrc);
 
-        // Realtime source always attempts the retransmit responder, but failure
-        // is non-fatal: audio still runs, only packet repair is unavailable.
-        let latency_max = media.latency_max;
-        let rtx_ring = RetransmitRing::new();
-        let retransmit = media
-            .transport
-            .clone_control_socket()
-            .ok()
-            .and_then(|socket| RetransmitWorker::start(socket, rtx_ring.clone()).ok());
+        let mut retransmit = None;
+        let mut sender = None;
+        let mut buffered_sender = None;
+        let mut buffered_control_transport = None;
+        let mut buffered_clock = None;
 
-        let mut sender = if let Some(clock) = ptp_clock.clone() {
-            RealtimeMediaSender::new_ptp_clock_with_format(
-                media.transport,
+        if use_buffered {
+            let media = buffered_media
+                .take()
+                .expect("buffered media prepared for buffered route");
+            buffered_sender = Some(BufferedMediaSender::new_with_format(
+                media.data_stream,
                 rtp,
                 audio_secret,
-                clock,
                 audio_format,
-            )
+            ));
+            buffered_control_transport = Some(media.control_transport);
+            buffered_clock = ptp_clock.clone();
         } else {
-            RealtimeMediaSender::new_with_format(
-                media.transport,
-                rtp,
-                audio_secret,
-                audio_format,
-            )
-        };
-        if retransmit.is_some() {
-            sender.set_retransmit_ring(rtx_ring);
+            let media = realtime_media
+                .take()
+                .expect("realtime media prepared for realtime route");
+            // Realtime source always attempts the retransmit responder, but
+            // failure is non-fatal. Buffered type103 has no RTX path: TCP is
+            // the reliability layer.
+            let rtx_ring = RetransmitRing::new();
+            retransmit = media
+                .transport
+                .clone_control_socket()
+                .ok()
+                .and_then(|socket| RetransmitWorker::start(socket, rtx_ring.clone()).ok());
+
+            let mut realtime_sender = if let Some(clock) = ptp_clock.clone() {
+                RealtimeMediaSender::new_ptp_clock_with_format(
+                    media.transport,
+                    rtp,
+                    audio_secret,
+                    clock,
+                    audio_format,
+                )
+            } else {
+                RealtimeMediaSender::new_with_format(
+                    media.transport,
+                    rtp,
+                    audio_secret,
+                    audio_format,
+                )
+            };
+            if retransmit.is_some() {
+                realtime_sender.set_retransmit_ring(rtx_ring);
+            }
+            sender = Some(realtime_sender);
         }
         let ptp_receiver_ip = ptp_timing.as_ref().map(|_| receiver_ip);
         Ok(Self {
@@ -461,7 +552,11 @@ impl NativeSession {
             _ntp_timing: ntp_timing,
             _ptp_timing: ptp_timing,
             event: Some(event),
-            sender: Some(sender),
+            sender,
+            buffered_sender,
+            _buffered_control_transport: buffered_control_transport,
+            buffered_clock,
+            use_buffered,
             session_uri: session_uri.clone(),
             dacp_id: config.dacp_id.clone(),
             active_remote: config.active_remote.clone(),
@@ -490,6 +585,10 @@ impl NativeSession {
         self.audio_format
     }
 
+    pub fn uses_buffered_audio(&self) -> bool {
+        self.use_buffered
+    }
+
     pub fn control_channel(&self) -> crate::SharedRtspControl {
         Arc::clone(&self.control)
     }
@@ -515,6 +614,11 @@ impl NativeSession {
         if self.audio_worker.as_ref().is_some_and(|worker| worker.is_running()) {
             return Err(NativeSessionError::Flow(
                 "audio target cannot be extracted while single-device capture is running".into(),
+            ));
+        }
+        if self.use_buffered {
+            return Err(NativeSessionError::Flow(
+                "buffered type103 group handoff is not enabled until mixed type96/type103 MultiRoom support lands".into(),
             ));
         }
         let sender = self.sender.take().ok_or_else(|| {
@@ -548,17 +652,37 @@ impl NativeSession {
             return Ok(());
         }
 
-        let sender = self.sender.take().ok_or_else(|| {
-            NativeSessionError::Flow("realtime sender is already owned by audio worker".into())
-        })?;
+        let worker_result = if self.use_buffered {
+            let sender = self.buffered_sender.take().ok_or_else(|| {
+                NativeSessionError::Flow("buffered sender is already owned by audio worker".into())
+            })?;
+            let clock = self.buffered_clock.clone().ok_or_else(|| {
+                NativeSessionError::Flow("buffered route is missing its PTP clock".into())
+            })?;
+            WindowsAudioWorker::start_buffered(
+                sender,
+                clock,
+                Arc::clone(&self.control),
+                Arc::clone(&self.next_cseq),
+                self.session_uri.clone(),
+                self.dacp_id.clone(),
+                self.active_remote.clone(),
+                self.cold_start_delay_ms,
+            )
+        } else {
+            let sender = self.sender.take().ok_or_else(|| {
+                NativeSessionError::Flow("realtime sender is already owned by audio worker".into())
+            })?;
+            WindowsAudioWorker::start(
+                sender,
+                self.lead_frames,
+                self.latency_max,
+                self.rtp_offset,
+                self.cold_start_delay_ms,
+            )
+        };
 
-        match WindowsAudioWorker::start(
-            sender,
-            self.lead_frames,
-            self.latency_max,
-            self.rtp_offset,
-            self.cold_start_delay_ms,
-        ) {
+        match worker_result {
             Ok(worker) => {
                 self.audio_worker = Some(worker);
                 Ok(())

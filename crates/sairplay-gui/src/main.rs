@@ -1565,7 +1565,7 @@ impl SairplayApp {
             if requested_mode == PlaybackMode::Single && member_count == 1 {
                 let (fullname, device) = &selected_devices[0];
                 let hires_override = self.hires_overrides.get(fullname).copied();
-                let config = match native_config_for_device(
+                let mut config = match native_config_for_device(
                     device,
                     initial_volume,
                     hires_override,
@@ -1578,6 +1578,7 @@ impl SairplayApp {
                         return;
                     }
                 };
+                config.buffered_auto_enabled = true;
 
                 thread::Builder::new()
                     .name("sairplay-native-single-connect".into())
@@ -1616,6 +1617,8 @@ impl SairplayApp {
                             return;
                         }
                     };
+                    let mut config = config;
+                    config.buffered_auto_enabled = false;
                     configs.push(NativeGroupMemberConfig::new(
                         fullname.clone(),
                         config,
@@ -3975,6 +3978,7 @@ fn native_config_for_device(
     config.dacp_id = "A1B2C3D4E5F60708".into();
     config.active_remote = "123456789".into();
     config.supports_ptp = service.txt.supports_ptp();
+    config.supports_buffered_audio = service.txt.supports_buffered_audio();
     config.follow_receiver_clock = service.txt.follows_receiver_clock();
     config.apple_model = service.txt.is_apple_model();
     config.receiver_name = device.display_name.clone();
