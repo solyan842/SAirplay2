@@ -31,6 +31,7 @@ pub mod media_handshake;
 pub mod rtp_packets;
 pub mod audio_packet;
 pub mod media_sender;
+pub mod buffered_sender;
 pub mod retransmit;
 pub mod teardown;
 pub mod volume;
@@ -91,8 +92,12 @@ pub use media_handshake::{
     MediaHandshakeConfig, MediaHandshakeError, MediaHandshakeResult,
 };
 pub use rtp_packets::{build_ntp_sync_packet, build_ptp_sync_packet, build_rtp_header, NtpSyncPacketArgs, PtpSyncPacketArgs, RtpState, FRAMES_PER_PACKET_44100};
-pub use audio_packet::{build_audio_nonce, build_encrypted_realtime_packet, AudioPacketError};
+pub use audio_packet::{
+    build_audio_nonce, build_buffered_audio_nonce, build_encrypted_buffered_frame,
+    build_encrypted_realtime_packet, AudioPacketError, RTP_PAYLOAD_TYPE_BUFFERED,
+};
 pub use media_sender::{RealtimeMediaSender, MediaSendError, MediaSendResult};
+pub use buffered_sender::{BufferedMediaSender, BufferedSendError, BufferedWriteOutcome};
 pub use retransmit::{RetransmitRing, RetransmitStats, RetransmitWorker, RTX_RING_SLOTS};
 pub use teardown::{send_teardown, TeardownError};
 pub use volume::{set_native_volume, volume_percent_to_db, NativeVolumeControl, VolumeError, VolumeSetResult};
