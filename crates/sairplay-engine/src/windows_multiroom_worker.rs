@@ -329,6 +329,14 @@ impl WindowsMultiroomAudioWorker {
                                 input_starved_since = None;
                             }
                             pair_nonzero_gap_reported = false;
+                        } else if chunker.pending_nonzero_bytes() != 0 {
+                            // A 2.5 s Stereo Pair cold/shared start can leave a large
+                            // valid PCM backlog in the local chunker. A quiet current
+                            // WASAPI drain is not a track boundary while that backlog
+                            // still contains real audio; resetting the timer here
+                            // prevents local cleanup from discarding queued content.
+                            pair_nonzero_gap_started = None;
+                            pair_nonzero_gap_reported = false;
                         } else {
                             let started = pair_nonzero_gap_started.get_or_insert_with(Instant::now);
                             if !pair_nonzero_gap_reported
