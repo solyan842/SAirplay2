@@ -1108,7 +1108,10 @@ impl SairplayApp {
             return;
         }
 
-        let title = self.t("Cảnh báo chất lượng 24-bit", "24-bit Quality Warning");
+        let title = self.t(
+            "Kết nối AirPlay chưa ổn định",
+            "AirPlay connection is unstable",
+        );
         let close_label = self.t("Đã hiểu", "Got it");
         let mut open = self.hires_quality_warning_open;
 
@@ -1120,7 +1123,10 @@ impl SairplayApp {
             .show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new(self.t(
-                        "Phát hiện mất gói không thể khôi phục",
+                        self.t(
+                            "Chất lượng kết nối chưa ổn định",
+                            "Connection quality is unstable",
+                        ),
                         "Unrecoverable packet loss detected",
                     ))
                     .size(15.0)
@@ -1290,21 +1296,21 @@ impl SairplayApp {
                 self.hires_quality_warning_open = true;
                 self.hires_quality_warning_text = match self.language {
                     UiLanguage::Vi if expired_delta > 0 => format!(
-                        "Đường truyền 24-bit đang không đạt độ ổn định cần thiết. Có {} gói RTP không thể khôi phục (tổng {}).\n\nNếu có mất tiếng, rè hoặc ngắt quãng, nên chuyển thiết bị này về 16-bit.",
+                        "Kết nối AirPlay 24-bit vừa xuất hiện dao động ngắn, có thể gây tiếng rè hoặc gián đoạn âm thanh.\n\nNếu tình trạng lặp lại, hãy chuyển sang 16-bit để phát ổn định hơn.",
                         expired_delta,
                         rtx.expired
                     ),
                     UiLanguage::Vi => format!(
-                        "Đường truyền 24-bit vừa xuất hiện một đợt yêu cầu truyền lại cao: {} gói trong một chu kỳ đo. Tất cả vẫn được khôi phục, nhưng kiểu burst này đã trùng với hiện tượng bụp/rè khi thử HomePod 24-bit.\n\nBạn có thể tiếp tục nghe; nếu hiện tượng lặp lại, nên chuyển thiết bị này về 16-bit.",
+                        "Kết nối AirPlay 24-bit vừa xuất hiện dao động ngắn, có thể gây tiếng rè hoặc gián đoạn âm thanh.\n\nNếu tình trạng lặp lại, hãy chuyển sang 16-bit để phát ổn định hơn.",
                         requested_delta
                     ),
                     UiLanguage::En if expired_delta > 0 => format!(
-                        "The 24-bit path is not meeting the required stability. {} RTP packet(s) could not be recovered ({} total).\n\nIf you hear dropouts, crackle, or silence, switch this receiver back to 16-bit.",
+                        "The 24-bit AirPlay connection experienced a brief instability that may cause distortion or audio dropouts.\n\nIf this continues, switch to 16-bit for more stable playback.",
                         expired_delta,
                         rtx.expired
                     ),
                     UiLanguage::En => format!(
-                        "The 24-bit path just produced a high retransmit burst: {} packet(s) in one measurement interval. All were recovered, but this burst pattern matched audible crackle during HomePod 24-bit testing.\n\nYou can keep listening; if it repeats, switch this receiver back to 16-bit.",
+                        "The 24-bit AirPlay connection experienced a brief instability that may cause distortion or audio dropouts.\n\nIf this continues, switch to 16-bit for more stable playback.",
                         requested_delta
                     ),
                 };
