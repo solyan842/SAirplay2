@@ -1500,8 +1500,8 @@ impl SairplayApp {
         self.last_feedback_error = None;
 
         if all_native {
-            let mut configs = Vec::<NativeGroupMemberConfig>::with_capacity(member_count);
-            for (fullname, device) in &selected_devices {
+            if requested_mode == PlaybackMode::Single && member_count == 1 {
+                let (fullname, device) = &selected_devices[0];
                 let hires_override = self.hires_overrides.get(fullname).copied();
                 let config = match native_config_for_device(
                     device,
@@ -1516,27 +1516,66 @@ impl SairplayApp {
                         return;
                     }
                 };
-                configs.push(NativeGroupMemberConfig::new(
-                    fullname.clone(),
-                    config,
-                ));
-            }
 
-            thread::Builder::new()
-                .name("sairplay-native-connect".into())
-                .spawn(move || {
-                    let result = NativeGroupSession::connect(configs)
-                        .map(ActiveSession::Group)
-                        .map_err(|e| e.to_string())
-                        .map(|session| ConnectSuccess {
-                            session,
-                            active_fullnames,
-                            label,
-                            mode: requested_mode,
-                        });
-                    let _ = tx.send(result);
-                })
-                .expect("failed to spawn native connect worker");
+                thread::Builder::new()
+                    .name("sairplay-native-single-connect".into())
+                    .spawn(move || {
+                        let result = NativeSession::connect(&config)
+                            .map_err(|e| e.to_string())
+                            .and_then(|mut session| {
+                                session
+                                    .start_windows_audio()
+                                    .map_err(|e| e.to_string())?;
+                                Ok(ActiveSession::Single(session))
+                            })
+                            .map(|session| ConnectSuccess {
+                                session,
+                                active_fullnames,
+                                label,
+                                mode: requested_mode,
+                            });
+                        let _ = tx.send(result);
+                    })
+                    .expect("failed to spawn native single connect worker");
+            } else {
+                let mut configs = Vec::<NativeGroupMemberConfig>::with_capacity(member_count);
+                for (fullname, device) in &selected_devices {
+                    let hires_override = self.hires_overrides.get(fullname).copied();
+                    let config = match native_config_for_device(
+                        device,
+                        initial_volume,
+                        hires_override,
+                    ) {
+                        Ok(config) => config,
+                        Err(message) => {
+                            self.log.push(message.clone());
+                            self.playback = PlaybackUiState::Error(message);
+                            self.connect_rx = None;
+                            return;
+                        }
+                    };
+                    configs.push(NativeGroupMemberConfig::new(
+                        fullname.clone(),
+                        config,
+                    ));
+                }
+
+                thread::Builder::new()
+                    .name("sairplay-native-connect".into())
+                    .spawn(move || {
+                        let result = NativeGroupSession::connect(configs)
+                            .map(ActiveSession::Group)
+                            .map_err(|e| e.to_string())
+                            .map(|session| ConnectSuccess {
+                                session,
+                                active_fullnames,
+                                label,
+                                mode: requested_mode,
+                            });
+                        let _ = tx.send(result);
+                    })
+                    .expect("failed to spawn native connect worker");
+            }
         } else {
             let mut configs = Vec::<LegacyMemberConfig>::with_capacity(member_count);
             for (_, device) in &selected_devices {
