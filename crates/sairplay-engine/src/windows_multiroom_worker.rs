@@ -234,6 +234,13 @@ impl WindowsMultiroomAudioWorker {
                 let mut cold_armed = false;
                 let mut group_start_ntp: Option<u64> = None;
                 let mut input_starved_since: Option<Instant> = None;
+                // Stereo Pair owns a fixed two-member hot splice line. Keep its
+                // track-gap state separate from MultiRoom membership/recovery.
+                let mut pair_nonzero_gap_started: Option<Instant> = None;
+                let mut pair_nonzero_gap_reported = false;
+                let mut pair_inferred_idle = false;
+                let mut pair_idle_keepalive_reported = false;
+                let mut pair_transition_epoch = 0u64;
                 let mut packet_index = 0u64;
                 let mut pending_joins = Vec::<PendingJoin>::new();
 
@@ -281,6 +288,86 @@ impl WindowsMultiroomAudioWorker {
                     }
                     let frames = report.frames;
                     captured_frames_total = captured_frames_total.saturating_add(frames as u64);
+
+                    if kind == WindowsGroupAudioKind::StereoPair && cold_armed {
+                        if report.first_nonzero_frame_offset.is_some() {
+                            if let Some(started) = pair_nonzero_gap_started.take() {
+                                let gap_ms = started.elapsed().as_millis();
+                                if gap_ms >= 100 {
+                                    if let Ok(mut events) = startup_events_thread.lock() {
+                                        events.push(format!(
+                                            "Stereo Pair transition: nonzero PCM resumed after {} ms · wasapi_frames={} · discontinuities={} · pending_bytes={}.",
+                                            gap_ms,
+                                            frames,
+                                            report.discontinuities,
+                                            chunker.pending_bytes()
+                                        ));
+                                    }
+                                }
+                            }
+                            if pair_inferred_idle {
+                                if let Ok(now_ntp) = system_time_to_ntp(SystemTime::now()) {
+                                    if let Ok(mut events) = startup_events_thread.lock() {
+                                        let heads = targets
+                                            .iter()
+                                            .map(|target| {
+                                                let delta = target.sender.timeline_head_delta_frames(now_ntp);
+                                                format!("{}={}f", target.name, delta)
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(", ");
+                                        events.push(format!(
+                                            "Stereo Pair transition: boundary #{} resume · heads=[{}] · pending_bytes={} · anchor/seq/timestamp preserved.",
+                                            pair_transition_epoch,
+                                            heads,
+                                            chunker.pending_bytes()
+                                        ));
+                                    }
+                                }
+                                pair_inferred_idle = false;
+                                pair_idle_keepalive_reported = false;
+                                input_starved_since = None;
+                            }
+                            pair_nonzero_gap_reported = false;
+                        } else {
+                            let started = pair_nonzero_gap_started.get_or_insert_with(Instant::now);
+                            if !pair_nonzero_gap_reported
+                                && started.elapsed() >= Duration::from_millis(250)
+                            {
+                                pair_transition_epoch = pair_transition_epoch.saturating_add(1);
+                                let pending_before = chunker.pending_bytes();
+                                let pending_nonzero_before = chunker.pending_nonzero_bytes();
+                                let dropped_pad = targets
+                                    .iter()
+                                    .map(|target| target.sender.splice_pad_frames())
+                                    .max()
+                                    .unwrap_or(0);
+
+                                // Same local warm-boundary semantics as the proven
+                                // Single worker: discard only sender-local PCM/pad.
+                                // Never RTSP FLUSH and never reset RTP/PTP/crypto.
+                                chunker.clear();
+                                for target in &mut targets {
+                                    target.sender.begin_warm_splice_boundary();
+                                }
+                                pair_inferred_idle = true;
+                                pair_idle_keepalive_reported = false;
+                                input_starved_since = None;
+                                pair_nonzero_gap_reported = true;
+
+                                if let Ok(mut events) = startup_events_thread.lock() {
+                                    events.push(format!(
+                                        "Stereo Pair transition: boundary #{} local cleanup · discarded_bytes={} · stale_nonzero_bytes={} · dropped_pad_frames={} · members={} · seq/timestamp/anchor preserved.",
+                                        pair_transition_epoch,
+                                        pending_before,
+                                        pending_nonzero_before,
+                                        dropped_pad,
+                                        targets.len()
+                                    ));
+                                }
+                            }
+                        }
+                    }
 
                     // Before START, source silence is not content. This mirrors
                     // the upstream readiness gate: connect members, prove audio
@@ -393,7 +480,9 @@ impl WindowsMultiroomAudioWorker {
                         }
                     };
 
-                    if chunker.has_packet() {
+                    if kind == WindowsGroupAudioKind::StereoPair && pair_inferred_idle {
+                        input_starved_since = None;
+                    } else if chunker.has_packet() {
                         input_starved_since = None;
                         for target in &mut targets {
                             let _ = target
@@ -413,6 +502,84 @@ impl WindowsMultiroomAudioWorker {
                             }
                             align_splice_pad(&mut targets);
                             input_starved_since = Some(Instant::now());
+                        }
+                    }
+
+                    // A Stereo Pair is one fixed audible object. During an inferred
+                    // track gap keep both member wires hot with the same source-silence
+                    // packet cadence, exactly like Single, while preserving each member's
+                    // own RTP sequence/timestamp and shared PTP anchor.
+                    if kind == WindowsGroupAudioKind::StereoPair
+                        && pair_inferred_idle
+                        && !chunker.has_packet()
+                        && targets.len() == 2
+                    {
+                        align_splice_pad(&mut targets);
+                        let ntp = match system_time_to_ntp(SystemTime::now()) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                if let Ok(mut slot) = last_error_thread.lock() {
+                                    *slot = Some(format!("NTP clock conversion failed: {error:?}"));
+                                }
+                                running_thread.store(false, Ordering::SeqCst);
+                                return;
+                            }
+                        };
+                        let gate_index = targets
+                            .iter()
+                            .enumerate()
+                            .min_by_key(|(_, target)| target.sender.pacing_window_frames())
+                            .map(|(index, _)| index)
+                            .unwrap_or(0);
+                        if targets[gate_index].sender.can_accept_frames(ntp) {
+                            let silence =
+                                vec![0u8; crate::ALAC_FRAMES_PER_PACKET * bytes_per_frame];
+                            let mut failed = None;
+                            for target in &mut targets {
+                                let target_packet = match adapt_group_pcm_packet(
+                                    &silence,
+                                    source_format,
+                                    target.sender.audio_format(),
+                                ) {
+                                    Ok(packet) => packet,
+                                    Err(error) => {
+                                        failed = Some(format!(
+                                            "{} stereo-pair silence format failed: {error}",
+                                            target.name
+                                        ));
+                                        break;
+                                    }
+                                };
+                                if let Err(error) = target.sender.send_pcm_352(
+                                    &target_packet,
+                                    ntp,
+                                    target.lead_frames,
+                                ) {
+                                    failed = Some(format!(
+                                        "{} stereo-pair idle keepalive failed: {error:?}",
+                                        target.name
+                                    ));
+                                    break;
+                                }
+                            }
+                            if let Some(message) = failed {
+                                if let Ok(mut slot) = last_error_thread.lock() {
+                                    *slot = Some(message);
+                                }
+                                running_thread.store(false, Ordering::SeqCst);
+                                return;
+                            }
+                            packet_index = packet_index.saturating_add(1);
+                            if !pair_idle_keepalive_reported {
+                                if let Ok(mut events) = startup_events_thread.lock() {
+                                    events.push(format!(
+                                        "Stereo Pair transition: inferred idle keepalive active · boundary={} · packet={} · members=2.",
+                                        pair_transition_epoch,
+                                        packet_index
+                                    ));
+                                }
+                                pair_idle_keepalive_reported = true;
+                            }
                         }
                     }
 
