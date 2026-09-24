@@ -1,5 +1,7 @@
 use crate::{
-    system_time_to_ntp, Pcm352Chunker, RealtimeMediaSender, WasapiLoopbackCapture,
+    buffered_anchor_start, system_time_to_ntp, BufferedAnchorStartConfig,
+    BufferedMediaSender, BufferedWriteOutcome, Pcm352Chunker, PtpClock,
+    RealtimeMediaSender, SharedCseq, SharedRtspControl, WasapiLoopbackCapture,
     WasapiLoopbackError,
 };
 use std::fmt;
@@ -40,6 +42,244 @@ pub struct WindowsAudioWorker {
 }
 
 impl WindowsAudioWorker {
+    pub fn start_buffered(
+        mut sender: BufferedMediaSender,
+        clock: PtpClock,
+        control: SharedRtspControl,
+        next_cseq: SharedCseq,
+        session_uri: String,
+        dacp_id: String,
+        active_remote: String,
+        cold_start_delay_ms: u64,
+    ) -> Result<Self, WindowsAudioWorkerError> {
+        let running = Arc::new(AtomicBool::new(true));
+        let running_thread = Arc::clone(&running);
+        let last_error = Arc::new(Mutex::new(None));
+        let last_error_thread = Arc::clone(&last_error);
+        let discontinuities = Arc::new(AtomicU64::new(0));
+        let discontinuities_thread = Arc::clone(&discontinuities);
+        let last_discontinuity_frame = Arc::new(AtomicU64::new(u64::MAX));
+        let last_discontinuity_frame_thread = Arc::clone(&last_discontinuity_frame);
+        let first_non_silent_frame = Arc::new(AtomicU64::new(u64::MAX));
+        let first_non_silent_frame_thread = Arc::clone(&first_non_silent_frame);
+        let startup_events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let startup_events_thread = Arc::clone(&startup_events);
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let audio_format = sender.audio_format();
+        let bytes_per_frame = audio_format.input_bytes_per_frame();
+
+        let worker = thread::spawn(move || {
+            let capture = match WasapiLoopbackCapture::open_default_for_format(audio_format) {
+                Ok(capture) => {
+                    let _ = ready_tx.send(Ok(()));
+                    capture
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    let _ = ready_tx.send(Err(message.clone()));
+                    if let Ok(mut slot) = last_error_thread.lock() {
+                        *slot = Some(message);
+                    }
+                    running_thread.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            let mut chunker = Pcm352Chunker::new_with_bytes_per_frame(bytes_per_frame);
+            let mut captured_frames_total = 0u64;
+            let mut source_present = false;
+            let mut cold_armed = false;
+
+            while running_thread.load(Ordering::SeqCst) {
+                match capture.drain_into(&mut chunker) {
+                    Ok(report) => {
+                        if report.discontinuities != 0 {
+                            let cumulative = discontinuities_thread
+                                .fetch_add(report.discontinuities, Ordering::SeqCst)
+                                .saturating_add(report.discontinuities);
+                            if let Some(offset) = report.discontinuity_frame_offset {
+                                last_discontinuity_frame_thread.store(
+                                    captured_frames_total.saturating_add(offset),
+                                    Ordering::SeqCst,
+                                );
+                            }
+                            if let Ok(mut events) = startup_events_thread.lock() {
+                                events.push(format!(
+                                    "Buffered: WASAPI discontinuity · count={} · cumulative={}.",
+                                    report.discontinuities, cumulative
+                                ));
+                            }
+                        }
+                        if let Some(offset) = report.first_non_silent_frame_offset {
+                            let absolute = captured_frames_total.saturating_add(offset);
+                            let _ = first_non_silent_frame_thread.compare_exchange(
+                                u64::MAX,
+                                absolute,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            );
+                        }
+                        captured_frames_total =
+                            captured_frames_total.saturating_add(report.frames as u64);
+
+                        if !source_present {
+                            if report.first_non_silent_frame_offset.is_some() {
+                                source_present = true;
+                            } else {
+                                chunker.clear();
+                                thread::sleep(Duration::from_millis(1));
+                                continue;
+                            }
+                        }
+
+                        if !cold_armed {
+                            if !chunker.has_packet() {
+                                thread::sleep(Duration::from_millis(1));
+                                continue;
+                            }
+                            let now_ntp = match system_time_to_ntp(SystemTime::now()) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(format!("NTP clock conversion failed: {error:?}"));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            };
+                            let start_ntp =
+                                now_ntp.saturating_add(ms_to_ntp(cold_start_delay_ms));
+                            sender.arm_cold_start(start_ntp);
+                            let anchor_config = BufferedAnchorStartConfig {
+                                session_uri: session_uri.clone(),
+                                dacp_id: dacp_id.clone(),
+                                active_remote: active_remote.clone(),
+                                rtp_time: sender.state().timestamp,
+                                commanded_start_ntp: start_ntp,
+                            };
+                            let anchor_result = {
+                                let mut guard = match control.lock() {
+                                    Ok(guard) => guard,
+                                    Err(_) => {
+                                        if let Ok(mut slot) = last_error_thread.lock() {
+                                            *slot = Some("buffered RTSP control mutex poisoned".into());
+                                        }
+                                        running_thread.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+                                };
+                                buffered_anchor_start(
+                                    &mut guard,
+                                    next_cseq.as_ref(),
+                                    &clock,
+                                    &anchor_config,
+                                )
+                            };
+                            match anchor_result {
+                                Ok(anchor_ns) => {
+                                    sender.mark_anchored();
+                                    cold_armed = true;
+                                    if let Ok(mut events) = startup_events_thread.lock() {
+                                        events.push(format!(
+                                            "Buffered startup: anchor armed · delay={} ms · anchor_ns={} · rtp={} · format={}/{}.",
+                                            cold_start_delay_ms,
+                                            anchor_ns,
+                                            sender.state().timestamp,
+                                            audio_format.bit_depth,
+                                            audio_format.sample_rate
+                                        ));
+                                    }
+                                }
+                                Err(error) => {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(format!("buffered cold START failed: {error:?}"));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            }
+                        }
+
+                        loop {
+                            if !chunker.has_packet() {
+                                break;
+                            }
+                            let now_ntp = match system_time_to_ntp(SystemTime::now()) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(format!("NTP clock conversion failed: {error:?}"));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            };
+                            match sender.can_accept_frames(now_ntp) {
+                                Ok(true) => {}
+                                Ok(false) => break,
+                                Err(error) => {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(format!("buffered pacing failed: {error:?}"));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            }
+
+                            let Some(packet) = chunker.pop_packet() else { break; };
+                            match sender.send_pcm_352(&packet) {
+                                Ok(BufferedWriteOutcome::Sent | BufferedWriteOutcome::Backpressured) => {}
+                                Err(error) => {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(format!("buffered media send failed: {error:?}"));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            }
+                        }
+
+                        if report.frames == 0 {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                    Err(error) => {
+                        if let Ok(mut slot) = last_error_thread.lock() {
+                            *slot = Some(error.to_string());
+                        }
+                        running_thread.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                }
+            }
+        });
+
+        match ready_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(Ok(())) => Ok(Self {
+                running,
+                worker: Some(worker),
+                last_error,
+                discontinuities,
+                last_discontinuity_frame,
+                first_non_silent_frame,
+                startup_events,
+            }),
+            Ok(Err(message)) => {
+                running.store(false, Ordering::SeqCst);
+                let _ = worker.join();
+                Err(WindowsAudioWorkerError::Media(message))
+            }
+            Err(_) => {
+                running.store(false, Ordering::SeqCst);
+                let _ = worker.join();
+                Err(WindowsAudioWorkerError::Media(
+                    "buffered audio worker did not become ready".into(),
+                ))
+            }
+        }
+    }
+
     /// Starts a dedicated Windows audio thread.
     ///
     /// The worker owns the WASAPI COM apartment, capture client, chunker and
