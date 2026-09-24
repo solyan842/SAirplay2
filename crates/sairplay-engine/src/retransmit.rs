@@ -5,6 +5,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
