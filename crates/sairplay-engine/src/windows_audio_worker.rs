@@ -103,6 +103,7 @@ impl WindowsAudioWorker {
             let mut transition_epoch: u64 = 0;
             let mut last_ptp_probe_alive: Option<bool> = None;
             let mut last_ptp_snapshot = std::time::Instant::now();
+            let mut last_steady_diag = std::time::Instant::now();
 
             while running_thread.load(Ordering::SeqCst) {
                 match capture.drain_into(&mut chunker) {
@@ -396,6 +397,31 @@ impl WindowsAudioWorker {
                                 return;
                             }
                         };
+
+                        if cold_armed && last_steady_diag.elapsed() >= Duration::from_secs(1) {
+                            let state = sender.state();
+                            let head_delta = sender.timeline_head_delta_frames(recovery_ntp);
+                            let head_delta_ms =
+                                head_delta as f64 * 1000.0 / audio_format.sample_rate as f64;
+                            if let Ok(mut events) = startup_events_thread.lock() {
+                                events.push(format!(
+                                    "Diagnostic: steady timeline · frames={} · seq={} ts={} · head_delta_frames={} ({:.1} ms) · pending_bytes={} · nonzero_bytes={} · pad_debt={} · inferred_idle={} · gap_ms={}.",
+                                    frames,
+                                    state.sequence,
+                                    state.timestamp,
+                                    head_delta,
+                                    head_delta_ms,
+                                    chunker.pending_bytes(),
+                                    chunker.pending_nonzero_bytes(),
+                                    sender.splice_pad_frames(),
+                                    inferred_idle,
+                                    nonzero_gap_started
+                                        .map(|started| started.elapsed().as_millis())
+                                        .unwrap_or(0)
+                                ));
+                            }
+                            last_steady_diag = std::time::Instant::now();
+                        }
 
                         // A sustained all-zero Windows loopback interval is
                         // the local equivalent of source PAUSED/EOF/track-gap:
