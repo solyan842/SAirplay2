@@ -818,6 +818,8 @@ mod tests {
                 sync_sent: true,
                 audio_delivered: true,
                 first_marker: true,
+                alac_payload_len: b"fake-alac".len(),
+                wire_packet_len: 12 + b"fake-alac".len() + 16 + 8,
             }
         );
 
