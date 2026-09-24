@@ -302,15 +302,18 @@ impl WindowsAudioWorker {
                                         }
                                     }
 
-                                    // Important source boundary:
-                                    // upstream's ap2_session_flush() is command-driven.
-                                    // Silence alone never authorizes us to drop the PCM
-                                    // ring or reset splice-pad debt. Keep the wire hot and
-                                    // preserve every queued sample exactly as the last
-                                    // known-good pre-hires worker did.
+                                    // Restore the known-good local half of a warm boundary.
+                                    // Windows has no explicit FLUSH command pipe, so after a
+                                    // sustained all-zero gap we may discard only sender-local
+                                    // PCM/pad that has not reached the wire yet. The receiver
+                                    // queue, RTP sequence/timestamp, crypto and immutable anchor
+                                    // remain untouched; no RTSP FLUSH is sent.
+                                    chunker.clear();
+                                    sender.begin_warm_splice_boundary();
+
                                     if let Ok(mut events) = startup_events_thread.lock() {
                                         events.push(format!(
-                                            "Transition: boundary #{} inferred from silence only · diagnostic, no FLUSH · pending_bytes={} · nonzero_bytes={} · pad_debt={} · seq/timestamp/anchor preserved.",
+                                            "Transition: boundary #{} local cleanup · discarded_bytes={} · stale_nonzero_bytes={} · dropped_pad_frames={} · seq/timestamp/anchor preserved.",
                                             transition_epoch,
                                             pending_before,
                                             pending_nonzero_before,
