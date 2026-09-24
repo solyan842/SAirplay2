@@ -13,6 +13,7 @@ pub struct ReceiverCapabilities {
     pub supports_pairing: bool,
     pub supports_ptp: bool,
     pub supports_buffered_audio: bool,
+    pub is_apple_model: bool,
     pub has_stored_credentials: bool,
     pub requires_pin: bool,
     pub legacy_pairing: bool,
@@ -32,6 +33,7 @@ impl ReceiverCapabilities {
             supports_pairing: txt.supports_pairing(),
             supports_ptp: txt.supports_ptp(),
             supports_buffered_audio: txt.supports_buffered_audio(),
+            is_apple_model: txt.is_apple_model(),
             has_stored_credentials,
             requires_pin: txt.pin_required(),
             legacy_pairing: txt.legacy_pairing(),
@@ -45,6 +47,20 @@ impl ReceiverCapabilities {
 pub struct RouteResolver;
 
 impl RouteResolver {
+    /// Port of pinned music-assistant/airplay-cli ap2_buffered_route() auto policy.
+    ///
+    /// Buffered type 103 is a transport decision layered on top of the base route:
+    /// native AirPlay 2 + PTP + SupportsBufferedAudio, excluding Apple models.
+    /// The upstream measured-hostile deny-list is currently empty, so there is
+    /// no model-specific third-party exclusion to copy here yet.
+    pub fn buffered_auto_eligible(route: Route, caps: ReceiverCapabilities) -> bool {
+        route == Route::AirPlay2Native
+            && caps.supports_ptp
+            && caps.supports_buffered_audio
+            && !caps.is_apple_model
+    }
+
+
     pub fn resolve(caps: ReceiverCapabilities) -> Route {
         if !caps.supports_airplay2 {
             return Route::Raop;
@@ -127,6 +143,61 @@ mod tests {
             }),
             Route::AirPlay2Compat
         );
+    }
+
+    #[test]
+    fn buffered_auto_matches_pinned_msa_third_party_policy() {
+        let txt = AirPlayTxt::parse([
+            ("features", ((1u64 << 38) | (1u64 << 40) | (1u64 << 41) | (1u64 << 46)).to_string()),
+            ("model", "Era 100".to_string()),
+        ]).unwrap();
+        let caps = ReceiverCapabilities::from_txt(&txt, false, false);
+        let route = RouteResolver::resolve(caps);
+        assert_eq!(route, Route::AirPlay2Native);
+        assert!(RouteResolver::buffered_auto_eligible(route, caps));
+    }
+
+    #[test]
+    fn buffered_auto_rejects_apple_models_even_when_bit40_and_ptp_are_set() {
+        for model in ["AppleTV14,1", "AudioAccessory5,1", "Mac14,7"] {
+            let txt = AirPlayTxt::parse([
+                ("features", ((1u64 << 38) | (1u64 << 40) | (1u64 << 41) | (1u64 << 46)).to_string()),
+                ("model", model.to_string()),
+            ]).unwrap();
+            let caps = ReceiverCapabilities::from_txt(&txt, false, false);
+            let route = RouteResolver::resolve(caps);
+            assert_eq!(route, Route::AirPlay2Native);
+            assert!(!RouteResolver::buffered_auto_eligible(route, caps));
+        }
+    }
+
+    #[test]
+    fn buffered_auto_requires_ptp_and_native_route() {
+        let no_ptp = ReceiverCapabilities {
+            supports_airplay2: true,
+            supports_pairing: true,
+            supports_buffered_audio: true,
+            supports_ptp: false,
+            ..Default::default()
+        };
+        let route = RouteResolver::resolve(no_ptp);
+        assert_eq!(route, Route::AirPlay2Native);
+        assert!(!RouteResolver::buffered_auto_eligible(route, no_ptp));
+
+        let compat = ReceiverCapabilities {
+            supports_airplay2: true,
+            supports_pairing: false,
+            supports_ptp: true,
+            supports_buffered_audio: true,
+            ..Default::default()
+        };
+        let route = RouteResolver::resolve(compat);
+        assert_eq!(route, Route::AirPlay2Compat);
+        assert!(!RouteResolver::buffered_auto_eligible(route, compat));
+
+        let raop = ReceiverCapabilities::default();
+        assert_eq!(RouteResolver::resolve(raop), Route::Raop);
+        assert!(!RouteResolver::buffered_auto_eligible(Route::Raop, raop));
     }
 
     #[test]
