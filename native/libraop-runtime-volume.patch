@@ -1,0 +1,59 @@
+diff --git a/src/cliraop.c b/src/cliraop.c
+index 3f2dca0..a80b6d1 100644
+--- a/src/cliraop.c
++++ b/src/cliraop.c
+@@ -67,6 +67,7 @@ static int print_usage(char *argv[])
+ \t[-p <port number>]\n"
+ \t[-v <volume> (0-100)]\n"
++\t[-V <runtime volume file>]\n"
+ \t[-l <latency> (frames]\n"
+ \t[-w <wait>]  (start after <wait> milliseconds)\n"
+ \t[-n <start>] (start at NTP <start> + <wait>)\n"
+@@ -136,6 +137,7 @@ int main(int argc, char *argv[]) {
+ 	bool interactive = false, alac = false, pairing = false;
+ 	char *secret = NULL, *md = NULL, *et = NULL;
++	char *volume_file = NULL;
+ 	bool auth = false;
+ 	struct in_addr host = { INADDR_ANY };
+ 
+@@ -151,6 +153,8 @@ int main(int argc, char *argv[]) {
+ 			port=atoi(argv[++i]);
+ 		} else if (!strcmp(argv[i],"-v")) {
+ 			volume=atoi(argv[++i]);
++		} else if (!strcmp(argv[i],"-V")) {
++			volume_file=argv[++i];
+ 		} else if (!strcmp(argv[i],"-w")) {
+ 			wait=atoi(argv[++i]);
+ 		} else if(!strcmp(argv[i],"-l")) {
+@@ -260,6 +264,8 @@ int main(int argc, char *argv[]) {
+ 	start = raopcl_get_ntp(NULL);
+ 	status = PLAYING;
++	int runtime_volume = volume;
++	uint64_t last_volume_check = 0;
+ 
+ 	buf = malloc(DEFAULT_FRAMES_PER_CHUNK * 4);
+ 	
+@@ -269,6 +275,23 @@ int main(int argc, char *argv[]) {
+ 
+ 		now = raopcl_get_ntp(NULL);
+ 
++		if (volume_file && now - last_volume_check >= MS2NTP(100)) {
++			FILE *vf;
++			int next_volume;
++			last_volume_check = now;
++			vf = fopen(volume_file, "r");
++			if (vf) {
++				if (fscanf(vf, "%d", &next_volume) == 1 &&
++					next_volume >= 0 && next_volume <= 100 &&
++					next_volume != runtime_volume) {
++					runtime_volume = next_volume;
++					raopcl_set_volume(raopcl, raopcl_float_volume(runtime_volume));
++					LOG_INFO("runtime volume %d%%", runtime_volume);
++				}
++				fclose(vf);
++			}
++		}
++
+ 		if (now - last > MS2NTP(1000)) {
+ 			last = now;
+ 			if (frames && frames > raopcl_latency(raopcl)) {

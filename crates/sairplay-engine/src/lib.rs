@@ -112,7 +112,8 @@ pub use native_group::{
 };
 #[cfg(windows)]
 pub use legacy_session::{
-    LegacyGroupError, LegacyGroupSession, LegacyMemberConfig, LIBRAOP_PINNED_COMMIT,
+    LegacyGroupError, LegacyGroupSession, LegacyMemberConfig, LegacyVolumeControl,
+    LIBRAOP_PINNED_COMMIT,
 };
 pub use native_session::{NativeSession, NativeSessionConfig, NativeSessionError};
 pub use ptp_engine::{PtpClock, PtpEngine, PtpEngineError, PtpExchange};

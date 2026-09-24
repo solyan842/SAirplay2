@@ -26,6 +26,7 @@ const WRITER_QUEUE_PACKETS: usize = 96;
 // PCM feed for 35 s as a failed member. Do the same here, but preserve every
 // PCM packet until that deadline instead of guessing a larger queue.
 const WRITER_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(35);
+static LEGACY_VOLUME_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct LegacyMemberConfig {
@@ -95,12 +96,39 @@ impl fmt::Display for LegacyGroupError {
 
 impl std::error::Error for LegacyGroupError {}
 
+#[derive(Clone)]
+pub struct LegacyVolumeControl {
+    path: PathBuf,
+}
+
+impl LegacyVolumeControl {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn set(&self, percent: u8) -> Result<VolumeSetResult, std::io::Error> {
+        let percent = percent.min(100);
+        // The source helper polls this tiny control file and applies the value
+        // through libraop's own raopcl_set_volume() on the live RTSP session.
+        // Keep the file write atomic enough for the helper's integer parser.
+        std::fs::write(&self.path, format!("{}\n", percent))?;
+        Ok(VolumeSetResult {
+            percent,
+            db: volume_percent_to_db(percent),
+            // 0 means queued to the source-built legacy helper. Native RTSP
+            // responses use real HTTP/RTSP status codes and never report 0.
+            status: 0,
+        })
+    }
+}
+
 struct SpawnedMember {
     name: String,
     pid: u32,
     pcm_tx: SyncSender<[u8; PCM352_PACKET_BYTES]>,
     connected_rx: Receiver<Result<(), String>>,
     writer: JoinHandle<()>,
+    volume_control: LegacyVolumeControl,
 }
 
 pub struct LegacyGroupSession {
@@ -113,6 +141,7 @@ pub struct LegacyGroupSession {
     first_non_silent_frame: Arc<AtomicU64>,
     startup_events: Arc<Mutex<Vec<String>>>,
     active_members: Arc<AtomicU64>,
+    volume_controls: Vec<LegacyVolumeControl>,
 }
 
 impl LegacyGroupSession {
@@ -195,6 +224,10 @@ impl LegacyGroupSession {
         let active_thread = Arc::clone(&active_members);
 
         let helper_pids = spawned.iter().map(|member| member.pid).collect::<Vec<_>>();
+        let volume_controls = spawned
+            .iter()
+            .map(|member| member.volume_control.clone())
+            .collect::<Vec<_>>();
         let mut senders = spawned
             .iter()
             .map(|member| (member.name.clone(), member.pcm_tx.clone()))
@@ -388,6 +421,7 @@ impl LegacyGroupSession {
             first_non_silent_frame,
             startup_events,
             active_members,
+            volume_controls,
         })
     }
 
@@ -398,6 +432,10 @@ impl LegacyGroupSession {
 
     pub fn active_members(&self) -> usize {
         self.active_members.load(Ordering::SeqCst) as usize
+    }
+
+    pub fn volume_controls(&self) -> Vec<LegacyVolumeControl> {
+        self.volume_controls.clone()
     }
 
     pub fn last_error(&self) -> Option<String> {
@@ -472,12 +510,25 @@ fn spawn_member(
     startup_events: Arc<Mutex<Vec<String>>>,
     active_members: Arc<AtomicU64>,
 ) -> Result<SpawnedMember, LegacyGroupError> {
+    let volume_path = std::env::temp_dir().join(format!(
+        "sairplay2-legacy-volume-{}-{}.txt",
+        std::process::id(),
+        LEGACY_VOLUME_FILE_ID.fetch_add(1, Ordering::SeqCst),
+    ));
+    std::fs::write(&volume_path, format!("{}\n", config.volume.min(100)))
+        .map_err(|error| LegacyGroupError::Spawn {
+            name: config.name.clone(),
+            error: format!("cannot initialize legacy volume control: {error}"),
+        })?;
+
     let mut command = Command::new(helper);
     command
         .arg("-p")
         .arg(config.port.to_string())
         .arg("-v")
         .arg(config.volume.min(100).to_string())
+        .arg("-V")
+        .arg(&volume_path)
         .arg("-l")
         .arg(RAOP_CONFIGURED_LATENCY_FRAMES.to_string())
         .arg("-t")
@@ -607,6 +658,7 @@ fn spawn_member(
         pcm_tx,
         connected_rx,
         writer,
+        volume_control: LegacyVolumeControl::new(volume_path),
     })
 }
 

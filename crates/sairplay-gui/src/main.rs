@@ -40,6 +40,21 @@ enum ActiveSession {
     Legacy(LegacyGroupSession),
 }
 
+#[derive(Clone)]
+enum ActiveVolumeControl {
+    Native(sairplay_engine::NativeVolumeControl),
+    Legacy(sairplay_engine::LegacyVolumeControl),
+}
+
+impl ActiveVolumeControl {
+    fn set(&self, percent: u8) -> Result<VolumeSetResult, String> {
+        match self {
+            Self::Native(control) => control.set(percent).map_err(|e| format!("{e:?}")),
+            Self::Legacy(control) => control.set(percent).map_err(|e| e.to_string()),
+        }
+    }
+}
+
 impl ActiveSession {
     fn audio_running(&self) -> bool {
         match self {
@@ -104,12 +119,24 @@ impl ActiveSession {
         }
     }
 
-    fn volume_controls(&self) -> Vec<sairplay_engine::NativeVolumeControl> {
+    fn volume_controls(&self) -> Vec<ActiveVolumeControl> {
         match self {
-            Self::Single(session) => vec![session.volume_control()],
-            Self::StereoPair(session) => session.volume_controls(),
-            Self::MultiRoom(session) => session.volume_controls(),
-            Self::Legacy(_) => Vec::new(),
+            Self::Single(session) => vec![ActiveVolumeControl::Native(session.volume_control())],
+            Self::StereoPair(session) => session
+                .volume_controls()
+                .into_iter()
+                .map(ActiveVolumeControl::Native)
+                .collect(),
+            Self::MultiRoom(session) => session
+                .volume_controls()
+                .into_iter()
+                .map(ActiveVolumeControl::Native)
+                .collect(),
+            Self::Legacy(session) => session
+                .volume_controls()
+                .into_iter()
+                .map(ActiveVolumeControl::Legacy)
+                .collect(),
         }
     }
 
@@ -804,10 +831,17 @@ impl SairplayApp {
         let finished = match rx.try_recv() {
             Ok(Ok(results)) => {
                 for result in results {
-                    self.log.push(format!(
-                        "Receiver volume {}% = {:.2} dB · RTSP {}.",
-                        result.percent, result.db, result.status
-                    ));
+                    if result.status == 0 {
+                        self.log.push(format!(
+                            "Legacy receiver volume {}% = {:.2} dB · queued to libraop runtime control.",
+                            result.percent, result.db
+                        ));
+                    } else {
+                        self.log.push(format!(
+                            "Receiver volume {}% = {:.2} dB · RTSP {}.",
+                            result.percent, result.db, result.status
+                        ));
+                    }
                 }
                 true
             }
@@ -847,7 +881,7 @@ impl SairplayApp {
             .spawn(move || {
                 let result = controls
                     .into_iter()
-                    .map(|control| control.set(volume).map_err(|e| format!("{e:?}")))
+                    .map(|control| control.set(volume))
                     .collect::<Result<Vec<_>, _>>();
                 let _ = tx.send(result);
             })

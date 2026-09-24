@@ -72,6 +72,7 @@ jobs:
           git clone --filter=blob:none https://github.com/philippe44/libraop.git $src
           git -C $src checkout $pin
           git -C $src submodule update --init --recursive
+          git -C $src apply "$env:GITHUB_WORKSPACE/native/libraop-runtime-volume.patch"
 
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe |
