@@ -1671,8 +1671,30 @@ impl SairplayApp {
     }
 
     fn stop_playback(&mut self) {
-        if self.session.take().is_some() {
-            self.log.push("Playback stopped; AirPlay session resources released.".into());
+        if let Some(session) = self.session.take() {
+            match session {
+                // Legacy shutdown deliberately waits for stdin EOF -> RAOP drain ->
+                // FLUSH/TEARDOWN, with a watchdog fallback. Never execute that
+                // blocking destructor on egui's UI thread: it makes the window
+                // appear hung for the whole graceful-drain/watchdog interval.
+                ActiveSession::Legacy(session) => {
+                    thread::Builder::new()
+                        .name("sairplay-legacy-stop".into())
+                        .spawn(move || drop(session))
+                        .expect("failed to spawn legacy stop worker");
+                    self.log.push(
+                        "Playback stopped; legacy AirPlay resources are releasing asynchronously."
+                            .into(),
+                    );
+                }
+                // Native workers currently have bounded local shutdown and stay
+                // on the existing path; do not change their proven stop behavior.
+                session => {
+                    drop(session);
+                    self.log
+                        .push("Playback stopped; AirPlay session resources released.".into());
+                }
+            }
         }
         self.active_fullnames.clear();
         self.active_mode = None;
