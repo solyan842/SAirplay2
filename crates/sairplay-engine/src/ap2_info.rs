@@ -151,10 +151,21 @@ pub fn select_native_stream_format(
         return Ap2AudioFormat::ALAC_44100_16_STEREO;
     }
 
+    let advertised = info.advertised_formats();
     match session_sample_rate {
-        48_000 => Ap2AudioFormat::ALAC_48000_24_STEREO,
-        44_100 => Ap2AudioFormat::ALAC_44100_24_STEREO,
-        _ => Ap2AudioFormat::ALAC_44100_24_STEREO,
+        48_000 if advertised & ALAC_48000_24_2 != 0 => {
+            Ap2AudioFormat::ALAC_48000_24_STEREO
+        }
+        44_100 if advertised & ALAC_44100_24_2 != 0 => {
+            Ap2AudioFormat::ALAC_44100_24_STEREO
+        }
+        _ if advertised & ALAC_44100_24_2 != 0 => {
+            Ap2AudioFormat::ALAC_44100_24_STEREO
+        }
+        _ if advertised & ALAC_48000_24_2 != 0 => {
+            Ap2AudioFormat::ALAC_48000_24_STEREO
+        }
+        _ => Ap2AudioFormat::ALAC_44100_16_STEREO,
     }
 }
 
@@ -312,11 +323,28 @@ mod tests {
         );
         assert_eq!(
             select_native_stream_format(&info, true, 48_000),
-            Ap2AudioFormat::ALAC_48000_24_STEREO
+            Ap2AudioFormat::ALAC_44100_24_STEREO
         );
         assert_eq!(
             select_native_stream_format(&info, true, 96_000),
             Ap2AudioFormat::ALAC_44100_24_STEREO
+        );
+    }
+
+    #[test]
+    fn source_policy_uses_48k_hires_when_receiver_advertises_it() {
+        let info = Ap2Info {
+            realtime: AudioFormatCapability {
+                mask: ALAC_44100_24_2 | ALAC_48000_24_2,
+                known: true,
+                extended: true,
+            },
+            buffered: AudioFormatCapability::default(),
+        };
+
+        assert_eq!(
+            select_native_stream_format(&info, true, 48_000),
+            Ap2AudioFormat::ALAC_48000_24_STEREO
         );
     }
 
