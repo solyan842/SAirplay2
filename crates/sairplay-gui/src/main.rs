@@ -1253,32 +1253,46 @@ impl SairplayApp {
                 ));
             }
 
-            // A retransmit request by itself is recoverable and is not enough
-            // to call the 24-bit path unhealthy. "expired" is the objective
-            // failure signal we already measure: the receiver requested an RTP
-            // packet that had fallen out of the retransmit ring and could not
-            // be recovered. Warn once per 24-bit session; never auto-downgrade.
+            // Runtime HomePod evidence showed audible crackle with a burst of
+            // retransmit requests even when every request was still answered.
+            // Upstream also documents HomePod 24-bit realtime UDP as MTU-sensitive.
+            // Treat a burst (>=4 requests in one monitor interval) as degraded,
+            // while any expired packet remains an immediate hard warning.
+            // This is a SAirplay2 runtime-health policy, not an AirPlay protocol rule.
             let is_hires_24 = session
                 .audio_format()
                 .is_some_and(|format| format.bit_depth > 16);
-            if is_hires_24 && expired_delta > 0 && !self.hires_quality_warning_shown {
+            let retransmit_burst = requested_delta >= 4;
+            let degraded_24bit = expired_delta > 0 || retransmit_burst;
+            if is_hires_24 && degraded_24bit && !self.hires_quality_warning_shown {
                 self.hires_quality_warning_shown = true;
                 self.hires_quality_warning_open = true;
                 self.hires_quality_warning_text = match self.language {
+                    UiLanguage::Vi if expired_delta > 0 => format!(
+                        "Đường truyền 24-bit đang không đạt độ ổn định cần thiết. Có {} gói RTP không thể khôi phục (tổng {}).\n\nNếu có mất tiếng, rè hoặc ngắt quãng, nên chuyển thiết bị này về 16-bit.",
+                        expired_delta,
+                        rtx.expired
+                    ),
                     UiLanguage::Vi => format!(
-                        "Đường truyền 24-bit đang không đạt độ ổn định cần thiết. HomePod/receiver đã yêu cầu truyền lại nhưng có {} gói RTP không còn trong bộ đệm để khôi phục (tổng {}).\n\nBạn có thể tiếp tục nghe, nhưng nếu có mất tiếng, rè hoặc ngắt quãng thì nên chuyển thiết bị này về 16-bit.",
+                        "Đường truyền 24-bit vừa xuất hiện một đợt yêu cầu truyền lại cao: {} gói trong một chu kỳ đo. Tất cả vẫn được khôi phục, nhưng kiểu burst này đã trùng với hiện tượng bụp/rè khi thử HomePod 24-bit.\n\nBạn có thể tiếp tục nghe; nếu hiện tượng lặp lại, nên chuyển thiết bị này về 16-bit.",
+                        requested_delta
+                    ),
+                    UiLanguage::En if expired_delta > 0 => format!(
+                        "The 24-bit path is not meeting the required stability. {} RTP packet(s) could not be recovered ({} total).\n\nIf you hear dropouts, crackle, or silence, switch this receiver back to 16-bit.",
                         expired_delta,
                         rtx.expired
                     ),
                     UiLanguage::En => format!(
-                        "The 24-bit path is not meeting the required stability. The HomePod/receiver requested retransmission, but {} RTP packet(s) were no longer available for recovery ({} total).\n\nYou can keep listening, but if you hear dropouts, crackle, or silence, switch this receiver back to 16-bit.",
-                        expired_delta,
-                        rtx.expired
+                        "The 24-bit path just produced a high retransmit burst: {} packet(s) in one measurement interval. All were recovered, but this burst pattern matched audible crackle during HomePod 24-bit testing.\n\nYou can keep listening; if it repeats, switch this receiver back to 16-bit.",
+                        requested_delta
                     ),
                 };
                 self.log.push(format!(
-                    "24-bit quality warning: unrecoverable retransmit loss detected · expired +{} (total {}).",
+                    "24-bit quality warning: retransmit burst +{} · expired +{} · totals requested={} answered={} expired={}.",
+                    requested_delta,
                     expired_delta,
+                    rtx.requested,
+                    rtx.answered,
                     rtx.expired
                 ));
             }
