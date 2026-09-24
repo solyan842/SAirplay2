@@ -72,7 +72,7 @@ jobs:
           git clone --filter=blob:none https://github.com/philippe44/libraop.git $src
           git -C $src checkout $pin
           git -C $src submodule update --init --recursive
-          git -C $src apply "$env:GITHUB_WORKSPACE/native/libraop-runtime-volume.patch"
+          Copy-Item "$env:GITHUB_WORKSPACE/native/cliraop-runtime-volume.c" "$src/src/cliraop.c" -Force
 
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe |
@@ -83,7 +83,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Current libraop source build failed" }
           if (-not (Test-Path "$src/bin/cliraop.exe")) { throw "Source-built cliraop.exe missing" }
 
-          & "$src/bin/cliraop.exe" --help | Out-String | Write-Host
+          $help = (& "$src/bin/cliraop.exe" --help | Out-String)
+          $help | Write-Host
+          if ($help -notmatch '\[-V <runtime volume file>\]') {
+            throw "Source-built cliraop.exe is missing runtime-volume support"
+          }
           # Upstream cliraop returns -1 after printing usage. The binary has
           # already been source-built successfully; normalize this documented
           # help exit so it cannot fail the packaging job.
