@@ -96,6 +96,8 @@ impl WindowsAudioWorker {
             let mut nonzero_gap_started: Option<std::time::Instant> = None;
             let mut nonzero_gap_reported = false;
             let mut resume_packet_pending = false;
+            let mut transition_packet_diag_remaining: u32 = 0;
+            let mut transition_packet_diag_index: u32 = 0;
             let mut inferred_idle = false;
             let mut idle_keepalive_reported = false;
             let mut transition_epoch: u64 = 0;
@@ -179,6 +181,10 @@ impl WindowsAudioWorker {
                                             ));
                                         }
                                         resume_packet_pending = true;
+                                        if audio_format.bit_depth > 16 {
+                                            transition_packet_diag_remaining = 32;
+                                            transition_packet_diag_index = 0;
+                                        }
                                     }
                                 }
                                 if inferred_idle {
@@ -513,6 +519,9 @@ impl WindowsAudioWorker {
                                 break;
                             }
 
+                            let head_delta_before = sender.timeline_head_delta_frames(ntp);
+                            let head_delta_before_ms =
+                                head_delta_before as f64 * 1000.0 / audio_format.sample_rate as f64;
                             let packet = chunker
                                 .pop_packet_with_silence_prefix(pad_now)
                                 .expect("required real-byte count checked");
@@ -552,6 +561,27 @@ impl WindowsAudioWorker {
                                             ));
                                         }
                                         resume_packet_pending = false;
+                                    }
+                                    if transition_packet_diag_remaining > 0 {
+                                        transition_packet_diag_index =
+                                            transition_packet_diag_index.saturating_add(1);
+                                        if let Ok(mut events) = startup_events_thread.lock() {
+                                            events.push(format!(
+                                                "Transition: 24-bit packet diag · boundary={} · packet={}/32 · seq={} ts={} · alac={} B · wire={} B · head_delta_before={} ({:.2} ms) · wasapi_discontinuities={} · pad_before={} · pending_after={}.",
+                                                transition_epoch,
+                                                transition_packet_diag_index,
+                                                result.sequence_sent,
+                                                result.timestamp_sent,
+                                                result.alac_payload_len,
+                                                result.wire_packet_len,
+                                                head_delta_before,
+                                                head_delta_before_ms,
+                                                discontinuities_thread.load(Ordering::SeqCst),
+                                                pad_now,
+                                                chunker.pending_bytes()
+                                            ));
+                                        }
+                                        transition_packet_diag_remaining -= 1;
                                     }
                                     if startup_started.map(|t| t.elapsed() <= Duration::from_secs(3)).unwrap_or(false)
                                         && (startup_packet_index <= 10 || result.sync_sent || !result.audio_delivered)

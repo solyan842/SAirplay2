@@ -31,6 +31,10 @@ pub struct MediaSendResult {
     pub sync_sent: bool,
     pub audio_delivered: bool,
     pub first_marker: bool,
+    /// Encoded ALAC bytes before RTP/encryption framing. Diagnostic only.
+    pub alac_payload_len: usize,
+    /// Final encrypted realtime UDP datagram bytes. Diagnostic only.
+    pub wire_packet_len: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -452,6 +456,8 @@ impl RealtimeMediaSender {
         let timestamp_sent = self.state.timestamp;
         let first_marker = self.state.first_packet;
         let packet = build_encrypted_realtime_packet(&self.state, alac_payload, &self.audio_key)?;
+        let alac_payload_len = alac_payload.len();
+        let wire_packet_len = packet.len();
 
         // Keep every sequence that enters the wire timeline in retransmit
         // history, including the rare Windows local-UDP deadline drop. The
@@ -487,6 +493,8 @@ impl RealtimeMediaSender {
             sync_sent: should_sync && sync_delivered,
             audio_delivered,
             first_marker,
+            alac_payload_len,
+            wire_packet_len,
         })
     }
 

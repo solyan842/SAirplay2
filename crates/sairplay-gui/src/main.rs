@@ -1231,11 +1231,27 @@ impl SairplayApp {
             return;
         };
 
-        for event in session.drain_startup_events() {
+        let transition_events = session.drain_startup_events();
+        let has_24bit_transition_diag = transition_events
+            .iter()
+            .any(|event| event.starts_with("Transition: 24-bit packet diag"));
+        for event in transition_events {
             self.log.push(event);
         }
 
         let rtx = session.retransmit_stats();
+        if has_24bit_transition_diag {
+            let prev = self.last_retransmit_stats;
+            self.log.push(format!(
+                "Transition: RTX snapshot · requested +{} (total {}) · answered +{} (total {}) · expired +{} (total {}).",
+                rtx.requested.saturating_sub(prev.requested),
+                rtx.requested,
+                rtx.answered.saturating_sub(prev.answered),
+                rtx.answered,
+                rtx.expired.saturating_sub(prev.expired),
+                rtx.expired
+            ));
+        }
         if rtx != self.last_retransmit_stats {
             let prev = self.last_retransmit_stats;
             let requested_delta = rtx.requested.saturating_sub(prev.requested);
