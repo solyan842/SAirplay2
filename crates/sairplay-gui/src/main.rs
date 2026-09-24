@@ -166,7 +166,8 @@ struct MembershipAdded {
 
 struct HiresProbeResult {
     fullname: String,
-    advertised: Option<bool>,
+    realtime_hires: Option<bool>,
+    buffered_hires: Option<bool>,
     realtime_mask: Option<u64>,
     buffered_mask: Option<u64>,
 }
@@ -292,6 +293,7 @@ struct SairplayApp {
     legacy_secrets: BTreeMap<String, String>,
     hires_overrides: BTreeMap<String, bool>,
     hires_capabilities: BTreeMap<String, bool>,
+    buffered_hires_capabilities: BTreeMap<String, bool>,
     hires_probe_pending: BTreeSet<String>,
     hires_probe_tx: mpsc::Sender<HiresProbeResult>,
     hires_probe_rx: Receiver<HiresProbeResult>,
@@ -367,6 +369,7 @@ impl Default for SairplayApp {
             legacy_secrets: BTreeMap::new(),
             hires_overrides: BTreeMap::new(),
             hires_capabilities: BTreeMap::new(),
+            buffered_hires_capabilities: BTreeMap::new(),
             hires_probe_pending: BTreeSet::new(),
             hires_probe_tx,
             hires_probe_rx,
@@ -420,9 +423,12 @@ impl SairplayApp {
                 .get_info(&host, port)
                 .ok();
 
-                let advertised = result
+                let realtime_hires = result
                     .as_ref()
-                    .map(|result| result.info.advertises_hires());
+                    .map(|result| result.info.advertises_realtime_hires());
+                let buffered_hires = result
+                    .as_ref()
+                    .map(|result| result.info.advertises_buffered_hires());
                 let realtime_mask = result
                     .as_ref()
                     .and_then(|result| result.info.realtime.known.then_some(result.info.realtime.mask));
@@ -432,7 +438,8 @@ impl SairplayApp {
 
                 let _ = tx.send(HiresProbeResult {
                     fullname,
-                    advertised,
+                    realtime_hires,
+                    buffered_hires,
                     realtime_mask,
                     buffered_mask,
                 });
@@ -443,47 +450,55 @@ impl SairplayApp {
     fn pump_hires_probes(&mut self) {
         while let Ok(result) = self.hires_probe_rx.try_recv() {
             self.hires_probe_pending.remove(&result.fullname);
-            match result.advertised {
-                Some(advertised) => {
+            match (result.realtime_hires, result.buffered_hires) {
+                (Some(realtime_hires), Some(buffered_hires)) => {
+                    // hires_capabilities means "safe for the transport we
+                    // currently implement here": native realtime type 96.
+                    // Buffered-only 24-bit must never light the realtime toggle.
                     self.hires_capabilities
-                        .insert(result.fullname.clone(), advertised);
+                        .insert(result.fullname.clone(), realtime_hires);
+                    self.buffered_hires_capabilities
+                        .insert(result.fullname.clone(), buffered_hires);
 
-                    let union_mask =
-                        result.realtime_mask.unwrap_or(0) | result.buffered_mask.unwrap_or(0);
-                    let formats = [
-                        ("44.1/16", ALAC_44100_16_2),
-                        ("44.1/24", ALAC_44100_24_2),
-                        ("48/16", ALAC_48000_16_2),
-                        ("48/24", ALAC_48000_24_2),
-                    ]
-                    .into_iter()
-                    .filter_map(|(name, bit)| ((union_mask & bit) != 0).then_some(name))
-                    .collect::<Vec<_>>();
-
-                    self.log.push(format!(
-                        "{}: /info formats = {} · realtime_mask={} · buffered_mask={}.",
-                        result.fullname,
+                    let describe = |mask: Option<u64>| {
+                        let formats = [
+                            ("44.1/16", ALAC_44100_16_2),
+                            ("44.1/24", ALAC_44100_24_2),
+                            ("48/16", ALAC_48000_16_2),
+                            ("48/24", ALAC_48000_24_2),
+                        ]
+                        .into_iter()
+                        .filter_map(|(name, bit)| {
+                            mask.and_then(|value| ((value & bit) != 0).then_some(name))
+                        })
+                        .collect::<Vec<_>>();
                         if formats.is_empty() {
                             "none of 44.1/16, 44.1/24, 48/16, 48/24".to_owned()
                         } else {
                             formats.join(", ")
-                        },
-                        result
-                            .realtime_mask
+                        }
+                    };
+
+                    self.log.push(format!(
+                        "{}: /info realtime(type 96)={} [{}] · buffered(type 103)={} [{}].",
+                        result.fullname,
+                        describe(result.realtime_mask),
+                        result.realtime_mask
                             .map(|mask| format!("0x{mask:016X}"))
                             .unwrap_or_else(|| "unknown".into()),
-                        result
-                            .buffered_mask
+                        describe(result.buffered_mask),
+                        result.buffered_mask
                             .map(|mask| format!("0x{mask:016X}"))
                             .unwrap_or_else(|| "unknown".into()),
                     ));
                     self.log.push(format!(
-                        "{}: /info 24-bit capability = {}.",
+                        "{}: /info 24-bit capability · realtime={} · buffered={}.",
                         result.fullname,
-                        if advertised { "advertised" } else { "not advertised" }
+                        if realtime_hires { "advertised" } else { "not advertised" },
+                        if buffered_hires { "advertised" } else { "not advertised" },
                     ));
                 }
-                None => {
+                _ => {
                     self.log.push(format!(
                         "{}: /info capability probe unavailable; keeping baseline policy until next discovery.",
                         result.fullname

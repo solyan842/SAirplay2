@@ -128,30 +128,41 @@ impl Ap2Info {
         Ap2AudioFormat::ALAC_44100_16_STEREO.audio_format_code()
     }
 
-    /// Music Assistant treats the two /info stream tables as advisory evidence
-    /// and unions the formats from tables the receiver actually published.
+    /// Diagnostic union only. Never use this to select a stream format:
+    /// audioStream (type 96) and bufferStream (type 103) are different
+    /// transports and a format advertised by one does not make it valid on
+    /// the other.
     pub fn advertised_formats(&self) -> u64 {
-        let realtime = if self.realtime.known { self.realtime.mask } else { 0 };
-        let buffered = if self.buffered.known { self.buffered.mask } else { 0 };
-        realtime | buffered
+        self.realtime_formats() | self.buffered_formats()
     }
 
-    pub fn advertises_hires(&self) -> bool {
-        self.advertised_formats() & AIRPLAY_HIRES_AUDIO_FORMATS != 0
+    pub fn realtime_formats(&self) -> u64 {
+        if self.realtime.known { self.realtime.mask } else { 0 }
+    }
+
+    pub fn buffered_formats(&self) -> u64 {
+        if self.buffered.known { self.buffered.mask } else { 0 }
+    }
+
+    pub fn advertises_realtime_hires(&self) -> bool {
+        self.realtime_formats() & AIRPLAY_HIRES_AUDIO_FORMATS != 0
+    }
+
+    pub fn advertises_buffered_hires(&self) -> bool {
+        self.buffered_formats() & AIRPLAY_HIRES_AUDIO_FORMATS != 0
     }
 }
 
-
-pub fn select_native_stream_format(
-    info: &Ap2Info,
+fn select_format_for_capability(
+    capability: AudioFormatCapability,
     hires_enabled: bool,
     session_sample_rate: u32,
 ) -> Ap2AudioFormat {
-    if !hires_enabled || !info.advertises_hires() {
+    if !hires_enabled || !capability.known {
         return Ap2AudioFormat::ALAC_44100_16_STEREO;
     }
 
-    let advertised = info.advertised_formats();
+    let advertised = capability.mask;
     match session_sample_rate {
         48_000 if advertised & ALAC_48000_24_2 != 0 => {
             Ap2AudioFormat::ALAC_48000_24_STEREO
@@ -167,6 +178,22 @@ pub fn select_native_stream_format(
         }
         _ => Ap2AudioFormat::ALAC_44100_16_STEREO,
     }
+}
+
+pub fn select_native_realtime_stream_format(
+    info: &Ap2Info,
+    hires_enabled: bool,
+    session_sample_rate: u32,
+) -> Ap2AudioFormat {
+    select_format_for_capability(info.realtime, hires_enabled, session_sample_rate)
+}
+
+pub fn select_native_buffered_stream_format(
+    info: &Ap2Info,
+    hires_enabled: bool,
+    session_sample_rate: u32,
+) -> Ap2AudioFormat {
+    select_format_for_capability(info.buffered, hires_enabled, session_sample_rate)
 }
 
 fn parse_stream_capability(
@@ -318,15 +345,15 @@ mod tests {
         };
 
         assert_eq!(
-            select_native_stream_format(&info, false, 48_000),
+            select_native_realtime_stream_format(&info, false, 48_000),
             Ap2AudioFormat::ALAC_44100_16_STEREO
         );
         assert_eq!(
-            select_native_stream_format(&info, true, 48_000),
+            select_native_realtime_stream_format(&info, true, 48_000),
             Ap2AudioFormat::ALAC_44100_24_STEREO
         );
         assert_eq!(
-            select_native_stream_format(&info, true, 96_000),
+            select_native_realtime_stream_format(&info, true, 96_000),
             Ap2AudioFormat::ALAC_44100_24_STEREO
         );
     }
@@ -343,7 +370,7 @@ mod tests {
         };
 
         assert_eq!(
-            select_native_stream_format(&info, true, 48_000),
+            select_native_realtime_stream_format(&info, true, 48_000),
             Ap2AudioFormat::ALAC_48000_24_STEREO
         );
     }
@@ -352,7 +379,7 @@ mod tests {
     fn source_policy_keeps_unknown_or_16bit_only_receivers_on_baseline() {
         let unknown = Ap2Info::default();
         assert_eq!(
-            select_native_stream_format(&unknown, true, 48_000),
+            select_native_realtime_stream_format(&unknown, true, 48_000),
             Ap2AudioFormat::ALAC_44100_16_STEREO
         );
 
@@ -365,13 +392,13 @@ mod tests {
             buffered: AudioFormatCapability::default(),
         };
         assert_eq!(
-            select_native_stream_format(&only_16, true, 48_000),
+            select_native_realtime_stream_format(&only_16, true, 48_000),
             Ap2AudioFormat::ALAC_44100_16_STEREO
         );
     }
 
     #[test]
-    fn advertised_formats_union_only_published_tables() {
+    fn buffered_only_hires_never_upgrades_realtime_stream() {
         let info = Ap2Info {
             realtime: AudioFormatCapability {
                 mask: ALAC_44100_16_2,
@@ -384,10 +411,20 @@ mod tests {
                 extended: true,
             },
         };
+
+        assert!(!info.advertises_realtime_hires());
+        assert!(info.advertises_buffered_hires());
+        assert_eq!(
+            select_native_realtime_stream_format(&info, true, 48_000),
+            Ap2AudioFormat::ALAC_44100_16_STEREO
+        );
+        assert_eq!(
+            select_native_buffered_stream_format(&info, true, 48_000),
+            Ap2AudioFormat::ALAC_48000_24_STEREO
+        );
         assert_eq!(
             info.advertised_formats(),
             ALAC_44100_16_2 | ALAC_48000_24_2
         );
-        assert!(info.advertises_hires());
     }
 }
