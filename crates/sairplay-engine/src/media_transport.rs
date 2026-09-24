@@ -13,6 +13,7 @@ pub enum MediaTransportError {
     RemoteNotAttached,
     SendData(io::Error),
     SendControl(io::Error),
+    ConnectBuffered(io::Error),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

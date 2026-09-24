@@ -6,6 +6,7 @@ use plist::{Dictionary, Value};
 use std::io::Cursor;
 
 pub const REALTIME_STREAM_TYPE: u64 = 96;
+pub const BUFFERED_STREAM_TYPE: u64 = 103;
 pub const ALAC_CODEC_TYPE: u64 = 2;
 pub const FRAMES_PER_PACKET: u64 = 352;
 pub const LATENCY_MIN_FRAMES: u64 = 11_025;
@@ -22,6 +23,24 @@ pub struct RealtimeStreamSetupConfig {
     pub audio_secret: [u8; 32],
     pub stream_connection_id: u32,
     pub audio_format: Ap2AudioFormat,
+}
+
+#[derive(Debug, Clone)]
+pub struct BufferedStreamSetupConfig {
+    pub cseq: u32,
+    pub session_uri: String,
+    pub dacp_id: String,
+    pub active_remote: String,
+    pub local_control_port: u16,
+    pub audio_secret: [u8; 32],
+    pub stream_connection_id: u32,
+    pub audio_format: Ap2AudioFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferedStreamSetupResult {
+    pub data_port: u16,
+    pub control_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +79,118 @@ impl From<EncryptedRtspError> for StreamSetupError {
 }
 impl From<plist::Error> for StreamSetupError {
     fn from(value: plist::Error) -> Self { Self::Plist(value) }
+}
+
+pub fn build_buffered_stream_plist(
+    local_control_port: u16,
+    audio_secret: &[u8; 32],
+    stream_connection_id: u32,
+    audio_format: Ap2AudioFormat,
+) -> Result<Vec<u8>, StreamSetupError> {
+    // Pinned MSA type-103 contract: no sender dataPort and no
+    // latencyMin/latencyMax. The receiver owns the TCP buffer and returns the
+    // listener dataPort in the SETUP response.
+    let mut stream = Dictionary::new();
+    stream.insert(
+        "audioFormat".into(),
+        Value::Integer(audio_format.audio_format_code().into()),
+    );
+    stream.insert("audioMode".into(), Value::String("default".into()));
+    stream.insert("controlPort".into(), Value::Integer((local_control_port as u64).into()));
+    stream.insert("ct".into(), Value::Integer(ALAC_CODEC_TYPE.into()));
+    stream.insert("isMedia".into(), Value::Boolean(true));
+    stream.insert("shk".into(), Value::Data(audio_secret.to_vec()));
+    stream.insert("spf".into(), Value::Integer(FRAMES_PER_PACKET.into()));
+    stream.insert(
+        "sr".into(),
+        Value::Integer((audio_format.sample_rate as u64).into()),
+    );
+    stream.insert(
+        "streamConnectionID".into(),
+        Value::Integer((stream_connection_id as u64).into()),
+    );
+    stream.insert("supportsDynamicStreamID".into(), Value::Boolean(false));
+    stream.insert("type".into(), Value::Integer(BUFFERED_STREAM_TYPE.into()));
+
+    let mut root = Dictionary::new();
+    root.insert("streams".into(), Value::Array(vec![Value::Dictionary(stream)]));
+
+    let mut out = Vec::new();
+    Value::Dictionary(root).to_writer_binary(&mut out)?;
+    Ok(out)
+}
+
+pub fn parse_buffered_stream_setup_response(
+    body: &[u8],
+) -> Result<BufferedStreamSetupResult, StreamSetupError> {
+    let value = Value::from_reader(Cursor::new(body))?;
+    let root = value.as_dictionary().ok_or(StreamSetupError::InvalidRoot)?;
+    let streams = root
+        .get("streams")
+        .and_then(Value::as_array)
+        .ok_or(StreamSetupError::MissingStreams)?;
+    let stream = streams
+        .first()
+        .and_then(Value::as_dictionary)
+        .ok_or(StreamSetupError::InvalidStream)?;
+
+    let data = stream
+        .get("dataPort")
+        .and_then(Value::as_unsigned_integer)
+        .ok_or(StreamSetupError::MissingDataPort)?;
+    if !(1024..=65535).contains(&data) {
+        return Err(StreamSetupError::InvalidDataPort);
+    }
+
+    let control_port = stream
+        .get("controlPort")
+        .and_then(Value::as_unsigned_integer)
+        .filter(|value| (1024..=65535).contains(value))
+        .map(|value| value as u16);
+
+    Ok(BufferedStreamSetupResult {
+        data_port: data as u16,
+        control_port,
+    })
+}
+
+pub fn setup_buffered_stream(
+    flow: &mut NativeConnectFlow,
+    channel: &mut EncryptedRtspChannel,
+    config: &BufferedStreamSetupConfig,
+) -> Result<BufferedStreamSetupResult, StreamSetupError> {
+    if flow.phase() != crate::NativePhase::Recorded {
+        flow.stream_setup()?;
+        unreachable!("stream_setup succeeds only from Recorded");
+    }
+
+    let body = build_buffered_stream_plist(
+        config.local_control_port,
+        &config.audio_secret,
+        config.stream_connection_id,
+        config.audio_format,
+    )?;
+
+    let request = RtspRequest {
+        method: "SETUP".into(),
+        uri: config.session_uri.clone(),
+        cseq: config.cseq,
+        user_agent: "AirPlay/670.6.2".into(),
+        dacp_id: config.dacp_id.clone(),
+        active_remote: config.active_remote.clone(),
+        client_instance: None,
+        content_type: Some("application/x-apple-binary-plist".into()),
+        body,
+    };
+
+    let response = channel.exchange(&request.encode(), config.cseq)?;
+    if response.status != 200 {
+        return Err(StreamSetupError::Status(response.status));
+    }
+
+    let result = parse_buffered_stream_setup_response(&response.body)?;
+    flow.stream_setup()?;
+    Ok(result)
 }
 
 pub fn build_realtime_stream_plist(
@@ -285,6 +416,50 @@ mod tests {
         assert_eq!(stream.get("isMedia").and_then(Value::as_boolean), Some(true));
         assert_eq!(stream.get("supportsDynamicStreamID").and_then(Value::as_boolean), Some(false));
         assert_eq!(stream.get("shk").and_then(Value::as_data), Some(secret.as_slice()));
+    }
+
+    #[test]
+    fn buffered_plist_matches_type103_contract() {
+        let secret = [0xEEu8; 32];
+        let body = build_buffered_stream_plist(
+            50001,
+            &secret,
+            0x12345678,
+            Ap2AudioFormat::ALAC_48000_24_STEREO,
+        ).unwrap();
+        let value = Value::from_reader(Cursor::new(&body)).unwrap();
+        let stream = value
+            .as_dictionary().unwrap()
+            .get("streams").unwrap().as_array().unwrap()[0]
+            .as_dictionary().unwrap();
+
+        assert_eq!(stream.get("type").and_then(Value::as_unsigned_integer), Some(103));
+        assert_eq!(stream.get("audioFormat").and_then(Value::as_unsigned_integer), Some(crate::ALAC_48000_24_2));
+        assert_eq!(stream.get("sr").and_then(Value::as_unsigned_integer), Some(48_000));
+        assert_eq!(stream.get("controlPort").and_then(Value::as_unsigned_integer), Some(50001));
+        assert!(stream.get("dataPort").is_none());
+        assert!(stream.get("latencyMin").is_none());
+        assert!(stream.get("latencyMax").is_none());
+        assert_eq!(stream.get("spf").and_then(Value::as_unsigned_integer), Some(352));
+        assert_eq!(stream.get("ct").and_then(Value::as_unsigned_integer), Some(2));
+    }
+
+    #[test]
+    fn buffered_response_requires_data_port_but_not_control_port() {
+        let mut stream = Dictionary::new();
+        stream.insert("dataPort".into(), Value::Integer(60000u64.into()));
+        let mut root = Dictionary::new();
+        root.insert("streams".into(), Value::Array(vec![Value::Dictionary(stream)]));
+        let mut body = Vec::new();
+        Value::Dictionary(root).to_writer_binary(&mut body).unwrap();
+
+        assert_eq!(
+            parse_buffered_stream_setup_response(&body).unwrap(),
+            BufferedStreamSetupResult {
+                data_port: 60000,
+                control_port: None,
+            }
+        );
     }
 
     #[test]

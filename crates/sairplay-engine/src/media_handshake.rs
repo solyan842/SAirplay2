@@ -1,9 +1,10 @@
 use crate::{
-    setup_realtime_stream, Ap2AudioFormat, EncryptedRtspChannel, MediaTransport,
-    MediaTransportError, NativeConnectFlow, RealtimeStreamSetupConfig, StreamPorts,
-    StreamSetupError,
+    setup_buffered_stream, setup_realtime_stream, Ap2AudioFormat, BufferedStreamSetupConfig,
+    EncryptedRtspChannel, MediaTransport, MediaTransportError, NativeConnectFlow,
+    RealtimeStreamSetupConfig, StreamPorts, StreamSetupError,
 };
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct MediaHandshakeConfig {
@@ -36,6 +37,67 @@ pub struct MediaHandshakeResult {
     pub remote_ports: StreamPorts,
     pub latency_min: Option<u32>,
     pub latency_max: Option<u32>,
+}
+
+pub struct BufferedMediaHandshakeResult {
+    pub control_transport: MediaTransport,
+    pub data_stream: TcpStream,
+    pub remote_data_port: u16,
+    pub remote_control_port: Option<u16>,
+}
+
+pub fn prepare_buffered_media(
+    flow: &mut NativeConnectFlow,
+    channel: &mut EncryptedRtspChannel,
+    config: &MediaHandshakeConfig,
+) -> Result<BufferedMediaHandshakeResult, MediaHandshakeError> {
+    // Pinned MSA still binds its UDP media sockets before SETUP. Type 103
+    // advertises only the local controlPort; dataPort is assigned by the
+    // receiver and returned in the SETUP response.
+    let mut control_transport = MediaTransport::bind(config.bind_ip)?;
+    let local = control_transport.local_ports()?;
+
+    let setup = BufferedStreamSetupConfig {
+        cseq: config.cseq,
+        session_uri: config.session_uri.clone(),
+        dacp_id: config.dacp_id.clone(),
+        active_remote: config.active_remote.clone(),
+        local_control_port: local.control_port,
+        audio_secret: config.audio_secret,
+        stream_connection_id: config.stream_connection_id,
+        audio_format: config.audio_format,
+    };
+    let setup_result = setup_buffered_stream(flow, channel, &setup)?;
+
+    if let Some(control_port) = setup_result.control_port {
+        control_transport.attach_remote(
+            config.receiver_ip,
+            StreamPorts {
+                data_port: setup_result.data_port,
+                control_port,
+            },
+        );
+    }
+
+    let remote = SocketAddr::new(config.receiver_ip, setup_result.data_port);
+    let data_stream = TcpStream::connect_timeout(&remote, Duration::from_secs(2))
+        .map_err(|error| MediaHandshakeError::Transport(MediaTransportError::ConnectBuffered(error)))?;
+    data_stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| MediaHandshakeError::Transport(MediaTransportError::Configure(error)))?;
+    data_stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| MediaHandshakeError::Transport(MediaTransportError::Configure(error)))?;
+    data_stream
+        .set_nodelay(true)
+        .map_err(|error| MediaHandshakeError::Transport(MediaTransportError::Configure(error)))?;
+
+    Ok(BufferedMediaHandshakeResult {
+        control_transport,
+        data_stream,
+        remote_data_port: setup_result.data_port,
+        remote_control_port: setup_result.control_port,
+    })
 }
 
 pub fn prepare_realtime_media(
