@@ -104,6 +104,30 @@ impl NativeGroupJoinHandle {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MultiRoomFormatPlan {
+    session_sample_rate: u32,
+}
+
+fn plan_multiroom_format(configs: &[NativeGroupMemberConfig]) -> MultiRoomFormatPlan {
+    // Music Assistant selects ONE shared flow sample-rate from the intersection
+    // of every output player's supported rates, but keeps bit depth per player.
+    //
+    // AirPlay's non-hires baseline is 44.1/16. A hi-res-enabled AirPlay 2
+    // player contributes 44.1/24 and 48/24. Therefore:
+    //   * if every member is hi-res enabled, 48 kHz is available to the group;
+    //   * if any member is baseline 16-bit, the common rate is 44.1 kHz.
+    //
+    // Per-member /info remains authoritative during NativeSession::connect:
+    // a hi-res member on a mixed group negotiates 44.1/24 while the baseline
+    // member negotiates 44.1/16. The worker then performs depth-only handoff.
+    let all_hires = !configs.is_empty()
+        && configs.iter().all(|member| member.config.hires_enabled);
+    MultiRoomFormatPlan {
+        session_sample_rate: if all_hires { 48_000 } else { 44_100 },
+    }
+}
+
 pub struct NativeGroupSession {
     kind: NativeGroupKind,
     members: Vec<(String, NativeSession)>,
@@ -121,6 +145,13 @@ impl NativeGroupSession {
             NativeGroupKind::StereoPair if configs.len() != 2 => return Err(NativeGroupError::InvalidMembership { kind, members: configs.len() }),
             NativeGroupKind::MultiRoom if configs.len() < 2 => return Err(NativeGroupError::InvalidMembership { kind, members: configs.len() }),
             _ => {}
+        }
+
+        if kind == NativeGroupKind::MultiRoom {
+            let plan = plan_multiroom_format(&configs);
+            for member in &mut configs {
+                member.config.session_sample_rate = plan.session_sample_rate;
+            }
         }
 
         // Source architecture: one shared PTP daemon owns 319/320 for every
@@ -349,5 +380,54 @@ impl Drop for NativeGroupSession {
             session.teardown_while_audio_hot();
         }
         self.stop_audio();
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member(name: &str, hires_enabled: bool, requested_rate: u32) -> NativeGroupMemberConfig {
+        let mut config = NativeSessionConfig::new("127.0.0.1", 7000);
+        config.hires_enabled = hires_enabled;
+        config.session_sample_rate = requested_rate;
+        NativeGroupMemberConfig::new(name, config)
+    }
+
+    #[test]
+    fn multiroom_plan_keeps_48k_when_every_member_is_hires() {
+        let configs = vec![
+            member("a", true, 48_000),
+            member("b", true, 48_000),
+        ];
+        assert_eq!(plan_multiroom_format(&configs).session_sample_rate, 48_000);
+    }
+
+    #[test]
+    fn multiroom_plan_mixed_24_and_16_uses_common_44100_rate() {
+        let configs = vec![
+            member("hires", true, 48_000),
+            member("baseline", false, 44_100),
+        ];
+        assert_eq!(plan_multiroom_format(&configs).session_sample_rate, 44_100);
+    }
+
+    #[test]
+    fn multiroom_plan_all_16bit_uses_44100_rate() {
+        let configs = vec![
+            member("a", false, 44_100),
+            member("b", false, 44_100),
+        ];
+        assert_eq!(plan_multiroom_format(&configs).session_sample_rate, 44_100);
+    }
+
+    #[test]
+    fn multiroom_plan_ignores_per_member_requested_rate_in_favor_of_common_rate() {
+        let configs = vec![
+            member("hires", true, 48_000),
+            member("baseline", false, 48_000),
+        ];
+        assert_eq!(plan_multiroom_format(&configs).session_sample_rate, 44_100);
     }
 }
