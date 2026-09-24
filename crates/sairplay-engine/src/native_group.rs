@@ -273,6 +273,11 @@ impl NativeGroupSession {
             total.requested = total.requested.saturating_add(stats.requested);
             total.answered = total.answered.saturating_add(stats.answered);
             total.expired = total.expired.saturating_add(stats.expired);
+            total.requested_over_1472 = total
+                .requested_over_1472
+                .saturating_add(stats.requested_over_1472);
+            total.max_requested_wire_len =
+                total.max_requested_wire_len.max(stats.max_requested_wire_len);
             total
         })
     }
