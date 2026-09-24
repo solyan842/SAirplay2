@@ -1295,24 +1295,8 @@ impl SairplayApp {
                 self.hires_quality_warning_shown = true;
                 self.hires_quality_warning_open = true;
                 self.hires_quality_warning_text = match self.language {
-                    UiLanguage::Vi if expired_delta > 0 => format!(
-                        "Kết nối AirPlay 24-bit vừa xuất hiện dao động ngắn, có thể gây tiếng rè hoặc gián đoạn âm thanh.\n\nNếu tình trạng lặp lại, hãy chuyển sang 16-bit để phát ổn định hơn.",
-                        expired_delta,
-                        rtx.expired
-                    ),
-                    UiLanguage::Vi => format!(
-                        "Kết nối AirPlay 24-bit vừa xuất hiện dao động ngắn, có thể gây tiếng rè hoặc gián đoạn âm thanh.\n\nNếu tình trạng lặp lại, hãy chuyển sang 16-bit để phát ổn định hơn.",
-                        requested_delta
-                    ),
-                    UiLanguage::En if expired_delta > 0 => format!(
-                        "The 24-bit AirPlay connection experienced a brief instability that may cause distortion or audio dropouts.\n\nIf this continues, switch to 16-bit for more stable playback.",
-                        expired_delta,
-                        rtx.expired
-                    ),
-                    UiLanguage::En => format!(
-                        "The 24-bit AirPlay connection experienced a brief instability that may cause distortion or audio dropouts.\n\nIf this continues, switch to 16-bit for more stable playback.",
-                        requested_delta
-                    ),
+                    UiLanguage::Vi => "Kết nối AirPlay 24-bit vừa xuất hiện dao động ngắn, có thể gây tiếng rè hoặc gián đoạn âm thanh.\n\nNếu tình trạng lặp lại, hãy chuyển sang 16-bit để phát ổn định hơn.".to_owned(),
+                    UiLanguage::En => "The 24-bit AirPlay connection experienced a brief instability that may cause distortion or audio dropouts.\n\nIf this continues, switch to 16-bit for more stable playback.".to_owned(),
                 };
                 self.log.push(format!(
                     "24-bit quality warning: retransmit burst +{} · expired +{} · totals requested={} answered={} expired={}.",
