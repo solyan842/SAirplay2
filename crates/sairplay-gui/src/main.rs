@@ -1970,12 +1970,18 @@ impl SairplayApp {
                     hires_clicked = toggle.clicked();
                     show_hires_tooltip(toggle, &tooltip_title, &tooltip_body);
                 } else {
-                    ui.add_space(12.0);
                     ui.label(
                         egui::RichText::new("16-bit")
                             .size(10.5)
                             .color(UiTheme::text_soft()),
                     );
+                    ui.add_space(2.0);
+                    let mut fixed_off = false;
+                    let disabled = draw_compact_switch(ui, &mut fixed_off, false);
+                    disabled.on_hover_text(self.t(
+                        "Thiết bị này chỉ hỗ trợ 16-bit.",
+                        "This receiver supports 16-bit only.",
+                    ));
                 }
             });
         });
