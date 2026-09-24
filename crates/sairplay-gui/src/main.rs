@@ -2550,6 +2550,12 @@ impl eframe::App for SairplayApp {
         self.pump_volume_result();
         self.pump_legacy_pairing();
         self.monitor_running_session();
+        if self.session.is_some() {
+            // Audio/transition diagnostics are produced by background workers.
+            // Keep the GUI monitor polling even when playback is controlled from
+            // another application and no egui input event wakes this window.
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
 
         let mut visuals = egui::Visuals::light();
         visuals.panel_fill = UiTheme::bg();
