@@ -304,6 +304,12 @@ impl NativeGroupSession {
 
 impl Drop for NativeGroupSession {
     fn drop(&mut self) {
+        // Keep the shared producer alive until every receiver has received its
+        // TEARDOWN. This preserves the same clean shutdown boundary as MSA for
+        // Stereo Pair and MultiRoom instead of starving all armed queues first.
+        for (_, session) in &mut self.members {
+            session.teardown_while_audio_hot();
+        }
         self.stop_audio();
     }
 }

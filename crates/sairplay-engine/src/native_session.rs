@@ -121,6 +121,7 @@ pub struct NativeSession {
     ptp_receiver_ip: Option<IpAddr>,
     initial_volume_result: Option<VolumeSetResult>,
     audio_format: Ap2AudioFormat,
+    teardown_sent: bool,
     #[cfg(windows)]
     audio_worker: Option<WindowsAudioWorker>,
 }
@@ -471,6 +472,7 @@ impl NativeSession {
             ptp_receiver_ip,
             initial_volume_result,
             audio_format,
+            teardown_sent: false,
             #[cfg(windows)]
             audio_worker: None,
         })
@@ -635,6 +637,28 @@ impl NativeSession {
     }
 
 
+    /// Source-aligned disconnect boundary: retire RTSP-side workers and send
+    /// TEARDOWN while the realtime audio producer is still feeding the receiver.
+    /// MSA explicitly keeps teardown ahead of starving the armed receiver queue.
+    pub(crate) fn teardown_while_audio_hot(&mut self) {
+        if self.teardown_sent {
+            return;
+        }
+        if let Some(worker) = self.retransmit.as_mut() {
+            worker.stop();
+        }
+        self.feedback.stop();
+        self.event.take();
+        let _ = send_teardown(
+            &self.control,
+            &self.next_cseq,
+            &self.session_uri,
+            &self.dacp_id,
+            &self.active_remote,
+        );
+        self.teardown_sent = true;
+    }
+
     #[cfg(windows)]
     pub fn stop_windows_audio(&mut self) {
         if let Some(mut worker) = self.audio_worker.take() {
@@ -645,28 +669,16 @@ impl NativeSession {
 
 impl Drop for NativeSession {
     fn drop(&mut self) {
-        // Stop the realtime producer first, then the RTSP keepalive worker.
-        // Only after both threads are joined may timing/event resources drop.
+        // MSA disconnect semantics: tell the receiver to tear down while its
+        // realtime queue is still being fed. Starving an armed queue first can
+        // produce an audible pop/noise burst on Apple receivers.
+        self.teardown_while_audio_hot();
+
         #[cfg(windows)]
         self.stop_windows_audio();
-        if let Some(worker) = self.retransmit.as_mut() {
-            worker.stop();
-        }
-        self.feedback.stop();
 
-        // Match upstream disconnect ordering: the reverse event channel is
-        // closed before the final RTSP TEARDOWN, while timing remains alive.
-        self.event.take();
-        let _ = send_teardown(
-            &self.control,
-            &self.next_cseq,
-            &self.session_uri,
-            &self.dacp_id,
-            &self.active_remote,
-        );
-
-        // Shared-daemon source parity: a stream unregisters its receiver when
-        // its RTSP lifecycle ends, without stopping timing for other members.
+        // Timing remains alive through TEARDOWN and is unregistered only after
+        // the local audio producer has stopped.
         if let (Some(engine), Some(receiver_ip)) =
             (self._ptp_timing.as_ref(), self.ptp_receiver_ip)
         {
