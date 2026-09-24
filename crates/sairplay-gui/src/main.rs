@@ -3,8 +3,9 @@
 use eframe::egui;
 use sairplay_engine::{
     Ap2PreflightClient, DeviceCatalog, DeviceRecord, DiscoveredService, DiscoveryEvent,
-    LegacyGroupSession, LegacyMemberConfig, MdnsBrowser, NativeGroupMemberConfig, NativeGroupSession,
-    NativeSession, NativeSessionConfig, RetransmitStats, Route, ServiceKind, VolumeSetResult,
+    LegacyGroupSession, LegacyMemberConfig, MdnsBrowser, NativeGroupKind,
+    NativeGroupMemberConfig, NativeGroupSession, NativeSession, NativeSessionConfig,
+    RetransmitStats, Route, ServiceKind, VolumeSetResult,
     ALAC_44100_16_2, ALAC_44100_24_2, ALAC_48000_16_2,
     ALAC_48000_24_2,
 };
@@ -34,7 +35,8 @@ enum PlaybackMode {
 
 enum ActiveSession {
     Single(NativeSession),
-    Group(NativeGroupSession),
+    StereoPair(NativeGroupSession),
+    MultiRoom(NativeGroupSession),
     Legacy(LegacyGroupSession),
 }
 
@@ -42,7 +44,8 @@ impl ActiveSession {
     fn audio_running(&self) -> bool {
         match self {
             Self::Single(session) => session.audio_running(),
-            Self::Group(session) => session.audio_running(),
+            Self::StereoPair(session) => session.audio_running(),
+            Self::MultiRoom(session) => session.audio_running(),
             Self::Legacy(session) => session.is_running(),
         }
     }
@@ -50,7 +53,8 @@ impl ActiveSession {
     fn audio_error(&self) -> Option<String> {
         match self {
             Self::Single(session) => session.audio_error(),
-            Self::Group(session) => session.audio_error(),
+            Self::StereoPair(session) => session.audio_error(),
+            Self::MultiRoom(session) => session.audio_error(),
             Self::Legacy(session) => session.last_error(),
         }
     }
@@ -58,7 +62,8 @@ impl ActiveSession {
     fn audio_format(&self) -> Option<sairplay_engine::Ap2AudioFormat> {
         match self {
             Self::Single(session) => Some(session.audio_format()),
-            Self::Group(session) => session.audio_format(),
+            Self::StereoPair(session) => session.audio_format(),
+            Self::MultiRoom(session) => session.audio_format(),
             Self::Legacy(_) => None,
         }
     }
@@ -66,7 +71,8 @@ impl ActiveSession {
     fn drain_startup_events(&self) -> Vec<String> {
         match self {
             Self::Single(session) => session.drain_startup_events(),
-            Self::Group(session) => session.drain_startup_events(),
+            Self::StereoPair(session) => session.drain_startup_events(),
+            Self::MultiRoom(session) => session.drain_startup_events(),
             Self::Legacy(session) => session.drain_startup_events(),
         }
     }
@@ -74,7 +80,8 @@ impl ActiveSession {
     fn retransmit_stats(&self) -> RetransmitStats {
         match self {
             Self::Single(session) => session.retransmit_stats(),
-            Self::Group(session) => session.retransmit_stats(),
+            Self::StereoPair(session) => session.retransmit_stats(),
+            Self::MultiRoom(session) => session.retransmit_stats(),
             Self::Legacy(_) => RetransmitStats::default(),
         }
     }
@@ -82,7 +89,8 @@ impl ActiveSession {
     fn feedback_running(&self) -> bool {
         match self {
             Self::Single(session) => session.feedback_running(),
-            Self::Group(session) => session.feedback_running(),
+            Self::StereoPair(session) => session.feedback_running(),
+            Self::MultiRoom(session) => session.feedback_running(),
             Self::Legacy(session) => session.is_running(),
         }
     }
@@ -90,7 +98,8 @@ impl ActiveSession {
     fn feedback_error(&self) -> Option<String> {
         match self {
             Self::Single(session) => session.feedback_error(),
-            Self::Group(session) => session.feedback_error(),
+            Self::StereoPair(session) => session.feedback_error(),
+            Self::MultiRoom(session) => session.feedback_error(),
             Self::Legacy(_) => None,
         }
     }
@@ -98,7 +107,8 @@ impl ActiveSession {
     fn volume_controls(&self) -> Vec<sairplay_engine::NativeVolumeControl> {
         match self {
             Self::Single(session) => vec![session.volume_control()],
-            Self::Group(session) => session.volume_controls(),
+            Self::StereoPair(session) => session.volume_controls(),
+            Self::MultiRoom(session) => session.volume_controls(),
             Self::Legacy(_) => Vec::new(),
         }
     }
@@ -109,7 +119,8 @@ impl ActiveSession {
                 .initial_volume_result()
                 .map(|result| vec![("receiver".to_owned(), result)])
                 .unwrap_or_default(),
-            Self::Group(session) => session.initial_volume_results(),
+            Self::StereoPair(session) => session.initial_volume_results(),
+            Self::MultiRoom(session) => session.initial_volume_results(),
             Self::Legacy(_) => Vec::new(),
         }
     }
@@ -633,7 +644,7 @@ impl SairplayApp {
         match rx.try_recv() {
             Ok(Ok(added)) => {
                 let mut adopted = 0usize;
-                if let Some(ActiveSession::Group(group)) = self.session.as_mut() {
+                if let Some(ActiveSession::MultiRoom(group)) = self.session.as_mut() {
                     for (fullname, session) in added.members {
                         group.adopt_member(fullname.clone(), session);
                         self.active_fullnames.insert(fullname.clone());
@@ -669,7 +680,7 @@ impl SairplayApp {
         if self.membership_rx.is_some() {
             return;
         }
-        let Some(ActiveSession::Group(group)) = self.session.as_ref() else {
+        let Some(ActiveSession::MultiRoom(group)) = self.session.as_ref() else {
             return;
         };
         let Some(join_handle) = group.join_handle() else {
@@ -765,7 +776,7 @@ impl SairplayApp {
             return;
         }
 
-        let Some(ActiveSession::Group(group)) = self.session.as_mut() else {
+        let Some(ActiveSession::MultiRoom(group)) = self.session.as_mut() else {
             return;
         };
 
@@ -1335,7 +1346,9 @@ impl SairplayApp {
                             && error.contains("peer/control channel closed");
                         let native_session = matches!(
                             self.session,
-                            Some(ActiveSession::Single(_)) | Some(ActiveSession::Group(_))
+                            Some(ActiveSession::Single(_))
+                                | Some(ActiveSession::StereoPair(_))
+                                | Some(ActiveSession::MultiRoom(_))
                         );
 
                         self.session = None;
@@ -1563,8 +1576,16 @@ impl SairplayApp {
                 thread::Builder::new()
                     .name("sairplay-native-connect".into())
                     .spawn(move || {
-                        let result = NativeGroupSession::connect(configs)
-                            .map(ActiveSession::Group)
+                        let group_kind = match requested_mode {
+                            PlaybackMode::StereoPair => NativeGroupKind::StereoPair,
+                            PlaybackMode::MultiRoom => NativeGroupKind::MultiRoom,
+                            PlaybackMode::Single => unreachable!("single native playback uses NativeSession"),
+                        };
+                        let result = NativeGroupSession::connect(group_kind, configs)
+                            .map(|group| match group_kind {
+                                NativeGroupKind::StereoPair => ActiveSession::StereoPair(group),
+                                NativeGroupKind::MultiRoom => ActiveSession::MultiRoom(group),
+                            })
                             .map_err(|e| e.to_string())
                             .map(|session| ConnectSuccess {
                                 session,

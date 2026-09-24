@@ -17,6 +17,21 @@ pub const AIRPLAY_START_LEAD_MS: u64 = 400;
 pub const AIRPLAY_COLD_GROUP_START_LEAD_MS: u64 = 2_500;
 pub const AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS: u64 = 2_500;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsGroupAudioKind {
+    StereoPair,
+    MultiRoom,
+}
+
+impl WindowsGroupAudioKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::StereoPair => "stereo-pair",
+            Self::MultiRoom => "multi-room",
+        }
+    }
+}
+
 pub struct WindowsAudioTarget {
     pub(crate) name: String,
     pub(crate) sender: RealtimeMediaSender,
@@ -117,6 +132,7 @@ impl WindowsMultiroomJoinHandle {
 }
 
 pub struct WindowsMultiroomAudioWorker {
+    kind: WindowsGroupAudioKind,
     running: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     last_error: Arc<Mutex<Option<String>>>,
@@ -129,9 +145,14 @@ pub struct WindowsMultiroomAudioWorker {
 }
 
 impl WindowsMultiroomAudioWorker {
-    pub fn start(mut targets: Vec<WindowsAudioTarget>) -> Result<Self, WindowsMultiroomAudioError> {
+    pub fn start(kind: WindowsGroupAudioKind, mut targets: Vec<WindowsAudioTarget>) -> Result<Self, WindowsMultiroomAudioError> {
         if targets.is_empty() {
             return Err(WindowsMultiroomAudioError::EmptyGroup);
+        }
+        match kind {
+            WindowsGroupAudioKind::StereoPair if targets.len() != 2 => return Err(WindowsMultiroomAudioError::Media(format!("stereo-pair worker requires exactly 2 targets, got {}", targets.len()))),
+            WindowsGroupAudioKind::MultiRoom if targets.len() < 2 => return Err(WindowsMultiroomAudioError::Media(format!("multi-room worker requires at least 2 targets, got {}", targets.len()))),
+            _ => {}
         }
 
         let sample_rate = targets[0].sender.audio_format().sample_rate;
@@ -184,8 +205,12 @@ impl WindowsMultiroomAudioWorker {
             command_tx: command_tx.clone(),
         };
 
+        let worker_name = match kind {
+            WindowsGroupAudioKind::StereoPair => "sairplay-stereo-pair-audio",
+            WindowsGroupAudioKind::MultiRoom => "sairplay-multiroom-audio",
+        };
         let worker = thread::Builder::new()
-            .name("sairplay-multiroom-audio".into())
+            .name(worker_name.into())
             .spawn(move || {
                 let capture = match WasapiLoopbackCapture::open_default_for_format(source_format) {
                     Ok(capture) => {
@@ -349,7 +374,8 @@ impl WindowsMultiroomAudioWorker {
                         group_start_ntp = Some(start_ntp);
                         if let Ok(mut events) = startup_events_thread.lock() {
                             events.push(format!(
-                                "AirPlay session: {} member(s) ready · shared START={} ms · one WASAPI source.",
+                                "AirPlay {} session: {} member(s) ready · shared START={} ms · one WASAPI source.",
+                                kind.label(),
                                 targets.len(),
                                 delay_ms
                             ));
@@ -539,6 +565,7 @@ impl WindowsMultiroomAudioWorker {
 
         match ready_rx.recv_timeout(Duration::from_secs(3)) {
             Ok(Ok(())) => Ok(Self {
+                kind,
                 running,
                 worker: Some(worker),
                 last_error,
@@ -565,6 +592,10 @@ impl WindowsMultiroomAudioWorker {
                 ))
             }
         }
+    }
+
+    pub fn kind(&self) -> WindowsGroupAudioKind {
+        self.kind
     }
 
     pub fn join_handle(&self) -> WindowsMultiroomJoinHandle {

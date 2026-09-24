@@ -100,13 +100,15 @@ pub use wasapi_loopback::{WasapiDrainReport, WasapiLoopbackCapture, WasapiLoopba
 pub use windows_audio_worker::{WindowsAudioWorker, WindowsAudioWorkerError};
 #[cfg(windows)]
 pub use windows_multiroom_worker::{
-    WindowsAudioTarget, WindowsMultiroomAudioError, WindowsMultiroomAudioWorker,
-    WindowsMultiroomJoinHandle, AIRPLAY_COLD_GROUP_START_LEAD_MS,
+    WindowsAudioTarget, WindowsGroupAudioKind, WindowsMultiroomAudioError,
+    WindowsMultiroomAudioWorker, WindowsMultiroomJoinHandle,
+    AIRPLAY_COLD_GROUP_START_LEAD_MS,
     AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS, AIRPLAY_START_LEAD_MS,
 };
 #[cfg(windows)]
 pub use native_group::{
-    NativeGroupError, NativeGroupJoinHandle, NativeGroupMemberConfig, NativeGroupSession,
+    NativeGroupError, NativeGroupJoinHandle, NativeGroupKind, NativeGroupMemberConfig,
+    NativeGroupSession,
 };
 #[cfg(windows)]
 pub use legacy_session::{

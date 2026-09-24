@@ -1,6 +1,7 @@
 use crate::{
     NativeSession, NativeSessionConfig, NativeVolumeControl, PtpEngine, RetransmitStats,
-    WindowsMultiroomAudioError, WindowsMultiroomAudioWorker, WindowsMultiroomJoinHandle,
+    WindowsGroupAudioKind, WindowsMultiroomAudioError, WindowsMultiroomAudioWorker,
+    WindowsMultiroomJoinHandle,
 };
 use std::fmt;
 use std::sync::Arc;
@@ -20,9 +21,17 @@ impl NativeGroupMemberConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeGroupKind {
+    StereoPair,
+    MultiRoom,
+}
+
 #[derive(Debug)]
 pub enum NativeGroupError {
     EmptyGroup,
+    InvalidMembership { kind: NativeGroupKind, members: usize },
+    MembershipLocked,
     Member { name: String, error: String },
     Audio(WindowsMultiroomAudioError),
 }
@@ -31,6 +40,8 @@ impl fmt::Display for NativeGroupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyGroup => write!(f, "AirPlay session requires at least one receiver"),
+            Self::InvalidMembership { kind, members } => write!(f, "{kind:?} has invalid receiver count: {members}"),
+            Self::MembershipLocked => write!(f, "Stereo Pair membership is fixed for the session"),
             Self::Member { name, error } => write!(f, "{name}: {error}"),
             Self::Audio(error) => write!(f, "{error}"),
         }
@@ -94,6 +105,7 @@ impl NativeGroupJoinHandle {
 }
 
 pub struct NativeGroupSession {
+    kind: NativeGroupKind,
     members: Vec<(String, NativeSession)>,
     audio_worker: Option<WindowsMultiroomAudioWorker>,
     shared_ptp: Option<Arc<PtpEngine>>,
@@ -101,9 +113,14 @@ pub struct NativeGroupSession {
 }
 
 impl NativeGroupSession {
-    pub fn connect(mut configs: Vec<NativeGroupMemberConfig>) -> Result<Self, NativeGroupError> {
+    pub fn connect(kind: NativeGroupKind, mut configs: Vec<NativeGroupMemberConfig>) -> Result<Self, NativeGroupError> {
         if configs.is_empty() {
             return Err(NativeGroupError::EmptyGroup);
+        }
+        match kind {
+            NativeGroupKind::StereoPair if configs.len() != 2 => return Err(NativeGroupError::InvalidMembership { kind, members: configs.len() }),
+            NativeGroupKind::MultiRoom if configs.len() < 2 => return Err(NativeGroupError::InvalidMembership { kind, members: configs.len() }),
+            _ => {}
         }
 
         // Source architecture: one shared PTP daemon owns 319/320 for every
@@ -158,10 +175,15 @@ impl NativeGroupSession {
             targets.push(target);
         }
 
+        let worker_kind = match kind {
+            NativeGroupKind::StereoPair => WindowsGroupAudioKind::StereoPair,
+            NativeGroupKind::MultiRoom => WindowsGroupAudioKind::MultiRoom,
+        };
         let audio_worker =
-            WindowsMultiroomAudioWorker::start(targets).map_err(NativeGroupError::Audio)?;
+            WindowsMultiroomAudioWorker::start(worker_kind, targets).map_err(NativeGroupError::Audio)?;
 
         Ok(Self {
+            kind,
             members,
             audio_worker: Some(audio_worker),
             shared_ptp,
@@ -169,7 +191,14 @@ impl NativeGroupSession {
         })
     }
 
+    pub fn kind(&self) -> NativeGroupKind {
+        self.kind
+    }
+
     pub fn join_handle(&self) -> Option<NativeGroupJoinHandle> {
+        if self.kind != NativeGroupKind::MultiRoom {
+            return None;
+        }
         let audio = self.audio_worker.as_ref()?.join_handle();
         Some(NativeGroupJoinHandle {
             shared_ptp: self.shared_ptp.as_ref().map(Arc::clone),
@@ -179,6 +208,7 @@ impl NativeGroupSession {
     }
 
     pub fn adopt_member(&mut self, name: String, session: NativeSession) {
+        debug_assert_eq!(self.kind, NativeGroupKind::MultiRoom);
         if let Some(index) = self.members.iter().position(|(member, _)| member == &name) {
             self.members.remove(index);
         }
@@ -186,6 +216,9 @@ impl NativeGroupSession {
     }
 
     pub fn remove_member(&mut self, name: &str) -> Result<(), NativeGroupError> {
+        if self.kind != NativeGroupKind::MultiRoom {
+            return Err(NativeGroupError::MembershipLocked);
+        }
         if let Some(audio) = self.audio_worker.as_ref() {
             audio
                 .join_handle()
