@@ -1,4 +1,5 @@
 use crate::RtpState;
+use crate::rtp_packets::RTP_MARKER_BIT;
 use chacha20poly1305::{
     aead::{AeadInPlace, KeyInit},
     ChaCha20Poly1305, Key, Nonce, Tag,
@@ -63,7 +64,7 @@ pub fn build_encrypted_buffered_frame(
 ) -> Result<Vec<u8>, AudioPacketError> {
     let mut header = state.header();
     header[1] = RTP_PAYLOAD_TYPE_BUFFERED
-        | if state.first_packet { crate::RTP_MARKER_BIT } else { 0 };
+        | if state.first_packet { RTP_MARKER_BIT } else { 0 };
 
     let nonce_bytes = build_buffered_audio_nonce(nonce_counter);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(audio_key));
