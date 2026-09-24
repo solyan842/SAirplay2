@@ -32,6 +32,7 @@ pub mod rtp_packets;
 pub mod audio_packet;
 pub mod media_sender;
 pub mod buffered_sender;
+pub mod rate_anchor;
 pub mod retransmit;
 pub mod teardown;
 pub mod volume;
@@ -98,6 +99,9 @@ pub use audio_packet::{
 };
 pub use media_sender::{RealtimeMediaSender, MediaSendError, MediaSendResult};
 pub use buffered_sender::{BufferedMediaSender, BufferedSendError, BufferedWriteOutcome};
+pub use rate_anchor::{
+    build_setrateanchortime_plist, send_setrateanchortime, RateAnchorConfig, RateAnchorError,
+};
 pub use retransmit::{RetransmitRing, RetransmitStats, RetransmitWorker, RTX_RING_SLOTS};
 pub use teardown::{send_teardown, TeardownError};
 pub use volume::{set_native_volume, volume_percent_to_db, NativeVolumeControl, VolumeError, VolumeSetResult};
