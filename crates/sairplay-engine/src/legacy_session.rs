@@ -1,8 +1,8 @@
 #![cfg(windows)]
 
 use crate::{
-    system_time_to_ntp, Pcm352Chunker, WasapiLoopbackCapture, WasapiLoopbackError,
-    PCM352_PACKET_BYTES,
+    system_time_to_ntp, volume_percent_to_db, Pcm352Chunker, VolumeSetResult,
+    WasapiLoopbackCapture, WasapiLoopbackError, PCM352_PACKET_BYTES,
 };
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
