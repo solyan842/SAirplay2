@@ -49,7 +49,8 @@ pub mod legacy_session;
 pub mod alac_encoder;
 
 pub use ap2_info::{
-    select_native_stream_format, Ap2AudioFormat, Ap2Info, Ap2InfoError, AudioFormatCapability,
+    select_native_buffered_stream_format, select_native_realtime_stream_format,
+    Ap2AudioFormat, Ap2Info, Ap2InfoError, AudioFormatCapability,
     AIRPLAY_HIRES_AUDIO_FORMATS, ALAC_44100_16_2, ALAC_44100_24_2,
     ALAC_48000_16_2, ALAC_48000_24_2,
 };

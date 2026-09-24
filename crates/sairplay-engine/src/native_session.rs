@@ -4,7 +4,7 @@ use crate::{
     EventChannel, FeedbackWorker, MediaHandshakeConfig, NativeConnectFlow, NativePhase,
     NtpSessionSetupConfig, NtpTimingResponder, PairingError, PreflightError, PtpEngine,
     PtpSessionSetupConfig, RealtimeMediaSender, RecordConfig, RetransmitRing,
-    select_native_realtime_stream_format, Ap2AudioFormat, NativeVolumeControl, RetransmitStats, RetransmitWorker, RtpState,
+    Ap2AudioFormat, NativeVolumeControl, RetransmitStats, RetransmitWorker, RtpState,
     SetPeersConfig, TransientPairingClient,
     VolumeSetResult, set_native_volume,
 };
@@ -153,7 +153,7 @@ impl NativeSession {
 
         let local_addr = stream.local_addr().map_err(NativeSessionError::LocalAddress)?;
         let receiver_ip = info.peer.ip();
-        let audio_format = select_native_realtime_stream_format(
+        let audio_format = crate::select_native_realtime_stream_format(
             &info.info,
             config.hires_enabled,
             config.session_sample_rate,
