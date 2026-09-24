@@ -1234,15 +1234,18 @@ impl SairplayApp {
         };
 
         let transition_events = session.drain_startup_events();
-        let has_24bit_transition_diag = transition_events
+        let has_transition_diag = transition_events
             .iter()
-            .any(|event| event.starts_with("Transition: 24-bit packet diag"));
+            .any(|event| {
+                event.starts_with("Transition: packet diag")
+                    || event.starts_with("Transition: WASAPI discontinuity")
+            });
         for event in transition_events {
             self.log.push(event);
         }
 
         let rtx = session.retransmit_stats();
-        if has_24bit_transition_diag {
+        if has_transition_diag {
             let prev = self.last_retransmit_stats;
             self.log.push(format!(
                 "Transition: RTX snapshot · requested +{} (total {}) · answered +{} (total {}) · expired +{} (total {}).",

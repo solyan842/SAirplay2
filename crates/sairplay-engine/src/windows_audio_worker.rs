@@ -108,12 +108,31 @@ impl WindowsAudioWorker {
                 match capture.drain_into(&mut chunker) {
                     Ok(report) => {
                         if report.discontinuities != 0 {
-                            discontinuities_thread.fetch_add(report.discontinuities, Ordering::SeqCst);
-                            if let Some(offset) = report.discontinuity_frame_offset {
-                                last_discontinuity_frame_thread.store(
-                                    captured_frames_total.saturating_add(offset),
-                                    Ordering::SeqCst,
-                                );
+                            let cumulative = discontinuities_thread
+                                .fetch_add(report.discontinuities, Ordering::SeqCst)
+                                .saturating_add(report.discontinuities);
+                            let absolute_frame = report
+                                .discontinuity_frame_offset
+                                .map(|offset| captured_frames_total.saturating_add(offset));
+                            if let Some(frame) = absolute_frame {
+                                last_discontinuity_frame_thread.store(frame, Ordering::SeqCst);
+                            }
+                            if cold_armed {
+                                transition_packet_diag_remaining = 32;
+                                transition_packet_diag_index = 0;
+                                let state = sender.state();
+                                if let Ok(mut events) = startup_events_thread.lock() {
+                                    events.push(format!(
+                                        "Transition: WASAPI discontinuity · count={} · cumulative={} · frame={:?} · seq={} ts={} · pending_bytes={} · pad_debt={}.",
+                                        report.discontinuities,
+                                        cumulative,
+                                        absolute_frame,
+                                        state.sequence,
+                                        state.timestamp,
+                                        chunker.pending_bytes(),
+                                        sender.splice_pad_frames()
+                                    ));
+                                }
                             }
                         }
                         if let Some(offset) = report.first_non_silent_frame_offset {
@@ -181,10 +200,8 @@ impl WindowsAudioWorker {
                                             ));
                                         }
                                         resume_packet_pending = true;
-                                        if audio_format.bit_depth > 16 {
-                                            transition_packet_diag_remaining = 32;
-                                            transition_packet_diag_index = 0;
-                                        }
+                                        transition_packet_diag_remaining = 32;
+                                        transition_packet_diag_index = 0;
                                     }
                                 }
                                 if inferred_idle {
@@ -567,7 +584,9 @@ impl WindowsAudioWorker {
                                             transition_packet_diag_index.saturating_add(1);
                                         if let Ok(mut events) = startup_events_thread.lock() {
                                             events.push(format!(
-                                                "Transition: 24-bit packet diag · boundary={} · packet={}/32 · seq={} ts={} · alac={} B · wire={} B · head_delta_before={} ({:.2} ms) · wasapi_discontinuities={} · pad_before={} · pending_after={}.",
+                                                "Transition: packet diag · format={}-bit/{}Hz · boundary={} · packet={}/32 · seq={} ts={} · alac={} B · wire={} B · head_delta_before={} ({:.2} ms) · wasapi_discontinuities={} · pad_before={} · pending_after={}.",
+                                                audio_format.bit_depth,
+                                                audio_format.sample_rate,
                                                 transition_epoch,
                                                 transition_packet_diag_index,
                                                 result.sequence_sent,

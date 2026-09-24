@@ -5,14 +5,48 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 
 pub const RTX_RING_SLOTS: usize = 512;
-// Upstream blocks in poll(..., 200 ms), which wakes immediately when a D5
-// retransmit request arrives. A plain sleep(200 ms) is not equivalent and can
-// delay the response by the full 200 ms, so keep the nonblocking loop but use
-// a short idle sleep to preserve effectively-immediate request service.
-const RTX_POLL: Duration = Duration::from_millis(5);
+const RTX_CTRL_POLL_MS: i32 = 200;
+
+#[cfg(windows)]
+#[repr(C)]
+struct WsaPollFd {
+    fd: usize,
+    events: i16,
+    revents: i16,
+}
+
+#[cfg(windows)]
+#[link(name = "Ws2_32")]
+unsafe extern "system" {
+    fn WSAPoll(fdarray: *mut WsaPollFd, fds: u32, timeout: i32) -> i32;
+    fn WSAGetLastError() -> i32;
+}
+
+#[cfg(windows)]
+fn wait_for_control_readable(socket: &UdpSocket) -> io::Result<bool> {
+    const POLLRDNORM: i16 = 0x0100;
+    let mut pfd = WsaPollFd {
+        fd: socket.as_raw_socket() as usize,
+        events: POLLRDNORM,
+        revents: 0,
+    };
+    let status = unsafe { WSAPoll(&mut pfd, 1, RTX_CTRL_POLL_MS) };
+    if status < 0 {
+        return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+    }
+    Ok(status > 0 && (pfd.revents & POLLRDNORM) != 0)
+}
+
+#[cfg(not(windows))]
+fn wait_for_control_readable(_socket: &UdpSocket) -> io::Result<bool> {
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    Ok(true)
+}
 
 #[derive(Clone)]
 pub struct RetransmitRing {
@@ -91,7 +125,15 @@ impl RetransmitWorker {
             .spawn(move || {
                 let mut buf = [0u8; 512];
                 while !stop_thread.load(Ordering::SeqCst) {
-                    let mut received_any = false;
+                    match wait_for_control_readable(&socket) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(_) => {
+                            running_thread.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+
                     for _ in 0..256 {
                         let (n, from) = match socket.recv_from(&mut buf) {
                             Ok(v) => v,
@@ -101,7 +143,6 @@ impl RetransmitWorker {
                                 return;
                             }
                         };
-                        received_any = true;
                         if n < 8 || (buf[1] & 0x7f) != 0x55 {
                             continue;
                         }
@@ -136,9 +177,6 @@ impl RetransmitWorker {
                         }
                     }
 
-                    if !received_any {
-                        thread::sleep(RTX_POLL);
-                    }
                 }
                 running_thread.store(false, Ordering::SeqCst);
             })?;
