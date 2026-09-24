@@ -100,7 +100,9 @@ pub use audio_packet::{
 pub use media_sender::{RealtimeMediaSender, MediaSendError, MediaSendResult};
 pub use buffered_sender::{BufferedMediaSender, BufferedSendError, BufferedWriteOutcome};
 pub use rate_anchor::{
-    build_setrateanchortime_plist, send_setrateanchortime, RateAnchorConfig, RateAnchorError,
+    buffered_anchor_start, build_setrateanchortime_plist, send_setrateanchortime,
+    BufferedAnchorStartConfig, RateAnchorConfig, RateAnchorError,
+    BUFFERED_ANCHOR_MAX_TRIES, BUFFERED_ANCHOR_RETRY_DELAY,
 };
 pub use retransmit::{RetransmitRing, RetransmitStats, RetransmitWorker, RTX_RING_SLOTS};
 pub use teardown::{send_teardown, TeardownError};

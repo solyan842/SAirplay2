@@ -1,5 +1,8 @@
-use crate::{EncryptedRtspChannel, EncryptedRtspError, PtpClock, RtspRequest};
+use crate::{system_time_to_ntp, EncryptedRtspChannel, EncryptedRtspError, PtpClock, RtspRequest};
 use plist::{Dictionary, Value};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone)]
 pub struct RateAnchorConfig {
@@ -12,11 +15,37 @@ pub struct RateAnchorConfig {
     pub rate: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct BufferedAnchorStartConfig {
+    pub session_uri: String,
+    pub dacp_id: String,
+    pub active_remote: String,
+    pub rtp_time: u32,
+    /// Immutable commanded group start in NTP 32.32 units.
+    pub commanded_start_ntp: u64,
+}
+
+pub const BUFFERED_ANCHOR_MAX_TRIES: usize = 12;
+pub const BUFFERED_ANCHOR_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+fn remaining_lead_ns(commanded_start_ntp: u64, now_ntp: u64) -> u64 {
+    if commanded_start_ntp <= now_ntp {
+        return 0;
+    }
+    let delta = commanded_start_ntp - now_ntp;
+    let secs = delta >> 32;
+    let frac = delta & 0xffff_ffff;
+    secs.saturating_mul(1_000_000_000)
+        .saturating_add(((frac as u128 * 1_000_000_000u128) >> 32) as u64)
+}
+
 #[derive(Debug)]
 pub enum RateAnchorError {
     Transport(EncryptedRtspError),
     Plist(plist::Error),
     Status(u16),
+    Time,
+    StartRetriesExhausted,
 }
 
 impl From<EncryptedRtspError> for RateAnchorError {
@@ -90,6 +119,47 @@ pub fn send_setrateanchortime(
     Ok(())
 }
 
+/// Port of pinned MSA ap2_buffered_anchor_start().
+///
+/// The commanded NTP instant never moves. Each retry recomputes only the
+/// remaining lead, then maps the same RTP head onto the current PTP master
+/// timeline. Receivers may reject the anchor until their PTP clock probe has
+/// completed, so retry up to 12 times with 500 ms spacing.
+pub fn buffered_anchor_start(
+    channel: &mut EncryptedRtspChannel,
+    next_cseq: &AtomicU32,
+    clock: &PtpClock,
+    config: &BufferedAnchorStartConfig,
+) -> Result<u64, RateAnchorError> {
+    for attempt in 0..BUFFERED_ANCHOR_MAX_TRIES {
+        if attempt != 0 {
+            thread::sleep(BUFFERED_ANCHOR_RETRY_DELAY);
+        }
+
+        let now_ntp = system_time_to_ntp(SystemTime::now())
+            .map_err(|_| RateAnchorError::Time)?;
+        let lead_ns = remaining_lead_ns(config.commanded_start_ntp, now_ntp);
+        let anchor_ns = clock.master_now_ns().saturating_add(lead_ns);
+        let cseq = next_cseq.fetch_add(1, Ordering::SeqCst);
+
+        let request = RateAnchorConfig {
+            cseq,
+            session_uri: config.session_uri.clone(),
+            dacp_id: config.dacp_id.clone(),
+            active_remote: config.active_remote.clone(),
+            rtp_time: config.rtp_time,
+            anchor_ns,
+            rate: 1,
+        };
+
+        if send_setrateanchortime(channel, clock, &request).is_ok() {
+            return Ok(anchor_ns);
+        }
+    }
+
+    Err(RateAnchorError::StartRetriesExhausted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +182,24 @@ mod tests {
                 return cipher.decrypt(&carry[..frame_len]).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn remaining_lead_keeps_commanded_start_fixed_and_shrinks_with_now() {
+        let start = (100u64 << 32) | 0x8000_0000; // 100.5s
+        let now1 = 99u64 << 32;
+        let now2 = 100u64 << 32;
+        let now3 = 101u64 << 32;
+
+        assert_eq!(remaining_lead_ns(start, now1), 1_500_000_000);
+        assert_eq!(remaining_lead_ns(start, now2), 500_000_000);
+        assert_eq!(remaining_lead_ns(start, now3), 0);
+    }
+
+    #[test]
+    fn anchor_retry_policy_matches_pinned_msa_constants() {
+        assert_eq!(BUFFERED_ANCHOR_MAX_TRIES, 12);
+        assert_eq!(BUFFERED_ANCHOR_RETRY_DELAY, Duration::from_millis(500));
     }
 
     #[test]
