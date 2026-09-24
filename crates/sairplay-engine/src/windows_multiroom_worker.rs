@@ -241,6 +241,13 @@ impl WindowsMultiroomAudioWorker {
                 let mut pair_inferred_idle = false;
                 let mut pair_idle_keepalive_reported = false;
                 let mut pair_transition_epoch = 0u64;
+                // MultiRoom has dynamic membership, so its idle/boundary state
+                // is deliberately independent from Stereo Pair.
+                let mut multi_nonzero_gap_started: Option<Instant> = None;
+                let mut multi_nonzero_gap_reported = false;
+                let mut multi_inferred_idle = false;
+                let mut multi_idle_keepalive_reported = false;
+                let mut multi_transition_epoch = 0u64;
                 let mut packet_index = 0u64;
                 let mut pending_joins = Vec::<PendingJoin>::new();
 
@@ -377,6 +384,96 @@ impl WindowsMultiroomAudioWorker {
                         }
                     }
 
+                    if kind == WindowsGroupAudioKind::MultiRoom && cold_armed {
+                        if report.first_nonzero_frame_offset.is_some() {
+                            if let Some(started) = multi_nonzero_gap_started.take() {
+                                let gap_ms = started.elapsed().as_millis();
+                                if gap_ms >= 100 {
+                                    if let Ok(mut events) = startup_events_thread.lock() {
+                                        events.push(format!(
+                                            "MultiRoom transition: nonzero PCM resumed after {} ms · wasapi_frames={} · discontinuities={} · pending_bytes={}.",
+                                            gap_ms,
+                                            frames,
+                                            report.discontinuities,
+                                            chunker.pending_bytes()
+                                        ));
+                                    }
+                                }
+                            }
+                            if multi_inferred_idle {
+                                if let Ok(now_ntp) = system_time_to_ntp(SystemTime::now()) {
+                                    if let Ok(mut events) = startup_events_thread.lock() {
+                                        let heads = targets
+                                            .iter()
+                                            .map(|target| {
+                                                let delta = target.sender.timeline_head_delta_frames(now_ntp);
+                                                format!("{}={}f", target.name, delta)
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(", ");
+                                        events.push(format!(
+                                            "MultiRoom transition: boundary #{} resume · heads=[{}] · active_members={} · pending_bytes={} · anchor/seq/timestamp preserved.",
+                                            multi_transition_epoch,
+                                            heads,
+                                            targets.len(),
+                                            chunker.pending_bytes()
+                                        ));
+                                    }
+                                }
+                                multi_inferred_idle = false;
+                                multi_idle_keepalive_reported = false;
+                                input_starved_since = None;
+                            }
+                            multi_nonzero_gap_reported = false;
+                        } else if chunker.pending_nonzero_bytes() != 0 {
+                            // A cold group can hold seconds of valid queued PCM.
+                            // Current capture silence is not a boundary until that
+                            // queued content has drained to silence too.
+                            multi_nonzero_gap_started = None;
+                            multi_nonzero_gap_reported = false;
+                        } else {
+                            let started = multi_nonzero_gap_started.get_or_insert_with(Instant::now);
+                            if !multi_nonzero_gap_reported
+                                && started.elapsed() >= Duration::from_millis(250)
+                            {
+                                multi_transition_epoch = multi_transition_epoch.saturating_add(1);
+                                let pending_before = chunker.pending_bytes();
+                                let pending_nonzero_before = chunker.pending_nonzero_bytes();
+                                let dropped_pad = targets
+                                    .iter()
+                                    .map(|target| target.sender.splice_pad_frames())
+                                    .max()
+                                    .unwrap_or(0);
+
+                                // Sender-local cleanup only. MSA's real group
+                                // replacement explicitly coordinates receiver
+                                // FLUSH/START; Windows system-audio capture has no
+                                // application-level Next signal, so silence inference
+                                // must never mutate receiver session/timing state.
+                                chunker.clear();
+                                for target in &mut targets {
+                                    target.sender.begin_warm_splice_boundary();
+                                }
+                                multi_inferred_idle = true;
+                                multi_idle_keepalive_reported = false;
+                                input_starved_since = None;
+                                multi_nonzero_gap_reported = true;
+
+                                if let Ok(mut events) = startup_events_thread.lock() {
+                                    events.push(format!(
+                                        "MultiRoom transition: boundary #{} local cleanup · discarded_bytes={} · stale_nonzero_bytes={} · dropped_pad_frames={} · active_members={} · pending_joins={} · seq/timestamp/anchor preserved.",
+                                        multi_transition_epoch,
+                                        pending_before,
+                                        pending_nonzero_before,
+                                        dropped_pad,
+                                        targets.len(),
+                                        pending_joins.len()
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
                     // Before START, source silence is not content. This mirrors
                     // the upstream readiness gate: connect members, prove audio
                     // is flowing, then choose one shared audible anchor.
@@ -488,7 +585,9 @@ impl WindowsMultiroomAudioWorker {
                         }
                     };
 
-                    if kind == WindowsGroupAudioKind::StereoPair && pair_inferred_idle {
+                    if (kind == WindowsGroupAudioKind::StereoPair && pair_inferred_idle)
+                        || (kind == WindowsGroupAudioKind::MultiRoom && multi_inferred_idle)
+                    {
                         input_starved_since = None;
                     } else if chunker.has_packet() {
                         input_starved_since = None;
@@ -587,6 +686,85 @@ impl WindowsMultiroomAudioWorker {
                                     ));
                                 }
                                 pair_idle_keepalive_reported = true;
+                            }
+                        }
+                    }
+
+                    if kind == WindowsGroupAudioKind::MultiRoom
+                        && multi_inferred_idle
+                        && !chunker.has_packet()
+                        && !targets.is_empty()
+                    {
+                        align_splice_pad(&mut targets);
+                        let ntp = match system_time_to_ntp(SystemTime::now()) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                if let Ok(mut slot) = last_error_thread.lock() {
+                                    *slot = Some(format!("NTP clock conversion failed: {error:?}"));
+                                }
+                                running_thread.store(false, Ordering::SeqCst);
+                                return;
+                            }
+                        };
+                        let gate_index = targets
+                            .iter()
+                            .enumerate()
+                            .min_by_key(|(_, target)| target.sender.pacing_window_frames())
+                            .map(|(index, _)| index)
+                            .unwrap_or(0);
+                        if targets[gate_index].sender.can_accept_frames(ntp) {
+                            let silence =
+                                vec![0u8; crate::ALAC_FRAMES_PER_PACKET * bytes_per_frame];
+                            let mut failed = Vec::<(usize, String)>::new();
+                            for (index, target) in targets.iter_mut().enumerate() {
+                                let target_packet = match adapt_group_pcm_packet(
+                                    &silence,
+                                    source_format,
+                                    target.sender.audio_format(),
+                                ) {
+                                    Ok(packet) => packet,
+                                    Err(error) => {
+                                        failed.push((
+                                            index,
+                                            format!("{} multi-room silence format failed: {error}", target.name),
+                                        ));
+                                        continue;
+                                    }
+                                };
+                                if let Err(error) = target.sender.send_pcm_352(
+                                    &target_packet,
+                                    ntp,
+                                    target.lead_frames,
+                                ) {
+                                    failed.push((
+                                        index,
+                                        format!("{} multi-room idle keepalive failed: {error:?}", target.name),
+                                    ));
+                                }
+                            }
+                            packet_index = packet_index.saturating_add(1);
+
+                            if !failed.is_empty() {
+                                for (index, message) in failed.into_iter().rev() {
+                                    if let Ok(mut events) = startup_events_thread.lock() {
+                                        events.push(format!("AirPlay member removed: {message}"));
+                                    }
+                                    targets.remove(index);
+                                }
+                                active_members_thread.store(targets.len() as u64, Ordering::SeqCst);
+                            }
+
+                            if !multi_idle_keepalive_reported {
+                                if let Ok(mut events) = startup_events_thread.lock() {
+                                    events.push(format!(
+                                        "MultiRoom transition: inferred idle keepalive active · boundary={} · packet={} · active_members={} · pending_joins={}.",
+                                        multi_transition_epoch,
+                                        packet_index,
+                                        targets.len(),
+                                        pending_joins.len()
+                                    ));
+                                }
+                                multi_idle_keepalive_reported = true;
                             }
                         }
                     }
