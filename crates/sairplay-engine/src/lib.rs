@@ -33,6 +33,7 @@ pub mod audio_packet;
 pub mod media_sender;
 pub mod buffered_sender;
 pub mod rate_anchor;
+pub mod flush_buffered;
 pub mod retransmit;
 pub mod teardown;
 pub mod volume;
@@ -103,6 +104,9 @@ pub use rate_anchor::{
     buffered_anchor_start, build_setrateanchortime_plist, send_setrateanchortime,
     BufferedAnchorStartConfig, RateAnchorConfig, RateAnchorError,
     BUFFERED_ANCHOR_MAX_TRIES, BUFFERED_ANCHOR_RETRY_DELAY,
+};
+pub use flush_buffered::{
+    build_flushbuffered_plist, send_flushbuffered, FlushBufferedConfig, FlushBufferedError,
 };
 pub use retransmit::{RetransmitRing, RetransmitStats, RetransmitWorker, RTX_RING_SLOTS};
 pub use teardown::{send_teardown, TeardownError};

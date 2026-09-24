@@ -1,6 +1,8 @@
 use crate::{build_encrypted_buffered_frame, AudioPacketError, RtpState, FRAMES_PER_PACKET_44100};
 use std::io::{self, Write};
 use std::net::TcpStream;
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub enum BufferedSendError {
@@ -26,6 +28,7 @@ pub struct BufferedMediaSender<W: Write = TcpStream> {
     nonce_counter: u64,
     pending: Vec<u8>,
     pending_offset: usize,
+    anchored: bool,
 }
 
 impl<W: Write> BufferedMediaSender<W> {
@@ -37,6 +40,7 @@ impl<W: Write> BufferedMediaSender<W> {
             nonce_counter: 0,
             pending: Vec::new(),
             pending_offset: 0,
+            anchored: false,
         }
     }
 
@@ -44,6 +48,42 @@ impl<W: Write> BufferedMediaSender<W> {
     pub fn nonce_counter(&self) -> u64 { self.nonce_counter }
     pub fn pending_bytes(&self) -> usize {
         self.pending.len().saturating_sub(self.pending_offset)
+    }
+
+    pub fn pending_offset(&self) -> usize { self.pending_offset }
+    pub fn is_anchored(&self) -> bool { self.anchored }
+    pub fn mark_anchored(&mut self) { self.anchored = true; }
+    pub fn clear_anchored(&mut self) { self.anchored = false; }
+
+    /// Source-aligned pre-FLUSHBUFFERED quiesce for the portable/Windows path.
+    /// If none of a parked frame reached the socket yet, drop it completely.
+    /// If a partial frame was written, finish that frame if possible so the
+    /// TCP framing cannot be truncated. The source gives this at most 1 s.
+    /// Windows has no kernel send-queue introspection in the pinned code, so
+    /// after the parked tail is handled there is no additional drain wait.
+    pub fn quiesce_for_flush(&mut self) -> Result<bool, BufferedSendError> {
+        if self.pending.is_empty() {
+            return Ok(true);
+        }
+
+        if self.pending_offset == 0 {
+            self.pending.clear();
+            self.pending_offset = 0;
+            return Ok(true);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match self.flush_pending()? {
+                BufferedWriteOutcome::Sent => return Ok(true),
+                BufferedWriteOutcome::Backpressured => {
+                    if Instant::now() >= deadline {
+                        return Ok(false);
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
     }
 
     /// Retry the unwritten tail. TimedOut/WouldBlock are flow control, not a
@@ -130,6 +170,37 @@ mod tests {
             Ok(n)
         }
         fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn flush_quiesce_drops_wholly_unwritten_parked_frame() {
+        let writer = ChunkWriter {
+            max_once: 8,
+            block_after_first: true,
+            ..Default::default()
+        };
+        let state = RtpState::new(1, 2000, 0);
+        let mut sender = BufferedMediaSender::new(writer, state, [0x44; 32]);
+
+        // Build a parked frame explicitly at offset zero, mirroring a frame
+        // accepted into the stash before any kernel write.
+        sender.pending = vec![0, 4, 0x80, 0x67];
+        sender.pending_offset = 0;
+        assert!(sender.quiesce_for_flush().unwrap());
+        assert_eq!(sender.pending_bytes(), 0);
+        assert_eq!(sender.pending_offset(), 0);
+    }
+
+    #[test]
+    fn anchor_state_can_be_cleared_by_flush_path() {
+        let writer = ChunkWriter { max_once: usize::MAX, ..Default::default() };
+        let state = RtpState::new(1, 2000, 0);
+        let mut sender = BufferedMediaSender::new(writer, state, [0x44; 32]);
+        assert!(!sender.is_anchored());
+        sender.mark_anchored();
+        assert!(sender.is_anchored());
+        sender.clear_anchored();
+        assert!(!sender.is_anchored());
     }
 
     #[test]
