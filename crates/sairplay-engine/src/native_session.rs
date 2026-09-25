@@ -132,6 +132,7 @@ pub struct NativeSession {
     latency_max: Option<u32>,
     rtp_offset: u32,
     cold_start_delay_ms: u64,
+    apple_model: bool,
     ptp_receiver_ip: Option<IpAddr>,
     initial_volume_result: Option<VolumeSetResult>,
     audio_format: Ap2AudioFormat,
@@ -562,6 +563,7 @@ impl NativeSession {
             latency_max,
             rtp_offset,
             cold_start_delay_ms,
+            apple_model: config.apple_model,
             ptp_receiver_ip,
             initial_volume_result,
             audio_format,
@@ -629,6 +631,7 @@ impl NativeSession {
             latency_max: self.latency_max,
             rtp_offset: self.rtp_offset,
             cold_start_delay_ms: self.cold_start_delay_ms,
+            apple_model: self.apple_model,
             metadata: NativeMetadataControl::new(
                 Arc::clone(&self.control),
                 Arc::clone(&self.next_cseq),

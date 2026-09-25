@@ -17,6 +17,8 @@ use std::time::{Duration, Instant, SystemTime};
 pub const AIRPLAY_START_LEAD_MS: u64 = 400;
 pub const AIRPLAY_COLD_GROUP_START_LEAD_MS: u64 = 2_500;
 pub const AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS: u64 = 2_500;
+pub const AIRPLAY_CLOCK_READY_TIMEOUT_MS: u64 = 2_500;
+pub const AIRPLAY_CLOCK_READY_LEAD_MS: u64 = 500;
 pub const AIRPLAY_LATE_JOIN_RING_MIN_SECONDS: f64 = 12.0;
 pub const AIRPLAY_LATE_JOIN_RING_MARGIN_SECONDS: f64 = 2.0;
 pub const AIRPLAY_LATE_JOIN_RING_MAX_BYTES: usize = 6 * 1024 * 1024;
@@ -43,6 +45,7 @@ pub struct WindowsAudioTarget {
     pub(crate) latency_max: Option<u32>,
     pub(crate) rtp_offset: u32,
     pub(crate) cold_start_delay_ms: u64,
+    pub(crate) apple_model: bool,
     pub(crate) metadata: NativeMetadataControl,
 }
 
@@ -517,13 +520,31 @@ impl WindowsMultiroomAudioWorker {
                         } else {
                             AIRPLAY_START_LEAD_MS
                         };
-                        let settle_ms = targets
-                            .iter()
-                            .map(|target| target.cold_start_delay_ms)
-                            .max()
+                        let clock_projection_ms = wait_members_clock_projection_ms(
+                            &targets,
+                            Duration::from_millis(AIRPLAY_CLOCK_READY_TIMEOUT_MS),
+                        );
+                        let readiness_lead_ms = clock_projection_ms
+                            .map(|delay| delay.saturating_add(AIRPLAY_CLOCK_READY_LEAD_MS))
                             .unwrap_or(0);
-                        let delay_ms = source_lead.max(settle_ms);
+                        // MSA anchors at max(now + cold-group lead,
+                        // latest projected receiver-ready instant + 500 ms).
+                        // A receiver that reports no projection contributes
+                        // nothing and rides the ordinary start lead.
+                        let delay_ms = source_lead.max(readiness_lead_ms);
                         let start_ntp = now_ntp.saturating_add(ms_to_ntp(delay_ms));
+                        if let Ok(mut events) = startup_events_thread.lock() {
+                            events.push(match clock_projection_ms {
+                                Some(delay) => format!(
+                                    "AirPlay group clock readiness: latest projection in {} ms; shared START lead={} ms.",
+                                    delay, delay_ms
+                                ),
+                                None => format!(
+                                    "AirPlay group clock readiness: no PTP projection reported; shared START lead={} ms.",
+                                    delay_ms
+                                ),
+                            });
+                        }
 
                         for target in &mut targets {
                             if let Err(error) = target.sender.arm_cold_start(
@@ -1317,6 +1338,55 @@ fn handle_group_commands(
     }
 }
 
+fn clock_ready_delay_ms(exchange: crate::PtpExchange, apple_model: bool) -> u64 {
+    const CLOCK_LOCK_MS: u64 = 2_300;
+    const CLOCK_SETTLE_MS: u64 = 250;
+    const CLOCK_SEAT_EXCHANGES: u32 = 3;
+
+    let full = CLOCK_LOCK_MS.saturating_sub(exchange.first_ms);
+    if apple_model && exchange.count >= CLOCK_SEAT_EXCHANGES {
+        let fast = CLOCK_SETTLE_MS.saturating_sub(exchange.third_ms);
+        full.min(fast)
+    } else {
+        full
+    }
+}
+
+fn wait_members_clock_projection_ms(
+    targets: &[WindowsAudioTarget],
+    timeout: Duration,
+) -> Option<u64> {
+    let ptp_members = targets
+        .iter()
+        .filter(|target| target.sender.uses_ptp_timing())
+        .count();
+    if ptp_members == 0 {
+        return None;
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        let projections = targets
+            .iter()
+            .filter(|target| target.sender.uses_ptp_timing())
+            .filter_map(|target| {
+                target
+                    .sender
+                    .ptp_probe_exchange()
+                    .map(|exchange| clock_ready_delay_ms(exchange, target.apple_model))
+            })
+            .collect::<Vec<_>>();
+
+        // MSA waits for every member's clock result concurrently. Here the
+        // worker has the same receiver-probe evidence locally, so stop waiting
+        // once every PTP member has produced a projection.
+        if projections.len() == ptp_members || Instant::now() >= deadline {
+            return projections.into_iter().max();
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn trim_late_join_ring(
     ring: &mut VecDeque<(u64, Vec<u8>)>,
     source_format: Ap2AudioFormat,
@@ -1389,6 +1459,27 @@ fn ntp_delta_to_frames_ceil(delta: u64, sample_rate: u32) -> u64 {
 #[cfg(test)]
 mod mixed_format_tests {
     use super::*;
+
+    #[test]
+    fn clock_readiness_matches_msa_full_and_apple_fast_seat() {
+        let first = crate::PtpExchange {
+            count: 1,
+            first_ms: 800,
+            last_ms: 0,
+            third_ms: 0,
+        };
+        assert_eq!(clock_ready_delay_ms(first, false), 1_500);
+        assert_eq!(clock_ready_delay_ms(first, true), 1_500);
+
+        let seated = crate::PtpExchange {
+            count: 3,
+            first_ms: 1_000,
+            last_ms: 0,
+            third_ms: 100,
+        };
+        assert_eq!(clock_ready_delay_ms(seated, false), 1_300);
+        assert_eq!(clock_ready_delay_ms(seated, true), 150);
+    }
 
     #[test]
     fn late_join_ring_uses_msa_floor_and_hard_cap() {
