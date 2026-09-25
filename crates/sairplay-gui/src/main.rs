@@ -4183,7 +4183,7 @@ fn load_native_credentials() -> BTreeMap<String, String> {
     };
     text.lines()
         .filter_map(|line| {
-            let (key, credentials) = line.split_once('	')?;
+            let (key, credentials) = line.split_once('\\t')?;
             let credentials = credentials.trim();
             (credentials.len() == 192
                 && credentials.chars().all(|ch| ch.is_ascii_hexdigit())
@@ -4207,13 +4207,11 @@ fn save_native_credentials(credentials: &BTreeMap<String, String>) {
     let mut text = String::new();
     for (key, value) in credentials {
         if value.len() == 192 && value.chars().all(|ch| ch.is_ascii_hexdigit()) {
-            let clean_key = key.replace(['	', '', '
-'], "");
+            let clean_key = key.replace(['\\t', '\\r', '\\n'], "");
             text.push_str(&clean_key);
-            text.push('	');
+            text.push('\\t');
             text.push_str(value);
-            text.push('
-');
+            text.push('\\n');
         }
     }
     let _ = std::fs::write(path, text);
