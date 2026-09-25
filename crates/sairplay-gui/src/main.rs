@@ -166,7 +166,7 @@ struct MembershipAdded {
 
 struct HiresProbeResult {
     fullname: String,
-    apple_model: bool,
+    hires: Option<bool>,
     realtime_hires: Option<bool>,
     buffered_hires: Option<bool>,
     realtime_mask: Option<u64>,
@@ -410,7 +410,6 @@ impl SairplayApp {
         }
 
         let fullname = service.fullname.clone();
-        let apple_model = service.txt.is_apple_model();
         let host = preferred_service_address(service);
         let port = service.port;
         let tx = self.hires_probe_tx.clone();
@@ -425,6 +424,9 @@ impl SairplayApp {
                 .get_info(&host, port)
                 .ok();
 
+                let hires = result
+                    .as_ref()
+                    .map(|result| result.info.advertises_hires());
                 let realtime_hires = result
                     .as_ref()
                     .map(|result| result.info.advertises_realtime_hires());
@@ -440,7 +442,7 @@ impl SairplayApp {
 
                 let _ = tx.send(HiresProbeResult {
                     fullname,
-                    apple_model,
+                    hires,
                     realtime_hires,
                     buffered_hires,
                     realtime_mask,
@@ -455,16 +457,12 @@ impl SairplayApp {
             self.hires_probe_pending.remove(&result.fullname);
             match (result.realtime_hires, result.buffered_hires) {
                 (Some(realtime_hires), Some(buffered_hires)) => {
-                    // Keep realtime/buffered tables separate for routing.
-                    // But pinned MSA explicitly says these tables are advisory
-                    // and Apple hardware can under-advertise 24-bit. We have a
-                    // proven Apple realtime-24 path, so an Apple receiver whose
-                    // companion bufferStream exposes 24-bit keeps the explicit
-                    // 24-bit toggle available without enabling type103.
-                    let realtime_hires_available = realtime_hires
-                        || (result.apple_model && buffered_hires);
+                    // Exact pinned MSA server policy:
+                    // 24-bit capability is the UNION of audioStream and
+                    // bufferStream. Transport routing remains separate.
+                    let hires = result.hires.unwrap_or(false);
                     self.hires_capabilities
-                        .insert(result.fullname.clone(), realtime_hires_available);
+                        .insert(result.fullname.clone(), hires);
                     self.buffered_hires_capabilities
                         .insert(result.fullname.clone(), buffered_hires);
 
@@ -500,15 +498,11 @@ impl SairplayApp {
                             .unwrap_or_else(|| "unknown".into()),
                     ));
                     self.log.push(format!(
-                        "{}: /info 24-bit capability · realtime={} · buffered={}{}.",
+                        "{}: /info 24-bit capability · union={} · realtime={} · buffered={}.",
                         result.fullname,
+                        if result.hires.unwrap_or(false) { "advertised" } else { "not advertised" },
                         if realtime_hires { "advertised" } else { "not advertised" },
                         if buffered_hires { "advertised" } else { "not advertised" },
-                        if result.apple_model && !realtime_hires && buffered_hires {
-                            " · Apple advisory-table exception keeps explicit realtime 24-bit available"
-                        } else {
-                            ""
-                        },
                     ));
                 }
                 _ => {

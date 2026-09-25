@@ -144,6 +144,13 @@ impl Ap2Info {
         if self.buffered.known { self.buffered.mask } else { 0 }
     }
 
+    /// Match pinned Music Assistant server helpers._parse_format_tables():
+    /// 24-bit capability is the union of audioStream and bufferStream.
+    /// Stream selection is a separate transport decision.
+    pub fn advertises_hires(&self) -> bool {
+        self.advertised_formats() & AIRPLAY_HIRES_AUDIO_FORMATS != 0
+    }
+
     pub fn advertises_realtime_hires(&self) -> bool {
         self.realtime_formats() & AIRPLAY_HIRES_AUDIO_FORMATS != 0
     }
@@ -332,6 +339,25 @@ mod tests {
         assert_eq!(Ap2AudioFormat::ALAC_48000_24_STEREO.alac_bytes_per_frame(), 6);
     }
 
+
+    #[test]
+    fn msa_hires_capability_is_union_of_realtime_and_buffered_tables() {
+        let info = Ap2Info {
+            realtime: AudioFormatCapability {
+                mask: ALAC_44100_16_2,
+                known: true,
+                extended: false,
+            },
+            buffered: AudioFormatCapability {
+                mask: ALAC_48000_24_2,
+                known: true,
+                extended: false,
+            },
+        };
+        assert!(!info.advertises_realtime_hires());
+        assert!(info.advertises_buffered_hires());
+        assert!(info.advertises_hires());
+    }
 
     #[test]
     fn source_policy_selects_hires_only_when_enabled_and_advertised() {
