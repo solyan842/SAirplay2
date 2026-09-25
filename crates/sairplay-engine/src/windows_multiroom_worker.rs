@@ -1106,16 +1106,20 @@ fn handle_group_commands(
                     .first()
                     .map(|item| item.sender.reanchor_shifted_frames())
                     .unwrap_or(0);
-                let effective_start = base_start.saturating_add(frames_to_ntp(shift_frames));
+                let sample_rate = source_format.sample_rate;
+                let effective_start =
+                    base_start.saturating_add(frames_to_ntp(shift_frames, sample_rate));
                 let join_floor =
                     now_ntp.saturating_add(ms_to_ntp(AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS));
                 let required_frames = ntp_delta_to_frames_ceil(
                     join_floor.saturating_sub(effective_start),
+                    sample_rate,
                 );
                 let required_packet = required_frames.div_ceil(352);
                 let start_packet = packet_index.max(required_packet);
                 let start_ntp = effective_start.saturating_add(frames_to_ntp(
                     start_packet.saturating_mul(352),
+                    sample_rate,
                 ));
 
                 match target.sender.arm_cold_start(
@@ -1220,17 +1224,35 @@ fn ms_to_ntp(ms: u64) -> u64 {
     ((ms as u128) << 32).div_ceil(1000) as u64
 }
 
-fn frames_to_ntp(frames: u64) -> u64 {
-    ((frames as u128) << 32).div_ceil(44_100) as u64
+fn frames_to_ntp(frames: u64, sample_rate: u32) -> u64 {
+    ((frames as u128) << 32).div_ceil(sample_rate as u128) as u64
 }
 
-fn ntp_delta_to_frames_ceil(delta: u64) -> u64 {
-    ((delta as u128) * 44_100u128).div_ceil(1u128 << 32) as u64
+fn ntp_delta_to_frames_ceil(delta: u64, sample_rate: u32) -> u64 {
+    ((delta as u128) * sample_rate as u128).div_ceil(1u128 << 32) as u64
 }
 
 #[cfg(test)]
 mod mixed_format_tests {
     use super::*;
+
+    #[test]
+    fn late_join_timeline_math_uses_session_sample_rate() {
+        let one_second = 1u64 << 32;
+        assert_eq!(frames_to_ntp(44_100, 44_100), one_second);
+        assert_eq!(frames_to_ntp(48_000, 48_000), one_second);
+        assert_eq!(ntp_delta_to_frames_ceil(one_second, 44_100), 44_100);
+        assert_eq!(ntp_delta_to_frames_ceil(one_second, 48_000), 48_000);
+    }
+
+    #[test]
+    fn late_join_48k_packet_duration_is_not_44100_duration() {
+        let packets = 10u64;
+        let frames = packets * 352;
+        let at_48k = frames_to_ntp(frames, 48_000);
+        let at_441 = frames_to_ntp(frames, 44_100);
+        assert!(at_48k < at_441);
+    }
 
     #[test]
     fn mixed_depth_group_downconverts_s32le_to_s16le() {
