@@ -186,6 +186,17 @@ impl NativeSession {
                 config.hires_enabled,
                 config.session_sample_rate,
             )
+        } else if config.apple_model && config.hires_enabled {
+            // Pinned MSA treats /info format tables as advisory because Apple
+            // receivers can under-advertise formats that they render correctly.
+            // This project already proved Apple realtime 24-bit on the native
+            // type96 path, so an explicit user opt-in must not be downgraded
+            // merely because audioStream omits the 24-bit bit.
+            if config.session_sample_rate >= 48_000 {
+                Ap2AudioFormat::ALAC_48000_24_STEREO
+            } else {
+                Ap2AudioFormat::ALAC_44100_24_STEREO
+            }
         } else {
             crate::select_native_realtime_stream_format(
                 &info.info,
@@ -335,11 +346,19 @@ impl NativeSession {
         // transport.
         let use_buffered = buffered_auto_requested && ptp_clock.is_some();
         if !use_buffered {
-            audio_format = crate::select_native_realtime_stream_format(
-                &info.info,
-                config.hires_enabled,
-                config.session_sample_rate,
-            );
+            audio_format = if config.apple_model && config.hires_enabled {
+                if config.session_sample_rate >= 48_000 {
+                    Ap2AudioFormat::ALAC_48000_24_STEREO
+                } else {
+                    Ap2AudioFormat::ALAC_44100_24_STEREO
+                }
+            } else {
+                crate::select_native_realtime_stream_format(
+                    &info.info,
+                    config.hires_enabled,
+                    config.session_sample_rate,
+                )
+            };
         }
 
         // 3) Keep-open reverse event TCP.

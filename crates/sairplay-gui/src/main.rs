@@ -166,6 +166,7 @@ struct MembershipAdded {
 
 struct HiresProbeResult {
     fullname: String,
+    apple_model: bool,
     realtime_hires: Option<bool>,
     buffered_hires: Option<bool>,
     realtime_mask: Option<u64>,
@@ -409,6 +410,7 @@ impl SairplayApp {
         }
 
         let fullname = service.fullname.clone();
+        let apple_model = service.txt.is_apple_model();
         let host = preferred_service_address(service);
         let port = service.port;
         let tx = self.hires_probe_tx.clone();
@@ -438,6 +440,7 @@ impl SairplayApp {
 
                 let _ = tx.send(HiresProbeResult {
                     fullname,
+                    apple_model,
                     realtime_hires,
                     buffered_hires,
                     realtime_mask,
@@ -452,11 +455,16 @@ impl SairplayApp {
             self.hires_probe_pending.remove(&result.fullname);
             match (result.realtime_hires, result.buffered_hires) {
                 (Some(realtime_hires), Some(buffered_hires)) => {
-                    // hires_capabilities means "safe for the transport we
-                    // currently implement here": native realtime type 96.
-                    // Buffered-only 24-bit must never light the realtime toggle.
+                    // Keep realtime/buffered tables separate for routing.
+                    // But pinned MSA explicitly says these tables are advisory
+                    // and Apple hardware can under-advertise 24-bit. We have a
+                    // proven Apple realtime-24 path, so an Apple receiver whose
+                    // companion bufferStream exposes 24-bit keeps the explicit
+                    // 24-bit toggle available without enabling type103.
+                    let realtime_hires_available = realtime_hires
+                        || (result.apple_model && buffered_hires);
                     self.hires_capabilities
-                        .insert(result.fullname.clone(), realtime_hires);
+                        .insert(result.fullname.clone(), realtime_hires_available);
                     self.buffered_hires_capabilities
                         .insert(result.fullname.clone(), buffered_hires);
 
@@ -492,10 +500,15 @@ impl SairplayApp {
                             .unwrap_or_else(|| "unknown".into()),
                     ));
                     self.log.push(format!(
-                        "{}: /info 24-bit capability · realtime={} · buffered={}.",
+                        "{}: /info 24-bit capability · realtime={} · buffered={}{}.",
                         result.fullname,
                         if realtime_hires { "advertised" } else { "not advertised" },
                         if buffered_hires { "advertised" } else { "not advertised" },
+                        if result.apple_model && !realtime_hires && buffered_hires {
+                            " · Apple advisory-table exception keeps explicit realtime 24-bit available"
+                        } else {
+                            ""
+                        },
                     ));
                 }
                 _ => {
