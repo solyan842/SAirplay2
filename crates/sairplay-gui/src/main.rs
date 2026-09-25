@@ -4,8 +4,8 @@ use eframe::egui;
 use sairplay_engine::{
     Ap2PreflightClient, DeviceCatalog, DeviceRecord, DiscoveredService, DiscoveryEvent,
     LegacyGroupSession, LegacyMemberConfig, MdnsBrowser, NativeGroupKind,
-    NativeGroupMemberConfig, NativeGroupSession, NativeSession, NativeSessionConfig,
-    RetransmitStats, Route, ServiceKind, VolumeSetResult,
+    NativeGroupMemberConfig, NativeGroupSession, NativeHapPairingClient,
+    NativeSession, NativeSessionConfig, RetransmitStats, Route, ServiceKind, VolumeSetResult,
     ALAC_44100_16_2, ALAC_44100_24_2, ALAC_48000_16_2,
     ALAC_48000_24_2,
 };
@@ -179,6 +179,11 @@ enum LegacyPairingResult {
         device_name: String,
         secret: String,
     },
+    NativeSuccess {
+        device_key: String,
+        device_name: String,
+        credentials: String,
+    },
     Failed {
         device_name: String,
         error: String,
@@ -292,6 +297,7 @@ struct SairplayApp {
     volume_rx: Option<Receiver<Result<Vec<VolumeSetResult>, String>>>,
     pending_volume: Option<u8>,
     legacy_secrets: BTreeMap<String, String>,
+    native_credentials: BTreeMap<String, String>,
     hires_overrides: BTreeMap<String, bool>,
     hires_capabilities: BTreeMap<String, bool>,
     buffered_hires_capabilities: BTreeMap<String, bool>,
@@ -368,6 +374,7 @@ impl Default for SairplayApp {
             volume_rx: None,
             pending_volume: None,
             legacy_secrets: BTreeMap::new(),
+            native_credentials: load_native_credentials(),
             hires_overrides: BTreeMap::new(),
             hires_capabilities: BTreeMap::new(),
             buffered_hires_capabilities: BTreeMap::new(),
@@ -769,7 +776,10 @@ impl SairplayApp {
             }
             let hires_override = self.hires_overrides.get(fullname).copied();
             match native_config_for_device(device, initial_volume, hires_override) {
-                Ok(config) => requests.push((fullname.clone(), config)),
+                Ok(mut config) => {
+                    config.auth_credentials = self.native_credentials.get(fullname).cloned();
+                    requests.push((fullname.clone(), config));
+                }
                 Err(error) => self.log.push(error),
             }
         }
@@ -936,6 +946,75 @@ impl SairplayApp {
             return true;
         };
         !self.legacy_secrets.contains_key(&key)
+    }
+
+    fn native_pairing_key(device: &DeviceRecord) -> Option<String> {
+        device.airplay.as_ref().map(|service| service.fullname.clone())
+    }
+
+    fn native_pairing_required(&self, device: &DeviceRecord) -> bool {
+        if !is_genuine_appletv_candidate(device) {
+            return false;
+        }
+        let Some(key) = Self::native_pairing_key(device) else {
+            return false;
+        };
+        !self.native_credentials.contains_key(&key)
+    }
+
+    fn begin_native_pairing(&mut self, device: &DeviceRecord) {
+        let Some(service) = device.airplay.as_ref() else {
+            return;
+        };
+        let Some(device_key) = Self::native_pairing_key(device) else {
+            return;
+        };
+
+        let host = preferred_service_address(service);
+        let port = service.port;
+        let name = device.display_name.clone();
+        let dacp_id = "A1B2C3D4E5F60708".to_owned();
+
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let (pin_tx, pin_rx) = mpsc::sync_channel::<String>(1);
+        self.pairing_rx = Some(result_rx);
+        self.pairing_pin_tx = Some(pin_tx);
+        self.pairing_open = true;
+        self.pairing_pin.clear();
+        self.pairing_name = name.clone();
+        self.pairing_pin_sent = false;
+        self.pairing_retry_start = true;
+        self.playback = PlaybackUiState::Idle;
+        self.log.push(format!(
+            "{name}: starting MSA native AppleTV PIN pair-setup on {host}:{port}."
+        ));
+
+        thread::Builder::new()
+            .name("sairplay-native-appletv-pairing".into())
+            .spawn(move || {
+                let result = NativeHapPairingClient::default().pair_setup_pin(
+                    &host,
+                    port,
+                    &dacp_id,
+                    || pin_rx.recv().ok(),
+                );
+                match result {
+                    Ok(credentials) => {
+                        let _ = result_tx.send(LegacyPairingResult::NativeSuccess {
+                            device_key,
+                            device_name: name,
+                            credentials: credentials.to_hex(),
+                        });
+                    }
+                    Err(error) => {
+                        let _ = result_tx.send(LegacyPairingResult::Failed {
+                            device_name: name,
+                            error: format!("native HAP pair-setup failed: {error:?}"),
+                        });
+                    }
+                }
+            })
+            .expect("failed to spawn native AppleTV pairing worker");
     }
 
     fn begin_legacy_pairing(&mut self, device: &DeviceRecord) {
@@ -1161,6 +1240,21 @@ impl SairplayApp {
                     self.start_selected_inner();
                 }
             }
+            LegacyPairingResult::NativeSuccess {
+                device_key,
+                device_name,
+                credentials,
+            } => {
+                self.native_credentials.insert(device_key, credentials);
+                save_native_credentials(&self.native_credentials);
+                self.log.push(format!(
+                    "{device_name}: native AppleTV PIN pairing success; stored credentials ready for pair-verify."
+                ));
+                self.playback = PlaybackUiState::Idle;
+                if std::mem::take(&mut self.pairing_retry_start) {
+                    self.start_selected_inner();
+                }
+            }
             LegacyPairingResult::Failed { device_name, error } => {
                 self.pairing_retry_start = false;
                 let message = format!("{device_name}: AppleTV pairing failed: {error}");
@@ -1282,7 +1376,7 @@ impl SairplayApp {
                         if tx.send(self.pairing_pin.clone()).is_ok() {
                             self.pairing_pin_sent = true;
                             self.log.push(format!(
-                                "{}: PIN submitted to source pairing helper.",
+                                "{}: PIN submitted to AirPlay pairing worker.",
                                 self.pairing_name
                             ));
                         }
@@ -1510,6 +1604,19 @@ impl SairplayApp {
             }
         }
 
+        // Match MSA's Apple TV lifecycle: establish HomeKit credentials once,
+        // then all native sessions use pair-verify. Never hammer transient
+        // pair-setup on an Apple TV that expects stored credentials.
+        if all_native {
+            if let Some((_, device)) = selected_devices
+                .iter()
+                .find(|(_, device)| self.native_pairing_required(device))
+            {
+                self.begin_native_pairing(device);
+                return;
+            }
+        }
+
         let active_fullnames: BTreeSet<String> =
             selected_devices.iter().map(|(fullname, _)| fullname.clone()).collect();
         let member_count = selected_devices.len();
@@ -1585,6 +1692,7 @@ impl SairplayApp {
                         return;
                     }
                 };
+                config.auth_credentials = self.native_credentials.get(fullname).cloned();
                 config.buffered_auto_enabled = true;
 
                 thread::Builder::new()
@@ -1625,6 +1733,7 @@ impl SairplayApp {
                         }
                     };
                     let mut config = config;
+                    config.auth_credentials = self.native_credentials.get(fullname).cloned();
                     config.buffered_auto_enabled = false;
                     configs.push(NativeGroupMemberConfig::new(
                         fullname.clone(),
@@ -3338,7 +3447,8 @@ fn device_model(device: &DeviceRecord) -> String {
 }
 
 fn is_unsupported_living_tv(device: &DeviceRecord) -> bool {
-    if device_model(device) != "appletv3,1" {
+    let model = device_model(device);
+    if !model.starts_with("appletv3,") {
         return false;
     }
 
@@ -3347,9 +3457,13 @@ fn is_unsupported_living_tv(device: &DeviceRecord) -> bool {
         .airplay
         .as_ref()
         .or(device.raop.as_ref())
-        .is_some_and(|service| service.host.to_ascii_lowercase().starts_with("mitv--"));
+        .is_some_and(|service| service.host.to_ascii_lowercase().starts_with("mitv"));
 
     mitv_host || name.contains("mi project")
+}
+
+fn is_genuine_appletv_candidate(device: &DeviceRecord) -> bool {
+    device_model(device).starts_with("appletv") && !is_unsupported_living_tv(device)
 }
 
 fn device_color_is_dark(device: &DeviceRecord) -> bool {
@@ -4048,6 +4162,61 @@ fn native_config_for_device(
     };
 
     Ok(config)
+}
+
+fn native_credentials_path() -> Option<PathBuf> {
+    let base = std::env::var_os("APPDATA")?;
+    Some(
+        PathBuf::from(base)
+            .join("SolYan")
+            .join("SAirplay2")
+            .join("native_credentials.txt"),
+    )
+}
+
+fn load_native_credentials() -> BTreeMap<String, String> {
+    let Some(path) = native_credentials_path() else {
+        return BTreeMap::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (key, credentials) = line.split_once('	')?;
+            let credentials = credentials.trim();
+            (credentials.len() == 192
+                && credentials.chars().all(|ch| ch.is_ascii_hexdigit())
+                && !key.trim().is_empty())
+                .then(|| (key.to_owned(), credentials.to_owned()))
+        })
+        .collect()
+}
+
+fn save_native_credentials(credentials: &BTreeMap<String, String>) {
+    let Some(path) = native_credentials_path() else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+
+    let mut text = String::new();
+    for (key, value) in credentials {
+        if value.len() == 192 && value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            let clean_key = key.replace(['	', '', '
+'], "");
+            text.push_str(&clean_key);
+            text.push('	');
+            text.push_str(value);
+            text.push('
+');
+        }
+    }
+    let _ = std::fs::write(path, text);
 }
 
 fn volume_settings_path() -> Option<PathBuf> {
