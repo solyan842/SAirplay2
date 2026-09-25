@@ -62,7 +62,10 @@ pub use discovery::{AirPlayTxt, DiscoveryError};
 pub use hap_crypto::{derive_control_keys, HapControlCipher, HapCryptoError};
 pub use hap_tlv8::{Tlv8, Tlv8Error, TlvTag, HAP_TRANSIENT_FLAG};
 pub use hap_srp::{srp_client_compute, SrpClientResult, SrpError, SRP_TRANSIENT_PIN};
-pub use hap_pairing::{PairingError, TransientPairingClient, TransientPairingResult, TransientPairingSession};
+pub use hap_pairing::{
+    NativeHapPairingClient, PairingError, StoredHapCredentials,
+    TransientPairingClient, TransientPairingResult, TransientPairingSession,
+};
 pub use hap_rtsp::{EncryptedRtspChannel, EncryptedRtspError};
 pub use mdns_browser::{DiscoveredService, DiscoveryEvent, MdnsBrowser, ServiceKind};
 pub use native_preflight::{NativeConnectError, NativeConnectFlow, NativePhase};

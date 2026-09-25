@@ -6,7 +6,7 @@ use crate::{
     PtpSessionSetupConfig, RealtimeMediaSender, RecordConfig, RetransmitRing,
     Ap2AudioFormat, BufferedMediaSender, MediaTransport, NativeVolumeControl,
     ReceiverCapabilities, RetransmitStats, RetransmitWorker, Route, RouteResolver, RtpState,
-    SetPeersConfig, TransientPairingClient,
+    SetPeersConfig, NativeHapPairingClient, StoredHapCredentials, TransientPairingClient,
     VolumeSetResult, set_native_volume,
 };
 use rand::RngCore;
@@ -26,6 +26,8 @@ pub struct NativeSessionConfig {
     pub host: String,
     pub port: u16,
     pub password: Option<String>,
+    /// Pinned MSA 192-hex HomeKit credentials; when present native AP2 uses pair-verify.
+    pub auth_credentials: Option<String>,
     pub dacp_id: String,
     pub active_remote: String,
     pub lead_frames: u32,
@@ -53,6 +55,7 @@ impl NativeSessionConfig {
             host: host.into(),
             port,
             password: None,
+            auth_credentials: None,
             dacp_id: "A1B2C3D4E5F60708".into(),
             active_remote: "123456789".into(),
             lead_frames: 11_025,
@@ -194,14 +197,17 @@ impl NativeSession {
             Ap2AudioFormat::ALAC_44100_16_STEREO
         };
 
-        let pairing_client = TransientPairingClient::default();
-        let pairing = pairing_client
-            .pair_channel_on_stream(
-                stream,
-                info.peer,
-                config.password.as_deref(),
-            )
-            .map_err(NativeSessionError::Pairing)?;
+        let pairing = if let Some(credentials_hex) = config.auth_credentials.as_deref() {
+            let credentials = StoredHapCredentials::from_hex(credentials_hex)
+                .map_err(NativeSessionError::Pairing)?;
+            NativeHapPairingClient::default()
+                .pair_verify_on_stream(stream, info.peer, &config.dacp_id, &credentials)
+                .map_err(NativeSessionError::Pairing)?
+        } else {
+            TransientPairingClient::default()
+                .pair_channel_on_stream(stream, info.peer, config.password.as_deref())
+                .map_err(NativeSessionError::Pairing)?
+        };
 
         flow.paired()
             .map_err(|e| NativeSessionError::Flow(format!("{e:?}")))?;

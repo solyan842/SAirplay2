@@ -3,6 +3,15 @@ use crate::{
     EncryptedRtspChannel, SrpError, Tlv8, Tlv8Error, TlvTag, HAP_TRANSIENT_FLAG,
     SRP_TRANSIENT_PIN,
 };
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    ChaCha20Poly1305, Key, Nonce,
+};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use hkdf::Hkdf;
+use rand::rngs::OsRng;
+use sha2::Sha512;
+use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
@@ -26,6 +35,10 @@ pub enum PairingError {
     InvalidSalt,
     InvalidServerPublicKey,
     InvalidServerProof,
+    InvalidCredentials,
+    MissingIdentifier,
+    MissingEncryptedData,
+    InvalidSignature,
 }
 
 impl From<RtspError> for PairingError {
@@ -53,6 +66,325 @@ pub struct TransientPairingResult {
 pub struct TransientPairingSession {
     pub pairing: TransientPairingResult,
     pub channel: EncryptedRtspChannel,
+}
+
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredHapCredentials {
+    pub client_seed: [u8; 32],
+    pub client_public: [u8; 32],
+    pub server_public: [u8; 32],
+}
+
+impl StoredHapCredentials {
+    pub fn from_hex(value: &str) -> Result<Self, PairingError> {
+        if value.len() != 192 {
+            return Err(PairingError::InvalidCredentials);
+        }
+        let mut raw = [0u8; 96];
+        for (i, byte) in raw.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[i * 2..i * 2 + 2], 16)
+                .map_err(|_| PairingError::InvalidCredentials)?;
+        }
+        let mut client_seed = [0u8; 32];
+        let mut client_public = [0u8; 32];
+        let mut server_public = [0u8; 32];
+        client_seed.copy_from_slice(&raw[..32]);
+        client_public.copy_from_slice(&raw[32..64]);
+        server_public.copy_from_slice(&raw[64..96]);
+        Ok(Self { client_seed, client_public, server_public })
+    }
+
+    pub fn to_hex(&self) -> String {
+        fn push_hex(out: &mut String, bytes: &[u8]) {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            for &byte in bytes {
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+        let mut out = String::with_capacity(192);
+        push_hex(&mut out, &self.client_seed);
+        push_hex(&mut out, &self.client_public);
+        push_hex(&mut out, &self.server_public);
+        out
+    }
+}
+
+pub struct NativeHapPairingClient {
+    connect_timeout: Duration,
+    exchange_timeout: Duration,
+    user_agent: String,
+}
+
+impl Default for NativeHapPairingClient {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(3),
+            exchange_timeout: Duration::from_secs(8),
+            user_agent: "AirPlay/670.6.2".into(),
+        }
+    }
+}
+
+impl NativeHapPairingClient {
+    pub fn pair_setup_pin<F>(
+        &self,
+        host: &str,
+        port: u16,
+        client_id: &str,
+        pin_provider: F,
+    ) -> Result<StoredHapCredentials, PairingError>
+    where
+        F: FnOnce() -> Option<String>,
+    {
+        let peer = (host, port)
+            .to_socket_addrs()
+            .map_err(|_| PairingError::Resolve)?
+            .next()
+            .ok_or(PairingError::Resolve)?;
+        let mut stream = TcpStream::connect_timeout(&peer, self.connect_timeout)
+            .map_err(PairingError::Connect)?;
+        configure_pairing_stream(&mut stream, self.exchange_timeout)?;
+
+        let mut codec = RtspCodec::default();
+        let mut pending = Vec::<RtspResponse>::new();
+
+        // Pinned MSA: Apple TV displays the code only after /pair-pin-start.
+        let _ = exchange(
+            &mut stream, &mut codec, &mut pending, 0, &self.user_agent,
+            "/pair-pin-start", 3, &[], self.exchange_timeout,
+        );
+
+        let mut m1 = Tlv8::new();
+        m1.insert_u8(TlvTag::State, 0x01);
+        m1.insert_u8(TlvTag::Method, 0x00);
+        let m2 = parse_pair_tlv(exchange(
+            &mut stream, &mut codec, &mut pending, 1, &self.user_agent,
+            "/pair-setup", 3, &m1.encode(), self.exchange_timeout,
+        )?)?;
+        require_state(&m2, 0x02)?;
+
+        let salt = m2.get(TlvTag::Salt).ok_or(PairingError::InvalidSalt)?;
+        if salt.len() != 16 {
+            return Err(PairingError::InvalidSalt);
+        }
+        let server_b = m2.get(TlvTag::PublicKey)
+            .ok_or(PairingError::InvalidServerPublicKey)?;
+        if server_b.is_empty() || server_b.len() > 384 {
+            return Err(PairingError::InvalidServerPublicKey);
+        }
+
+        let pin = pin_provider().filter(|pin| !pin.is_empty())
+            .ok_or(PairingError::InvalidCredentials)?;
+        let srp = srp_client_compute(salt, server_b, &pin)?;
+
+        let mut m3 = Tlv8::new();
+        m3.insert_u8(TlvTag::State, 0x03);
+        m3.insert(TlvTag::PublicKey, srp.public_key_a.clone());
+        m3.insert(TlvTag::Proof, srp.proof_m1.to_vec());
+        let m4 = parse_pair_tlv(exchange(
+            &mut stream, &mut codec, &mut pending, 2, &self.user_agent,
+            "/pair-setup", 3, &m3.encode(), self.exchange_timeout,
+        )?)?;
+        require_state(&m4, 0x04)?;
+        let proof = m4.get(TlvTag::Proof).ok_or(PairingError::InvalidServerProof)?;
+        if proof != srp.expected_hamk {
+            return Err(PairingError::InvalidServerProof);
+        }
+
+        let enc_key = hkdf32(
+            &srp.session_key,
+            b"Pair-Setup-Encrypt-Salt",
+            b"Pair-Setup-Encrypt-Info",
+        )?;
+        let device_x = hkdf32(
+            &srp.session_key,
+            b"Pair-Setup-Controller-Sign-Salt",
+            b"Pair-Setup-Controller-Sign-Info",
+        )?;
+
+        let signing = SigningKey::generate(&mut OsRng);
+        let client_public = signing.verifying_key().to_bytes();
+        let client_id = client_id.to_ascii_uppercase();
+        let mut controller_info = Vec::with_capacity(32 + client_id.len() + 32);
+        controller_info.extend_from_slice(&device_x);
+        controller_info.extend_from_slice(client_id.as_bytes());
+        controller_info.extend_from_slice(&client_public);
+        let signature = signing.sign(&controller_info).to_bytes();
+
+        let mut sub = Tlv8::new();
+        sub.insert(TlvTag::Identifier, client_id.as_bytes().to_vec());
+        sub.insert(TlvTag::PublicKey, client_public.to_vec());
+        sub.insert(TlvTag::Signature, signature.to_vec());
+        let encrypted = hap_message_encrypt(&enc_key, b"PS-Msg05", &sub.encode())?;
+
+        let mut m5 = Tlv8::new();
+        m5.insert_u8(TlvTag::State, 0x05);
+        m5.insert(TlvTag::EncryptedData, encrypted);
+        let m6 = parse_pair_tlv(exchange(
+            &mut stream, &mut codec, &mut pending, 3, &self.user_agent,
+            "/pair-setup", 3, &m5.encode(), self.exchange_timeout,
+        )?)?;
+        require_state(&m6, 0x06)?;
+        let encrypted_m6 = m6.get(TlvTag::EncryptedData)
+            .ok_or(PairingError::MissingEncryptedData)?;
+        let plain_m6 = hap_message_decrypt(&enc_key, b"PS-Msg06", encrypted_m6)?;
+        let sub_m6 = Tlv8::decode(&plain_m6)?;
+        let server_key = sub_m6.get(TlvTag::PublicKey)
+            .ok_or(PairingError::InvalidServerPublicKey)?;
+        if server_key.len() != 32 {
+            return Err(PairingError::InvalidServerPublicKey);
+        }
+        let mut server_public = [0u8; 32];
+        server_public.copy_from_slice(server_key);
+
+        Ok(StoredHapCredentials {
+            client_seed: signing.to_bytes(),
+            client_public,
+            server_public,
+        })
+    }
+
+    pub fn pair_verify_on_stream(
+        &self,
+        mut stream: TcpStream,
+        peer: SocketAddr,
+        client_id: &str,
+        credentials: &StoredHapCredentials,
+    ) -> Result<TransientPairingSession, PairingError> {
+        configure_pairing_stream(&mut stream, self.exchange_timeout)?;
+        let mut codec = RtspCodec::default();
+        let mut pending = Vec::<RtspResponse>::new();
+
+        let secret = EphemeralSecret::random_from_rng(OsRng);
+        let public = X25519PublicKey::from(&secret);
+        let mut m1 = Tlv8::new();
+        m1.insert_u8(TlvTag::State, 0x01);
+        m1.insert(TlvTag::PublicKey, public.as_bytes().to_vec());
+        let m2 = parse_pair_tlv(exchange(
+            &mut stream, &mut codec, &mut pending, 1, &self.user_agent,
+            "/pair-verify", 3, &m1.encode(), self.exchange_timeout,
+        )?)?;
+        require_state(&m2, 0x02)?;
+
+        let server_eph = m2.get(TlvTag::PublicKey)
+            .ok_or(PairingError::InvalidServerPublicKey)?;
+        if server_eph.len() != 32 {
+            return Err(PairingError::InvalidServerPublicKey);
+        }
+        let mut server_eph_bytes = [0u8; 32];
+        server_eph_bytes.copy_from_slice(server_eph);
+        let shared = secret.diffie_hellman(&X25519PublicKey::from(server_eph_bytes));
+        let shared_secret = *shared.as_bytes();
+        let verify_key = hkdf32(
+            &shared_secret,
+            b"Pair-Verify-Encrypt-Salt",
+            b"Pair-Verify-Encrypt-Info",
+        )?;
+
+        let encrypted_m2 = m2.get(TlvTag::EncryptedData)
+            .ok_or(PairingError::MissingEncryptedData)?;
+        let plain_m2 = hap_message_decrypt(&verify_key, b"PV-Msg02", encrypted_m2)?;
+        let sub_m2 = Tlv8::decode(&plain_m2)?;
+        let server_id = sub_m2.get(TlvTag::Identifier)
+            .ok_or(PairingError::MissingIdentifier)?;
+        let server_sig = sub_m2.get(TlvTag::Signature)
+            .ok_or(PairingError::InvalidSignature)?;
+        if server_sig.len() != 64 {
+            return Err(PairingError::InvalidSignature);
+        }
+
+        // Pinned MSA treats accessory signature verification as advisory here:
+        // the receiver's M4 verification of OUR stored identity is authoritative.
+        if let (Ok(server_verify), Ok(sig)) = (
+            VerifyingKey::from_bytes(&credentials.server_public),
+            Signature::from_slice(server_sig),
+        ) {
+            let mut accessory_info = Vec::with_capacity(32 + server_id.len() + 32);
+            accessory_info.extend_from_slice(server_eph);
+            accessory_info.extend_from_slice(server_id);
+            accessory_info.extend_from_slice(public.as_bytes());
+            let _ = server_verify.verify(&accessory_info, &sig);
+        }
+
+        let client_id = client_id.to_ascii_uppercase();
+        let signing = SigningKey::from_bytes(&credentials.client_seed);
+        let mut controller_info = Vec::with_capacity(32 + client_id.len() + 32);
+        controller_info.extend_from_slice(public.as_bytes());
+        controller_info.extend_from_slice(client_id.as_bytes());
+        controller_info.extend_from_slice(server_eph);
+        let signature = signing.sign(&controller_info).to_bytes();
+
+        let mut sub_m3 = Tlv8::new();
+        sub_m3.insert(TlvTag::Identifier, client_id.as_bytes().to_vec());
+        sub_m3.insert(TlvTag::Signature, signature.to_vec());
+        let encrypted_m3 = hap_message_encrypt(&verify_key, b"PV-Msg03", &sub_m3.encode())?;
+        let mut m3 = Tlv8::new();
+        m3.insert_u8(TlvTag::State, 0x03);
+        m3.insert(TlvTag::EncryptedData, encrypted_m3);
+
+        let m4 = parse_pair_tlv(exchange(
+            &mut stream, &mut codec, &mut pending, 2, &self.user_agent,
+            "/pair-verify", 3, &m3.encode(), self.exchange_timeout,
+        )?)?;
+        require_state(&m4, 0x04)?;
+
+        let (write_key, read_key) = derive_control_keys(&shared_secret)?;
+        let mut session_key = [0u8; 64];
+        session_key[..32].copy_from_slice(&shared_secret);
+        let pairing = TransientPairingResult {
+            peer,
+            write_key,
+            read_key,
+            audio_secret: shared_secret,
+            session_key,
+        };
+        let channel = EncryptedRtspChannel::new(
+            stream,
+            pairing.write_key,
+            pairing.read_key,
+            self.exchange_timeout,
+        );
+        Ok(TransientPairingSession { pairing, channel })
+    }
+}
+
+fn configure_pairing_stream(stream: &mut TcpStream, exchange_timeout: Duration) -> Result<(), PairingError> {
+    stream.set_nodelay(true).map_err(PairingError::Configure)?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .map_err(PairingError::Configure)?;
+    stream
+        .set_write_timeout(Some(exchange_timeout))
+        .map_err(PairingError::Configure)?;
+    Ok(())
+}
+
+fn hkdf32(secret: &[u8], salt: &[u8], info: &[u8]) -> Result<[u8; 32], PairingError> {
+    let hk = Hkdf::<Sha512>::new(Some(salt), secret);
+    let mut out = [0u8; 32];
+    hk.expand(info, &mut out)
+        .map_err(|_| PairingError::Crypto(HapCryptoError::Hkdf))?;
+    Ok(out)
+}
+
+fn hap_message_nonce(label: &[u8; 8]) -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    nonce[4..].copy_from_slice(label);
+    nonce
+}
+
+fn hap_message_encrypt(key: &[u8; 32], label: &[u8; 8], plaintext: &[u8]) -> Result<Vec<u8>, PairingError> {
+    ChaCha20Poly1305::new(Key::from_slice(key))
+        .encrypt(Nonce::from_slice(&hap_message_nonce(label)), plaintext)
+        .map_err(|_| PairingError::Crypto(HapCryptoError::Encrypt))
+}
+
+fn hap_message_decrypt(key: &[u8; 32], label: &[u8; 8], ciphertext: &[u8]) -> Result<Vec<u8>, PairingError> {
+    ChaCha20Poly1305::new(Key::from_slice(key))
+        .decrypt(Nonce::from_slice(&hap_message_nonce(label)), ciphertext)
+        .map_err(|_| PairingError::Crypto(HapCryptoError::Decrypt))
 }
 
 pub struct TransientPairingClient {
