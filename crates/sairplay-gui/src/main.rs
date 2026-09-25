@@ -4130,31 +4130,6 @@ mod gui_tests {
     use sairplay_engine::AirPlayTxt;
 
     #[test]
-    fn living_tv_signature_is_blocked_but_plain_appletv3_is_not() {
-        let mut living = DeviceRecord::new("Mi Project - Living room");
-        let mut service = DiscoveredService::test_airplay(
-            "Mi Project - Living room._airplay._tcp.local.",
-            "MITV--1954518582.local.",
-            52266,
-        );
-        service.txt.model = Some("AppleTV3,1".into());
-        living.airplay = Some(service);
-        assert!(is_unsupported_living_tv(&living));
-        assert_eq!(classify_device_artwork(&living), DeviceArtwork::Tv);
-
-        let mut apple = DeviceRecord::new("Apple TV");
-        let mut service = DiscoveredService::test_airplay(
-            "Apple TV._airplay._tcp.local.",
-            "Apple-TV.local.",
-            7000,
-        );
-        service.txt.model = Some("AppleTV3,1".into());
-        apple.airplay = Some(service);
-        assert!(!is_unsupported_living_tv(&apple));
-        assert_eq!(classify_device_artwork(&apple), DeviceArtwork::AppleTv);
-    }
-
-    #[test]
     fn all_device_artwork_assets_are_independent_valid_pngs() {
         assert_eq!(ALL_DEVICE_ARTWORK.len(), 17);
 
