@@ -2,6 +2,7 @@ use crate::{
     system_time_to_ntp, Ap2AudioFormat, NativeMetadataControl, Pcm352Chunker, RealtimeMediaSender,
     WasapiLoopbackCapture, WasapiLoopbackError,
 };
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -16,6 +17,9 @@ use std::time::{Duration, Instant, SystemTime};
 pub const AIRPLAY_START_LEAD_MS: u64 = 400;
 pub const AIRPLAY_COLD_GROUP_START_LEAD_MS: u64 = 2_500;
 pub const AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS: u64 = 2_500;
+pub const AIRPLAY_LATE_JOIN_RING_MIN_SECONDS: f64 = 12.0;
+pub const AIRPLAY_LATE_JOIN_RING_MARGIN_SECONDS: f64 = 2.0;
+pub const AIRPLAY_LATE_JOIN_RING_MAX_BYTES: usize = 6 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowsGroupAudioKind {
@@ -76,7 +80,8 @@ enum GroupAudioCommand {
 
 struct PendingJoin {
     target: WindowsAudioTarget,
-    start_packet: u64,
+    queued_packets: VecDeque<Vec<u8>>,
+    anchor_packet: u64,
     reply: Sender<Result<(), String>>,
 }
 
@@ -250,6 +255,7 @@ impl WindowsMultiroomAudioWorker {
                 let mut multi_transition_epoch = 0u64;
                 let mut packet_index = 0u64;
                 let mut pending_joins = Vec::<PendingJoin>::new();
+                let mut late_join_ring = VecDeque::<(u64, Vec<u8>)>::new();
 
                 while running_thread.load(Ordering::SeqCst) {
                     handle_group_commands(
@@ -262,6 +268,7 @@ impl WindowsMultiroomAudioWorker {
                         &active_members_thread,
                         &startup_events_thread,
                         source_format,
+                        &late_join_ring,
                     );
 
                     let report = match capture.drain_into(&mut chunker) {
@@ -451,6 +458,7 @@ impl WindowsMultiroomAudioWorker {
                                 // application-level Next signal, so silence inference
                                 // must never mutate receiver session/timing state.
                                 chunker.clear();
+                                late_join_ring.clear();
                                 for target in &mut targets {
                                     target.sender.begin_warm_splice_boundary();
                                 }
@@ -778,28 +786,6 @@ impl WindowsMultiroomAudioWorker {
                             return;
                         }
 
-                        // A late joiner was armed ahead of time. Attach it
-                        // exactly when the live feed reaches the content sample
-                        // mapped to that shared group instant. No old source is
-                        // replayed and the running members are never paused.
-                        let mut index = 0usize;
-                        while index < pending_joins.len() {
-                            if pending_joins[index].start_packet <= packet_index {
-                                let pending = pending_joins.remove(index);
-                                let name = pending.target.name.clone();
-                                targets.push(pending.target);
-                                active_members_thread.store(targets.len() as u64, Ordering::SeqCst);
-                                let _ = pending.reply.send(Ok(()));
-                                if let Ok(mut events) = startup_events_thread.lock() {
-                                    events.push(format!(
-                                        "Late joiner {name}: attached at shared content packet #{packet_index}."
-                                    ));
-                                }
-                            } else {
-                                index += 1;
-                            }
-                        }
-
                         if targets.is_empty() {
                             break;
                         }
@@ -870,7 +856,116 @@ impl WindowsMultiroomAudioWorker {
                                 )),
                             }
                         }
+                        let sent_packet_index = packet_index;
                         packet_index = packet_index.saturating_add(1);
+
+                        // MSA keeps one shared raw-PCM ring for late joiners.
+                        // Grow it to cover the measured write-head lead + margin,
+                        // with the same 12 s floor and 6 MiB hard cap.
+                        late_join_ring.push_back((sent_packet_index, packet.clone()));
+                        trim_late_join_ring(
+                            &mut late_join_ring,
+                            source_format,
+                            group_start_ntp,
+                            packet_index,
+                            targets.first().map(|target| target.sender.reanchor_shifted_frames()).unwrap_or(0),
+                        );
+
+                        // Feed each late joiner from its mapped historical packet
+                        // through the current write head while the existing group
+                        // keeps playing. Once its queue catches the live head,
+                        // attach it to normal fan-out on the next packet.
+                        let mut join_index = 0usize;
+                        while join_index < pending_joins.len() {
+                            pending_joins[join_index]
+                                .queued_packets
+                                .push_back(packet.clone());
+
+                            let now_ntp = match system_time_to_ntp(SystemTime::now()) {
+                                Ok(value) => value,
+                                Err(_) => {
+                                    join_index += 1;
+                                    continue;
+                                }
+                            };
+
+                            let mut join_failed = None::<String>;
+                            loop {
+                                let can_send = {
+                                    let pending = &mut pending_joins[join_index];
+                                    !pending.queued_packets.is_empty()
+                                        && pending.target.sender.can_accept_frames(now_ntp)
+                                };
+                                if !can_send {
+                                    break;
+                                }
+
+                                let source_packet = pending_joins[join_index]
+                                    .queued_packets
+                                    .front()
+                                    .cloned()
+                                    .expect("late-join queue checked");
+                                let target_format =
+                                    pending_joins[join_index].target.sender.audio_format();
+                                let target_packet = match adapt_group_pcm_packet(
+                                    &source_packet,
+                                    source_format,
+                                    target_format,
+                                ) {
+                                    Ok(packet) => packet,
+                                    Err(error) => {
+                                        join_failed = Some(format!(
+                                            "{} late-join media format failed: {error}",
+                                            pending_joins[join_index].target.name
+                                        ));
+                                        break;
+                                    }
+                                };
+                                let lead_frames = pending_joins[join_index].target.lead_frames;
+                                match pending_joins[join_index]
+                                    .target
+                                    .sender
+                                    .send_pcm_352(&target_packet, now_ntp, lead_frames)
+                                {
+                                    Ok(_) => {
+                                        pending_joins[join_index].queued_packets.pop_front();
+                                    }
+                                    Err(error) => {
+                                        join_failed = Some(format!(
+                                            "{} late-join media send failed: {error:?}",
+                                            pending_joins[join_index].target.name
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if let Some(error) = join_failed {
+                                let pending = pending_joins.remove(join_index);
+                                let _ = pending.reply.send(Err(error.clone()));
+                                if let Ok(mut events) = startup_events_thread.lock() {
+                                    events.push(error);
+                                }
+                                continue;
+                            }
+
+                            if pending_joins[join_index].queued_packets.is_empty() {
+                                let pending = pending_joins.remove(join_index);
+                                let name = pending.target.name.clone();
+                                let anchor_packet = pending.anchor_packet;
+                                targets.push(pending.target);
+                                active_members_thread.store(targets.len() as u64, Ordering::SeqCst);
+                                let _ = pending.reply.send(Ok(()));
+                                if let Ok(mut events) = startup_events_thread.lock() {
+                                    events.push(format!(
+                                        "Late joiner {name}: primed from packet #{anchor_packet} and caught the live head at packet #{}.",
+                                        packet_index.saturating_sub(1)
+                                    ));
+                                }
+                            } else {
+                                join_index += 1;
+                            }
+                        }
 
                         for target in &mut targets {
                             target.sender.consume_splice_pad(pad_now);
@@ -1045,6 +1140,7 @@ fn handle_group_commands(
     active_members: &AtomicU64,
     startup_events: &Mutex<Vec<String>>,
     source_format: Ap2AudioFormat,
+    late_join_ring: &VecDeque<(u64, Vec<u8>)>,
 ) {
     while let Ok(command) = command_rx.try_recv() {
         match command {
@@ -1116,11 +1212,24 @@ fn handle_group_commands(
                     sample_rate,
                 );
                 let required_packet = required_frames.div_ceil(352);
-                let start_packet = packet_index.max(required_packet);
+                let oldest_ring_packet = late_join_ring
+                    .front()
+                    .map(|(index, _)| *index)
+                    .unwrap_or(packet_index);
+                // MSA moves the anchor later only when the requested content
+                // predates the retained ring. Otherwise prime from history and
+                // keep the join floor instead of delaying all the way to the
+                // current write head.
+                let anchor_packet = required_packet.max(oldest_ring_packet).min(packet_index);
                 let start_ntp = effective_start.saturating_add(frames_to_ntp(
-                    start_packet.saturating_mul(352),
+                    anchor_packet.saturating_mul(352),
                     sample_rate,
                 ));
+                let queued_packets = late_join_ring
+                    .iter()
+                    .filter(|(index, _)| *index >= anchor_packet)
+                    .map(|(_, packet)| packet.clone())
+                    .collect::<VecDeque<_>>();
 
                 match target.sender.arm_cold_start(
                     start_ntp,
@@ -1158,15 +1267,17 @@ fn handle_group_commands(
                         }
                         if let Ok(mut events) = startup_events.lock() {
                             events.push(format!(
-                                "{}: late join armed for packet #{} with {} ms minimum headroom.",
+                                "{}: late join armed at packet #{} with {} queued prime packet(s) and {} ms minimum headroom.",
                                 target.name,
-                                start_packet,
+                                anchor_packet,
+                                queued_packets.len(),
                                 AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS
                             ));
                         }
                         pending_joins.push(PendingJoin {
                             target,
-                            start_packet,
+                            queued_packets,
+                            anchor_packet,
                             reply,
                         });
                     }
@@ -1206,6 +1317,49 @@ fn handle_group_commands(
     }
 }
 
+fn trim_late_join_ring(
+    ring: &mut VecDeque<(u64, Vec<u8>)>,
+    source_format: Ap2AudioFormat,
+    group_start_ntp: Option<u64>,
+    packet_index: u64,
+    reanchor_shift_frames: u64,
+) {
+    let packet_bytes = 352usize.saturating_mul(source_format.input_bytes_per_frame());
+    if packet_bytes == 0 {
+        ring.clear();
+        return;
+    }
+    let byte_rate = source_format
+        .sample_rate
+        .saturating_mul(source_format.input_bytes_per_frame() as u32) as f64;
+
+    let mut required_seconds = AIRPLAY_LATE_JOIN_RING_MIN_SECONDS;
+    if let (Some(base_start), Ok(now_ntp)) =
+        (group_start_ntp, system_time_to_ntp(SystemTime::now()))
+    {
+        let effective_start =
+            base_start.saturating_add(frames_to_ntp(reanchor_shift_frames, source_format.sample_rate));
+        let elapsed_frames = ntp_delta_to_frames_ceil(
+            now_ntp.saturating_sub(effective_start),
+            source_format.sample_rate,
+        );
+        let write_frames = packet_index.saturating_mul(352);
+        let lead_frames = write_frames.saturating_sub(elapsed_frames);
+        let lead_seconds = lead_frames as f64 / source_format.sample_rate as f64;
+        required_seconds = required_seconds.max(
+            lead_seconds + AIRPLAY_LATE_JOIN_RING_MARGIN_SECONDS,
+        );
+    }
+
+    let wanted_bytes = (required_seconds * byte_rate)
+        .ceil()
+        .min(AIRPLAY_LATE_JOIN_RING_MAX_BYTES as f64) as usize;
+    let max_packets = wanted_bytes.div_ceil(packet_bytes).max(1);
+    while ring.len() > max_packets {
+        ring.pop_front();
+    }
+}
+
 fn align_splice_pad(targets: &mut [WindowsAudioTarget]) {
     let max_pad = targets
         .iter()
@@ -1235,6 +1389,17 @@ fn ntp_delta_to_frames_ceil(delta: u64, sample_rate: u32) -> u64 {
 #[cfg(test)]
 mod mixed_format_tests {
     use super::*;
+
+    #[test]
+    fn late_join_ring_uses_msa_floor_and_hard_cap() {
+        let format = Ap2AudioFormat::ALAC_44100_16_STEREO;
+        let packet_bytes = 352 * format.input_bytes_per_frame();
+        let floor_packets =
+            ((AIRPLAY_LATE_JOIN_RING_MIN_SECONDS * 44_100.0 * 4.0) as usize)
+                .div_ceil(packet_bytes);
+        assert!(floor_packets > 0);
+        assert!(floor_packets * packet_bytes <= AIRPLAY_LATE_JOIN_RING_MAX_BYTES);
+    }
 
     #[test]
     fn late_join_timeline_math_uses_session_sample_rate() {
