@@ -1814,6 +1814,10 @@ impl SairplayApp {
     }
 
     fn device_status(&self, device: &DeviceRecord, stereo_pair: bool) -> (&'static str, StatusTone) {
+        if is_unsupported_living_tv(device) {
+            return (self.t("Không hỗ trợ", "Unsupported"), StatusTone::Gray);
+        }
+
         let members = device_selection_members(device, stereo_pair);
         let member_set = members.iter().cloned().collect::<BTreeSet<_>>();
         let selected = if stereo_pair {
@@ -1897,11 +1901,13 @@ impl SairplayApp {
                     .iter()
                     .all(|fullname| self.selected_fullnames.contains(fullname))
         };
+        let unsupported = is_unsupported_living_tv(device);
         let legacy_live = matches!(
             (&self.session, &self.playback),
             (Some(ActiveSession::Legacy(_)), PlaybackUiState::Playing(_))
         );
-        let selectable = !members.is_empty()
+        let selectable = !unsupported
+            && !members.is_empty()
             && !matches!(self.playback, PlaybackUiState::Connecting(_))
             && self.membership_rx.is_none()
             && !legacy_live;
@@ -2004,7 +2010,8 @@ impl SairplayApp {
                 );
             });
         });
-        let hires_available = !members.is_empty()
+        let hires_available = !unsupported
+            && !members.is_empty()
             && members.iter().all(|fullname| {
                 self.hires_capabilities.get(fullname).copied() == Some(true)
             });
@@ -2057,12 +2064,18 @@ impl SairplayApp {
                             .color(UiTheme::text_soft()),
                     );
                     ui.add_space(2.0);
-                    let mut fixed_off = false;
-                    let disabled = draw_compact_switch(ui, &mut fixed_off, false);
-                    disabled.on_hover_text(self.t(
-                        "Thiết bị này chỉ hỗ trợ 16-bit.",
-                        "This receiver supports 16-bit only.",
-                    ));
+                    let disabled = draw_inert_switch(ui);
+                    disabled.on_hover_text(if unsupported {
+                        self.t(
+                            "Thiết bị này không được hỗ trợ.",
+                            "This receiver is not supported.",
+                        )
+                    } else {
+                        self.t(
+                            "Thiết bị này chỉ hỗ trợ 16-bit.",
+                            "This receiver supports 16-bit only.",
+                        )
+                    });
                 }
             });
         });
@@ -3324,6 +3337,21 @@ fn device_model(device: &DeviceRecord) -> String {
         .to_ascii_lowercase()
 }
 
+fn is_unsupported_living_tv(device: &DeviceRecord) -> bool {
+    if device_model(device) != "appletv3,1" {
+        return false;
+    }
+
+    let name = device.display_name.to_ascii_lowercase();
+    let mitv_host = device
+        .airplay
+        .as_ref()
+        .or(device.raop.as_ref())
+        .is_some_and(|service| service.host.to_ascii_lowercase().starts_with("mitv--"));
+
+    mitv_host || name.contains("mi project")
+}
+
 fn device_color_is_dark(device: &DeviceRecord) -> bool {
     let name = device.display_name.to_ascii_lowercase();
     let model = device_model(device);
@@ -3379,7 +3407,9 @@ fn classify_device_artwork(device: &DeviceRecord) -> DeviceArtwork {
     let model = device_model(device);
     let name = device.display_name.to_ascii_lowercase();
 
-    if model.starts_with("airport") || name.contains("airport") {
+    if is_unsupported_living_tv(device) {
+        DeviceArtwork::Tv
+    } else if model.starts_with("airport") || name.contains("airport") {
         DeviceArtwork::AirportExpress
     } else if model.starts_with("audioaccessory") || name.contains("homepod") {
         match (homepod_is_mini(device), device_color_is_dark(device)) {
@@ -3654,6 +3684,19 @@ fn draw_compact_switch(
         egui::Color32::WHITE,
     );
 
+    response
+}
+
+fn draw_inert_switch(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(38.0, 18.0), egui::Sense::hover());
+    // Placeholder only: intentionally no white knob, so it cannot be mistaken
+    // for an actionable 24-bit toggle while preserving row alignment.
+    ui.painter().rect_filled(
+        rect,
+        egui::CornerRadius::same(9),
+        egui::Color32::from_rgb(202, 212, 226),
+    );
     response
 }
 
@@ -4085,6 +4128,31 @@ fn address_rank(ip: IpAddr) -> u8 {
 mod gui_tests {
     use super::*;
     use sairplay_engine::AirPlayTxt;
+
+    #[test]
+    fn living_tv_signature_is_blocked_but_plain_appletv3_is_not() {
+        let mut living = DeviceRecord::new("Mi Project - Living room");
+        let mut service = DiscoveredService::test_airplay(
+            "Mi Project - Living room._airplay._tcp.local.",
+            "MITV--1954518582.local.",
+            52266,
+        );
+        service.txt.model = Some("AppleTV3,1".into());
+        living.airplay = Some(service);
+        assert!(is_unsupported_living_tv(&living));
+        assert_eq!(classify_device_artwork(&living), DeviceArtwork::Tv);
+
+        let mut apple = DeviceRecord::new("Apple TV");
+        let mut service = DiscoveredService::test_airplay(
+            "Apple TV._airplay._tcp.local.",
+            "Apple-TV.local.",
+            7000,
+        );
+        service.txt.model = Some("AppleTV3,1".into());
+        apple.airplay = Some(service);
+        assert!(!is_unsupported_living_tv(&apple));
+        assert_eq!(classify_device_artwork(&apple), DeviceArtwork::AppleTv);
+    }
 
     #[test]
     fn all_device_artwork_assets_are_independent_valid_pngs() {
