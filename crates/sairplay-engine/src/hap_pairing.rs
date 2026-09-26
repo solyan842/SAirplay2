@@ -147,21 +147,20 @@ impl NativeHapPairingClient {
             .map_err(PairingError::Connect)?;
         configure_pairing_stream(&mut stream, self.exchange_timeout)?;
 
-        let mut codec = RtspCodec::default();
-        let mut pending = Vec::<RtspResponse>::new();
-
-        // Pinned MSA: Apple TV displays the code only after /pair-pin-start.
-        let _ = exchange(
-            &mut stream, &mut codec, &mut pending, 0, &self.user_agent,
-            "/pair-pin-start", 3, &[], self.exchange_timeout,
+        // Full PIN pairing follows MSA's raw pair-setup helper. The
+        // /pair-pin-start response is not required to have normal RTSP/CSeq
+        // semantics, so do not route it through the strict session codec.
+        let _ = exchange_pair_setup_raw(
+            &mut stream, 0, &self.user_agent, "/pair-pin-start", 3, &[],
+            self.exchange_timeout,
         );
 
         let mut m1 = Tlv8::new();
         m1.insert_u8(TlvTag::State, 0x01);
         m1.insert_u8(TlvTag::Method, 0x00);
-        let m2 = parse_pair_tlv(exchange(
-            &mut stream, &mut codec, &mut pending, 1, &self.user_agent,
-            "/pair-setup", 3, &m1.encode(), self.exchange_timeout,
+        let m2 = parse_pair_setup_tlv(exchange_pair_setup_raw(
+            &mut stream, 1, &self.user_agent, "/pair-setup", 3, &m1.encode(),
+            self.exchange_timeout,
         )?)?;
         require_state(&m2, 0x02)?;
 
@@ -183,9 +182,9 @@ impl NativeHapPairingClient {
         m3.insert_u8(TlvTag::State, 0x03);
         m3.insert(TlvTag::PublicKey, srp.public_key_a.clone());
         m3.insert(TlvTag::Proof, srp.proof_m1.to_vec());
-        let m4 = parse_pair_tlv(exchange(
-            &mut stream, &mut codec, &mut pending, 2, &self.user_agent,
-            "/pair-setup", 3, &m3.encode(), self.exchange_timeout,
+        let m4 = parse_pair_setup_tlv(exchange_pair_setup_raw(
+            &mut stream, 2, &self.user_agent, "/pair-setup", 3, &m3.encode(),
+            self.exchange_timeout,
         )?)?;
         require_state(&m4, 0x04)?;
         let proof = m4.get(TlvTag::Proof).ok_or(PairingError::InvalidServerProof)?;
@@ -222,9 +221,9 @@ impl NativeHapPairingClient {
         let mut m5 = Tlv8::new();
         m5.insert_u8(TlvTag::State, 0x05);
         m5.insert(TlvTag::EncryptedData, encrypted);
-        let m6 = parse_pair_tlv(exchange(
-            &mut stream, &mut codec, &mut pending, 3, &self.user_agent,
-            "/pair-setup", 3, &m5.encode(), self.exchange_timeout,
+        let m6 = parse_pair_setup_tlv(exchange_pair_setup_raw(
+            &mut stream, 3, &self.user_agent, "/pair-setup", 3, &m5.encode(),
+            self.exchange_timeout,
         )?)?;
         require_state(&m6, 0x06)?;
         let encrypted_m6 = m6.get(TlvTag::EncryptedData)
@@ -524,6 +523,103 @@ impl TransientPairingClient {
         Ok(TransientPairingSession { pairing, channel })
     }
 
+}
+
+
+#[derive(Debug)]
+struct PairSetupRawResponse {
+    status: u16,
+    body: Vec<u8>,
+}
+
+fn exchange_pair_setup_raw(
+    stream: &mut TcpStream,
+    cseq: u32,
+    user_agent: &str,
+    path: &str,
+    hkp: u8,
+    body: &[u8],
+    timeout: Duration,
+) -> Result<PairSetupRawResponse, PairingError> {
+    let request = encode_pair_request(cseq, user_agent, path, hkp, body);
+    stream.write_all(&request).map_err(PairingError::Write)?;
+
+    let deadline = Instant::now() + timeout;
+    let mut response = Vec::<u8>::with_capacity(8192);
+    let mut header_len = None::<usize>;
+    let mut content_len = None::<usize>;
+    let mut buf = [0u8; 4096];
+
+    loop {
+        if let (Some(h), Some(cl)) = (header_len, content_len) {
+            if response.len() >= h.saturating_add(cl) {
+                break;
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(PairingError::Timeout);
+        }
+
+        match stream.read(&mut buf) {
+            Ok(0) => return Err(PairingError::Closed),
+            Ok(n) => {
+                response.extend_from_slice(&buf[..n]);
+                if header_len.is_none() {
+                    if let Some(end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let h = end + 4;
+                        let header = std::str::from_utf8(&response[..end])
+                            .map_err(|_| PairingError::Rtsp(RtspError::InvalidHeader))?;
+                        let mut cl = 0usize;
+                        for line in header.split("\r\n").skip(1) {
+                            if let Some((name, value)) = line.split_once(':') {
+                                if name.trim().eq_ignore_ascii_case("content-length") {
+                                    cl = value.trim().parse().map_err(|_| {
+                                        PairingError::Rtsp(RtspError::InvalidContentLength)
+                                    })?;
+                                }
+                            }
+                        }
+                        header_len = Some(h);
+                        content_len = Some(cl);
+                    }
+                }
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(err) => return Err(PairingError::Read(err)),
+        }
+    }
+
+    let h = header_len.ok_or(PairingError::Rtsp(RtspError::InvalidHeader))?;
+    let cl = content_len.unwrap_or(0);
+    let header = std::str::from_utf8(&response[..h - 4])
+        .map_err(|_| PairingError::Rtsp(RtspError::InvalidHeader))?;
+    let status = header
+        .split("\r\n")
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or(PairingError::Rtsp(RtspError::InvalidStatusCode))?
+        .parse::<u16>()
+        .map_err(|_| PairingError::Rtsp(RtspError::InvalidStatusCode))?;
+
+    Ok(PairSetupRawResponse {
+        status,
+        body: response[h..h + cl].to_vec(),
+    })
+}
+
+fn parse_pair_setup_tlv(response: PairSetupRawResponse) -> Result<Tlv8, PairingError> {
+    if response.status != 200 {
+        return Err(PairingError::Status(response.status));
+    }
+    let tlv = Tlv8::decode(&response.body)?;
+    if let Some(error) = tlv.error() {
+        if error != 0 {
+            return Err(PairingError::TlvError(error));
+        }
+    }
+    Ok(tlv)
 }
 
 fn parse_pair_tlv(response: RtspResponse) -> Result<Tlv8, PairingError> {
