@@ -7,7 +7,7 @@ use crate::{
     Ap2AudioFormat, BufferedMediaSender, MediaTransport, NativeVolumeControl,
     ReceiverCapabilities, RetransmitStats, RetransmitWorker, Route, RouteResolver, RtpState,
     SetPeersConfig, NativeHapPairingClient, StoredHapCredentials, TransientPairingClient,
-    VolumeSetResult, set_native_volume,
+    VolumeSetResult, set_native_volume, system_time_to_ntp,
 };
 use rand::RngCore;
 use std::fmt;
@@ -16,7 +16,7 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc, Mutex,
 };
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 #[cfg(windows)]
 use crate::{NativeMetadataControl, WindowsAudioTarget, WindowsAudioWorker, WindowsAudioWorkerError};
