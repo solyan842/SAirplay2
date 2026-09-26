@@ -1153,6 +1153,12 @@ impl SairplayApp {
     }
 
     fn remove_live_members(&mut self, members: &[String]) {
+        // Explicit member removal cancels a pending automatic re-join even
+        // when the transport is already absent from active_fullnames.
+        for fullname in members {
+            self.cancel_group_rejoin_for(fullname);
+        }
+
         let active_to_remove: Vec<String> = members
             .iter()
             .filter(|fullname| self.active_fullnames.contains(*fullname))
@@ -1175,6 +1181,7 @@ impl SairplayApp {
             match group.remove_member(&fullname) {
                 Ok(()) => {
                     self.active_fullnames.remove(&fullname);
+                    self.active_native_configs.remove(&fullname);
                     self.log.push(format!(
                         "{fullname}: removed from MultiRoom while the remaining receivers keep playing."
                     ));
@@ -1864,10 +1871,12 @@ impl SairplayApp {
 
         if let Some(error) = audio_error {
             self.log.push(format!("Audio worker stopped: {error}"));
+            self.cancel_group_rejoins();
             self.playback = PlaybackUiState::Error(error);
             self.session = None;
         } else if !audio_running {
             self.log.push("Audio worker stopped.".into());
+            self.cancel_group_rejoins();
             self.playback = PlaybackUiState::Error("Audio worker stopped".into());
             self.session = None;
         } else {
@@ -1887,8 +1896,10 @@ impl SairplayApp {
                                 | Some(ActiveSession::MultiRoom(_))
                         );
 
+                        self.cancel_group_rejoins();
                         self.session = None;
                         self.active_fullnames.clear();
+                        self.active_native_configs.clear();
 
                         if is_hard_close && native_session {
                             // For a SOLO native stream, pinned MSA treats a
@@ -1908,8 +1919,10 @@ impl SairplayApp {
                     if !feedback_running {
                         let error = "Feedback keepalive worker stopped".to_string();
                         self.log.push(error.clone());
+                        self.cancel_group_rejoins();
                         self.playback = PlaybackUiState::Error(error);
                         self.session = None;
+                        self.active_native_configs.clear();
                     }
                 }
             }
@@ -1924,6 +1937,11 @@ impl SairplayApp {
         if !matches!(self.playback, PlaybackUiState::Idle | PlaybackUiState::Error(_)) {
             return;
         }
+
+        // An explicit new playback request supersedes any recovery intent left
+        // from the previous group, matching MSA's user-action cancellation.
+        self.cancel_group_rejoins();
+        self.active_native_configs.clear();
 
         if self.selected_fullnames.is_empty() {
             self.playback =
@@ -2200,6 +2218,7 @@ impl SairplayApp {
     }
 
     fn stop_playback(&mut self) {
+        self.cancel_group_rejoins();
         if let Some(session) = self.session.take() {
             match session {
                 // Legacy shutdown deliberately waits for stdin EOF -> RAOP drain ->
@@ -2226,6 +2245,7 @@ impl SairplayApp {
             }
         }
         self.active_fullnames.clear();
+        self.active_native_configs.clear();
         self.active_mode = None;
         self.membership_pending.clear();
         self.membership_rx = None;
