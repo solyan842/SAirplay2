@@ -1109,6 +1109,11 @@ impl SairplayApp {
             match native_config_for_device(device, initial_volume, hires_override) {
                 Ok(mut config) => {
                     config.auth_credentials = self.native_credentials.get(fullname).cloned();
+                    // Match MSA auto routing per receiver. Apple models remain
+                    // realtime96 because RouteResolver excludes them; eligible
+                    // third-party PTP receivers may use buffered103 on the same
+                    // shared group clock.
+                    config.buffered_auto_enabled = true;
                     requests.push((fullname.clone(), config));
                 }
                 Err(error) => self.log.push(error),
@@ -2140,7 +2145,7 @@ impl SairplayApp {
                     };
                     let mut config = config;
                     config.auth_credentials = self.native_credentials.get(fullname).cloned();
-                    config.buffered_auto_enabled = false;
+                    config.buffered_auto_enabled = true;
                     configs.push(NativeGroupMemberConfig::new(
                         fullname.clone(),
                         config,
