@@ -13,6 +13,9 @@ pub struct ReceiverCapabilities {
     pub supports_pairing: bool,
     pub supports_ptp: bool,
     pub supports_buffered_audio: bool,
+    /// Hardware measured to accept buffered type 103 setup but fail to render it
+    /// correctly. Pinned MSA routes these receivers back to realtime type 96.
+    pub buffered_denied: bool,
     pub is_apple_model: bool,
     pub has_stored_credentials: bool,
     pub requires_pin: bool,
@@ -33,6 +36,7 @@ impl ReceiverCapabilities {
             supports_pairing: txt.supports_pairing(),
             supports_ptp: txt.supports_ptp(),
             supports_buffered_audio: txt.supports_buffered_audio(),
+            buffered_denied: buffered_model_denied(txt),
             is_apple_model: txt.is_apple_model(),
             has_stored_credentials,
             requires_pin: txt.pin_required(),
@@ -42,6 +46,18 @@ impl ReceiverCapabilities {
             txt_was_empty: txt.fields.is_empty(),
         }
     }
+}
+
+fn buffered_model_denied(txt: &AirPlayTxt) -> bool {
+    // Mirrors pinned MSA's measured-hostile buffered deny-list mechanism.
+    // 2026-09-27 hardware validation: Naim Mu-so Qb accepts native type-103
+    // setup/anchor but renders silence/intermittent audio. Keep native AP2,
+    // fall back only the media lane to realtime type 96.
+    const PREFIXES: &[&str] = &["Mu-so Qb"];
+    let Some(model) = txt.fields.get("model") else {
+        return false;
+    };
+    PREFIXES.iter().any(|prefix| model.starts_with(prefix))
 }
 
 pub struct RouteResolver;
@@ -57,6 +73,7 @@ impl RouteResolver {
         route == Route::AirPlay2Native
             && caps.supports_ptp
             && caps.supports_buffered_audio
+            && !caps.buffered_denied
             && !caps.is_apple_model
     }
 
@@ -155,6 +172,19 @@ mod tests {
         let route = RouteResolver::resolve(caps);
         assert_eq!(route, Route::AirPlay2Native);
         assert!(RouteResolver::buffered_auto_eligible(route, caps));
+    }
+
+    #[test]
+    fn buffered_auto_denies_measured_hostile_naim_muso_qb() {
+        let txt = AirPlayTxt::parse([
+            ("features", ((1u64 << 38) | (1u64 << 40) | (1u64 << 41) | (1u64 << 46)).to_string()),
+            ("model", "Mu-so Qb".to_string()),
+        ]).unwrap();
+        let caps = ReceiverCapabilities::from_txt(&txt, false, false);
+        let route = RouteResolver::resolve(caps);
+        assert_eq!(route, Route::AirPlay2Native);
+        assert!(caps.buffered_denied);
+        assert!(!RouteResolver::buffered_auto_eligible(route, caps));
     }
 
     #[test]
