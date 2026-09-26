@@ -824,7 +824,35 @@ impl WindowsMultiroomAudioWorker {
                             .map(|(index, _)| index)
                             .unwrap_or(0);
                         let gate_lead = targets[gate_index].lead_frames;
-                        if !targets[gate_index].sender.can_accept_frames(ntp) {
+
+                        // MSA fans one PCM chunk to every member and waits for
+                        // all writes before advancing the shared source. With a
+                        // buffered TCP member, its parked tail/backpressure must
+                        // therefore hold the NEXT group packet rather than let
+                        // realtime members run ahead by a sample block.
+                        let mut every_member_ready = true;
+                        let mut gate_failed = Vec::<(usize, String)>::new();
+                        for (index, target) in targets.iter_mut().enumerate() {
+                            match target.sender.can_accept_frames(ntp) {
+                                Ok(true) => {}
+                                Ok(false) => every_member_ready = false,
+                                Err(error) => gate_failed.push((
+                                    index,
+                                    format!("{} pacing/data channel failed: {error}", target.name),
+                                )),
+                            }
+                        }
+                        if !gate_failed.is_empty() {
+                            for (index, message) in gate_failed.into_iter().rev() {
+                                if let Ok(mut events) = startup_events_thread.lock() {
+                                    events.push(format!("AirPlay member removed: {message}"));
+                                }
+                                targets.remove(index);
+                            }
+                            active_members_thread.store(targets.len() as u64, Ordering::SeqCst);
+                            continue;
+                        }
+                        if !every_member_ready {
                             thread::sleep(Duration::from_millis(1));
                             break;
                         }
@@ -909,11 +937,22 @@ impl WindowsMultiroomAudioWorker {
                             loop {
                                 let can_send = {
                                     let pending = &mut pending_joins[join_index];
-                                    !pending.queued_packets.is_empty()
-                                        && pending.target.sender.can_accept_frames(now_ntp)
+                                    if pending.queued_packets.is_empty() {
+                                        Ok(false)
+                                    } else {
+                                        pending.target.sender.can_accept_frames(now_ntp)
+                                    }
                                 };
-                                if !can_send {
-                                    break;
+                                match can_send {
+                                    Ok(true) => {}
+                                    Ok(false) => break,
+                                    Err(error) => {
+                                        join_failed = Some(format!(
+                                            "{} late-join pacing/data channel failed: {error}",
+                                            pending_joins[join_index].target.name
+                                        ));
+                                        break;
+                                    }
                                 }
 
                                 let source_packet = pending_joins[join_index]
