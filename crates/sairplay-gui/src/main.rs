@@ -650,16 +650,35 @@ impl SairplayApp {
                         self.hires_capabilities.remove(&fullname);
                         self.hires_probe_pending.remove(&fullname);
                     }
-                    self.selected_fullnames.remove(&fullname);
-                    if self
-                        .selected_stereo_pair
-                        .as_ref()
-                        .is_some_and(|pair| pair.contains(&fullname))
-                    {
-                        self.selected_stereo_pair = None;
+
+                    // MSA keeps sync-group membership as intent across a
+                    // discovery/network blackout. mDNS disappearance alone is
+                    // not a transport verdict, so do not dissolve the logical
+                    // Pair/MultiRoom selection while its session is live (or
+                    // while that member is on the bounded re-join ladder).
+                    let preserve_group_intent = matches!(self.playback, PlaybackUiState::Playing(_))
+                        && matches!(
+                            self.active_mode,
+                            Some(PlaybackMode::StereoPair | PlaybackMode::MultiRoom)
+                        )
+                        && (self.active_fullnames.contains(&fullname)
+                            || self.group_rejoin_pending.contains(&fullname));
+                    if !preserve_group_intent {
+                        self.selected_fullnames.remove(&fullname);
+                        if self
+                            .selected_stereo_pair
+                            .as_ref()
+                            .is_some_and(|pair| pair.contains(&fullname))
+                        {
+                            self.selected_stereo_pair = None;
+                        }
+                        self.active_fullnames.remove(&fullname);
                     }
-                    self.active_fullnames.remove(&fullname);
-                    self.log.push(format!("mDNS removed: {fullname}"));
+                    self.log.push(if preserve_group_intent {
+                        format!("mDNS removed: {fullname} · live group intent retained.")
+                    } else {
+                        format!("mDNS removed: {fullname}")
+                    });
                 }
                 DiscoveryEvent::Error(err) => {
                     self.log.push(format!("mDNS error: {err}"));
@@ -669,6 +688,7 @@ impl SairplayApp {
     }
 
     fn rescan_devices(&mut self) {
+        self.cancel_group_rejoins();
         self.discovery.take();
         self.discovery_rx = None;
         self.catalog = DeviceCatalog::default();
@@ -781,6 +801,223 @@ impl SairplayApp {
                     PlaybackUiState::Error("Connect worker ended unexpectedly".into());
                 self.connect_rx = None;
             }
+        }
+    }
+
+    fn cancel_group_rejoins(&mut self) {
+        self.group_rejoin_generation = self.group_rejoin_generation.wrapping_add(1);
+        for (_, cancel) in std::mem::take(&mut self.group_rejoin_cancels) {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        self.group_rejoin_pending.clear();
+    }
+
+    fn cancel_group_rejoin_for(&mut self, fullname: &str) {
+        if let Some(cancel) = self.group_rejoin_cancels.remove(fullname) {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        self.group_rejoin_pending.remove(fullname);
+    }
+
+    fn schedule_group_member_rejoin(&mut self, fullname: String, cause: String) {
+        if self.group_rejoin_pending.contains(&fullname) {
+            return;
+        }
+        let Some(config) = self.active_native_configs.get(&fullname).cloned() else {
+            self.log.push(format!(
+                "{fullname}: automatic group re-join not scheduled because the original native configuration is unavailable."
+            ));
+            return;
+        };
+        let Some(join_handle) = self
+            .session
+            .as_ref()
+            .and_then(ActiveSession::recovery_join_handle)
+        else {
+            return;
+        };
+
+        const REJOIN_DELAYS_SECS: [u64; 5] = [5, 15, 30, 60, 120];
+        let generation = self.group_rejoin_generation;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.group_rejoin_cancels
+            .insert(fullname.clone(), Arc::clone(&cancel));
+        self.group_rejoin_pending.insert(fullname.clone());
+        self.log.push(format!(
+            "{fullname}: group transport lost ({cause}); keeping the surviving group live and scheduling MSA bounded re-join attempts at 5/15/30/60/120 s."
+        ));
+
+        let tx = self.group_rejoin_tx.clone();
+        thread::Builder::new()
+            .name("sairplay-group-rejoin".into())
+            .spawn(move || {
+                let mut last_error = cause;
+                for (index, delay_secs) in REJOIN_DELAYS_SECS.into_iter().enumerate() {
+                    let slices = delay_secs.saturating_mul(10);
+                    for _ in 0..slices {
+                        if cancel.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                    if cancel.load(Ordering::SeqCst) {
+                        return;
+                    }
+
+                    match join_handle.connect_member(fullname.clone(), config.clone()) {
+                        Ok((_joined, session)) => {
+                            if cancel.load(Ordering::SeqCst) {
+                                drop(session);
+                                return;
+                            }
+                            let _ = tx.send(GroupRejoinEvent::Success {
+                                generation,
+                                fullname,
+                                attempt: index + 1,
+                                session,
+                            });
+                            return;
+                        }
+                        Err(error) => {
+                            last_error = error.to_string();
+                            let _ = tx.send(GroupRejoinEvent::AttemptFailed {
+                                generation,
+                                fullname: fullname.clone(),
+                                attempt: index + 1,
+                                error: last_error.clone(),
+                            });
+                        }
+                    }
+                }
+
+                let _ = tx.send(GroupRejoinEvent::Exhausted {
+                    generation,
+                    fullname,
+                    error: last_error,
+                });
+            })
+            .expect("failed to spawn AirPlay group re-join worker");
+    }
+
+    fn pump_group_rejoin_events(&mut self) {
+        loop {
+            let event = match self.group_rejoin_rx.try_recv() {
+                Ok(event) => event,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            };
+
+            match event {
+                GroupRejoinEvent::AttemptFailed {
+                    generation,
+                    fullname,
+                    attempt,
+                    error,
+                } => {
+                    if generation == self.group_rejoin_generation
+                        && self.group_rejoin_pending.contains(&fullname)
+                    {
+                        self.log.push(format!(
+                            "{fullname}: automatic group re-join attempt {attempt}/5 failed: {error}"
+                        ));
+                    }
+                }
+                GroupRejoinEvent::Success {
+                    generation,
+                    fullname,
+                    attempt,
+                    session,
+                } => {
+                    if generation != self.group_rejoin_generation
+                        || !self.group_rejoin_pending.contains(&fullname)
+                        || !self.selected_fullnames.contains(&fullname)
+                    {
+                        drop(session);
+                        continue;
+                    }
+
+                    let adopted = self
+                        .session
+                        .as_mut()
+                        .is_some_and(|active| {
+                            active.adopt_recovered_group_member(fullname.clone(), session)
+                        });
+                    if adopted {
+                        self.active_fullnames.insert(fullname.clone());
+                        self.group_rejoin_pending.remove(&fullname);
+                        self.group_rejoin_cancels.remove(&fullname);
+                        self.last_member_retransmit_stats.remove(&fullname);
+                        self.log.push(format!(
+                            "{fullname}: automatic group re-join succeeded on attempt {attempt}/5; member restored through the shared live timeline."
+                        ));
+                    }
+                }
+                GroupRejoinEvent::Exhausted {
+                    generation,
+                    fullname,
+                    error,
+                } => {
+                    if generation == self.group_rejoin_generation
+                        && self.group_rejoin_pending.remove(&fullname)
+                    {
+                        self.group_rejoin_cancels.remove(&fullname);
+                        self.log.push(format!(
+                            "{fullname}: automatic group re-join exhausted after 5 attempts; surviving members remain live. Last error: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    fn isolate_failed_group_members(&mut self, failures: Vec<(String, String)>) {
+        let mut detached = Vec::<(String, String)>::new();
+        for (fullname, error) in failures {
+            let result = self
+                .session
+                .as_mut()
+                .map(|session| session.detach_failed_group_member(&fullname))
+                .unwrap_or(Ok(false));
+            match result {
+                Ok(true) => {
+                    self.active_fullnames.remove(&fullname);
+                    self.last_member_retransmit_stats.remove(&fullname);
+                    detached.push((fullname, error));
+                }
+                Ok(false) => {}
+                Err(detach_error) => {
+                    self.log.push(format!(
+                        "{fullname}: failed to isolate dead group transport: {detach_error}"
+                    ));
+                }
+            }
+        }
+
+        if detached.is_empty() {
+            return;
+        }
+
+        if self.active_fullnames.is_empty() {
+            self.cancel_group_rejoins();
+            let detail = detached
+                .iter()
+                .map(|(name, error)| format!("{name}: {error}"))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            self.log.push(format!(
+                "AirPlay group ended because no live member survived: {detail}"
+            ));
+            self.session = None;
+            self.active_mode = None;
+            self.playback = PlaybackUiState::Error(detail);
+            return;
+        }
+
+        for (fullname, error) in detached {
+            self.log.push(format!(
+                "{fullname}: removed from the live AirPlay transport after unexpected control failure; remaining member(s) continue."
+            ));
+            self.schedule_group_member_rejoin(fullname, error);
         }
     }
 
