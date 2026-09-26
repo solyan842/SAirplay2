@@ -1844,18 +1844,33 @@ impl SairplayApp {
             self.last_retransmit_stats = rtx;
         }
 
-        if let Some(error) = session.audio_error() {
+        // Snapshot member/session health before mutating group membership.
+        // A failed group member follows MSA's group lifecycle: isolate only
+        // that transport and keep survivors running. Solo remains terminal.
+        let group_failures = session.failed_group_members();
+        let audio_error = session.audio_error();
+        let audio_running = session.audio_running();
+        let feedback_error = session.feedback_error();
+        let feedback_running = session.feedback_running();
+
+        if !group_failures.is_empty() {
+            self.isolate_failed_group_members(group_failures);
+            // The aggregate feedback snapshot above described the pre-removal
+            // membership. Re-evaluate the surviving session on the next GUI
+            // monitor tick instead of turning that stale failure into a group
+            // teardown.
+            return;
+        }
+
+        if let Some(error) = audio_error {
             self.log.push(format!("Audio worker stopped: {error}"));
             self.playback = PlaybackUiState::Error(error);
             self.session = None;
-        } else if !session.audio_running() {
+        } else if !audio_running {
             self.log.push("Audio worker stopped.".into());
             self.playback = PlaybackUiState::Error("Audio worker stopped".into());
             self.session = None;
         } else {
-            let feedback_error = session.feedback_error();
-            let feedback_running = session.feedback_running();
-
             match feedback_error {
                 Some(error) => {
                     if self.last_feedback_error.as_deref() != Some(error.as_str()) {
@@ -1876,10 +1891,10 @@ impl SairplayApp {
                         self.active_fullnames.clear();
 
                         if is_hard_close && native_session {
-                            // Pinned MSA treats a peer-close/reset as terminal.
-                            // Do not immediately build a replacement transport:
-                            // the receiver may have displaced this AirPlay
-                            // session because another app took audio ownership.
+                            // For a SOLO native stream, pinned MSA treats a
+                            // peer-close/reset as terminal. Group member loss
+                            // has already been intercepted above and follows the
+                            // bounded re-join lifecycle instead.
                             self.log.push(
                                 "Native AirPlay session ended by receiver; automatic reconnect suppressed."
                                     .into(),
@@ -3196,6 +3211,7 @@ impl eframe::App for SairplayApp {
         self.pump_hires_probes();
         self.pump_connect_result();
         self.pump_membership_result();
+        self.pump_group_rejoin_events();
         self.pump_volume_result();
         self.pump_legacy_pairing();
         self.monitor_running_session();
