@@ -355,13 +355,6 @@ impl RealtimeMediaSender {
         self.splice_pad_frames
     }
 
-    /// Source-equivalent local half of a warm splice FLUSH. The receiver
-    /// queue, RTP sequence, RTP timestamp and immutable anchor line stay
-    /// untouched; only pad debt from the superseded content epoch is dropped.
-    pub fn begin_warm_splice_boundary(&mut self) {
-        self.splice_pad_frames = 0;
-    }
-
     pub fn add_splice_pad(&mut self, frames: u32) {
         self.splice_pad_frames = self.splice_pad_frames.saturating_add(frames);
     }
