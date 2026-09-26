@@ -54,6 +54,7 @@ impl WindowsAudioWorker {
         dacp_id: String,
         active_remote: String,
         cold_start_delay_ms: u64,
+        apple_model: bool,
     ) -> Result<Self, WindowsAudioWorkerError> {
         let running = Arc::new(AtomicBool::new(true));
         let running_thread = Arc::clone(&running);
@@ -92,6 +93,7 @@ impl WindowsAudioWorker {
             let mut chunker = Pcm352Chunker::new_with_bytes_per_frame(bytes_per_frame);
             let mut captured_frames_total = 0u64;
             let mut cold_armed = false;
+            let mut clock_wait_started: Option<std::time::Instant> = None;
 
             while running_thread.load(Ordering::SeqCst) {
                 match capture.drain_into(&mut chunker) {
@@ -136,6 +138,32 @@ impl WindowsAudioWorker {
                                 thread::sleep(Duration::from_millis(1));
                                 continue;
                             }
+
+                            // Same MSA clock-ready gate as realtime solo. Keep
+                            // draining WASAPI while waiting so type103 also has
+                            // a real PCM prefill before its anchor is committed.
+                            let clock_projection_ms = if let Some(exchange) = clock.exchange() {
+                                clock_wait_started = None;
+                                Some(worker_clock_ready_delay_ms(exchange, apple_model))
+                            } else {
+                                let waiting_since = clock_wait_started
+                                    .get_or_insert_with(std::time::Instant::now);
+                                if waiting_since.elapsed()
+                                    < Duration::from_millis(AIRPLAY_CLOCK_READY_TIMEOUT_MS)
+                                {
+                                    if report.frames == 0 {
+                                        thread::sleep(Duration::from_millis(1));
+                                    }
+                                    continue;
+                                }
+                                None
+                            };
+                            let readiness_lead_ms = clock_projection_ms
+                                .map(|delay| delay.saturating_add(AIRPLAY_CLOCK_READY_LEAD_MS))
+                                .unwrap_or(0);
+                            let effective_start_delay_ms =
+                                cold_start_delay_ms.max(readiness_lead_ms);
+
                             let now_ntp = match system_time_to_ntp(SystemTime::now()) {
                                 Ok(value) => value,
                                 Err(error) => {
@@ -146,15 +174,29 @@ impl WindowsAudioWorker {
                                     return;
                                 }
                             };
-                            let start_ntp =
-                                now_ntp.saturating_add(ms_to_ntp(cold_start_delay_ms));
-                            sender.arm_cold_start(start_ntp);
+                            let requested_start_ntp =
+                                now_ntp.saturating_add(ms_to_ntp(effective_start_delay_ms));
+                            let mut floor_ntp = now_ntp.saturating_add(ms_to_ntp(250));
+                            if let Some(exchange) = clock.exchange() {
+                                floor_ntp = floor_ntp.max(
+                                    now_ntp.saturating_add(ms_to_ntp(
+                                        worker_clock_ready_delay_ms(exchange, apple_model),
+                                    )),
+                                );
+                            }
+                            let committed_start_ntp =
+                                resolve_worker_start_ntp(requested_start_ntp, floor_ntp);
+                            let correction_ms = ntp_delta_ms(
+                                committed_start_ntp.saturating_sub(requested_start_ntp),
+                            );
+
+                            sender.arm_cold_start(committed_start_ntp);
                             let anchor_config = BufferedAnchorStartConfig {
                                 session_uri: session_uri.clone(),
                                 dacp_id: dacp_id.clone(),
                                 active_remote: active_remote.clone(),
                                 rtp_time: sender.state().timestamp,
-                                commanded_start_ntp: start_ntp,
+                                commanded_start_ntp: committed_start_ntp,
                             };
                             let anchor_result = {
                                 let mut guard = match control.lock() {
@@ -179,9 +221,26 @@ impl WindowsAudioWorker {
                                     sender.mark_anchored();
                                     cold_armed = true;
                                     if let Ok(mut events) = startup_events_thread.lock() {
+                                        events.push(match clock_projection_ms {
+                                            Some(delay) => format!(
+                                                "Buffered startup: receiver clock projection={} ms · requested START lead={} ms.",
+                                                delay, effective_start_delay_ms
+                                            ),
+                                            None => format!(
+                                                "Buffered startup: no PTP clock projection within {} ms · fallback START lead={} ms.",
+                                                AIRPLAY_CLOCK_READY_TIMEOUT_MS, effective_start_delay_ms
+                                            ),
+                                        });
+                                        if correction_ms > 0 {
+                                            events.push(format!(
+                                                "Buffered startup: START corrected forward by {} ms before anchor commit.",
+                                                correction_ms
+                                            ));
+                                        }
                                         events.push(format!(
-                                            "Buffered startup: anchor armed · delay={} ms · anchor_ns={} · rtp={} · format={}/{}.",
-                                            cold_start_delay_ms,
+                                            "Buffered startup: anchor armed · requested_delay={} ms · committed_correction={} ms · anchor_ns={} · rtp={} · format={}/{}.",
+                                            effective_start_delay_ms,
+                                            correction_ms,
                                             anchor_ns,
                                             sender.state().timestamp,
                                             audio_format.bit_depth,
@@ -889,6 +948,30 @@ fn ms_to_ntp(ms: u64) -> u64 {
 
 fn ntp_delta_ms(delta: u64) -> u64 {
     (((delta as u128) * 1000) >> 32) as u64
+}
+
+fn worker_clock_ready_delay_ms(exchange: crate::PtpExchange, apple_model: bool) -> u64 {
+    const CLOCK_LOCK_MS: u64 = 2_300;
+    const CLOCK_SETTLE_MS: u64 = 250;
+    const CLOCK_SEAT_EXCHANGES: u32 = 3;
+
+    let full = CLOCK_LOCK_MS.saturating_sub(exchange.first_ms);
+    if apple_model && exchange.count >= CLOCK_SEAT_EXCHANGES {
+        let fast = CLOCK_SETTLE_MS.saturating_sub(exchange.third_ms);
+        full.min(fast)
+    } else {
+        full
+    }
+}
+
+fn resolve_worker_start_ntp(requested_start_ntp: u64, floor_ntp: u64) -> u64 {
+    if requested_start_ntp >= floor_ntp {
+        requested_start_ntp
+    } else if requested_start_ntp == 0 {
+        floor_ntp
+    } else {
+        floor_ntp.saturating_add(ms_to_ntp(250))
+    }
 }
 
 fn ptp_probe_summary(sender: &RealtimeMediaSender) -> String {
