@@ -327,7 +327,6 @@ impl WindowsAudioWorker {
 
             let mut chunker = Pcm352Chunker::new_with_bytes_per_frame(bytes_per_frame);
             let mut captured_frames_total = 0u64;
-            let mut source_present = false;
             let mut cold_armed = false;
             let mut clock_wait_started: Option<std::time::Instant> = None;
             let mut startup_packet_index: u32 = 0;
@@ -467,23 +466,11 @@ impl WindowsAudioWorker {
                             }
                         }
 
-                        // Before the first START, upstream has no live wire feed.
-                        // Shared-mode WASAPI may still emit engine SILENT buffers
-                        // while no application audio exists; those are equivalent
-                        // to "no stdin bytes yet", not content to stream.
-                        if !source_present {
-                            if report.first_non_silent_frame_offset.is_some() {
-                                source_present = true;
-                            } else {
-                                chunker.clear();
-                                thread::sleep(Duration::from_millis(1));
-                                continue;
-                            }
-                        }
-
-                        // Cold START is committed only once a complete 352-frame
-                        // transport packet is buffered, matching airplay-cli's
-                        // audio-buffered gate. Nothing is sent before this point.
+                        // Match pinned MSA and the group worker: PCM amplitude
+                        // never defines stream state. Digital-zero is valid PCM;
+                        // cold START waits only for one complete 352-frame packet.
+                        // A zero-frame WASAPI read is merely "no bytes this pass".
+                        // Nothing is sent before the first complete packet.
                         if !cold_armed {
                             if !chunker.has_packet() {
                                 if frames == 0 {
