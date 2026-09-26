@@ -19,6 +19,7 @@ pub const AIRPLAY_COLD_GROUP_START_LEAD_MS: u64 = 2_500;
 pub const AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS: u64 = 2_500;
 pub const AIRPLAY_CLOCK_READY_TIMEOUT_MS: u64 = 2_500;
 pub const AIRPLAY_CLOCK_READY_LEAD_MS: u64 = 500;
+pub const AIRPLAY_SPLICE_LEAD_MARGIN_MS: u64 = 150;
 pub const AIRPLAY_CLOCK_STALL_MS: u64 = 5_000;
 pub const AIRPLAY_LATE_JOIN_RING_MIN_SECONDS: f64 = 12.0;
 pub const AIRPLAY_LATE_JOIN_RING_MARGIN_SECONDS: f64 = 2.0;
@@ -375,23 +376,72 @@ impl WindowsMultiroomAudioWorker {
                             });
                         }
 
-                        for target in &mut targets {
-                            if let Err(error) = target.sender.arm_cold_start(
-                                start_ntp,
-                                target.latency_max,
-                                target.lead_frames,
-                                target.rtp_offset,
-                            ) {
-                                if let Ok(mut slot) = last_error_thread.lock() {
-                                    *slot = Some(format!(
-                                        "{} cold session START failed: {error:?}",
-                                        target.name
-                                    ));
-                                }
-                                running_thread.store(false, Ordering::SeqCst);
-                                return;
+                        // MSA does not trust the requested START blindly.
+                        // Every member returns the instant it actually committed;
+                        // if any member corrected forward, all members are
+                        // re-STARTed on the largest reported instant (+150 ms
+                        // command fan-out margin), for at most four rounds.
+                        let mut requested_start_ntp = start_ntp;
+                        let mut committed_group_ntp = start_ntp;
+                        let mut converged = false;
+                        let mut rounds = 0usize;
+
+                        for round in 1..=4 {
+                            rounds = round;
+                            let mut latest_committed_ntp = requested_start_ntp;
+                            for target in &mut targets {
+                                let committed = match target.sender.arm_cold_start_verified(
+                                    requested_start_ntp,
+                                    target.latency_max,
+                                    target.lead_frames,
+                                    target.rtp_offset,
+                                    target.apple_model,
+                                ) {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        if let Ok(mut slot) = last_error_thread.lock() {
+                                            *slot = Some(format!(
+                                                "{} cold session START failed: {error:?}",
+                                                target.name
+                                            ));
+                                        }
+                                        running_thread.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+                                };
+                                latest_committed_ntp = latest_committed_ntp.max(committed);
                             }
 
+                            let correction_ntp =
+                                latest_committed_ntp.saturating_sub(requested_start_ntp);
+                            if correction_ntp <= ms_to_ntp(2) {
+                                committed_group_ntp = requested_start_ntp;
+                                converged = true;
+                                break;
+                            }
+
+                            if let Ok(mut events) = startup_events_thread.lock() {
+                                events.push(format!(
+                                    "AirPlay group START corrected: round {round}/4 · member floor moved shared instant +{} ms.",
+                                    ntp_delta_to_ms(correction_ntp)
+                                ));
+                            }
+                            committed_group_ntp = latest_committed_ntp;
+                            if round < 4 {
+                                requested_start_ntp = latest_committed_ntp
+                                    .saturating_add(ms_to_ntp(AIRPLAY_SPLICE_LEAD_MARGIN_MS));
+                            }
+                        }
+
+                        if !converged {
+                            if let Ok(mut events) = startup_events_thread.lock() {
+                                events.push(format!(
+                                    "AirPlay group START did not converge after 4 rounds; latest committed instant retained for diagnostics."
+                                ));
+                            }
+                        }
+
+                        for target in &mut targets {
                             let rtp_timestamp = target.sender.state().timestamp;
                             match target.metadata.send("SAirplay2", "", "", rtp_timestamp) {
                                 Ok(result) if (200..300).contains(&result.status) => {
@@ -421,13 +471,14 @@ impl WindowsMultiroomAudioWorker {
                             }
                         }
                         cold_armed = true;
-                        group_start_ntp = Some(start_ntp);
+                        group_start_ntp = Some(committed_group_ntp);
                         if let Ok(mut events) = startup_events_thread.lock() {
                             events.push(format!(
-                                "AirPlay {} session: {} member(s) ready · shared START={} ms · one WASAPI source.",
+                                "AirPlay {} session: {} member(s) ready · shared START={} ms · verified in {} round(s) · one WASAPI source.",
                                 kind.label(),
                                 targets.len(),
-                                delay_ms
+                                ntp_delta_to_ms(committed_group_ntp.saturating_sub(now_ntp)),
+                                rounds
                             ));
                         }
                     }
@@ -1049,6 +1100,7 @@ fn prepare_pending_joins(
                 pending.target.latency_max,
                 pending.target.lead_frames,
                 pending.target.rtp_offset,
+                pending.target.apple_model,
             )
         };
         let committed_start_ntp = match arm_result {
@@ -1295,6 +1347,11 @@ mod mixed_format_tests {
         };
         assert_eq!(clock_ready_delay_ms(seated, false), 1_300);
         assert_eq!(clock_ready_delay_ms(seated, true), 150);
+    }
+
+    #[test]
+    fn msa_group_start_convergence_constants_match_source() {
+        assert_eq!(AIRPLAY_SPLICE_LEAD_MARGIN_MS, 150);
     }
 
     #[test]
