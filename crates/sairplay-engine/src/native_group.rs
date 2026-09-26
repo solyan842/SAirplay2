@@ -342,12 +342,6 @@ impl NativeGroupSession {
             .and_then(WindowsMultiroomAudioWorker::last_discontinuity_frame)
     }
 
-    pub fn audio_first_non_silent_frame(&self) -> Option<u64> {
-        self.audio_worker
-            .as_ref()
-            .and_then(WindowsMultiroomAudioWorker::first_non_silent_frame)
-    }
-
     pub fn drain_startup_events(&self) -> Vec<String> {
         self.audio_worker
             .as_ref()
