@@ -749,6 +749,7 @@ impl SairplayApp {
                     self.hires_quality_warning_shown = false;
                     self.hires_quality_warning_text.clear();
                     self.active_fullnames = success.active_fullnames;
+                    self.active_native_configs = success.native_configs;
                     self.active_mode = Some(success.mode);
                     self.playback = PlaybackUiState::Playing(success.label);
                     self.session = Some(success.session);
@@ -757,6 +758,7 @@ impl SairplayApp {
                         "native transport returned without a running Windows audio path".to_owned();
                     self.log.push(message.clone());
                     self.active_fullnames.clear();
+                    self.active_native_configs.clear();
                     self.playback = PlaybackUiState::Error(message);
                 }
                 self.connect_rx = None;
@@ -764,6 +766,7 @@ impl SairplayApp {
             Ok(Err(error)) => {
                 self.log.push(format!("Connect failed: {error}"));
                 self.active_fullnames.clear();
+                self.active_native_configs.clear();
                 self.active_mode = None;
                 self.playback = PlaybackUiState::Error(error);
                 self.connect_rx = None;
@@ -772,6 +775,7 @@ impl SairplayApp {
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.log.push("Connect worker ended unexpectedly.".into());
                 self.active_fullnames.clear();
+                self.active_native_configs.clear();
                 self.active_mode = None;
                 self.playback =
                     PlaybackUiState::Error("Connect worker ended unexpectedly".into());
@@ -789,8 +793,9 @@ impl SairplayApp {
             Ok(Ok(added)) => {
                 let mut adopted = 0usize;
                 if let Some(ActiveSession::MultiRoom(group)) = self.session.as_mut() {
-                    for (fullname, session) in added.members {
+                    for (fullname, session, config) in added.members {
                         group.adopt_member(fullname.clone(), session);
+                        self.active_native_configs.insert(fullname.clone(), config);
                         self.active_fullnames.insert(fullname.clone());
                         self.selected_fullnames.insert(fullname);
                         adopted += 1;
@@ -891,12 +896,13 @@ impl SairplayApp {
         thread::Builder::new()
             .name("sairplay-live-join".into())
             .spawn(move || {
-                let mut added = Vec::<(String, NativeSession)>::new();
+                let mut added = Vec::<(String, NativeSession, NativeSessionConfig)>::new();
                 for (fullname, config) in requests {
+                    let retained_config = config.clone();
                     match join_handle.connect_member(fullname.clone(), config) {
-                        Ok(member) => added.push(member),
+                        Ok((joined, session)) => added.push((joined, session, retained_config)),
                         Err(error) => {
-                            for (joined, _) in &added {
+                            for (joined, _, _) in &added {
                                 let _ = join_handle.remove_audio_member(joined.clone());
                             }
                             let _ = tx.send(Err(error.to_string()));
@@ -1821,6 +1827,8 @@ impl SairplayApp {
                 };
                 config.auth_credentials = self.native_credentials.get(fullname).cloned();
                 config.buffered_auto_enabled = true;
+                let native_configs =
+                    BTreeMap::from([(fullname.clone(), config.clone())]);
 
                 thread::Builder::new()
                     .name("sairplay-native-single-connect".into())
@@ -1836,6 +1844,7 @@ impl SairplayApp {
                             .map(|session| ConnectSuccess {
                                 session,
                                 active_fullnames,
+                                native_configs,
                                 label,
                                 mode: requested_mode,
                             });
@@ -1868,6 +1877,11 @@ impl SairplayApp {
                     ));
                 }
 
+                let native_configs = configs
+                    .iter()
+                    .map(|member| (member.name.clone(), member.config.clone()))
+                    .collect::<BTreeMap<_, _>>();
+
                 thread::Builder::new()
                     .name("sairplay-native-connect".into())
                     .spawn(move || {
@@ -1885,6 +1899,7 @@ impl SairplayApp {
                             .map(|session| ConnectSuccess {
                                 session,
                                 active_fullnames,
+                                native_configs,
                                 label,
                                 mode: requested_mode,
                             });
@@ -1922,6 +1937,7 @@ impl SairplayApp {
                         .map(|session| ConnectSuccess {
                             session,
                             active_fullnames,
+                            native_configs: BTreeMap::new(),
                             label,
                             mode: requested_mode,
                         });
