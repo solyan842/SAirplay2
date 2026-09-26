@@ -1,109 +1,255 @@
 # SAirplay2 source parity audit
 
-Primary reference pinned for this audit:
+This document describes the current active architecture. It replaces the old
+early-alpha audit snapshot.
 
-- music-assistant/airplay-cli
-- commit `431c5c582eef9307c4e39c50a0ea65e970bc1128`
-- primary files: `src/ap2_client.c`, `src/ap2_ptp.c`, `src/ap2_hap.c`, `src/ap2_io.c`, `DESIGN.md`
+## References
 
-Rule: when the primary source already defines native AirPlay 2 behavior, SAirplay2 ports that behavior to Rust/Windows without inventing a different protocol design. Platform substitutions are allowed only below the wire/lifecycle contract.
+Primary native reference:
 
+- `music-assistant/airplay-cli@431c5c582eef9307c4e39c50a0ea65e970bc1128`
 
-## Verification snapshot
+The upstream `airplay-cli` main branch was rechecked during the 2026-09-27
+cleanup and still points at the same commit.
 
-- **Primary source:** music-assistant/airplay-cli @ `431c5c582eef9307c4e39c50a0ea65e970bc1128`.
-- **Code head verified:** `4bda14a09ae819308a6dfcd77432518f0eacb666`.
-- **Windows CI:** run #348 / `35552066871` — Check PASS, invariant tests PASS, GUI build PASS, artifact upload PASS.
-- **Artifact:** `SAirplay2-v0.1.0-Windows` / ID `10619260379` / 2,979,257 bytes.
-- **Artifact digest:** `sha256:caf8a76762a4b26f4e86e6eddc5ea0e15d90a50a066c3a448111c85400dbabad`.
-- **Hardware status:** AirPort Express HARDWARE-MEASURED on CI #348 / code `4bda14a09ae819308a6dfcd77432518f0eacb666`: cold start has immediate audio; continuous playback passes the old 25 s failure point and >60 s; stop/rest behavior is good. Intermittent very small crackle remains **UNKNOWN** and is not yet attributed to RTP, retransmit, pacing, ALAC, or Windows capture. HomePod mini remains hardware-pending. CI-PROVEN never means hardware-proven.
+Server/lifecycle references:
 
-## Hardware observations
+- project-pinned `music-assistant/server@9e311eb84aba0a940bdfbf7433d5a29c07bab1b6`
+- current stable cross-check:
+  `e30a4974ba951f38e21bea8d502af3b903df992c`
 
-- **AirPort Express (`AirPort10,115`) — HARDWARE-MEASURED:** CI #348 starts with audio immediately, remains audible beyond 25–60 s, and stop/rest behavior is good.
-- **Residual symptom — HARDWARE-MEASURED:** occasional very small crackle/click. Root cause is **UNKNOWN**.
-- **Windows capture cross-check — CROSS-CHECKED:** Microsoft documents `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY` as a capture glitch indicator. Current `wasapi_loopback.rs` does not inspect that flag, so WASAPI discontinuity is a candidate to instrument before changing media-wire behavior.
-- **HomePod mini:** no fresh hardware measurement yet for CI #348.
+Legacy RAOP:
 
-## Audit matrix
+- `philippe44/libraop@dadcfcaa26d988cdd3e3501ddf8286c224f1b494`
 
-| Area | Primary source | SAirplay2 at audit | Status / action |
-|---|---|---|---|
-| Discovery feature bits | AP2 bits 38/40/41/46/48, flags, model | Parsed and preserved | MATCH |
-| Route selection | Conservative native/compat split | Conservative resolver | MATCH for current alpha |
-| GET /info connection | Same TCP continues into HAP | Same TCP retained | MATCH |
-| GET /info CSeq | Main RTSP counter starts at 0 | CSeq 0 | MATCH |
-| RTSP User-Agent | `AirPlay/670.6.2` | Same | MATCH |
-| RTSP base headers | CSeq, User-Agent, DACP-ID, Active-Remote | Native requests emit the same base set; Client-Instance removed | **MATCH · CI-PROVEN** |
-| /info capability parse | audioStream/bufferStream masks/extended tables | Implemented | MATCH for 16/44.1 realtime |
-| HAP transient pairing | transient M1/M3, fixed PIN unless password, same TCP | Implemented | MATCH current transient path |
-| Stored pair-verify | Supported by source | Not implemented | FEATURE GAP; not required for current transient HomePod test path |
-| Audio key | first 32 bytes of transient SRP session key | Same | MATCH |
-| Timing choice | feature bit 41 -> PTP; fallback NTP only if PTP unavailable | Same high-level decision | MATCH |
-| PTP bind | UDP 319/320, multicast membership/interface + unicast peer delivery | Binds 319/320, joins 224.0.1.129, selects RTSP-local multicast egress interface | **MATCH · CI-PROVEN** |
-| PTP pre-SETPEERS delivery | peer list empty -> multicast fallback | Empty peer list uses 224.0.1.129; populated peers use source-style unicast delivery | **MATCH · CI-PROVEN** |
-| PTP Announce/Sync/Follow_Up | source-shaped gPTP majorSdoId=1 | Source-shaped gPTP majorSdoId=1, Announce 1s, Sync/FUP 125ms, Apple/802.1AS TLVs | **MATCH base sender · CI-PROVEN** |
-| PTP Delay/Pdelay replies | required | Implemented | MATCH basic wire path |
-| PTP Signaling grants | REQUEST_UNICAST -> GRANT | Implemented | MATCH basic wire path |
-| PTP BMCA / peer Announce processing | implemented; sender holds GM normally | Sender hold-GM behavior is preserved for the current one-receiver path; full generic BMCA diagnostics/election are not ported | **PARTIAL · not blocking current single-receiver realtime path** |
-| HomePod OS27 follow-clock | conditional AudioAccessory standalone follow mode | Exact model/igl/pgid/tsid/osvers/ov/srcvers/vs predicate; tracks receiver Announce + Sync/FUP, offset and dynamic ClockID/timebase | **MATCH source rule/path · CI-PROVEN; HARDWARE-PENDING** |
-| PTP settle | source observes peer/offset up to 400ms | Polls follow-clock decision/offset up to 400ms instead of blind sleep | **MATCH current follow path · CI-PROVEN** |
-| PTP Session SETUP plist | PTP protocol, IDs, group, timingPeerInfo/List | implemented | MATCH for GM path |
-| PTP identity | deviceID/macAddress/ClockID derived from DACP ID | same | MATCH |
-| NTP Session SETUP | deviceID, UUID, timingPort, timingProtocol=NTP | implemented | MATCH |
-| Event channel | separate TCP to eventPort, event keys, keep open | implemented and kept open | MATCH for no-MRP audio path |
-| RECORD order | RECORD before stream SETUP | same | MATCH |
-| Realtime Stream SETUP | type 96, ALAC, ports, latency fields, shk, spf=352 | same request fields | MATCH request |
-| Stream response ports | parse dataPort/controlPort by key | same | MATCH |
-| Stream response latency | parse latencyMin/latencyMax, clamp lead; arrival latency info | Parses both fields and clamps effective lead immediately after SETUP | **MATCH · CI-PROVEN** |
-| SETPEERS | after stream SETUP for PTP; bare plist [receiver, us] | Implemented immediately after Stream SETUP as bare plist `[receiver, us]` | **MATCH · CI-PROVEN** |
-| PTP peer list after SETPEERS | hand same peers to PTP engine and kick | Same `[receiver, us]` peers handed to engine; kick forces immediate timing emission | **MATCH · CI-PROVEN** |
-| Main RTSP CSeq | /info=0, setup=1, RECORD=2, stream=3, SETPEERS=4, then feedback=5... | PTP follows 0/1/2/3/4 then shared feedback/teardown counter; NTP omits SETPEERS and continues at 4 | **MATCH · CI-PROVEN** |
-| RTP SSRC | PTP=0, NTP=session_id | same | MATCH |
-| RTP header | PT 96, marker first packet | same | MATCH |
-| Realtime audio crypto | ChaCha20-Poly1305, seq nonce, AAD timestamp+SSRC, nonce suffix | same | MATCH |
-| NTP sync | 20-byte D4 | implemented | MATCH |
-| PTP realtime anchor | 28-byte D7, PTP ns + ClockID + frame geometry | Frozen start line uses dynamic PTP master time/ClockID, including receiver-follow mode | **MATCH · CI-PROVEN; HARDWARE-PENDING** |
-| ALAC 16/44.1/352 | fixed realtime encoder | implemented | MATCH target format |
-| Delivery pacing window | latencyMax-250ms or default 1.75s; splice depth rules | Receiver window applied with source 250ms margin and shallow 600ms realtime splice depth | **MATCH current realtime target · CI-PROVEN** |
-| Initial fill spacing | >=1ms packet release spacing | 1ms minimum release spacing in the Windows producer | **MATCH · CI-PROVEN** |
-| Retransmit history | 512 exact wire packets | 512-slot ring stores the exact encrypted wire RTP only after successful local send | **MATCH · CI-PROVEN** |
-| Retransmit request | read control UDP type 0x55 | Dedicated control worker drains type 0x55 requests | **MATCH · CI-PROVEN** |
-| Retransmit response | type 0x56/D6 + original wire RTP | D6 wrapper echoes request sequence and returns original retained wire RTP | **MATCH · CI-PROVEN** |
-| /feedback keepalive | POST /feedback every ~2s | 2s cadence on shared encrypted RTSP channel | **MATCH · CI-PROVEN** |
-| Feedback timeout | 2s total budget including serialization lock | One 2s deadline covers lock acquisition + exchange; busy-lock expiry skips tick without consuming CSeq | **MATCH · CI-PROVEN** |
-| Feedback miss budget | 3 consecutive misses | added | MATCH basic policy |
-| RTSP serializer | one shared channel + lock + global CSeq | added in latest refactor | MATCH architecture |
-| Late feedback response carry | preserve stream/HAP nonce sequencing | channel preserves encrypted carry/pending stale CSeq | MATCH basic mechanism |
-| MRP/event servicing | source services MRP when MRP exists | MRP not implemented | FEATURE GAP, not required for base audio |
-| Native volume | SET_PARAMETER text/parameters on shared RTSP | Exact libraop 0–100 mapping; initial volume is sent before audio start when explicitly configured; live Apply uses shared RTSP/CSeq on a non-UI worker | **MATCH · CI-PROVEN; HARDWARE-PENDING** |
-| Metadata | source supports native metadata/MRP | absent | FEATURE GAP; not base HomePod transport prerequisite |
-| Buffered type 103 | opt-in only in source | not implemented | OK for current realtime-only target |
-| Warm splice/flush lifecycle | source has persistent timeline behavior | Timeline invariants are implemented; Windows realtime producer now keeps the same wire alive with encoded silence through temporary source starvation. Explicit pause/seek command API is still not wired into GUI/native session | **PARTIAL · starvation/source-switch base path CI-PROVEN; explicit command path pending** |
-| TEARDOWN | source sends clean native teardown | Stops producer/workers, closes event channel, then serialized TEARDOWN with shared CSeq/deadline; read-timeout farewell is write-only 250ms | **MATCH · CI-PROVEN** |
-| Feedback/retransmit shutdown ordering | workers stop before sockets/resources close | Audio -> retransmit -> feedback -> event -> TEARDOWN; timing/control resources remain live through teardown | **MATCH current base lifecycle · CI-PROVEN** |
+The server layer is consulted for session orchestration such as receiver-clock
+readiness, START convergence, late join and warm lifecycle. The C client remains
+the primary reference for native wire behavior.
 
-## Correction order
+## Evidence labels
 
-Do not add unrelated features while parity corrections are open.
+- **SOURCE** — directly matched to the reference implementation.
+- **CI** — compiled/tested by the Windows workflow.
+- **HW** — observed on physical hardware.
+- **LOCAL-HW-EXCEPTION** — intentionally differs from an empty/default upstream
+  table because a real receiver demonstrated a reproducible problem.
+- **NOT-APPLICABLE** — Music Assistant application behavior that does not map to
+  a Windows system-audio sender.
 
-1. Remove non-source `Client-Instance` from native RTSP requests.
-2. Port PTP `SETPEERS` exactly after realtime Stream SETUP; advance shared CSeq correctly.
-3. Port PTP peer-list semantics and multicast fallback/member handling from `ap2_ptp.c`.
-4. Parse stream response `latencyMin/latencyMax` and clamp effective lead exactly like source.
-5. Port delivery pacing window + 1ms initial-fill spacing.
-6. Port realtime retransmit ring and 0x55/0x56 responder.
-7. Port clean TEARDOWN on stop/drop using the same shared RTSP lock/CSeq.
-8. Pass the full relevant TXT context into native session and port the source HomePod OS27 follow-clock predicate/engine behavior before claiming OS27 parity.
-9. Only after the above, integrate warm splice/flush and source-change lifecycle needed by the stable acceptance tests.
+## Current parity matrix
 
-## Items intentionally not treated as current protocol defects
+| Area | Active SAirplay2 state | Audit result |
+|---|---|---|
+| AirPlay + RAOP discovery | Both services browsed and correlated | SOURCE / CI |
+| TXT feature parsing | AirPlay2, pairing, PTP, buffered, auth/password state preserved | SOURCE / CI |
+| `GET /info` | Realtime and buffered format tables parsed separately | SOURCE / CI |
+| HAP transient pairing | Implemented | SOURCE / CI / HW |
+| Stored HAP pair-verify | Implemented when credentials are available | SOURCE / CI |
+| Encrypted RTSP | Shared serialized control/CSeq path | SOURCE / CI / HW |
+| Native ordering | info -> HAP -> timing -> session SETUP -> event -> RECORD -> stream SETUP -> SETPEERS | SOURCE / CI / HW |
+| PTP / NTP choice | PTP where supported, NTP fallback when required | SOURCE / CI / HW |
+| PTP ports/cadence | 319/320, Sync/FUP ~125 ms, Announce ~1 s | SOURCE / CI / HW |
+| HomePod follow-clock | Source predicate/path retained for standalone Apple receiver cases | SOURCE / CI / HW |
+| Realtime type 96 | UDP encrypted RTP + sync + RTX | SOURCE / CI / HW |
+| Buffered type 103 | TCP-framed encrypted RTP + SETRATEANCHORTIME + buffered flush | SOURCE / CI / HW on tested routes |
+| Apple buffered auto policy | Apple models excluded from automatic type 103 | SOURCE / CI |
+| Mu-so Qb buffered policy | Type 103 denied by local model prefix after physical instability; native AP2 retained on realtime96 | LOCAL-HW-EXCEPTION |
+| ALAC formats | 16/44.1, 24/44.1, 16/48, 24/48 native target set | SOURCE / CI; tested subsets HW |
+| Packet geometry | 352 PCM frames per native packet | SOURCE / CI / HW |
+| 24-bit carrier | Windows s32le -> packed s24 -> ALAC | SOURCE-aligned adaptation / CI / HW |
+| Realtime pacing | receiver window with 250 ms margin, capped by 600 ms splice depth | SOURCE / CI / HW |
+| Digital-zero PCM | ordinary PCM; never a boundary | SOURCE / CI / HW |
+| Zero read/starvation | temporary no-input recovery; never synthetic EOF | SOURCE / CI / HW |
+| RTX | 512 retained exact wire packets, D6 response | SOURCE / CI / HW |
+| Feedback | ~2 s cadence, 2 s budget, 3 consecutive misses | SOURCE / CI / HW |
+| Solo hard peer close | terminal; no hidden auto-reconnect | SOURCE / CI |
+| Group member failure | failed member isolated, survivors continue | SOURCE / CI / HW |
+| Bounded rejoin | 5/15/30/60/120 s, cancelled by user lifecycle changes | SOURCE-aligned server behavior / CI / HW |
+| Solo START | wait clock readiness, base 400 ms, +500 ms readiness margin, adopt committed correction | SOURCE / CI / HW |
+| Group cold START | 2500 ms floor, clock projection, verified commits, max four convergence rounds | SOURCE / CI / HW |
+| Late join | shared timeline, ring prime/skip, verified commit, bounded 35 s prime wait | SOURCE / CI / HW |
+| Native metadata | native metadata control exists | SOURCE / CI |
+| Legacy RAOP | pinned source-built libraop helper, runtime volume overlay | SOURCE pin / CI / HW |
 
-- Buffered type 103: source makes it opt-in (`buffered_requested`), so realtime type 96 is valid.
-- MRP/type-130/now-playing: not required to establish the base realtime audio path.
-- Pair-verify credentials: source supports it, but current alpha is intentionally exercising transient pairing; add when credential UI/storage is introduced.
+## START parity
 
-## Stable gate
+Current Music Assistant stable still uses:
 
-No build is called stable until the audit's wire-critical deviations are closed and hardware passes:
-cold start, >60s continuous audio, silence 15/30/60s then resume, source changes, repeated next, format transitions, HomePod AP2, AirPort AP2/RAOP as applicable, and 30-minute run.
+- receiver-clock readiness timeout: **2500 ms**;
+- readiness margin: **500 ms**;
+- solo base START lead: **400 ms**;
+- warm group lead: **500 ms**;
+- cold group lead: **2500 ms**.
+
+SAirplay2 follows the same planning model.
+
+For a single PTP receiver, audio bytes are allowed to accumulate while clock
+readiness is resolved. The requested anchor is no earlier than the base lead or
+the projected readiness plus 500 ms. The committed receiver instant is
+authoritative; a single receiver adopts a forward correction without issuing a
+second START.
+
+For a group, all members share one audible instant. If any member commits later,
+the group reconverges on the largest verified instant with the source-aligned
+fan-out margin, up to four rounds.
+
+The Mu-so Qb physical comparison was a useful proof of this distinction:
+standalone playback was unstable on the old fixed-400-ms path, while a group
+with HomePod naturally received the longer clock-readiness planning. The later
+solo path now reports projection before START and maintains a stable delivery
+head on the tested run.
+
+## PCM / starvation parity
+
+Music Assistant's `audio_present` means the first input **bytes** have arrived.
+It does not inspect PCM amplitude.
+
+Therefore active SAirplay2 intentionally:
+
+- does not use “first non-silent” or “first nonzero” state to start or splice;
+- treats Windows silent buffers as valid zero PCM;
+- treats an empty WASAPI drain as a temporary no-input poll;
+- never promotes prolonged `frames == 0` to EOF;
+- preserves the immutable realtime timeline while starvation recovery adds
+  silence headroom.
+
+The earlier experiment that introduced “EOF-style silence keepalive” from a dry
+Windows input is superseded and must not be reintroduced.
+
+## Buffered parity and local exception
+
+Upstream's measured-hostile buffered deny-list is currently empty.
+
+SAirplay2 keeps the same deny-list mechanism but has one local hardware entry:
+
+- model prefix: `Mu-so Qb`
+
+Reason: the physical receiver accepted native type-103 setup/anchor but produced
+silence/intermittent rendering. Realtime type 96 on the same native session is
+stable enough to continue testing. This exception does not force RAOP and does
+not apply to other Naim models without evidence.
+
+Music Assistant stable currently also keeps its automatic per-model buffer-depth
+override table empty. SAirplay2 therefore does not invent a deeper Naim queue.
+
+## Hardware validation snapshot
+
+The active development history contains real-device evidence for:
+
+- HomePod mini Stereo Pair 16-bit / 44.1 kHz;
+- HomePod mini Stereo Pair 24-bit / 48 kHz;
+- two-member MultiRoom 16-bit / 44.1 kHz;
+- member isolation while the surviving HomePod continues;
+- bounded power-loss recovery and automatic live late join;
+- per-member RTX with zero expired retransmits in the validated runs;
+- Mu-so Qb native realtime 16-bit / 44.1 kHz after the solo START correction:
+  clock projection is observed before START, committed correction is reported,
+  PTP remains alive and delivery head stays around the expected ~600 ms window.
+
+A hardware observation applies only to the exact tested route/format. It is not
+permission to generalize a device-family workaround.
+
+## Application-layer differences that are not protocol defects
+
+Music Assistant owns a media queue and explicit track/seek/replacement
+transitions. SAirplay2 owns Windows system audio.
+
+The following MSA application features therefore do not map 1:1 and are not
+treated as missing native-wire parity:
+
+- queue-level predicted replacement EOF;
+- provider/media loading state;
+- Music Assistant announcement mixing;
+- Sendspin/controller integration;
+- queue-owned seek/next metadata lifecycle.
+
+Where SAirplay2 has an equivalent transport event, it must still preserve the
+same wire/timing invariants.
+
+## Branch audit — 2026-09-27
+
+The repository contained 21 branch refs at the start of cleanup.
+
+### Keep as active or protected history
+
+- `stable-1` — immutable locked stable.
+- `dev/hires-source-port` — active development.
+- `main` — repository history/default branch; one accidental empty file was
+  removed during cleanup.
+- `baseline/clean-2026-09-23` — historical clean baseline.
+- `dev/discovery-foundation` — historical discovery baseline (same old tip as
+  the clean baseline at audit time).
+
+### Historical experiments whose correct behavior is already absorbed
+
+- `dev/msa-buffered-zero-pcm`
+- `dev/msa-group-failure-rejoin`
+- `dev/msa-group-member-recovery`
+- `dev/msa-group-start-convergence`
+- `dev/msa-group-zero-read-starvation`
+- `dev/msa-hard-close-terminal`
+- `dev/msa-mixed-group-transports`
+- `dev/msa-recovery-pacing-window`
+- `dev/msa-solo-start-lead-400`
+- `dev/msa-solo-start-lead-400-v2`
+- `dev/msa-start-convergence`
+- `dev/msa-zero-pcm-not-boundary`
+- `dev/msa-zero-read-starvation`
+- `dev/multiroom-clock-commit`
+- `dev/pair-member-diagnostics`
+
+Do not merge these wholesale. Their intended behavior is already represented in
+the active branch, often by later source-aligned implementations with different
+commit ancestry.
+
+### Explicitly superseded experiment
+
+- `dev/msa-dry-eof-keepalive`
+
+This branch converted prolonged dry Windows input into an EOF-style keepalive.
+Later MSA comparison established that Windows `frames == 0` has no EOF
+semantics; the active branch correctly uses starvation recovery and forbids
+synthetic EOF. This old branch must not be resurrected.
+
+Git ancestry alone is not a parity signal: several historical experiment
+branches show as “diverged” because the same behavior was reimplemented or
+ported later under different commits.
+
+## Cleanup completed during this audit
+
+Active development cleanup removed only state with no remaining production
+meaning:
+
+- first-non-silent / first-nonzero WASAPI amplitude probes;
+- nonzero-byte counting in the PCM chunker;
+- amplitude-only transition diagnostics and large packet dumps;
+- obsolete non-silent worker/session/group APIs;
+- duplicate stale solo timing helpers left behind after clock-readiness logic
+  moved to the canonical worker/sender path;
+- a dead warm-boundary helper and self-only test;
+- a dead PTP summary helper;
+- excessive steady-state diagnostic frequency (reduced to low cadence).
+
+On `main`, the accidental empty file
+`crates/sairplay-gui/assets/devices/a` created by the historical “Create a”
+commit was removed.
+
+No locked stable code was modified.
+
+## Do-not-regress list
+
+Do not change without new source discrepancy or hardware evidence:
+
+- 352 frames per packet;
+- PTP timing cadence;
+- realtime/buffered lane separation;
+- Apple auto-buffered exclusion;
+- digital-zero / EOF semantics;
+- solo/group START constants and verified-commit behavior;
+- shared group PTP;
+- RTX geometry/history;
+- feedback timeout policy;
+- late-join shared timeline;
+- bounded member recovery.
+
+The goal after this audit is stability, not further protocol churn.
