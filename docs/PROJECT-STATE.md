@@ -1,6 +1,6 @@
 # SAirplay2 — Project State
 
-Last updated: 2026-09-24  
+Last updated: 2026-09-26  
 Working branch: `dev/hires-source-port`
 
 ## 1. Repository / branch policy
@@ -24,8 +24,17 @@ gui: stop legacy RAOP off the UI thread
 
 GitHub Actions #691: PASS.
 
-Treat this as the clean development reference point for all work after 2026-09-24.
-It is not the locked stable branch.
+Current validated development head:
+
+```
+913c09e3f6eb09e8cfef0e2c143689c23674b5ee
+fix: allow MSA late-join prime window
+```
+
+GitHub Actions Windows #804: PASS.
+
+Treat the locked stable commit above as immutable. The current development head
+contains the later MSA-native group work and runtime recovery validation.
 
 Working rules:
 
@@ -88,21 +97,38 @@ Stereo Pair:
 The queued-PCM guard fixed the previous cold-start false boundary. Runtime logs
 showed `stale_nonzero_bytes=0` on valid Pair boundaries and equal member heads.
 
+Runtime validation on HomePod mini White + Black now also confirms:
+
+- Stereo Pair 16-bit / 44.1 kHz PASS;
+- Stereo Pair 24-bit / 48 kHz PASS;
+- one member may lose transport without collapsing the surviving member;
+- feedback failure isolates only the failed member;
+- bounded automatic rejoin runs at 5/15/30/60/120 s;
+- a powered-off member can boot, reconnect on shared PTP, late-join the live
+  timeline and resume automatically without Stop/Play;
+- RTX remains per member and observed expired retransmits stayed at zero during
+  the validated 24-bit runs.
+
 ## 6. MultiRoom
 
-Current MultiRoom work after Pair separation:
+Current MultiRoom state after Pair separation:
 
 - initial membership >=2;
-- dynamic join/remove remains a MultiRoom-only feature;
-- common sample-rate planner is separate from per-member bit depth;
-- mixed 24-bit + 16-bit initial group selects 44.1 kHz common rate;
-- bit depth remains per receiver;
-- MultiRoom has its own hot track-gap / silence keepalive state;
-- Pair state is not reused.
+- dynamic join/remove remains a MultiRoom-only user-facing feature;
+- Stereo Pair may use the same late-join path only for automatic recovery;
+- one shared WASAPI source and one shared PTP timeline are retained;
+- common sample-rate planning is separate from per-member bit depth;
+- mixed 24-bit + 16-bit groups select a common sample rate and adapt depth per
+  member;
+- late join uses a retained PCM ring plus prime/skip mapping aligned to the
+  shared live timeline;
+- realtime type 96 and buffered type 103 lanes remain distinct;
+- a failed member is isolated while healthy members continue;
+- bounded rejoin restores the member through the normal late-join path.
 
-Late-join parity with Music Assistant is not complete yet. In particular,
-per-member sample-rate conversion and exact ring/prime/skip behavior are still
-pending and must be source-aligned before implementation.
+Runtime validation confirms a 2-member MultiRoom 16-bit / 44.1 kHz session
+starts and fans out from one WASAPI source. Stereo Pair recovery has additionally
+validated the shared late-join/rejoin machinery end-to-end.
 
 ## 7. Legacy RAOP / libraop
 
@@ -185,11 +211,25 @@ Type 103 uses:
 Do not implement type 103 by modifying the realtime type-96 packet loop in
 place. Keep transport selection explicit.
 
-## 10. Next implementation order
+## 10. Runtime validation status / next work
 
-1. Split realtime vs buffered format capability in engine and GUI.
-2. Lock tests for a receiver with realtime 44.1/16 + buffered 48/24.
-3. Verify no regression on HomePod realtime 24-bit.
-4. Port buffered route eligibility from pinned MSA.
-5. Only then implement type-103 TCP media setup/send/anchor/flush.
-6. Integrate buffered members into MultiRoom shared PTP timeline.
+Validated on real HomePod mini hardware:
+
+1. Stereo Pair 16-bit / 44.1 kHz: PASS.
+2. MultiRoom 2-member 16-bit / 44.1 kHz: PASS.
+3. Stereo Pair 24-bit / 48 kHz: PASS.
+4. Per-member RTX with packets larger than 1472 bytes: PASS; no observed expired
+   retransmits in the validated run.
+5. Failed-member isolation: PASS; surviving member continues.
+6. Automatic bounded rejoin after physical power loss: PASS.
+7. Reconnected HomePod restores through shared PTP + live late-join timeline:
+   PASS, without Stop/Play.
+
+Late-join wait follows the pinned MSA 35-second prime/write allowance. This is a
+maximum wait, not a fixed delay. The previous 12-second local timeout was proven
+too short by a valid 24/48 join that required 2234 packets (~16.4 seconds of PCM)
+to prime.
+
+Do not change 352 frames/chunk, PTP cadence, realtime/buffered policy, START
+semantics or RTX merely because 24-bit packets exceed MTU. Further engine changes
+require a new runtime failure or pinned-source discrepancy.
