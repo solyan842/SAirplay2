@@ -688,6 +688,7 @@ impl NativeSession {
                 self.latency_max,
                 self.rtp_offset,
                 self.cold_start_delay_ms,
+                self.apple_model,
             )
         };
 
