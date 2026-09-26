@@ -167,7 +167,7 @@ impl ActiveSession {
     fn failed_group_members(&self) -> Vec<(String, String)> {
         match self {
             Self::StereoPair(session) | Self::MultiRoom(session) => {
-                session.failed_feedback_members()
+                session.failed_group_members()
             }
             Self::Single(_) | Self::Legacy(_) => Vec::new(),
         }
