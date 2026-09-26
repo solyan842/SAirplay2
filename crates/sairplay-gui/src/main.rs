@@ -101,6 +101,15 @@ impl ActiveSession {
         }
     }
 
+    fn member_retransmit_stats(&self) -> Vec<(String, RetransmitStats)> {
+        match self {
+            Self::StereoPair(session) | Self::MultiRoom(session) => {
+                session.member_retransmit_stats()
+            }
+            Self::Single(_) | Self::Legacy(_) => Vec::new(),
+        }
+    }
+
     fn feedback_running(&self) -> bool {
         match self {
             Self::Single(session) => session.feedback_running(),
@@ -317,6 +326,7 @@ struct SairplayApp {
     activation_key: String,
     last_feedback_error: Option<String>,
     last_retransmit_stats: RetransmitStats,
+    last_member_retransmit_stats: BTreeMap<String, RetransmitStats>,
     hires_quality_warning_open: bool,
     hires_quality_warning_shown: bool,
     hires_quality_warning_text: String,
@@ -393,6 +403,7 @@ impl Default for SairplayApp {
             activation_key: String::new(),
             last_feedback_error: None,
             last_retransmit_stats: RetransmitStats::default(),
+            last_member_retransmit_stats: BTreeMap::new(),
             hires_quality_warning_open: false,
             hires_quality_warning_shown: false,
             hires_quality_warning_text: String::new(),
@@ -655,6 +666,11 @@ impl SairplayApp {
                         success.active_fullnames.len()
                     ));
                     self.last_retransmit_stats = success.session.retransmit_stats();
+                    self.last_member_retransmit_stats = success
+                        .session
+                        .member_retransmit_stats()
+                        .into_iter()
+                        .collect();
                     self.hires_quality_warning_open = false;
                     self.hires_quality_warning_shown = false;
                     self.hires_quality_warning_text.clear();
@@ -1418,6 +1434,38 @@ impl SairplayApp {
         }
 
         let rtx = session.retransmit_stats();
+        for (name, member_rtx) in session.member_retransmit_stats() {
+            let prev = self
+                .last_member_retransmit_stats
+                .get(&name)
+                .copied()
+                .unwrap_or_default();
+            if member_rtx != prev {
+                let requested_delta = member_rtx.requested.saturating_sub(prev.requested);
+                let answered_delta = member_rtx.answered.saturating_sub(prev.answered);
+                let expired_delta = member_rtx.expired.saturating_sub(prev.expired);
+                let over_mtu_delta = member_rtx
+                    .requested_over_1472
+                    .saturating_sub(prev.requested_over_1472);
+                if requested_delta != 0 || expired_delta != 0 {
+                    self.log.push(format!(
+                        "Diagnostic: retransmit member · {} · requested +{} (total {}) · answered +{} (total {}) · expired +{} (total {}) · requested_wire>1472 +{} (total {}) · max_requested_wire={} B.",
+                        name,
+                        requested_delta,
+                        member_rtx.requested,
+                        answered_delta,
+                        member_rtx.answered,
+                        expired_delta,
+                        member_rtx.expired,
+                        over_mtu_delta,
+                        member_rtx.requested_over_1472,
+                        member_rtx.max_requested_wire_len
+                    ));
+                }
+                self.last_member_retransmit_stats.insert(name, member_rtx);
+            }
+        }
+
         if has_transition_diag {
             let prev = self.last_retransmit_stats;
             self.log.push(format!(
@@ -1841,6 +1889,7 @@ impl SairplayApp {
         self.membership_rx = None;
         self.playback = PlaybackUiState::Idle;
         self.last_retransmit_stats = RetransmitStats::default();
+        self.last_member_retransmit_stats.clear();
     }
 
     fn header_status(&self) -> (&'static str, String, egui::Color32) {
