@@ -572,7 +572,7 @@ impl WindowsAudioWorker {
                             }
                         };
 
-                        if cold_armed && last_steady_diag.elapsed() >= Duration::from_secs(1) {
+                        if cold_armed && last_steady_diag.elapsed() >= Duration::from_secs(5) {
                             let state = sender.state();
                             let head_delta = sender.timeline_head_delta_frames(recovery_ntp);
                             let head_delta_ms =
@@ -613,8 +613,7 @@ impl WindowsAudioWorker {
                                 if startup_window {
                                     if let Ok(mut events) = startup_events_thread.lock() {
                                         events.push(format!(
-                                            "{}: delivery-gap recovery added {} silence frames · total_pad={} · pending_bytes={}.",
-                                            if startup_window { "Startup" } else { "Transition" },
+                                            "Startup: delivery-gap recovery added {} silence frames · total_pad={} · pending_bytes={}.",
                                             added,
                                             sender.splice_pad_frames(),
                                             chunker.pending_bytes()
