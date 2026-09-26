@@ -3,8 +3,15 @@ use crate::{
     WindowsGroupAudioKind, WindowsMultiroomAudioError, WindowsMultiroomAudioWorker,
     WindowsMultiroomJoinHandle,
 };
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver, Sender},
+    Arc,
+};
+use std::thread;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct NativeGroupMemberConfig {
@@ -128,12 +135,24 @@ fn plan_multiroom_format(configs: &[NativeGroupMemberConfig]) -> MultiRoomFormat
     }
 }
 
+const AIRPLAY_REJOIN_ATTEMPT_DELAYS_SECS: [u64; 5] = [5, 15, 30, 60, 120];
+
+struct GroupRecoveryResult {
+    name: String,
+    result: Result<NativeSession, String>,
+}
+
 pub struct NativeGroupSession {
     kind: NativeGroupKind,
     members: Vec<(String, NativeSession)>,
     audio_worker: Option<WindowsMultiroomAudioWorker>,
     shared_ptp: Option<Arc<PtpEngine>>,
     use_ptp: bool,
+    member_configs: BTreeMap<String, NativeSessionConfig>,
+    recovery_pending: BTreeSet<String>,
+    recovery_tx: Sender<GroupRecoveryResult>,
+    recovery_rx: Receiver<GroupRecoveryResult>,
+    recovery_stop: Arc<AtomicBool>,
 }
 
 impl NativeGroupSession {
@@ -153,6 +172,11 @@ impl NativeGroupSession {
                 member.config.session_sample_rate = plan.session_sample_rate;
             }
         }
+
+        let member_configs = configs
+            .iter()
+            .map(|member| (member.name.clone(), member.config.clone()))
+            .collect::<BTreeMap<_, _>>();
 
         // Source architecture: one shared PTP daemon owns 319/320 for every
         // native AirPlay 2 member. A one-member session uses the same object so
@@ -213,12 +237,18 @@ impl NativeGroupSession {
         let audio_worker =
             WindowsMultiroomAudioWorker::start(worker_kind, targets).map_err(NativeGroupError::Audio)?;
 
+        let (recovery_tx, recovery_rx) = mpsc::channel();
         Ok(Self {
             kind,
             members,
             audio_worker: Some(audio_worker),
             shared_ptp,
             use_ptp,
+            member_configs,
+            recovery_pending: BTreeSet::new(),
+            recovery_tx,
+            recovery_rx,
+            recovery_stop: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -230,6 +260,15 @@ impl NativeGroupSession {
         if self.kind != NativeGroupKind::MultiRoom {
             return None;
         }
+        let audio = self.audio_worker.as_ref()?.join_handle();
+        Some(NativeGroupJoinHandle {
+            shared_ptp: self.shared_ptp.as_ref().map(Arc::clone),
+            use_ptp: self.use_ptp,
+            audio,
+        })
+    }
+
+    fn recovery_handle(&self) -> Option<NativeGroupJoinHandle> {
         let audio = self.audio_worker.as_ref()?.join_handle();
         Some(NativeGroupJoinHandle {
             shared_ptp: self.shared_ptp.as_ref().map(Arc::clone),
@@ -319,6 +358,123 @@ impl NativeGroupSession {
             .unwrap_or_default()
     }
 
+    /// Remove only an unexpectedly dead transport from the live fan-out and
+    /// schedule the same bounded 5/15/30/60/120 s re-join ladder used by MSA.
+    ///
+    /// The surviving members keep their shared PTP timeline and continue
+    /// playing. Re-joining goes through the normal late-join path, so the
+    /// recovered member maps onto the live ring instead of restarting the group.
+    pub fn poll_transport_recovery(&mut self) -> Vec<String> {
+        let mut events = Vec::new();
+
+        while let Ok(recovery) = self.recovery_rx.try_recv() {
+            self.recovery_pending.remove(&recovery.name);
+            match recovery.result {
+                Ok(session) => {
+                    if let Some(index) = self.members.iter().position(|(name, _)| name == &recovery.name) {
+                        self.members.remove(index);
+                    }
+                    self.members.push((recovery.name.clone(), session));
+                    events.push(format!(
+                        "{}: automatic AirPlay group re-join succeeded.",
+                        recovery.name
+                    ));
+                }
+                Err(error) => {
+                    events.push(format!(
+                        "{}: automatic AirPlay group re-join exhausted: {}.",
+                        recovery.name, error
+                    ));
+                }
+            }
+        }
+
+        let failed = self
+            .members
+            .iter()
+            .filter(|(name, session)| {
+                !self.recovery_pending.contains(name) && !session.feedback_running()
+            })
+            .map(|(name, session)| {
+                (
+                    name.clone(),
+                    session
+                        .feedback_error()
+                        .unwrap_or_else(|| "feedback worker stopped".to_owned()),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (name, reason) in failed {
+            // Preserve at least one live target. If every member is gone there
+            // is no session left for a late join to heal, matching MSA's
+            // whole-group terminal case.
+            if self.active_audio_members() <= 1 {
+                continue;
+            }
+
+            let Some(config) = self.member_configs.get(&name).cloned() else {
+                continue;
+            };
+            let Some(handle) = self.recovery_handle() else {
+                continue;
+            };
+
+            if handle.remove_audio_member(name.clone()).is_err() {
+                continue;
+            }
+            if let Some(index) = self.members.iter().position(|(member, _)| member == &name) {
+                self.members.remove(index);
+            }
+            self.recovery_pending.insert(name.clone());
+            events.push(format!(
+                "{}: removed from live AirPlay group after unexpected transport loss ({reason}); bounded re-join scheduled.",
+                name
+            ));
+
+            let tx = self.recovery_tx.clone();
+            let stop = Arc::clone(&self.recovery_stop);
+            thread::Builder::new()
+                .name(format!("sairplay-rejoin-{name}"))
+                .spawn(move || {
+                    let mut last_error = String::from("no re-join attempt completed");
+                    for delay_secs in AIRPLAY_REJOIN_ATTEMPT_DELAYS_SECS {
+                        // Sleep in small slices so explicit teardown cancels the
+                        // ladder promptly instead of leaving a detached retry.
+                        for _ in 0..delay_secs.saturating_mul(10) {
+                            if stop.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            thread::sleep(Duration::from_millis(100));
+                        }
+                        if stop.load(Ordering::SeqCst) {
+                            return;
+                        }
+
+                        match handle.connect_member(name.clone(), config.clone()) {
+                            Ok((_, session)) => {
+                                let _ = tx.send(GroupRecoveryResult {
+                                    name,
+                                    result: Ok(session),
+                                });
+                                return;
+                            }
+                            Err(error) => {
+                                last_error = error.to_string();
+                            }
+                        }
+                    }
+                    let _ = tx.send(GroupRecoveryResult {
+                        name,
+                        result: Err(last_error),
+                    });
+                })
+                .ok();
+        }
+
+        events
+    }
+
     pub fn feedback_running(&self) -> bool {
         self.members.iter().all(|(_, session)| session.feedback_running())
     }
@@ -386,6 +542,7 @@ impl NativeGroupSession {
 
 impl Drop for NativeGroupSession {
     fn drop(&mut self) {
+        self.recovery_stop.store(true, Ordering::SeqCst);
         // Keep the shared producer alive until every receiver has received its
         // TEARDOWN. This preserves the same clean shutdown boundary as MSA for
         // Stereo Pair and MultiRoom instead of starving all armed queues first.
