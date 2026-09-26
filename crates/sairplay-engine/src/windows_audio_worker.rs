@@ -840,19 +840,6 @@ fn resolve_worker_start_ntp(requested_start_ntp: u64, floor_ntp: u64) -> u64 {
     }
 }
 
-fn ptp_probe_summary(sender: &RealtimeMediaSender) -> String {
-    if !sender.uses_ptp_timing() {
-        return "ptp_probe=not-applicable".into();
-    }
-    match sender.ptp_probe_exchange() {
-        Some(ex) => format!(
-            "ptp_probe=alive exchanges={} streak_age_ms={} last_probe_age_ms={} third_probe_age_ms={}",
-            ex.count, ex.first_ms, ex.last_ms, ex.third_ms
-        ),
-        None => "ptp_probe=unavailable".into(),
-    }
-}
-
 impl Drop for WindowsAudioWorker {
     fn drop(&mut self) {
         self.stop();
