@@ -27,11 +27,15 @@ GitHub Actions #691: PASS.
 Current validated development head:
 
 ```
-913c09e3f6eb09e8cfef0e2c143689c23674b5ee
-fix: allow MSA late-join prime window
+aa38d4d866239a23e7d2da6b5539651a81b3e167
+chore: make solo PTP diagnostic precise
 ```
 
-GitHub Actions Windows #804: PASS.
+GitHub Actions Windows #817: PASS.
+
+The #817 checkpoint includes the MSA-aligned solo START audit/fixes described
+below. The prior late-join checkpoint at
+`913c09e3f6eb09e8cfef0e2c143689c23674b5ee` remains part of this history.
 
 Treat the locked stable commit above as immutable. The current development head
 contains the later MSA-native group work and runtime recovery validation.
@@ -80,6 +84,49 @@ Confirmed architecture:
 Single 16-bit is known-good. Single 24-bit works on HomePod; occasional tiny
 clicks correlate with oversized realtime UDP packets/retransmit activity and
 are not currently treated as a timeline defect.
+
+### Solo START alignment with Music Assistant
+
+A real Naim Mu-so Qb comparison exposed a solo-only timing discrepancy:
+
+- solo realtime previously armed START at the fixed 400 ms caller lead before
+  receiver PTP clock readiness was known;
+- the same Naim, when grouped with a HomePod, reported ~2296 ms receiver-clock
+  projection and the group path successfully planned a later shared START;
+- the group receiver also corrected the initially requested shared instant
+  forward, proving that the committed START instant may differ materially from
+  the caller request on this device.
+
+The solo path is now aligned with pinned/current Music Assistant semantics:
+
+- wait for receiver clock readiness for up to 2500 ms before a PTP cold START;
+- apply the reported projection plus the 500 ms readiness lead;
+- keep the normal solo caller floor at 400 ms;
+- continue capturing/buffering PCM while waiting for clock readiness rather
+  than blocking the WASAPI producer;
+- use the verified/committed START instant and, for a single receiver, adopt a
+  corrected-forward instant without issuing a second START;
+- do not cache a connect-time clock projection; sample readiness immediately
+  before planning the cold anchor;
+- treat digital-zero PCM as valid audio; START gating depends on complete PCM
+  bytes/352-frame transport readiness, never sample amplitude;
+- apply the same clock-ready / committed-start policy to solo buffered type 103.
+
+The source audit also re-confirmed that the existing solo implementation already
+matches the relevant MSA behavior for PTP->NTP fallback, realtime/buffered
+routing, 600 ms realtime splice depth, starvation recovery, RTX, feedback
+timeouts/hard-close handling and teardown-while-audio-hot.
+
+Naim Mu-so Qb remains on the realtime type-96 path because the observed receiver
+does not advertise usable realtime/buffered format masks and type 103 was
+physically unstable in the earlier test. No model-specific buffer-depth override
+was added; current Music Assistant keeps its automatic buffer-depth defaults
+table empty.
+
+**Validation status:** code review against pinned MSA and current MSA stable,
+cargo check and invariant tests all PASS in GitHub Actions #817. A fresh
+real-device Naim solo run from the #817 artifact is still required before
+declaring the physical stutter issue closed.
 
 ## 5. Stereo Pair
 
@@ -233,3 +280,13 @@ to prime.
 Do not change 352 frames/chunk, PTP cadence, realtime/buffered policy, START
 semantics or RTX merely because 24-bit packets exceed MTU. Further engine changes
 require a new runtime failure or pinned-source discrepancy.
+
+Next physical validation target:
+
+- use the Windows artifact from GitHub Actions #817;
+- run Naim Mu-so Qb **solo** on native AirPlay 2 realtime 16-bit / 44.1 kHz;
+- confirm the log reports receiver-clock projection before START, and record any
+  committed START correction;
+- confirm audible continuity without the repeated stutter seen on the pre-#817
+  400 ms solo-start path.
+
