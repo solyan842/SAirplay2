@@ -536,10 +536,14 @@ impl WindowsMultiroomAudioWorker {
                         } else {
                             AIRPLAY_START_LEAD_MS
                         };
-                        let clock_projection_ms = wait_members_clock_projection_ms(
+                        let clock_projections = wait_members_clock_projections_ms(
                             &targets,
                             Duration::from_millis(AIRPLAY_CLOCK_READY_TIMEOUT_MS),
                         );
+                        let clock_projection_ms = clock_projections
+                            .iter()
+                            .filter_map(|(_, projection)| *projection)
+                            .max();
                         let readiness_lead_ms = clock_projection_ms
                             .map(|delay| delay.saturating_add(AIRPLAY_CLOCK_READY_LEAD_MS))
                             .unwrap_or(0);
@@ -550,6 +554,18 @@ impl WindowsMultiroomAudioWorker {
                         let delay_ms = source_lead.max(readiness_lead_ms);
                         let start_ntp = now_ntp.saturating_add(ms_to_ntp(delay_ms));
                         if let Ok(mut events) = startup_events_thread.lock() {
+                            for (name, projection) in &clock_projections {
+                                events.push(match projection {
+                                    Some(delay) => format!(
+                                        "AirPlay group clock member: {} · projection={} ms.",
+                                        name, delay
+                                    ),
+                                    None => format!(
+                                        "AirPlay group clock member: {} · no PTP projection within {} ms.",
+                                        name, AIRPLAY_CLOCK_READY_TIMEOUT_MS
+                                    ),
+                                });
+                            }
                             events.push(match clock_projection_ms {
                                 Some(delay) => format!(
                                     "AirPlay group clock readiness: latest projection in {} ms; shared START lead={} ms.",
@@ -1504,16 +1520,16 @@ fn clock_ready_delay_ms(exchange: crate::PtpExchange, apple_model: bool) -> u64 
     }
 }
 
-fn wait_members_clock_projection_ms(
+fn wait_members_clock_projections_ms(
     targets: &[WindowsAudioTarget],
     timeout: Duration,
-) -> Option<u64> {
+) -> Vec<(String, Option<u64>)> {
     let ptp_members = targets
         .iter()
         .filter(|target| target.sender.uses_ptp_timing())
         .count();
     if ptp_members == 0 {
-        return None;
+        return Vec::new();
     }
 
     let deadline = Instant::now() + timeout;
@@ -1521,19 +1537,24 @@ fn wait_members_clock_projection_ms(
         let projections = targets
             .iter()
             .filter(|target| target.sender.uses_ptp_timing())
-            .filter_map(|target| {
-                target
+            .map(|target| {
+                let projection = target
                     .sender
                     .ptp_probe_exchange()
-                    .map(|exchange| clock_ready_delay_ms(exchange, target.apple_model))
+                    .map(|exchange| clock_ready_delay_ms(exchange, target.apple_model));
+                (target.name.clone(), projection)
             })
             .collect::<Vec<_>>();
 
-        // MSA waits for every member's clock result concurrently. Here the
-        // worker has the same receiver-probe evidence locally, so stop waiting
-        // once every PTP member has produced a projection.
-        if projections.len() == ptp_members || Instant::now() >= deadline {
-            return projections.into_iter().max();
+        // MSA waits for every member's clock result concurrently. Preserve
+        // that policy, but retain the per-member result for diagnostics so a
+        // Stereo Pair log identifies which receiver was still cold.
+        let projected = projections
+            .iter()
+            .filter(|(_, projection)| projection.is_some())
+            .count();
+        if projected == ptp_members || Instant::now() >= deadline {
+            return projections;
         }
         thread::sleep(Duration::from_millis(10));
     }
