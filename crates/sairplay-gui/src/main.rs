@@ -110,6 +110,15 @@ impl ActiveSession {
         }
     }
 
+    fn poll_transport_recovery(&mut self) -> Vec<String> {
+        match self {
+            Self::StereoPair(session) | Self::MultiRoom(session) => {
+                session.poll_transport_recovery()
+            }
+            Self::Single(_) | Self::Legacy(_) => Vec::new(),
+        }
+    }
+
     fn feedback_running(&self) -> bool {
         match self {
             Self::Single(session) => session.feedback_running(),
@@ -1418,6 +1427,15 @@ impl SairplayApp {
     }
 
     fn monitor_running_session(&mut self) {
+        let recovery_events = self
+            .session
+            .as_mut()
+            .map(ActiveSession::poll_transport_recovery)
+            .unwrap_or_default();
+        for event in recovery_events {
+            self.log.push(event);
+        }
+
         let Some(session) = self.session.as_ref() else {
             return;
         };
