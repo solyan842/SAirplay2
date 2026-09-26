@@ -18,6 +18,8 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime};
 
+const SOLO_COLD_START_LEAD_MS: u64 = 400;
+
 #[cfg(windows)]
 use crate::{NativeMetadataControl, WindowsAudioTarget, WindowsAudioWorker, WindowsAudioWorkerError};
 
@@ -466,9 +468,11 @@ impl NativeSession {
         )
         .map_err(NativeSessionError::Feedback)?;
 
-        // Preserve the source clock-readiness floor; only the absolute START
-        // instant is deferred until PCM is actually buffered.
-        let mut cold_start_delay_ms = 250u64;
+        // Match the pinned Music Assistant caller: a solo START is commanded
+        // 400 ms ahead. The 250 ms value remains only the cliairplay minimum
+        // warm/starvation floor; it is not the caller's solo START lead.
+        // The absolute START instant is still deferred until PCM is buffered.
+        let mut cold_start_delay_ms = SOLO_COLD_START_LEAD_MS;
         let mut clock_ready_at_ntp = None;
         if let Some(clock) = ptp_clock.as_ref() {
             if let Some(exchange) = clock.exchange() {
@@ -897,6 +901,11 @@ mod tests {
     use super::*;
     use rand::{rngs::StdRng, SeedableRng};
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn solo_cold_start_lead_matches_pinned_music_assistant() {
+        assert_eq!(SOLO_COLD_START_LEAD_MS, 400);
+    }
 
     #[test]
     fn clock_readiness_matches_source_bounds() {
