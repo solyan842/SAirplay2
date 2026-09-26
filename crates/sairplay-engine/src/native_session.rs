@@ -744,13 +744,6 @@ impl NativeSession {
     }
 
     #[cfg(windows)]
-    pub fn audio_first_non_silent_frame(&self) -> Option<u64> {
-        self.audio_worker
-            .as_ref()
-            .and_then(WindowsAudioWorker::first_non_silent_frame)
-    }
-
-    #[cfg(windows)]
     pub fn drain_startup_events(&self) -> Vec<String> {
         self.audio_worker
             .as_ref()
