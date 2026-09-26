@@ -291,6 +291,7 @@ impl WindowsAudioWorker {
         latency_max: Option<u32>,
         rtp_offset: u32,
         cold_start_delay_ms: u64,
+        apple_model: bool,
     ) -> Result<Self, WindowsAudioWorkerError> {
         let running = Arc::new(AtomicBool::new(true));
         let running_thread = Arc::clone(&running);
@@ -504,17 +505,26 @@ impl WindowsAudioWorker {
                             };
                             let start_ntp =
                                 now_ntp.saturating_add(ms_to_ntp(cold_start_delay_ms));
-                            if let Err(error) = sender.arm_cold_start(
+                            let committed_start_ntp = match sender.arm_cold_start_verified(
                                 start_ntp,
                                 latency_max,
                                 lead_frames,
                                 rtp_offset,
+                                apple_model,
                             ) {
-                                if let Ok(mut slot) = last_error_thread.lock() {
-                                    *slot = Some(format!("cold START failed: {error:?}"));
+                                Ok(value) => value,
+                                Err(error) => {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(format!("cold START failed: {error:?}"));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
                                 }
-                                running_thread.store(false, Ordering::SeqCst);
-                                return;
+                            };
+                            if committed_start_ntp != start_ntp {
+                                if let Ok(mut events) = startup_events_thread.lock() {
+                                    events.push("Startup: receiver feasibility floor corrected cold START forward.".into());
+                                }
                             }
                             cold_armed = true;
                             startup_started = Some(std::time::Instant::now());
