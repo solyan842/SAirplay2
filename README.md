@@ -1,28 +1,49 @@
 # SAirplay2
 
-Clean Windows AirPlay sender rewrite by SolYan.
+Windows AirPlay sender rewrite by SolYan.
 
-This repository is intentionally independent from the previous SolYan-AirPlay2 codebase.
+This repository is independent from the previous SolYan-AirPlay2 codebase and
+keeps native AirPlay 2 transport behavior source-aligned with Music Assistant.
 
-## First stable target
+## Current transport scope
 
 - Windows 10/11
-- ALAC
-- 16-bit
-- 44.1 kHz
-- Stereo
-- 352 frames per packet
-- AirPort / RAOP route
-- HomePod / AirPlay 2 native route
+- native AirPlay 2 and legacy/compatible RAOP
+- ALAC stereo
+- 16-bit / 44.1 kHz
+- 24-bit / 44.1 kHz
+- 16-bit / 48 kHz
+- 24-bit / 48 kHz
+- fixed 352 PCM frames per native packet
+- Single, Stereo Pair and MultiRoom
+- realtime type 96 and buffered type 103 as separate native lanes
+- PTP/NTP timing, feedback and realtime retransmit
+- live MultiRoom membership and bounded failed-member recovery
+
+No 96/192 kHz target is in scope.
 
 ## Core rules
 
 - Source lifetime is not session lifetime.
-- Pause is not disconnect.
-- Silence is audio data, not EOF.
-- Next/seek/source changes never reset transport.
-- Native AirPlay 2 RTP timeline is immutable for the session lifetime.
-- RAOP and AirPlay 2 native are separate transports.
-- GUI never owns protocol state.
+- Digital silence is PCM, not EOF.
+- A Windows zero-frame loopback poll is not EOF.
+- RAOP and native AirPlay 2 are separate transports.
+- Realtime and buffered AirPlay 2 are separate media lanes.
+- A native group shares one PTP timeline.
+- 352 frames per packet is locked unless upstream or hardware evidence requires a change.
+- START uses receiver-clock readiness and verified committed instants.
+- GUI state must not invent protocol state.
 
-Current phase: clean engine and clean GUI foundation.
+## Development
+
+Active development branch: `dev/hires-source-port`.
+
+Locked stable history: `stable-1` at
+`a7cb24b1faa6b54abf7d24812b732ed08eb72524`.
+
+See:
+
+- `docs/ARCHITECTURE.md`
+- `docs/DEVELOPMENT-RULES.md`
+- `docs/SOURCE-AUDIT.md`
+- `docs/PROJECT-STATE.md`
