@@ -329,6 +329,7 @@ impl WindowsAudioWorker {
             let mut captured_frames_total = 0u64;
             let mut source_present = false;
             let mut cold_armed = false;
+            let mut clock_wait_started: Option<std::time::Instant> = None;
             let mut startup_packet_index: u32 = 0;
             let mut startup_started: Option<std::time::Instant> = None;
             let mut dry_input_since: Option<std::time::Instant> = None;
@@ -491,6 +492,40 @@ impl WindowsAudioWorker {
                                 continue;
                             }
 
+                            // Pinned MSA waits for receiver-clock readiness while
+                            // audio continues feeding the binary. Do the same here:
+                            // never block WASAPI capture during the readiness wait,
+                            // so the PCM ring/prefill keeps growing just as cli stdin
+                            // does upstream.
+                            let clock_projection_ms = if sender.uses_ptp_timing() {
+                                if let Some(delay) =
+                                    sender.ptp_clock_ready_delay_ms(apple_model)
+                                {
+                                    clock_wait_started = None;
+                                    Some(delay)
+                                } else {
+                                    let waiting_since = clock_wait_started
+                                        .get_or_insert_with(std::time::Instant::now);
+                                    if waiting_since.elapsed()
+                                        < Duration::from_millis(AIRPLAY_CLOCK_READY_TIMEOUT_MS)
+                                    {
+                                        if frames == 0 {
+                                            thread::sleep(Duration::from_millis(1));
+                                        }
+                                        continue;
+                                    }
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
+                            let readiness_lead_ms = clock_projection_ms
+                                .map(|delay| delay.saturating_add(AIRPLAY_CLOCK_READY_LEAD_MS))
+                                .unwrap_or(0);
+                            let effective_start_delay_ms =
+                                cold_start_delay_ms.max(readiness_lead_ms);
+
                             let now_ntp = match system_time_to_ntp(SystemTime::now()) {
                                 Ok(value) => value,
                                 Err(error) => {
@@ -501,37 +536,38 @@ impl WindowsAudioWorker {
                                     return;
                                 }
                             };
-                            // Pinned Music Assistant waits for a receiver-clock
-                            // projection before every PTP start, including solo.
-                            // A third-party receiver can seat the render timeline only
-                            // after its full ~2.3 s servo window; Apple may use the
-                            // measured fast-seat path after the third exchange.
-                            let clock_projection_ms = if sender.uses_ptp_timing() {
-                                let deadline = std::time::Instant::now()
-                                    + Duration::from_millis(AIRPLAY_CLOCK_READY_TIMEOUT_MS);
-                                loop {
-                                    if let Some(delay) =
-                                        sender.ptp_clock_ready_delay_ms(apple_model)
-                                    {
-                                        break Some(delay);
+                            let requested_start_ntp = now_ntp
+                                .saturating_add(ms_to_ntp(effective_start_delay_ms));
+
+                            // MSA's START ack is authoritative. A solo member is
+                            // never STARTed a second time: if the receiver moves the
+                            // instant forward, adopt that committed instant exactly.
+                            let committed_start_ntp = match sender.arm_cold_start_verified(
+                                requested_start_ntp,
+                                latency_max,
+                                lead_frames,
+                                rtp_offset,
+                                apple_model,
+                            ) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(format!("cold START failed: {error:?}"));
                                     }
-                                    if std::time::Instant::now() >= deadline {
-                                        break None;
-                                    }
-                                    thread::sleep(Duration::from_millis(10));
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
                                 }
-                            } else {
-                                None
                             };
-                            let readiness_lead_ms = clock_projection_ms
-                                .map(|delay| delay.saturating_add(AIRPLAY_CLOCK_READY_LEAD_MS))
-                                .unwrap_or(0);
-                            let effective_start_delay_ms =
-                                cold_start_delay_ms.max(readiness_lead_ms);
+                            let correction_ms = ntp_delta_ms(
+                                committed_start_ntp.saturating_sub(requested_start_ntp),
+                            );
+
+                            cold_armed = true;
+                            startup_started = Some(std::time::Instant::now());
                             if let Ok(mut events) = startup_events_thread.lock() {
                                 events.push(match clock_projection_ms {
                                     Some(delay) => format!(
-                                        "Startup: receiver clock projection={} ms · START lead={} ms.",
+                                        "Startup: receiver clock projection={} ms · requested START lead={} ms.",
                                         delay, effective_start_delay_ms
                                     ),
                                     None if sender.uses_ptp_timing() => format!(
@@ -539,41 +575,20 @@ impl WindowsAudioWorker {
                                         AIRPLAY_CLOCK_READY_TIMEOUT_MS, effective_start_delay_ms
                                     ),
                                     None => format!(
-                                        "Startup: NTP timing · START lead={} ms.",
+                                        "Startup: NTP timing · requested START lead={} ms.",
                                         effective_start_delay_ms
                                     ),
                                 });
-                            }
-                            let now_ntp = match system_time_to_ntp(SystemTime::now()) {
-                                Ok(value) => value,
-                                Err(error) => {
-                                    if let Ok(mut slot) = last_error_thread.lock() {
-                                        *slot = Some(format!("NTP clock conversion failed: {error:?}"));
-                                    }
-                                    running_thread.store(false, Ordering::SeqCst);
-                                    return;
+                                if correction_ms > 0 {
+                                    events.push(format!(
+                                        "Startup: solo START corrected forward by {} ms; committed instant adopted without re-START.",
+                                        correction_ms
+                                    ));
                                 }
-                            };
-                            let start_ntp = now_ntp
-                                .saturating_add(ms_to_ntp(effective_start_delay_ms));
-                            if let Err(error) = sender.arm_cold_start(
-                                start_ntp,
-                                latency_max,
-                                lead_frames,
-                                rtp_offset,
-                            ) {
-                                if let Ok(mut slot) = last_error_thread.lock() {
-                                    *slot = Some(format!("cold START failed: {error:?}"));
-                                }
-                                running_thread.store(false, Ordering::SeqCst);
-                                return;
-                            }
-                            cold_armed = true;
-                            startup_started = Some(std::time::Instant::now());
-                            if let Ok(mut events) = startup_events_thread.lock() {
                                 events.push(format!(
-                                    "Startup: cold START armed · delay={} ms · lead_frames={} · pending_bytes={}.",
+                                    "Startup: cold START armed · requested_delay={} ms · committed_correction={} ms · lead_frames={} · pending_bytes={}.",
                                     effective_start_delay_ms,
+                                    correction_ms,
                                     lead_frames,
                                     chunker.pending_bytes()
                                 ));
@@ -883,6 +898,10 @@ impl WindowsAudioWorker {
 
 fn ms_to_ntp(ms: u64) -> u64 {
     ((ms as u128) << 32).div_ceil(1000) as u64
+}
+
+fn ntp_delta_ms(delta: u64) -> u64 {
+    (((delta as u128) * 1000) >> 32) as u64
 }
 
 fn ptp_probe_summary(sender: &RealtimeMediaSender) -> String {
