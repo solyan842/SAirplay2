@@ -469,10 +469,14 @@ impl NativeSession {
         // Preserve the source clock-readiness floor; only the absolute START
         // instant is deferred until PCM is actually buffered.
         let mut cold_start_delay_ms = 250u64;
+        let mut clock_ready_at_ntp = None;
         if let Some(clock) = ptp_clock.as_ref() {
             if let Some(exchange) = clock.exchange() {
                 let readiness = clock_ready_delay_ms(exchange, config.apple_model);
                 cold_start_delay_ms = cold_start_delay_ms.max(readiness);
+                if let Ok(now_ntp) = system_time_to_ntp(SystemTime::now()) {
+                    clock_ready_at_ntp = Some(now_ntp.saturating_add(ms_to_ntp(readiness)));
+                }
             }
         }
 

@@ -1482,6 +1482,16 @@ mod mixed_format_tests {
     }
 
     #[test]
+    fn msa_clock_readiness_floor_can_extend_group_lead() {
+        let now = 10u64 << 32;
+        let normal = now.saturating_add(ms_to_ntp(AIRPLAY_COLD_GROUP_START_LEAD_MS));
+        let projected = now
+            .saturating_add(ms_to_ntp(2_300))
+            .saturating_add(ms_to_ntp(AIRPLAY_CLOCK_READY_LEAD_MS));
+        assert!(projected > normal);
+    }
+
+    #[test]
     fn late_join_ring_uses_msa_floor_and_hard_cap() {
         let format = Ap2AudioFormat::ALAC_44100_16_STEREO;
         let packet_bytes = 352 * format.input_bytes_per_frame();
