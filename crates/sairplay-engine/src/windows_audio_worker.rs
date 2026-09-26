@@ -40,7 +40,6 @@ pub struct WindowsAudioWorker {
     last_error: Arc<Mutex<Option<String>>>,
     discontinuities: Arc<AtomicU64>,
     last_discontinuity_frame: Arc<AtomicU64>,
-    first_non_silent_frame: Arc<AtomicU64>,
     startup_events: Arc<Mutex<Vec<String>>>,
 }
 
@@ -64,8 +63,6 @@ impl WindowsAudioWorker {
         let discontinuities_thread = Arc::clone(&discontinuities);
         let last_discontinuity_frame = Arc::new(AtomicU64::new(u64::MAX));
         let last_discontinuity_frame_thread = Arc::clone(&last_discontinuity_frame);
-        let first_non_silent_frame = Arc::new(AtomicU64::new(u64::MAX));
-        let first_non_silent_frame_thread = Arc::clone(&first_non_silent_frame);
         let startup_events = Arc::new(Mutex::new(Vec::<String>::new()));
         let startup_events_thread = Arc::clone(&startup_events);
 
@@ -114,15 +111,6 @@ impl WindowsAudioWorker {
                                     report.discontinuities, cumulative
                                 ));
                             }
-                        }
-                        if let Some(offset) = report.first_non_silent_frame_offset {
-                            let absolute = captured_frames_total.saturating_add(offset);
-                            let _ = first_non_silent_frame_thread.compare_exchange(
-                                u64::MAX,
-                                absolute,
-                                Ordering::SeqCst,
-                                Ordering::SeqCst,
-                            );
                         }
                         captured_frames_total =
                             captured_frames_total.saturating_add(report.frames as u64);
@@ -319,7 +307,6 @@ impl WindowsAudioWorker {
                 last_error,
                 discontinuities,
                 last_discontinuity_frame,
-                first_non_silent_frame,
                 startup_events,
             }),
             Ok(Err(message)) => {
@@ -392,12 +379,6 @@ impl WindowsAudioWorker {
             let mut startup_started: Option<std::time::Instant> = None;
             let mut dry_input_since: Option<std::time::Instant> = None;
             let mut last_input_gap_recovery: Option<std::time::Instant> = None;
-            let mut nonzero_gap_started: Option<std::time::Instant> = None;
-            let mut nonzero_gap_reported = false;
-            let mut resume_packet_pending = false;
-            let mut transition_packet_diag_remaining: u32 = 0;
-            let mut transition_packet_diag_index: u32 = 0;
-            let mut transition_epoch: u64 = 0;
             let mut last_ptp_probe_alive: Option<bool> = None;
             let mut last_ptp_snapshot = std::time::Instant::now();
             let mut last_steady_diag = std::time::Instant::now();
@@ -416,8 +397,6 @@ impl WindowsAudioWorker {
                                 last_discontinuity_frame_thread.store(frame, Ordering::SeqCst);
                             }
                             if cold_armed {
-                                transition_packet_diag_remaining = 32;
-                                transition_packet_diag_index = 0;
                                 let state = sender.state();
                                 if let Ok(mut events) = startup_events_thread.lock() {
                                     events.push(format!(
@@ -432,15 +411,6 @@ impl WindowsAudioWorker {
                                     ));
                                 }
                             }
-                        }
-                        if let Some(offset) = report.first_non_silent_frame_offset {
-                            let absolute = captured_frames_total.saturating_add(offset);
-                            let _ = first_non_silent_frame_thread.compare_exchange(
-                                u64::MAX,
-                                absolute,
-                                Ordering::SeqCst,
-                                Ordering::SeqCst,
-                            );
                         }
                         let frames = report.frames;
                         captured_frames_total = captured_frames_total.saturating_add(frames as u64);
@@ -475,59 +445,11 @@ impl WindowsAudioWorker {
                             last_ptp_probe_alive = Some(alive);
                         }
 
-                        // Windows has no explicit player FLUSH/START command pipe.
-                        // Match MSA: digital-zero PCM is still valid PCM, not an
-                        // implicit PAUSE/FLUSH/START boundary. Only explicit session
-                        // commands or a genuinely dry input path may alter splice
-                        // state. Keep zero intervals diagnostic-only and let the PCM
-                        // continue through the normal packet/pacing path unchanged.
-                        if cold_armed {
-                            if report.first_nonzero_frame_offset.is_some() {
-                                if let Some(gap_started) = nonzero_gap_started.take() {
-                                    let gap_ms = gap_started.elapsed().as_millis();
-                                    if gap_ms >= 100 {
-                                        if let Ok(mut events) = startup_events_thread.lock() {
-                                            events.push(format!(
-                                                "Transition: nonzero PCM resumed after {} ms · wasapi_frames={} · discontinuities={} · pending_bytes={} · pad_debt={} · reanchors={}.",
-                                                gap_ms,
-                                                frames,
-                                                report.discontinuities,
-                                                chunker.pending_bytes(),
-                                                sender.splice_pad_frames(),
-                                                sender.timeline_reanchors()
-                                            ));
-                                        }
-                                        resume_packet_pending = true;
-                                        transition_packet_diag_remaining = 32;
-                                        transition_packet_diag_index = 0;
-                                    }
-                                }
-                                nonzero_gap_reported = false;
-                            } else {
-                                let gap_started = nonzero_gap_started
-                                    .get_or_insert_with(std::time::Instant::now);
-                                if !nonzero_gap_reported
-                                    && gap_started.elapsed() >= Duration::from_millis(250)
-                                {
-                                    transition_epoch = transition_epoch.saturating_add(1);
-                                    if let Ok(mut events) = startup_events_thread.lock() {
-                                        events.push(format!(
-                                            "Diagnostic: digital-zero PCM >=250 ms · zero_gap={} · wasapi_frames={} · pending_bytes={} · pad_debt={} · reanchors={} · timeline unchanged.",
-                                            transition_epoch,
-                                            frames,
-                                            chunker.pending_bytes(),
-                                            sender.splice_pad_frames(),
-                                            sender.timeline_reanchors()
-                                        ));
-                                    }
-                                    nonzero_gap_reported = true;
-                                }
-                            }
-                        }
-
-                        // Match pinned MSA and the group worker: PCM amplitude
-                        // never defines stream state. Digital-zero is valid PCM;
-                        // cold START waits only for one complete 352-frame packet.
+                        // Match pinned MSA: PCM amplitude is not stream state.
+                        // Digital-zero samples flow through exactly like any other
+                        // PCM; only byte availability and explicit transport/session
+                        // events influence the sender.
+                        // Cold START waits only for one complete 352-frame packet.
                         // A zero-frame WASAPI read is merely "no bytes this pass".
                         // Nothing is sent before the first complete packet.
                         if !cold_armed {
@@ -659,18 +581,14 @@ impl WindowsAudioWorker {
                                 head_delta as f64 * 1000.0 / audio_format.sample_rate as f64;
                             if let Ok(mut events) = startup_events_thread.lock() {
                                 events.push(format!(
-                                    "Diagnostic: steady timeline · frames={} · seq={} ts={} · head_delta_frames={} ({:.1} ms) · pending_bytes={} · nonzero_bytes={} · pad_debt={} · gap_ms={}.",
+                                    "Diagnostic: steady timeline · frames={} · seq={} ts={} · head_delta_frames={} ({:.1} ms) · pending_bytes={} · pad_debt={}.",
                                     frames,
                                     state.sequence,
                                     state.timestamp,
                                     head_delta,
                                     head_delta_ms,
                                     chunker.pending_bytes(),
-                                    chunker.pending_nonzero_bytes(),
-                                    sender.splice_pad_frames(),
-                                    nonzero_gap_started
-                                        .map(|started| started.elapsed().as_millis())
-                                        .unwrap_or(0)
+                                    sender.splice_pad_frames()
                                 ));
                             }
                             last_steady_diag = std::time::Instant::now();
@@ -694,7 +612,7 @@ impl WindowsAudioWorker {
                                 let startup_window = startup_started
                                     .map(|t| t.elapsed() <= Duration::from_secs(3))
                                     .unwrap_or(false);
-                                if startup_window || nonzero_gap_started.is_some() || resume_packet_pending {
+                                if startup_window {
                                     if let Ok(mut events) = startup_events_thread.lock() {
                                         events.push(format!(
                                             "{}: delivery-gap recovery added {} silence frames · total_pad={} · pending_bytes={}.",
@@ -764,9 +682,6 @@ impl WindowsAudioWorker {
                                 break;
                             }
 
-                            let head_delta_before = sender.timeline_head_delta_frames(ntp);
-                            let head_delta_before_ms =
-                                head_delta_before as f64 * 1000.0 / audio_format.sample_rate as f64;
                             let packet = chunker
                                 .pop_packet_with_silence_prefix(pad_now)
                                 .expect("required real-byte count checked");
@@ -790,45 +705,6 @@ impl WindowsAudioWorker {
                                                 pad_now
                                             ));
                                         }
-                                    }
-                                    if resume_packet_pending {
-                                        if let Ok(mut events) = startup_events_thread.lock() {
-                                            events.push(format!(
-                                                "Transition: first outbound after PCM resume · zero_gap={} · seq={} ts={} marker={} sync_sent={} audio_sent={} pad_before={} · pending_after={}.",
-                                                transition_epoch,
-                                                result.sequence_sent,
-                                                result.timestamp_sent,
-                                                result.first_marker,
-                                                result.sync_sent,
-                                                result.audio_delivered,
-                                                pad_now,
-                                                chunker.pending_bytes()
-                                            ));
-                                        }
-                                        resume_packet_pending = false;
-                                    }
-                                    if transition_packet_diag_remaining > 0 {
-                                        transition_packet_diag_index =
-                                            transition_packet_diag_index.saturating_add(1);
-                                        if let Ok(mut events) = startup_events_thread.lock() {
-                                            events.push(format!(
-                                                "Transition: packet diag · format={}-bit/{}Hz · zero_gap={} · packet={}/32 · seq={} ts={} · alac={} B · wire={} B · head_delta_before={} ({:.2} ms) · wasapi_discontinuities={} · pad_before={} · pending_after={}.",
-                                                audio_format.bit_depth,
-                                                audio_format.sample_rate,
-                                                transition_epoch,
-                                                transition_packet_diag_index,
-                                                result.sequence_sent,
-                                                result.timestamp_sent,
-                                                result.alac_payload_len,
-                                                result.wire_packet_len,
-                                                head_delta_before,
-                                                head_delta_before_ms,
-                                                discontinuities_thread.load(Ordering::SeqCst),
-                                                pad_now,
-                                                chunker.pending_bytes()
-                                            ));
-                                        }
-                                        transition_packet_diag_remaining -= 1;
                                     }
                                     if startup_started.map(|t| t.elapsed() <= Duration::from_secs(3)).unwrap_or(false)
                                         && (startup_packet_index <= 10 || result.sync_sent || !result.audio_delivered)
@@ -915,13 +791,6 @@ impl WindowsAudioWorker {
 
     pub fn last_discontinuity_frame(&self) -> Option<u64> {
         match self.last_discontinuity_frame.load(Ordering::SeqCst) {
-            u64::MAX => None,
-            value => Some(value),
-        }
-    }
-
-    pub fn first_non_silent_frame(&self) -> Option<u64> {
-        match self.first_non_silent_frame.load(Ordering::SeqCst) {
             u64::MAX => None,
             value => Some(value),
         }
