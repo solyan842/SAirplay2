@@ -273,15 +273,40 @@ impl RealtimeMediaSender {
     /// Returning it explicitly gives MultiRoom the same "commit then remap"
     /// contract as Music Assistant and keeps that contract correct if native
     /// commit correction is added later.
+    /// Resolve the same feasibility floor as pinned cliairplay before START.
+    ///
+    /// A requested instant must clear both the moving 250 ms command floor and
+    /// any receiver-clock readiness projection.  When it does not, cliairplay
+    /// corrects it to floor + another 250 ms so a retry does not chase the
+    /// moving wall clock.
+    pub fn resolve_start_ntp(&self, requested_ntp: u64, apple_model: bool) -> u64 {
+        const MIN_WARM_LEAD_MS: u64 = 250;
+        let now_ntp = unix_ns_to_ntp(system_unix_ns());
+        let mut floor_ntp = now_ntp.saturating_add(ms_to_ntp(MIN_WARM_LEAD_MS));
+
+        if let Some(exchange) = self.ptp_probe_exchange() {
+            let ready_delay_ms = clock_ready_delay_ms(exchange, apple_model);
+            floor_ntp = floor_ntp.max(now_ntp.saturating_add(ms_to_ntp(ready_delay_ms)));
+        }
+
+        if requested_ntp >= floor_ntp {
+            requested_ntp
+        } else {
+            floor_ntp.saturating_add(ms_to_ntp(MIN_WARM_LEAD_MS))
+        }
+    }
+
     pub fn arm_cold_start_verified(
         &mut self,
         start_ntp: u64,
         latency_max: Option<u32>,
         lead_frames: u32,
         rtp_offset: u32,
+        apple_model: bool,
     ) -> Result<u64, MediaSendError> {
-        self.arm_cold_start(start_ntp, latency_max, lead_frames, rtp_offset)?;
-        Ok(start_ntp)
+        let committed_ntp = self.resolve_start_ntp(start_ntp, apple_model);
+        self.arm_cold_start(committed_ntp, latency_max, lead_frames, rtp_offset)?;
+        Ok(committed_ntp)
     }
 
     fn splice_pad_to_lead(
@@ -625,6 +650,31 @@ fn frames_to_ns(frames: u32, sample_rate: u64) -> u64 {
 
 fn ms_to_frames(ms: u64, sample_rate: u64) -> u64 {
     ((ms as u128 * sample_rate as u128) / 1_000u128) as u64
+}
+
+fn ms_to_ntp(ms: u64) -> u64 {
+    ((ms as u128) << 32).saturating_div(1_000) as u64
+}
+
+fn unix_ns_to_ntp(unix_ns: u64) -> u64 {
+    const NTP_UNIX_EPOCH_DELTA: u64 = 2_208_988_800;
+    let sec = unix_ns / 1_000_000_000;
+    let ns = unix_ns % 1_000_000_000;
+    (sec.saturating_add(NTP_UNIX_EPOCH_DELTA) << 32)
+        .saturating_add(((ns as u128) << 32).saturating_div(1_000_000_000) as u64)
+}
+
+fn clock_ready_delay_ms(exchange: PtpExchange, apple_model: bool) -> u64 {
+    const CLOCK_LOCK_MS: u64 = 2_300;
+    const CLOCK_SETTLE_MS: u64 = 250;
+    const CLOCK_SEAT_EXCHANGES: u32 = 3;
+
+    let full = CLOCK_LOCK_MS.saturating_sub(exchange.first_ms);
+    if apple_model && exchange.count >= CLOCK_SEAT_EXCHANGES {
+        full.min(CLOCK_SETTLE_MS.saturating_sub(exchange.third_ms))
+    } else {
+        full
+    }
 }
 
 fn ntp_to_frames(ntp: u64, sample_rate: u64) -> u64 {
