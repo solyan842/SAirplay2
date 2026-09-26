@@ -464,6 +464,14 @@ impl RealtimeMediaSender {
         exchange
     }
 
+    /// Remaining receiver-clock readiness delay derived from the current PTP
+    /// probe streak. Mirrors pinned airplay-cli clock_ready_delay_ms() and is
+    /// used by the Windows solo caller before it commits a cold START.
+    pub fn ptp_clock_ready_delay_ms(&mut self, apple_model: bool) -> Option<u64> {
+        self.observe_ptp_probe_exchange()
+            .map(|exchange| clock_ready_delay_ms(exchange, apple_model))
+    }
+
     /// Return true only after a PTP receiver has spent a complete stall window
     /// without any fresh probe evidence. NTP sessions are never clock-stalled.
     pub fn ptp_probe_stalled(&self, stall_after: Duration) -> bool {
