@@ -1,153 +1,202 @@
 # SAirplay2 architecture
 
-SAirplay2 is a clean Windows AirPlay sender rewrite.
+SAirplay2 is a Windows AirPlay sender whose native AirPlay 2 behavior is ported
+from the pinned Music Assistant references rather than invented locally.
 
-The behavior reference is music-assistant/airplay-cli DESIGN.md and the current
-Music Assistant AirPlay provider. Source behavior wins over assumptions in this
-repository.
+Primary references:
 
-## Layering
+- `music-assistant/airplay-cli@431c5c582eef9307c4e39c50a0ea65e970bc1128`
+- Music Assistant AirPlay provider (pinned project snapshot plus current stable
+  cross-check)
+- `philippe44/libraop@dadcfcaa26d988cdd3e3501ddf8286c224f1b494`
+  for the legacy RAOP transport
 
-1. mDNS discovery and service correlation
-2. TXT capability parsing and route resolution
-3. Route-specific connection preflight
-4. Windows audio capture and normalization
-5. One persistent PCM input/ring for the session
-6. Route-specific transport
-   - RAOP
-   - AirPlay 2 RAOP-compatible
-   - AirPlay 2 native
-7. GUI adapter
+Source behavior wins over assumptions. Windows substitutions are allowed below
+the protocol boundary, but may not change RTSP/HAP/PTP/RTP lifecycle semantics.
 
-## Discovery contract
+## Layers
 
-- Browse both _airplay._tcp.local. and _raop._tcp.local.
-- _airplay is the primary capability source.
-- _raop is retained as the legacy/fallback endpoint.
-- The two advertisements are correlated into one logical receiver.
-- Route selection is driven by TXT feature/status bits, credentials and
-  password state, not by product-name guessing.
+1. mDNS discovery and AirPlay/RAOP service correlation.
+2. TXT + `/info` capability parsing.
+3. Route and stream-lane selection.
+4. HAP pairing / encrypted RTSP control.
+5. NTP or PTP timing.
+6. Windows WASAPI loopback capture and PCM normalization.
+7. Route-specific media transport.
+8. Single / Stereo Pair / MultiRoom lifecycle.
+9. GUI adapter.
 
-Relevant TXT rules mirrored from the reference:
+## Discovery and route contract
 
-- feature 38 or 48: AirPlay 2
-- feature 46 or 48: pairing-capable
-- feature 41: PTP-capable
-- feature 40: buffered-audio-capable
-- flags 0x8: PIN required
-- flags 0x200: legacy pairing
-- pw=true: password advertised
+- Browse both `_airplay._tcp.local.` and `_raop._tcp.local.`.
+- AirPlay TXT is the primary capability source; RAOP remains the legacy/fallback
+  endpoint.
+- Route selection uses capability/status/auth data, not product-name guessing.
+- Stored HAP credentials use native pair-verify.
+- Eligible unpaired receivers use transient HAP pairing.
+- Ineligible native sessions fall back to AirPlay-compatible/RAOP where the
+  advertised capabilities allow it.
 
-## Route contract
+Important feature meanings used by the active resolver include AirPlay 2,
+pairing, PTP and buffered-audio support. Stream format capability is refined
+with `/info`.
 
-Automatic route decision:
+## Native AirPlay 2 connect order
 
-1. No AirPlay 2 feature -> RAOP.
-2. Stored HAP credentials -> AP2 native pair-verify.
-3. Pairing-capable, no PIN, no legacy flag, and password requirements satisfied
-   -> AP2 native transient pairing.
-4. Otherwise -> AP2 RAOP-compatible fallback.
+The active native path preserves the source ordering:
 
-The user-facing GUI may later expose an advanced escape hatch, but automatic
-selection remains the default.
+1. TCP connect.
+2. plaintext `GET /info`.
+3. HAP pair-verify or transient pair-setup.
+4. timing setup (PTP when available, NTP fallback when required).
+5. encrypted session `SETUP`.
+6. reverse event connection.
+7. `RECORD`.
+8. media stream `SETUP`.
+9. PTP `SETPEERS` where applicable.
+10. feedback / media / retransmit workers.
 
-## Native AP2 connect order
+`RECORD` before stream `SETUP` is intentional.
 
-The native connection sequence must preserve reference ordering:
+## Audio formats
 
-1. TCP connect to the AirPlay RTSP port.
-2. Plaintext GET /info.
-3. HAP pairing:
-   - stored credentials -> pair-verify (HKP:3);
-   - otherwise transient pair-setup (HKP:4).
-4. Timing setup:
-   - PTP when selected/available;
-   - NTP fallback where required.
-5. Encrypted session SETUP with binary plist.
-6. Open the reverse event TCP connection returned by session SETUP.
-7. RECORD on the session URL.
-8. Stream SETUP.
+The native engine supports the Music Assistant target set used by this project:
 
-RECORD-before-stream-SETUP is intentional and must not be reordered.
+- ALAC 16-bit / 44.1 kHz
+- ALAC 24-bit / 44.1 kHz
+- ALAC 16-bit / 48 kHz
+- ALAC 24-bit / 48 kHz
 
-## Audio target for first stable build
+The wire packetization invariant remains **352 PCM frames per packet**. 24-bit
+capture uses an s32le Windows carrier, packed to s24 before ALAC encoding.
 
-- ALAC
-- 44.1 kHz
-- 16-bit
-- stereo
-- 352 frames per chunk
-- native realtime stream type 96 first
+No 96/192 kHz target is in scope.
 
-24-bit / 48 kHz and buffered type 103 remain out of scope until the 16/44.1
-realtime path is hardware-stable.
+## Realtime type 96 and buffered type 103
 
-## Persistent input contract
+The two media lanes are explicit and must not be conflated.
 
-Track/source lifetime is not connection lifetime.
+Realtime type 96:
 
-The capture/PCM producer remains attached to one session. A next-track or seek
-does not rebuild pairing, crypto, timing, sockets or the session.
+- encrypted RTP over UDP;
+- periodic sync/anchor packets;
+- retransmit ring and D6 responses;
+- 352 frames per packet;
+- pacing/splice window, normally capped at 600 ms.
 
-A warm FLUSH discards stale queued PCM so the next source cannot leak old
-samples into the new track.
+Buffered type 103:
 
-## Warm-boundary behavior differs by route
+- encrypted framed RTP over TCP;
+- PTP `SETRATEANCHORTIME`;
+- no realtime retransmit path;
+- `FLUSHBUFFERED` for buffered warm-boundary semantics.
 
-### RAOP / AP2 RAOP-compatible
+Automatic buffered eligibility follows the upstream policy: native AirPlay 2,
+PTP, `SupportsBufferedAudio`, non-Apple, and not in the measured-hostile deny
+set. Upstream currently has no deny prefixes. SAirplay2 adds one documented
+hardware exception: model prefix `Mu-so Qb`, whose type-103 setup succeeded but
+rendering was physically unstable; it remains native AirPlay 2 and falls back
+only the media lane to realtime type 96.
 
-The receiver uses the classic RAOP warm path, including RTSP FLUSH and a fresh
-start mapping as required by that protocol.
+## PTP and START contract
 
-### Native AP2 splice timeline
+PTP receivers use the shared sender timing engine. Key invariants:
 
-The default native realtime path keeps one frozen RTP-to-wall-clock anchor line
-for the session. Warm seek/next/pause/resume/starvation recovery must not
-discard the receiver buffer or reset sequence/timestamp state.
+- UDP 319/320;
+- Sync / Follow_Up cadence about 125 ms;
+- Announce about 1 s;
+- `SETPEERS` after stream setup;
+- HomePod standalone follow-clock behavior remains source-aligned;
+- one group shares one PTP timeline.
 
-Instead:
+Cold START planning follows current Music Assistant semantics:
 
-- the input ring is flushed locally when old content must be discarded;
-- the wire remains bitstream-continuous;
-- missing/gap audio is encoded silence;
-- RTP sequence and timestamps advance through silence exactly as through music;
-- a warm START chooses the splice instant on the existing line;
-- if that instant is too close to or behind the delivery head, it is corrected
-  forward to head + minimum warm lead;
-- the gap becomes a silence-pad debt consumed on the normal packet path.
+- solo base lead: 400 ms;
+- clock-readiness wait: up to 2500 ms;
+- readiness projection margin: +500 ms;
+- cold group floor: 2500 ms;
+- group convergence margin: 150 ms;
+- group convergence: at most four rounds.
 
-Classic FLUSH/re-anchor remains a receiver-specific fallback path, not the
-default native behavior.
+A receiver's committed START instant is authoritative. A solo receiver adopts a
+forward correction without a second START. A group converges members onto the
+largest verified committed instant.
 
-## Starvation and EOF
+## PCM, starvation and EOF
 
-Starvation is not EOF.
+PCM amplitude is **not** stream state.
 
-Temporary absence of PCM keeps the native realtime lane fed with encoded
-silence. The session stays armed and the packet clock continues.
+- digital-zero PCM is valid PCM;
+- a temporary zero-frame WASAPI drain is starvation/no input for that poll;
+- Windows loopback has no EOF sentinel, so `frames == 0` must never be promoted
+  to synthetic EOF;
+- starvation recovery preserves sequence, timestamp and the frozen timeline and
+  restores delivery headroom with silence-pad debt;
+- a true session stop/closed input is handled by the explicit lifecycle.
 
-EOF means the whole persistent input has closed, not that one track ended.
+Amplitude/nonzero probes are intentionally not part of the active sender state.
 
-## Hard failure contract
+## Retransmit and feedback
 
-Encode/allocation/encryption/socket/control/session failures are terminal.
-A local UDP backpressure/drop can advance the timeline as a bounded transient,
-but a protocol failure must not masquerade as EOF or silently rebuild the
-session behind the user's back.
+Realtime sessions retain 512 exact encrypted wire packets. Control-port
+retransmit requests are answered with D6-wrapped retained RTP when available.
 
-## Initial acceptance gates
+Feedback uses one serialized encrypted RTSP control channel:
 
-Before real playback is considered stable:
+- cadence about 2 s;
+- total timeout budget 2 s;
+- three consecutive misses before terminal feedback failure.
 
-- cold start with music already playing;
-- cold start while source is silent, then music starts;
-- silence 15 s / 30 s / 60 s then resume;
-- repeated next track;
-- WAV -> FLAC -> WAV;
-- offline player -> browser video -> offline player;
-- endpoint format/sample-rate transition;
-- AirPort RAOP route;
-- HomePod native AP2 route;
-- 30 minute continuous playback.
+For a solo native session, hard peer/control close is terminal. In a group, a
+failed member is isolated while healthy members continue and bounded recovery
+may rejoin it.
 
-Any failure blocks stable release.
+## Stereo Pair and MultiRoom
+
+Both use one Windows capture source and one shared group timeline, but they are
+different user-facing session types.
+
+Stereo Pair:
+
+- exactly two intended members;
+- shared START and PTP timeline;
+- late join is used for automatic member recovery, not arbitrary user
+  membership changes.
+
+MultiRoom:
+
+- two or more initial members;
+- live add/remove is allowed;
+- mixed realtime/buffered lanes may coexist when policy permits;
+- common sample rate is planned at group level while per-member bit depth may be
+  adapted;
+- late join maps retained PCM ring data to the shared live head with prime/skip
+  logic.
+
+Failed-member recovery uses bounded backoff: 5 / 15 / 30 / 60 / 120 seconds.
+Explicit Stop, removal or new playback cancels pending recovery.
+
+## Legacy RAOP
+
+Legacy RAOP and AirPlay-compatible legacy routes use the pinned source-built
+libraop helper. SAirplay2 captures one 16-bit / 44.1 kHz PCM source and fans it
+to helper processes. Runtime volume support is carried by the checked-in helper
+overlay and verified during CI.
+
+Legacy behavior is kept separate from native AirPlay 2 protocol code.
+
+## Stability rule
+
+Do not change the following solely to chase a symptom:
+
+- 352 frames per packet;
+- PTP cadence/identity behavior;
+- feedback cadence/timeout;
+- Apple automatic buffered exclusion;
+- shared group PTP;
+- retransmit packet geometry;
+- START lead/readiness/convergence policy;
+- digital-zero/EOF semantics.
+
+Any change to those requires either a fresh hardware failure with diagnostic
+evidence or a confirmed discrepancy against the pinned/current upstream source.
