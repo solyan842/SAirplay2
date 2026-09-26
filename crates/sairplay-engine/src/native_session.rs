@@ -693,6 +693,7 @@ impl NativeSession {
                 self.dacp_id.clone(),
                 self.active_remote.clone(),
                 self.cold_start_delay_ms,
+                self.apple_model,
             )
         } else {
             let sender = self.sender.take().ok_or_else(|| {
