@@ -37,6 +37,8 @@ pub struct NativeSessionConfig {
     pub lead_frames: u32,
     pub supports_ptp: bool,
     pub supports_buffered_audio: bool,
+    /// Model-specific measured-hostile deny-list for buffered type 103.
+    pub buffered_denied: bool,
     /// Auto-select type 103 only when the caller has enabled this routing
     /// surface. Groups leave it off until mixed type96/type103 handoff lands.
     pub buffered_auto_enabled: bool,
@@ -65,6 +67,7 @@ impl NativeSessionConfig {
             lead_frames: 11_025,
             supports_ptp: false,
             supports_buffered_audio: false,
+            buffered_denied: false,
             buffered_auto_enabled: false,
             follow_receiver_clock: false,
             apple_model: false,
@@ -183,6 +186,7 @@ impl NativeSession {
                     supports_airplay2: true,
                     supports_ptp: config.supports_ptp,
                     supports_buffered_audio: config.supports_buffered_audio,
+                    buffered_denied: config.buffered_denied,
                     is_apple_model: config.apple_model,
                     ..Default::default()
                 },
