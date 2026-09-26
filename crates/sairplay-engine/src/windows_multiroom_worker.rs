@@ -19,6 +19,7 @@ pub const AIRPLAY_COLD_GROUP_START_LEAD_MS: u64 = 2_500;
 pub const AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS: u64 = 2_500;
 pub const AIRPLAY_CLOCK_READY_TIMEOUT_MS: u64 = 2_500;
 pub const AIRPLAY_CLOCK_READY_LEAD_MS: u64 = 500;
+pub const AIRPLAY_CLOCK_STALL_MS: u64 = 5_000;
 pub const AIRPLAY_LATE_JOIN_RING_MIN_SECONDS: f64 = 12.0;
 pub const AIRPLAY_LATE_JOIN_RING_MARGIN_SECONDS: f64 = 2.0;
 pub const AIRPLAY_LATE_JOIN_RING_MAX_BYTES: usize = 6 * 1024 * 1024;
@@ -85,6 +86,9 @@ struct PendingJoin {
     target: WindowsAudioTarget,
     queued_packets: VecDeque<Vec<u8>>,
     anchor_packet: u64,
+    skip_packets: u64,
+    ready_wait_started: Instant,
+    armed: bool,
     reply: Sender<Result<(), String>>,
 }
 
@@ -266,9 +270,21 @@ impl WindowsMultiroomAudioWorker {
                         &mut targets,
                         &mut pending_joins,
                         cold_armed,
+                        &active_members_thread,
+                        &startup_events_thread,
+                        source_format,
+                    );
+
+                    // MSA waits for a late joiner's receiver-clock result outside
+                    // the live-session lock. Do the native equivalent here:
+                    // existing members keep flowing while an unarmed joiner
+                    // waits for projection/timeout, and only then is its exact
+                    // group-timeline instant committed.
+                    prepare_pending_joins(
+                        &mut pending_joins,
+                        &targets,
                         group_start_ntp,
                         packet_index,
-                        &active_members_thread,
                         &startup_events_thread,
                         source_format,
                         &late_join_ring,
@@ -898,6 +914,19 @@ impl WindowsMultiroomAudioWorker {
                         // attach it to normal fan-out on the next packet.
                         let mut join_index = 0usize;
                         while join_index < pending_joins.len() {
+                            if !pending_joins[join_index].armed {
+                                join_index += 1;
+                                continue;
+                            }
+                            // A committed join instant may lie ahead of the
+                            // current write head. Match MSA's live-feed skip:
+                            // discard whole shared PCM packets until the source
+                            // packet mapped to that instant reaches the head.
+                            if pending_joins[join_index].skip_packets > 0 {
+                                pending_joins[join_index].skip_packets -= 1;
+                                join_index += 1;
+                                continue;
+                            }
                             pending_joins[join_index]
                                 .queued_packets
                                 .push_back(packet.clone());
@@ -1156,16 +1185,13 @@ fn handle_group_commands(
     targets: &mut Vec<WindowsAudioTarget>,
     pending_joins: &mut Vec<PendingJoin>,
     cold_armed: bool,
-    group_start_ntp: Option<u64>,
-    packet_index: u64,
     active_members: &AtomicU64,
     startup_events: &Mutex<Vec<String>>,
     source_format: Ap2AudioFormat,
-    late_join_ring: &VecDeque<(u64, Vec<u8>)>,
 ) {
     while let Ok(command) = command_rx.try_recv() {
         match command {
-            GroupAudioCommand::Add { mut target, reply } => {
+            GroupAudioCommand::Add { target, reply } => {
                 let target_format = target.sender.audio_format();
                 if target_format.sample_rate != source_format.sample_rate
                     || (target_format.bit_depth > source_format.bit_depth)
@@ -1202,112 +1228,21 @@ fn handle_group_commands(
                     continue;
                 }
 
-                let Some(base_start) = group_start_ntp else {
-                    let _ = reply.send(Err("shared group timeline is unavailable".into()));
-                    continue;
-                };
-                let now_ntp = match system_time_to_ntp(SystemTime::now()) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        let _ = reply.send(Err(format!(
-                            "late-join clock conversion failed: {error:?}"
-                        )));
-                        continue;
-                    }
-                };
-
-                // Match upstream late-join semantics: map the joiner's first
-                // sample onto the group's effective timeline, including any
-                // accumulated starvation/re-anchor shift of the reference member.
-                let shift_frames = targets
-                    .first()
-                    .map(|item| item.sender.reanchor_shifted_frames())
-                    .unwrap_or(0);
-                let sample_rate = source_format.sample_rate;
-                let effective_start =
-                    base_start.saturating_add(frames_to_ntp(shift_frames, sample_rate));
-                let join_floor =
-                    now_ntp.saturating_add(ms_to_ntp(AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS));
-                let required_frames = ntp_delta_to_frames_ceil(
-                    join_floor.saturating_sub(effective_start),
-                    sample_rate,
-                );
-                let required_packet = required_frames.div_ceil(352);
-                let oldest_ring_packet = late_join_ring
-                    .front()
-                    .map(|(index, _)| *index)
-                    .unwrap_or(packet_index);
-                // MSA moves the anchor later only when the requested content
-                // predates the retained ring. Otherwise prime from history and
-                // keep the join floor instead of delaying all the way to the
-                // current write head.
-                let anchor_packet = required_packet.max(oldest_ring_packet).min(packet_index);
-                let start_ntp = effective_start.saturating_add(frames_to_ntp(
-                    anchor_packet.saturating_mul(352),
-                    sample_rate,
-                ));
-                let queued_packets = late_join_ring
-                    .iter()
-                    .filter(|(index, _)| *index >= anchor_packet)
-                    .map(|(_, packet)| packet.clone())
-                    .collect::<VecDeque<_>>();
-
-                match target.sender.arm_cold_start(
-                    start_ntp,
-                    target.latency_max,
-                    target.lead_frames,
-                    target.rtp_offset,
-                ) {
-                    Ok(()) => {
-                        let rtp_timestamp = target.sender.state().timestamp;
-                        match target.metadata.send("SAirplay2", "", "", rtp_timestamp) {
-                            Ok(result) if (200..300).contains(&result.status) => {
-                                if let Ok(mut events) = startup_events.lock() {
-                                    events.push(format!(
-                                        "{}: late-join DMAP metadata {} bytes · RTSP {}.",
-                                        target.name, result.bytes, result.status
-                                    ));
-                                }
-                            }
-                            Ok(result) => {
-                                if let Ok(mut events) = startup_events.lock() {
-                                    events.push(format!(
-                                        "{}: late-join DMAP metadata rejected · RTSP {}.",
-                                        target.name, result.status
-                                    ));
-                                }
-                            }
-                            Err(error) => {
-                                if let Ok(mut events) = startup_events.lock() {
-                                    events.push(format!(
-                                        "{}: late-join DMAP metadata failed: {error:?}.",
-                                        target.name
-                                    ));
-                                }
-                            }
-                        }
-                        if let Ok(mut events) = startup_events.lock() {
-                            events.push(format!(
-                                "{}: late join armed at packet #{} with {} queued prime packet(s) and {} ms minimum headroom.",
-                                target.name,
-                                anchor_packet,
-                                queued_packets.len(),
-                                AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS
-                            ));
-                        }
-                        pending_joins.push(PendingJoin {
-                            target,
-                            queued_packets,
-                            anchor_packet,
-                            reply,
-                        });
-                    }
-                    Err(error) => {
-                        let _ = reply.send(Err(format!(
-                            "{} late-join START failed: {error:?}",
-                            target.name
-                        )));
-                    }
+                let name = target.name.clone();
+                let timing = if target.sender.uses_ptp_timing() { "PTP" } else { "NTP" };
+                pending_joins.push(PendingJoin {
+                    target,
+                    queued_packets: VecDeque::new(),
+                    anchor_packet: 0,
+                    skip_packets: 0,
+                    ready_wait_started: Instant::now(),
+                    armed: false,
+                    reply,
+                });
+                if let Ok(mut events) = startup_events.lock() {
+                    events.push(format!(
+                        "{name}: late join connected on {timing}; waiting for receiver-clock readiness before committing its group instant."
+                    ));
                 }
             }
             GroupAudioCommand::Remove { name, reply } => {
@@ -1336,6 +1271,223 @@ fn handle_group_commands(
             }
         }
     }
+}
+
+fn prepare_pending_joins(
+    pending_joins: &mut Vec<PendingJoin>,
+    targets: &[WindowsAudioTarget],
+    group_start_ntp: Option<u64>,
+    packet_index: u64,
+    startup_events: &Mutex<Vec<String>>,
+    source_format: Ap2AudioFormat,
+    late_join_ring: &VecDeque<(u64, Vec<u8>)>,
+) {
+    let Some(base_start) = group_start_ntp else {
+        return;
+    };
+
+    let shift_frames = targets
+        .first()
+        .map(|item| item.sender.reanchor_shifted_frames())
+        .unwrap_or(0);
+    let sample_rate = source_format.sample_rate;
+    let effective_start =
+        base_start.saturating_add(frames_to_ntp(shift_frames, sample_rate));
+    let oldest_ring_packet = late_join_ring
+        .front()
+        .map(|(index, _)| *index)
+        .unwrap_or(packet_index);
+
+    let mut index = 0usize;
+    while index < pending_joins.len() {
+        if pending_joins[index].armed {
+            index += 1;
+            continue;
+        }
+
+        let uses_ptp = pending_joins[index].target.sender.uses_ptp_timing();
+        let mut readiness = "not-applicable";
+        let mut projection_ms = None;
+
+        if uses_ptp {
+            let exchange = pending_joins[index]
+                .target
+                .sender
+                .observe_ptp_probe_exchange();
+            if let Some(exchange) = exchange {
+                projection_ms = Some(clock_ready_delay_ms(
+                    exchange,
+                    pending_joins[index].target.apple_model,
+                ));
+                readiness = "projected";
+            } else if pending_joins[index]
+                .target
+                .sender
+                .ptp_probe_stalled(Duration::from_millis(AIRPLAY_CLOCK_STALL_MS))
+            {
+                let pending = pending_joins.remove(index);
+                let message = format!(
+                    "{}: late join refused because its receiver did not answer the shared PTP clock within {} ms",
+                    pending.target.name, AIRPLAY_CLOCK_STALL_MS
+                );
+                let _ = pending.reply.send(Err(message.clone()));
+                if let Ok(mut events) = startup_events.lock() {
+                    events.push(message);
+                }
+                continue;
+            } else if pending_joins[index].ready_wait_started.elapsed()
+                < Duration::from_millis(AIRPLAY_CLOCK_READY_TIMEOUT_MS)
+            {
+                index += 1;
+                continue;
+            } else {
+                // Same as MSA ClockReadiness.UNREPORTED: a planning timeout is
+                // not a stall verdict, so anchor on the join floor alone.
+                readiness = "unreported";
+            }
+        }
+
+        let now_ntp = match system_time_to_ntp(SystemTime::now()) {
+            Ok(value) => value,
+            Err(error) => {
+                let pending = pending_joins.remove(index);
+                let message = format!(
+                    "{}: late-join clock conversion failed: {error:?}",
+                    pending.target.name
+                );
+                let _ = pending.reply.send(Err(message.clone()));
+                if let Ok(mut events) = startup_events.lock() {
+                    events.push(message);
+                }
+                continue;
+            }
+        };
+
+        let readiness_lead_ms = projection_ms
+            .map(|delay| delay.saturating_add(AIRPLAY_CLOCK_READY_LEAD_MS))
+            .unwrap_or(0);
+        let floor_ms = AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS.max(readiness_lead_ms);
+        let floor_ntp = now_ntp.saturating_add(ms_to_ntp(floor_ms));
+        let required_frames = ntp_delta_to_frames_ceil(
+            floor_ntp.saturating_sub(effective_start),
+            sample_rate,
+        );
+        let required_packet = required_frames.div_ceil(352);
+        // If the requested sample fell out of the retained ring, move the free
+        // (not-yet-committed) anchor forward to the oldest sample we still own.
+        // Do NOT clamp a future packet back to the current write head: MSA skips
+        // live input until that future content position arrives.
+        let requested_packet = required_packet.max(oldest_ring_packet);
+        let requested_start_ntp = effective_start.saturating_add(frames_to_ntp(
+            requested_packet.saturating_mul(352),
+            sample_rate,
+        ));
+
+        let arm_result = {
+            let pending = &mut pending_joins[index];
+            pending.target.sender.arm_cold_start_verified(
+                requested_start_ntp,
+                pending.target.latency_max,
+                pending.target.lead_frames,
+                pending.target.rtp_offset,
+            )
+        };
+        let committed_start_ntp = match arm_result {
+            Ok(value) => value,
+            Err(error) => {
+                let pending = pending_joins.remove(index);
+                let message = format!(
+                    "{} late-join START failed: {error:?}",
+                    pending.target.name
+                );
+                let _ = pending.reply.send(Err(message.clone()));
+                if let Ok(mut events) = startup_events.lock() {
+                    events.push(message);
+                }
+                continue;
+            }
+        };
+
+        // The committed instant is the source of truth. Re-map content from it,
+        // not from the requested instant, exactly like MSA does after its binary
+        // START ack. In today's in-process native sender the two are identical;
+        // keeping this remap explicit prevents a future commit correction from
+        // silently offsetting a joiner.
+        let committed_frames = ntp_delta_to_frames_ceil(
+            committed_start_ntp.saturating_sub(effective_start),
+            sample_rate,
+        );
+        let committed_packet = committed_frames
+            .div_ceil(352)
+            .max(oldest_ring_packet);
+        let queued_packets = late_join_ring
+            .iter()
+            .filter(|(packet, _)| *packet >= committed_packet)
+            .map(|(_, pcm)| pcm.clone())
+            .collect::<VecDeque<_>>();
+        let skip_packets = committed_packet.saturating_sub(packet_index);
+
+        {
+            let pending = &mut pending_joins[index];
+            pending.anchor_packet = committed_packet;
+            pending.skip_packets = skip_packets;
+            pending.queued_packets = queued_packets;
+            pending.armed = true;
+
+            let rtp_timestamp = pending.target.sender.state().timestamp;
+            match pending
+                .target
+                .metadata
+                .send("SAirplay2", "", "", rtp_timestamp)
+            {
+                Ok(result) if (200..300).contains(&result.status) => {
+                    if let Ok(mut events) = startup_events.lock() {
+                        events.push(format!(
+                            "{}: late-join DMAP metadata {} bytes · RTSP {}.",
+                            pending.target.name, result.bytes, result.status
+                        ));
+                    }
+                }
+                Ok(result) => {
+                    if let Ok(mut events) = startup_events.lock() {
+                        events.push(format!(
+                            "{}: late-join DMAP metadata rejected · RTSP {}.",
+                            pending.target.name, result.status
+                        ));
+                    }
+                }
+                Err(error) => {
+                    if let Ok(mut events) = startup_events.lock() {
+                        events.push(format!(
+                            "{}: late-join DMAP metadata failed: {error:?}.",
+                            pending.target.name
+                        ));
+                    }
+                }
+            }
+
+            let requested_ms = ntp_delta_to_ms(requested_start_ntp);
+            let committed_ms = ntp_delta_to_ms(committed_start_ntp);
+            let commit_delta = committed_ms as i128 - requested_ms as i128;
+            if let Ok(mut events) = startup_events.lock() {
+                events.push(format!(
+                    "{}: late join clock={} · committed packet #{} · prime={} packet(s) · skip={} packet(s) · START commit delta={:+} ms.",
+                    pending.target.name,
+                    readiness,
+                    committed_packet,
+                    pending.queued_packets.len(),
+                    skip_packets,
+                    commit_delta
+                ));
+            }
+        }
+
+        index += 1;
+    }
+}
+
+fn ntp_delta_to_ms(value: u64) -> u64 {
+    (((value as u128) * 1000) >> 32) as u64
 }
 
 fn clock_ready_delay_ms(exchange: crate::PtpExchange, apple_model: bool) -> u64 {
