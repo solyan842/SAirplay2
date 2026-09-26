@@ -288,9 +288,14 @@ impl RealtimeMediaSender {
         &mut self,
         now_ts: u64,
         lapse_ts: u64,
-        lead_frames: u32,
     ) -> Option<u32> {
-        let recovery_lead = (lead_frames as u64).min(self.pacing_window_frames);
+        // Pinned MSA keeps two separate concepts here:
+        // AP2_MIN_WARM_LEAD_MS (250 ms) is only the starvation trigger floor,
+        // while recovery itself targets min(render lead, pacing window).
+        // SAirplay2's native realtime render lead is never shallower than its
+        // effective splice window, so the source-equivalent recovery target is
+        // the already-clamped pacing window (600 ms by default).
+        let recovery_lead = self.pacing_window_frames;
         let effective_head = self.head_ts.saturating_add(self.splice_pad_frames as u64);
         if effective_head > lapse_ts {
             return None;
@@ -308,19 +313,18 @@ impl RealtimeMediaSender {
         Some(pad_u32)
     }
 
-    pub fn recover_input_gap(&mut self, now_ntp: u64, lead_frames: u32) -> Option<u32> {
+    pub fn recover_input_gap(&mut self, now_ntp: u64, _lead_frames: u32) -> Option<u32> {
         let now_ts = ntp_to_frames(now_ntp, self.audio_format.sample_rate as u64);
         let floor = ms_to_frames(250, self.audio_format.sample_rate as u64); // source: AP2_MIN_WARM_LEAD_MS
         self.splice_pad_to_lead(
             now_ts,
             now_ts.saturating_add(floor),
-            lead_frames,
         )
     }
 
-    pub fn recover_delivery_gap(&mut self, now_ntp: u64, lead_frames: u32) -> Option<u32> {
+    pub fn recover_delivery_gap(&mut self, now_ntp: u64, _lead_frames: u32) -> Option<u32> {
         let now_ts = ntp_to_frames(now_ntp, self.audio_format.sample_rate as u64);
-        self.splice_pad_to_lead(now_ts, now_ts, lead_frames)
+        self.splice_pad_to_lead(now_ts, now_ts)
     }
 
     pub fn splice_pad_frames(&self) -> u32 {
@@ -801,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn starvation_recovery_adds_only_the_missing_silence_debt() {
+    fn starvation_recovery_targets_the_effective_splice_window() {
         let data_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let ctrl_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let transport = transport_to(&data_rx, &ctrl_rx);
@@ -813,8 +817,11 @@ mod tests {
         sender.configure_source_timeline(now, now_ts + 5_000, Some(66_150), 11_025);
 
         let added = sender.recover_input_gap(now, 11_025).unwrap();
-        assert_eq!(added, 6_025);
-        assert_eq!(sender.splice_pad_frames(), 6_025);
+        // MSA: 250 ms is only the trigger floor. Recovery targets the
+        // effective splice pacing depth: min(receiver window, 600 ms).
+        // Here that is 26_460 frames, with the head already 5_000 ahead.
+        assert_eq!(added, 21_460);
+        assert_eq!(sender.splice_pad_frames(), 21_460);
 
         // A second call sees the effective head already recovered and must
         // not stack another shift.
