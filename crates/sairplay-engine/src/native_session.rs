@@ -7,7 +7,7 @@ use crate::{
     Ap2AudioFormat, BufferedMediaSender, MediaTransport, NativeVolumeControl,
     ReceiverCapabilities, RetransmitStats, RetransmitWorker, Route, RouteResolver, RtpState,
     SetPeersConfig, NativeHapPairingClient, StoredHapCredentials, TransientPairingClient,
-    VolumeSetResult, set_native_volume, system_time_to_ntp,
+    VolumeSetResult, set_native_volume,
 };
 use rand::RngCore;
 use std::fmt;
@@ -16,7 +16,7 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc, Mutex,
 };
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 const SOLO_COLD_START_LEAD_MS: u64 = 400;
 
@@ -831,31 +831,6 @@ impl Drop for NativeSession {
     }
 }
 
-fn clock_ready_delay_ms(exchange: crate::PtpExchange, apple_model: bool) -> u64 {
-    const CLOCK_LOCK_MS: u64 = 2300;
-    const CLOCK_SETTLE_MS: u64 = 250;
-    const CLOCK_SEAT_EXCHANGES: u32 = 3;
-
-    let full = CLOCK_LOCK_MS.saturating_sub(exchange.first_ms);
-    if apple_model && exchange.count >= CLOCK_SEAT_EXCHANGES {
-        let fast = CLOCK_SETTLE_MS.saturating_sub(exchange.third_ms);
-        full.min(fast)
-    } else {
-        full
-    }
-}
-
-fn ms_to_ntp(ms: u64) -> u64 {
-    ((ms as u128) << 32).div_ceil(1000) as u64
-}
-
-fn ntp_to_frames(ntp: u64, sample_rate: u64) -> u64 {
-    let sec = ntp >> 32;
-    let frac = ntp & 0xFFFF_FFFF;
-    sec.saturating_mul(sample_rate)
-        .saturating_add(((frac as u128 * sample_rate as u128) >> 32) as u64)
-}
-
 fn format_session_uri(local_ip: IpAddr, session_id: u32) -> String {
     match local_ip {
         IpAddr::V4(ip) => format!("rtsp://{ip}/{session_id}"),
@@ -916,27 +891,6 @@ mod tests {
     #[test]
     fn solo_cold_start_lead_matches_pinned_music_assistant() {
         assert_eq!(SOLO_COLD_START_LEAD_MS, 400);
-    }
-
-    #[test]
-    fn clock_readiness_matches_source_bounds() {
-        let ex = crate::PtpExchange {
-            count: 1,
-            first_ms: 900,
-            last_ms: 0,
-            third_ms: 0,
-        };
-        assert_eq!(clock_ready_delay_ms(ex, false), 1400);
-        assert_eq!(clock_ready_delay_ms(ex, true), 1400);
-
-        let apple = crate::PtpExchange {
-            count: 3,
-            first_ms: 1200,
-            last_ms: 0,
-            third_ms: 100,
-        };
-        assert_eq!(clock_ready_delay_ms(apple, true), 150);
-        assert_eq!(clock_ready_delay_ms(apple, false), 1100);
     }
 
     #[test]
