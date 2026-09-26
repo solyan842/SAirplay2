@@ -67,8 +67,10 @@ impl RouteResolver {
     ///
     /// Buffered type 103 is a transport decision layered on top of the base route:
     /// native AirPlay 2 + PTP + SupportsBufferedAudio, excluding Apple models.
-    /// The upstream measured-hostile deny-list is currently empty, so there is
-    /// no model-specific third-party exclusion to copy here yet.
+    /// Upstream's measured-hostile deny-list is currently empty. SAirplay2
+    /// nevertheless honors its own hardware-measured deny flag; today that
+    /// contains only Mu-so Qb, which accepted type 103 setup but rendered it
+    /// unreliably in physical testing.
     pub fn buffered_auto_eligible(route: Route, caps: ReceiverCapabilities) -> bool {
         route == Route::AirPlay2Native
             && caps.supports_ptp
