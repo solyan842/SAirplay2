@@ -138,7 +138,6 @@ pub struct LegacyGroupSession {
     last_error: Arc<Mutex<Option<String>>>,
     discontinuities: Arc<AtomicU64>,
     last_discontinuity_frame: Arc<AtomicU64>,
-    first_non_silent_frame: Arc<AtomicU64>,
     startup_events: Arc<Mutex<Vec<String>>>,
     active_members: Arc<AtomicU64>,
     volume_controls: Vec<LegacyVolumeControl>,
@@ -163,7 +162,6 @@ impl LegacyGroupSession {
         let last_error = Arc::new(Mutex::new(None));
         let discontinuities = Arc::new(AtomicU64::new(0));
         let last_discontinuity_frame = Arc::new(AtomicU64::new(u64::MAX));
-        let first_non_silent_frame = Arc::new(AtomicU64::new(u64::MAX));
         let startup_events = Arc::new(Mutex::new(Vec::new()));
         let active_members = Arc::new(AtomicU64::new(configs.len() as u64));
 
@@ -219,7 +217,6 @@ impl LegacyGroupSession {
         let error_thread = Arc::clone(&last_error);
         let disc_thread = Arc::clone(&discontinuities);
         let last_disc_thread = Arc::clone(&last_discontinuity_frame);
-        let first_audio_thread = Arc::clone(&first_non_silent_frame);
         let events_thread = Arc::clone(&startup_events);
         let active_thread = Arc::clone(&active_members);
 
@@ -324,15 +321,6 @@ impl LegacyGroupSession {
                             );
                         }
                     }
-                    if let Some(offset) = report.first_non_silent_frame_offset {
-                        let absolute = captured_frames_total.saturating_add(offset);
-                        let _ = first_audio_thread.compare_exchange(
-                            u64::MAX,
-                            absolute,
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                        );
-                    }
                     captured_frames_total =
                         captured_frames_total.saturating_add(report.frames as u64);
 
@@ -418,7 +406,6 @@ impl LegacyGroupSession {
             last_error,
             discontinuities,
             last_discontinuity_frame,
-            first_non_silent_frame,
             startup_events,
             active_members,
             volume_controls,
@@ -448,13 +435,6 @@ impl LegacyGroupSession {
 
     pub fn last_discontinuity_frame(&self) -> Option<u64> {
         match self.last_discontinuity_frame.load(Ordering::SeqCst) {
-            u64::MAX => None,
-            value => Some(value),
-        }
-    }
-
-    pub fn first_non_silent_frame(&self) -> Option<u64> {
-        match self.first_non_silent_frame.load(Ordering::SeqCst) {
             u64::MAX => None,
             value => Some(value),
         }
