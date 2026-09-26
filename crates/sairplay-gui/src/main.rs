@@ -311,7 +311,6 @@ struct SairplayApp {
     pairing_name: String,
     pairing_pin_sent: bool,
     pairing_retry_start: bool,
-    native_retry_available: bool,
     language: UiLanguage,
     multiroom_enabled: bool,
     activation_open: bool,
@@ -388,7 +387,6 @@ impl Default for SairplayApp {
             pairing_name: String::new(),
             pairing_pin_sent: false,
             pairing_retry_start: false,
-            native_retry_available: true,
             language: UiLanguage::Vi,
             multiroom_enabled: false,
             activation_open: false,
@@ -1512,18 +1510,17 @@ impl SairplayApp {
                         self.session = None;
                         self.active_fullnames.clear();
 
-                        if is_hard_close && native_session && self.native_retry_available {
-                            self.native_retry_available = false;
+                        if is_hard_close && native_session {
+                            // Pinned MSA treats a peer-close/reset as terminal.
+                            // Do not immediately build a replacement transport:
+                            // the receiver may have displaced this AirPlay
+                            // session because another app took audio ownership.
                             self.log.push(
-                                "Native control channel closed during initial keepalive; rebuilding the same session once automatically."
+                                "Native AirPlay session ended by receiver; automatic reconnect suppressed."
                                     .into(),
                             );
-                            self.playback = PlaybackUiState::Idle;
-                            std::thread::sleep(std::time::Duration::from_millis(250));
-                            self.start_selected_inner();
-                        } else {
-                            self.playback = PlaybackUiState::Error(error);
                         }
+                        self.playback = PlaybackUiState::Error(error);
                     }
                 }
                 None => {
@@ -1540,7 +1537,6 @@ impl SairplayApp {
     }
 
     fn start_selected(&mut self) {
-        self.native_retry_available = true;
         self.start_selected_inner();
     }
 
@@ -1844,7 +1840,6 @@ impl SairplayApp {
         self.membership_pending.clear();
         self.membership_rx = None;
         self.playback = PlaybackUiState::Idle;
-        self.native_retry_available = true;
         self.last_retransmit_stats = RetransmitStats::default();
     }
 
