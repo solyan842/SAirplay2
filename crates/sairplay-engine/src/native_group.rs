@@ -226,10 +226,7 @@ impl NativeGroupSession {
         self.kind
     }
 
-    pub fn join_handle(&self) -> Option<NativeGroupJoinHandle> {
-        if self.kind != NativeGroupKind::MultiRoom {
-            return None;
-        }
+    fn build_join_handle(&self) -> Option<NativeGroupJoinHandle> {
         let audio = self.audio_worker.as_ref()?.join_handle();
         Some(NativeGroupJoinHandle {
             shared_ptp: self.shared_ptp.as_ref().map(Arc::clone),
@@ -238,12 +235,51 @@ impl NativeGroupSession {
         })
     }
 
+    /// User-driven membership changes remain MultiRoom-only. Stereo Pair
+    /// membership is fixed in the UI, matching the existing product contract.
+    pub fn join_handle(&self) -> Option<NativeGroupJoinHandle> {
+        (self.kind == NativeGroupKind::MultiRoom)
+            .then(|| self.build_join_handle())
+            .flatten()
+    }
+
+    /// Recovery path used after an unexpected member transport loss.
+    ///
+    /// Pinned Music Assistant preserves group intent when one member drops:
+    /// the surviving members keep playing and the failed receiver is allowed
+    /// to re-enter through the normal late-join path. This handle is therefore
+    /// available for both MultiRoom and a fixed Stereo Pair.
+    pub fn recovery_join_handle(&self) -> Option<NativeGroupJoinHandle> {
+        self.build_join_handle()
+    }
+
     pub fn adopt_member(&mut self, name: String, session: NativeSession) {
-        debug_assert_eq!(self.kind, NativeGroupKind::MultiRoom);
+        // MultiRoom uses this for user-driven live joins; Stereo Pair uses the
+        // same late-join path only to restore a member that died unexpectedly.
         if let Some(index) = self.members.iter().position(|(member, _)| member == &name) {
             self.members.remove(index);
         }
         self.members.push((name, session));
+    }
+
+    /// Remove one failed transport without dissolving the rest of the group.
+    ///
+    /// This deliberately bypasses the user-facing Stereo Pair membership lock:
+    /// the pair definition is preserved by the caller and the missing member is
+    /// scheduled for bounded re-join, exactly like Music Assistant's native
+    /// sync-group failure lifecycle.
+    pub fn detach_failed_member(&mut self, name: &str) -> Result<bool, NativeGroupError> {
+        let Some(index) = self.members.iter().position(|(member, _)| member == name) else {
+            return Ok(false);
+        };
+        if let Some(audio) = self.audio_worker.as_ref() {
+            audio
+                .join_handle()
+                .remove_target(name.to_owned())
+                .map_err(NativeGroupError::Audio)?;
+        }
+        self.members.remove(index);
+        Ok(true)
     }
 
     pub fn remove_member(&mut self, name: &str) -> Result<(), NativeGroupError> {
@@ -320,7 +356,11 @@ impl NativeGroupSession {
     }
 
     pub fn feedback_running(&self) -> bool {
-        self.members.iter().all(|(_, session)| session.feedback_running())
+        !self.members.is_empty()
+            && self
+                .members
+                .iter()
+                .all(|(_, session)| session.feedback_running())
     }
 
     pub fn feedback_error(&self) -> Option<String> {
@@ -329,6 +369,24 @@ impl NativeGroupSession {
                 .feedback_error()
                 .map(|error| format!("{name}: {error}"))
         })
+    }
+
+    /// Return members whose native control worker has ended unexpectedly.
+    /// The caller removes only those transports; surviving members keep the
+    /// shared producer and PTP timeline alive.
+    pub fn failed_feedback_members(&self) -> Vec<(String, String)> {
+        self.members
+            .iter()
+            .filter(|(_, session)| !session.feedback_running())
+            .map(|(name, session)| {
+                (
+                    name.clone(),
+                    session
+                        .feedback_error()
+                        .unwrap_or_else(|| "feedback keepalive worker stopped".to_owned()),
+                )
+            })
+            .collect()
     }
 
     pub fn retransmit_stats(&self) -> RetransmitStats {
