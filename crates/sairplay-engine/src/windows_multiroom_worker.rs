@@ -409,6 +409,7 @@ pub struct WindowsMultiroomAudioWorker {
     last_discontinuity_frame: Arc<AtomicU64>,
     first_non_silent_frame: Arc<AtomicU64>,
     startup_events: Arc<Mutex<Vec<String>>>,
+    failed_members: Arc<Mutex<Vec<(String, String)>>>,
     active_members: Arc<AtomicU64>,
     join_handle: WindowsMultiroomJoinHandle,
 }
@@ -466,6 +467,8 @@ impl WindowsMultiroomAudioWorker {
         let first_non_silent_frame_thread = Arc::clone(&first_non_silent_frame);
         let startup_events = Arc::new(Mutex::new(Vec::<String>::new()));
         let startup_events_thread = Arc::clone(&startup_events);
+        let failed_members = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let failed_members_thread = Arc::clone(&failed_members);
         let active_members = Arc::new(AtomicU64::new(targets.len() as u64));
         let active_members_thread = Arc::clone(&active_members);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -844,8 +847,15 @@ impl WindowsMultiroomAudioWorker {
                         }
                         if !gate_failed.is_empty() {
                             for (index, message) in gate_failed.into_iter().rev() {
+                                let name = targets
+                                    .get(index)
+                                    .map(|target| target.name.clone())
+                                    .unwrap_or_else(|| "unknown".to_owned());
                                 if let Ok(mut events) = startup_events_thread.lock() {
                                     events.push(format!("AirPlay member removed: {message}"));
+                                }
+                                if let Ok(mut failed_members) = failed_members_thread.lock() {
+                                    failed_members.push((name, message.clone()));
                                 }
                                 targets.remove(index);
                             }
@@ -1028,8 +1038,15 @@ impl WindowsMultiroomAudioWorker {
 
                         if !failed.is_empty() {
                             for (index, message) in failed.into_iter().rev() {
+                                let name = targets
+                                    .get(index)
+                                    .map(|target| target.name.clone())
+                                    .unwrap_or_else(|| "unknown".to_owned());
                                 if let Ok(mut events) = startup_events_thread.lock() {
                                     events.push(format!("AirPlay member removed: {message}"));
+                                }
+                                if let Ok(mut failed_members) = failed_members_thread.lock() {
+                                    failed_members.push((name, message.clone()));
                                 }
                                 targets.remove(index);
                             }
@@ -1076,6 +1093,7 @@ impl WindowsMultiroomAudioWorker {
                 last_discontinuity_frame,
                 first_non_silent_frame,
                 startup_events,
+                failed_members,
                 active_members,
                 join_handle,
             }),
@@ -1139,6 +1157,13 @@ impl WindowsMultiroomAudioWorker {
         self.startup_events
             .lock()
             .map(|mut events| std::mem::take(&mut *events))
+            .unwrap_or_default()
+    }
+
+    pub fn drain_failed_members(&self) -> Vec<(String, String)> {
+        self.failed_members
+            .lock()
+            .map(|mut failed| std::mem::take(&mut *failed))
             .unwrap_or_default()
     }
 
