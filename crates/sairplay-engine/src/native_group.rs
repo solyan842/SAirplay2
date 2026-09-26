@@ -374,8 +374,9 @@ impl NativeGroupSession {
     /// Return members whose native control worker has ended unexpectedly.
     /// The caller removes only those transports; surviving members keep the
     /// shared producer and PTP timeline alive.
-    pub fn failed_feedback_members(&self) -> Vec<(String, String)> {
-        self.members
+    pub fn failed_group_members(&self) -> Vec<(String, String)> {
+        let mut failures = self
+            .members
             .iter()
             .filter(|(_, session)| !session.feedback_running())
             .map(|(name, session)| {
@@ -386,7 +387,15 @@ impl NativeGroupSession {
                         .unwrap_or_else(|| "feedback keepalive worker stopped".to_owned()),
                 )
             })
-            .collect()
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        if let Some(audio) = self.audio_worker.as_ref() {
+            for (name, error) in audio.drain_failed_members() {
+                failures.entry(name).or_insert(error);
+            }
+        }
+
+        failures.into_iter().collect()
     }
 
     pub fn retransmit_stats(&self) -> RetransmitStats {
