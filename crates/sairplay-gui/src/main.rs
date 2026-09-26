@@ -5,7 +5,7 @@ use sairplay_engine::{
     Ap2PreflightClient, DeviceCatalog, DeviceRecord, DiscoveredService, DiscoveryEvent,
     LegacyGroupSession, LegacyMemberConfig, MdnsBrowser, NativeGroupJoinHandle, NativeGroupKind,
     NativeGroupMemberConfig, NativeGroupSession, NativeHapPairingClient,
-    NativeSession, NativeSessionConfig, RetransmitStats, Route, ServiceKind, VolumeSetResult,
+    NativeSession, NativeSessionConfig, ReceiverCapabilities, RetransmitStats, Route, ServiceKind, VolumeSetResult,
     ALAC_44100_16_2, ALAC_44100_24_2, ALAC_48000_16_2,
     ALAC_48000_24_2,
 };
@@ -4564,6 +4564,8 @@ fn native_config_for_device(
     config.active_remote = "123456789".into();
     config.supports_ptp = service.txt.supports_ptp();
     config.supports_buffered_audio = service.txt.supports_buffered_audio();
+    config.buffered_denied =
+        ReceiverCapabilities::from_txt(&service.txt, false, false).buffered_denied;
     config.follow_receiver_clock = service.txt.follows_receiver_clock();
     config.apple_model = service.txt.is_apple_model();
     config.receiver_name = device.display_name.clone();
