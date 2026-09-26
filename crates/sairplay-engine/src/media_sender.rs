@@ -59,6 +59,12 @@ pub struct RealtimeMediaSender {
     timeline_reanchors: u64,
     reanchor_shifted_frames: u64,
     audio_format: Ap2AudioFormat,
+    // Native equivalent of cliairplay's receiver-clock status latch.  A late
+    // joiner is created before it is handed to the group worker, so this clock
+    // lets the worker distinguish "not reported yet" from a receiver that has
+    // gone a full stall window without a fresh PTP probe.
+    ptp_observation_started: Instant,
+    ptp_last_probe_observed: Option<Instant>,
     #[cfg(windows)]
     alac24: Option<crate::Alac24Encoder>,
 }
@@ -95,6 +101,8 @@ impl RealtimeMediaSender {
             timeline_reanchors: 0,
             reanchor_shifted_frames: 0,
             audio_format,
+            ptp_observation_started: Instant::now(),
+            ptp_last_probe_observed: None,
             #[cfg(windows)]
             alac24: None,
         }
@@ -138,6 +146,8 @@ impl RealtimeMediaSender {
             timeline_reanchors: 0,
             reanchor_shifted_frames: 0,
             audio_format,
+            ptp_observation_started: Instant::now(),
+            ptp_last_probe_observed: None,
             #[cfg(windows)]
             alac24: None,
         }
@@ -181,6 +191,8 @@ impl RealtimeMediaSender {
             timeline_reanchors: 0,
             reanchor_shifted_frames: 0,
             audio_format,
+            ptp_observation_started: Instant::now(),
+            ptp_last_probe_observed: None,
             #[cfg(windows)]
             alac24: None,
         }
@@ -251,6 +263,25 @@ impl RealtimeMediaSender {
             let _ = self.prime_ptp_anchor(start_ntp, lead_frames)?;
         }
         Ok(())
+    }
+
+    /// Arm a native start and return the instant that was actually committed.
+    ///
+    /// Unlike cliairplay, this sender lives in the same process as the group
+    /// worker: arm_cold_start performs the commit synchronously and has no
+    /// downstream subprocess that can silently rewrite the requested instant.
+    /// Returning it explicitly gives MultiRoom the same "commit then remap"
+    /// contract as Music Assistant and keeps that contract correct if native
+    /// commit correction is added later.
+    pub fn arm_cold_start_verified(
+        &mut self,
+        start_ntp: u64,
+        latency_max: Option<u32>,
+        lead_frames: u32,
+        rtp_offset: u32,
+    ) -> Result<u64, MediaSendError> {
+        self.arm_cold_start(start_ntp, latency_max, lead_frames, rtp_offset)?;
+        Ok(start_ntp)
     }
 
     fn splice_pad_to_lead(
@@ -391,6 +422,30 @@ impl RealtimeMediaSender {
             RealtimeTiming::Ptp { clock } => clock.exchange(),
             RealtimeTiming::Ntp => None,
         }
+    }
+
+    /// Poll the receiver's current PTP probe evidence and remember when the
+    /// worker last observed a healthy exchange. This mirrors the information
+    /// cliairplay exposes through [STATUS] clock_ready without adding a second
+    /// timing engine to the native path.
+    pub fn observe_ptp_probe_exchange(&mut self) -> Option<PtpExchange> {
+        let exchange = self.ptp_probe_exchange();
+        if exchange.is_some() {
+            self.ptp_last_probe_observed = Some(Instant::now());
+        }
+        exchange
+    }
+
+    /// Return true only after a PTP receiver has spent a complete stall window
+    /// without any fresh probe evidence. NTP sessions are never clock-stalled.
+    pub fn ptp_probe_stalled(&self, stall_after: Duration) -> bool {
+        if !self.uses_ptp_timing() || self.ptp_probe_exchange().is_some() {
+            return false;
+        }
+        self.ptp_last_probe_observed
+            .unwrap_or(self.ptp_observation_started)
+            .elapsed()
+            >= stall_after
     }
 
     pub fn transport(&self) -> &MediaTransport {
