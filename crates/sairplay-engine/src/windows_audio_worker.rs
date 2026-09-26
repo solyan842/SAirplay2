@@ -466,7 +466,7 @@ impl WindowsAudioWorker {
                                             ex.third_ms
                                         )),
                                         None => events.push(
-                                            "Diagnostic: PTP probe streak unavailable · no Delay_Req/Pdelay_Req seen within 3 s.".into()
+                                            "Diagnostic: PTP probe streak unavailable · no current Delay_Req/Pdelay_Req evidence.".into()
                                         ),
                                     }
                                 }
