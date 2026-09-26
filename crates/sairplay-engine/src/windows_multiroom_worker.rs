@@ -356,6 +356,7 @@ pub struct WindowsMultiroomJoinHandle {
 
 impl WindowsMultiroomJoinHandle {
     pub fn add_target(&self, target: WindowsAudioTarget) -> Result<(), WindowsMultiroomAudioError> {
+        let name = target.name.clone();
         let (reply_tx, reply_rx) = mpsc::channel();
         self.command_tx
             .send(GroupAudioCommand::Add {
@@ -367,14 +368,29 @@ impl WindowsMultiroomJoinHandle {
                     "multi-room audio worker is not accepting new members".into(),
                 )
             })?;
-        reply_rx
-            .recv_timeout(Duration::from_secs(12))
-            .map_err(|error| {
-                WindowsMultiroomAudioError::Command(format!(
+
+        // Pinned Music Assistant allows up to 35 seconds for a late joiner's
+        // priming write. A 24-bit/48 kHz receiver can legitimately need more
+        // than 12 seconds of retained PCM to catch the shared live head, so a
+        // shorter local timeout can reject a healthy join after START/PTP have
+        // already succeeded.
+        match reply_rx.recv_timeout(Duration::from_secs(35)) {
+            Ok(result) => result.map_err(WindowsMultiroomAudioError::Command),
+            Err(error) => {
+                // Do not leave an orphaned pending/active target behind after
+                // the caller gives up. Removal covers both races: still pending
+                // in the prime path or attached just as the timeout fires.
+                let (remove_tx, remove_rx) = mpsc::channel();
+                let _ = self.command_tx.send(GroupAudioCommand::Remove {
+                    name,
+                    reply: remove_tx,
+                });
+                let _ = remove_rx.recv_timeout(Duration::from_secs(3));
+                Err(WindowsMultiroomAudioError::Command(format!(
                     "late join timed out waiting for the shared timeline: {error}"
-                ))
-            })?
-            .map_err(WindowsMultiroomAudioError::Command)
+                )))
+            }
+        }
     }
 
     pub fn remove_target(&self, name: impl Into<String>) -> Result<(), WindowsMultiroomAudioError> {
