@@ -81,6 +81,7 @@ impl<W: Write> BufferedMediaSender<W> {
     pub fn audio_format(&self) -> Ap2AudioFormat { self.audio_format }
     pub fn nonce_counter(&self) -> u64 { self.nonce_counter }
     pub fn head_ts(&self) -> u64 { self.head_ts }
+    pub fn pacing_window_frames(&self) -> u64 { self.pacing_window_frames }
 
     pub fn arm_cold_start(&mut self, commanded_start_ntp: u64) {
         self.head_ts = ntp_to_frames(commanded_start_ntp, self.audio_format.sample_rate as u64);
