@@ -3,7 +3,7 @@
 use eframe::egui;
 use sairplay_engine::{
     Ap2PreflightClient, DeviceCatalog, DeviceRecord, DiscoveredService, DiscoveryEvent,
-    LegacyGroupSession, LegacyMemberConfig, MdnsBrowser, NativeGroupKind,
+    LegacyGroupSession, LegacyMemberConfig, MdnsBrowser, NativeGroupJoinHandle, NativeGroupKind,
     NativeGroupMemberConfig, NativeGroupSession, NativeHapPairingClient,
     NativeSession, NativeSessionConfig, RetransmitStats, Route, ServiceKind, VolumeSetResult,
     ALAC_44100_16_2, ALAC_44100_24_2, ALAC_48000_16_2,
@@ -15,8 +15,11 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PlaybackUiState {
@@ -160,17 +163,75 @@ impl ActiveSession {
             Self::Legacy(_) => Vec::new(),
         }
     }
+
+    fn failed_group_members(&self) -> Vec<(String, String)> {
+        match self {
+            Self::StereoPair(session) | Self::MultiRoom(session) => {
+                session.failed_feedback_members()
+            }
+            Self::Single(_) | Self::Legacy(_) => Vec::new(),
+        }
+    }
+
+    fn recovery_join_handle(&self) -> Option<NativeGroupJoinHandle> {
+        match self {
+            Self::StereoPair(session) | Self::MultiRoom(session) => {
+                session.recovery_join_handle()
+            }
+            Self::Single(_) | Self::Legacy(_) => None,
+        }
+    }
+
+    fn detach_failed_group_member(&mut self, name: &str) -> Result<bool, String> {
+        match self {
+            Self::StereoPair(session) | Self::MultiRoom(session) => {
+                session.detach_failed_member(name).map_err(|error| error.to_string())
+            }
+            Self::Single(_) | Self::Legacy(_) => Ok(false),
+        }
+    }
+
+    fn adopt_recovered_group_member(&mut self, name: String, session: NativeSession) -> bool {
+        match self {
+            Self::StereoPair(group) | Self::MultiRoom(group) => {
+                group.adopt_member(name, session);
+                true
+            }
+            Self::Single(_) | Self::Legacy(_) => false,
+        }
+    }
 }
 
 struct ConnectSuccess {
     session: ActiveSession,
     active_fullnames: BTreeSet<String>,
+    native_configs: BTreeMap<String, NativeSessionConfig>,
     label: String,
     mode: PlaybackMode,
 }
 
 struct MembershipAdded {
-    members: Vec<(String, NativeSession)>,
+    members: Vec<(String, NativeSession, NativeSessionConfig)>,
+}
+
+enum GroupRejoinEvent {
+    AttemptFailed {
+        generation: u64,
+        fullname: String,
+        attempt: usize,
+        error: String,
+    },
+    Success {
+        generation: u64,
+        fullname: String,
+        attempt: usize,
+        session: NativeSession,
+    },
+    Exhausted {
+        generation: u64,
+        fullname: String,
+        error: String,
+    },
 }
 
 struct HiresProbeResult {
@@ -301,6 +362,12 @@ struct SairplayApp {
     connect_rx: Option<Receiver<Result<ConnectSuccess, String>>>,
     membership_rx: Option<Receiver<Result<MembershipAdded, String>>>,
     membership_pending: BTreeSet<String>,
+    group_rejoin_tx: Sender<GroupRejoinEvent>,
+    group_rejoin_rx: Receiver<GroupRejoinEvent>,
+    group_rejoin_cancels: BTreeMap<String, Arc<AtomicBool>>,
+    group_rejoin_pending: BTreeSet<String>,
+    group_rejoin_generation: u64,
+    active_native_configs: BTreeMap<String, NativeSessionConfig>,
     session: Option<ActiveSession>,
     initial_volume_text: String,
     volume_rx: Option<Receiver<Result<Vec<VolumeSetResult>, String>>>,
@@ -358,6 +425,7 @@ impl Default for SairplayApp {
         };
 
         let (hires_probe_tx, hires_probe_rx) = mpsc::channel();
+        let (group_rejoin_tx, group_rejoin_rx) = mpsc::channel();
         let initial_volume_text = load_saved_volume()
             .map(|volume| volume.to_string())
             .unwrap_or_else(|| "50".to_owned());
@@ -378,6 +446,12 @@ impl Default for SairplayApp {
             connect_rx: None,
             membership_rx: None,
             membership_pending: BTreeSet::new(),
+            group_rejoin_tx,
+            group_rejoin_rx,
+            group_rejoin_cancels: BTreeMap::new(),
+            group_rejoin_pending: BTreeSet::new(),
+            group_rejoin_generation: 0,
+            active_native_configs: BTreeMap::new(),
             session: None,
             initial_volume_text,
             volume_rx: None,
