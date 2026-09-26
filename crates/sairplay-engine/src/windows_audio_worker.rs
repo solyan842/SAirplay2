@@ -345,8 +345,6 @@ impl WindowsAudioWorker {
         let discontinuities_thread = Arc::clone(&discontinuities);
         let last_discontinuity_frame = Arc::new(AtomicU64::new(u64::MAX));
         let last_discontinuity_frame_thread = Arc::clone(&last_discontinuity_frame);
-        let first_non_silent_frame = Arc::new(AtomicU64::new(u64::MAX));
-        let first_non_silent_frame_thread = Arc::clone(&first_non_silent_frame);
         let startup_events = Arc::new(Mutex::new(Vec::<String>::new()));
         let startup_events_thread = Arc::clone(&startup_events);
 
@@ -756,7 +754,6 @@ impl WindowsAudioWorker {
                 last_error,
                 discontinuities,
                 last_discontinuity_frame,
-                first_non_silent_frame,
                 startup_events,
             }),
             Ok(Err(message)) => {
