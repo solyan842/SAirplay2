@@ -346,6 +346,19 @@ impl NativeGroupSession {
         })
     }
 
+    /// Per-member retransmit counters for runtime diagnostics.
+    ///
+    /// The aggregate above remains the session health surface.  This view is
+    /// intentionally observational only so Stereo Pair/MultiRoom transport
+    /// behavior is unchanged while logs can identify the receiver requesting
+    /// each retransmission.
+    pub fn member_retransmit_stats(&self) -> Vec<(String, RetransmitStats)> {
+        self.members
+            .iter()
+            .map(|(name, session)| (name.clone(), session.retransmit_stats()))
+            .collect()
+    }
+
     pub fn volume_controls(&self) -> Vec<NativeVolumeControl> {
         self.members
             .iter()
