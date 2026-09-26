@@ -767,7 +767,8 @@ impl SairplayApp {
                 self.log.push(format!("Live join skipped: {fullname} is no longer discovered."));
                 continue;
             };
-            if device.route(false, false) != Route::AirPlay2Native {
+            let has_native_credentials = self.native_credentials.contains_key(fullname);
+            if device.route(has_native_credentials, false) != Route::AirPlay2Native {
                 self.log.push(format!(
                     "Live join skipped: {} is not a native AirPlay 2 route.",
                     device.display_name
@@ -929,6 +930,13 @@ impl SairplayApp {
     }
 
     fn legacy_pairing_required(&self, device: &DeviceRecord) -> bool {
+        // Genuine Apple TV uses native HAP PIN pair-setup + stored pair-verify.
+        // Legacy PIN pairing remains only for receivers whose selected route is
+        // actually RAOP/AirPlay2Compat (and excludes the MiTV AppleTV clone via
+        // is_genuine_appletv_candidate()).
+        if is_genuine_appletv_candidate(device) {
+            return false;
+        }
         let Some(service) = device.airplay.as_ref().or(device.raop.as_ref()) else {
             return false;
         };
@@ -1576,9 +1584,23 @@ impl SairplayApp {
             return;
         }
 
+        // MSA pairs genuine Apple TV on the native AirPlay endpoint first.
+        // Route resolution only becomes native after those credentials exist,
+        // so doing route(false, false) first incorrectly demotes a PIN-required
+        // Apple TV to AirPlay2Compat and launches legacy cliraop pairing.
+        if let Some((_, device)) = selected_devices
+            .iter()
+            .find(|(_, device)| self.native_pairing_required(device))
+        {
+            self.begin_native_pairing(device);
+            return;
+        }
+
         let routes = selected_devices
             .iter()
-            .map(|(_, device)| device.route(false, false))
+            .map(|(fullname, device)| {
+                device.route(self.native_credentials.contains_key(fullname), false)
+            })
             .collect::<Vec<_>>();
         let all_native = routes
             .iter()
@@ -1600,19 +1622,6 @@ impl SairplayApp {
                 .find(|(_, device)| self.legacy_pairing_required(device))
             {
                 self.begin_legacy_pairing(device);
-                return;
-            }
-        }
-
-        // Match MSA's Apple TV lifecycle: establish HomeKit credentials once,
-        // then all native sessions use pair-verify. Never hammer transient
-        // pair-setup on an Apple TV that expects stored credentials.
-        if all_native {
-            if let Some((_, device)) = selected_devices
-                .iter()
-                .find(|(_, device)| self.native_pairing_required(device))
-            {
-                self.begin_native_pairing(device);
                 return;
             }
         }
