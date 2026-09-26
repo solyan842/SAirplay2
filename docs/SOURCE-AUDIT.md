@@ -149,6 +149,30 @@ The active development history contains real-device evidence for:
 A hardware observation applies only to the exact tested route/format. It is not
 permission to generalize a device-family workaround.
 
+## Remaining non-wire diagnostic difference
+
+The upstream CLI can emit an explicit `clock_ready state=stalled` verdict after
+about 5000 ms without a receiver PTP probe. SAirplay2 already uses the same
+5000-ms stall rule to refuse a late join, while normal solo playback currently
+reports PTP probe health without promoting that condition to a separately named
+solo `stalled` status.
+
+This is a support/diagnostic difference, not a known wire defect:
+
+- the 2500-ms planning timeout still behaves like MSA `UNREPORTED` and falls
+  back to the ordinary START lead;
+- late join distinguishes the definitive 5000-ms stall;
+- upstream itself does not automatically change streaming mode on a stalled
+  verdict;
+- current physical solo tests show a healthy probe streak.
+
+Do not alter transport behavior merely to close this logging difference. Add the
+explicit label only if it improves diagnosis of a real no-clock hardware case.
+
+The current active late-join ring also matches newer MSA stable behavior: it has
+a 12-second floor, grows to the measured session write-head lead plus a 2-second
+margin, and is bounded to 6 MiB.
+
 ## Application-layer differences that are not protocol defects
 
 Music Assistant owns a media queue and explicit track/seek/replacement
