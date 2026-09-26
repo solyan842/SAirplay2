@@ -12,6 +12,9 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
+const AIRPLAY_CLOCK_READY_TIMEOUT_MS: u64 = 2_500;
+const AIRPLAY_CLOCK_READY_LEAD_MS: u64 = 500;
+
 #[derive(Debug)]
 pub enum WindowsAudioWorkerError {
     Capture(WasapiLoopbackError),
@@ -286,6 +289,7 @@ impl WindowsAudioWorker {
         latency_max: Option<u32>,
         rtp_offset: u32,
         cold_start_delay_ms: u64,
+        apple_model: bool,
     ) -> Result<Self, WindowsAudioWorkerError> {
         let running = Arc::new(AtomicBool::new(true));
         let running_thread = Arc::clone(&running);
@@ -497,8 +501,61 @@ impl WindowsAudioWorker {
                                     return;
                                 }
                             };
-                            let start_ntp =
-                                now_ntp.saturating_add(ms_to_ntp(cold_start_delay_ms));
+                            // Pinned Music Assistant waits for a receiver-clock
+                            // projection before every PTP start, including solo.
+                            // A third-party receiver can seat the render timeline only
+                            // after its full ~2.3 s servo window; Apple may use the
+                            // measured fast-seat path after the third exchange.
+                            let clock_projection_ms = if sender.uses_ptp_timing() {
+                                let deadline = std::time::Instant::now()
+                                    + Duration::from_millis(AIRPLAY_CLOCK_READY_TIMEOUT_MS);
+                                loop {
+                                    if let Some(delay) =
+                                        sender.ptp_clock_ready_delay_ms(apple_model)
+                                    {
+                                        break Some(delay);
+                                    }
+                                    if std::time::Instant::now() >= deadline {
+                                        break None;
+                                    }
+                                    thread::sleep(Duration::from_millis(10));
+                                }
+                            } else {
+                                None
+                            };
+                            let readiness_lead_ms = clock_projection_ms
+                                .map(|delay| delay.saturating_add(AIRPLAY_CLOCK_READY_LEAD_MS))
+                                .unwrap_or(0);
+                            let effective_start_delay_ms =
+                                cold_start_delay_ms.max(readiness_lead_ms);
+                            if let Ok(mut events) = startup_events_thread.lock() {
+                                events.push(match clock_projection_ms {
+                                    Some(delay) => format!(
+                                        "Startup: receiver clock projection={} ms · START lead={} ms.",
+                                        delay, effective_start_delay_ms
+                                    ),
+                                    None if sender.uses_ptp_timing() => format!(
+                                        "Startup: no PTP clock projection within {} ms · fallback START lead={} ms.",
+                                        AIRPLAY_CLOCK_READY_TIMEOUT_MS, effective_start_delay_ms
+                                    ),
+                                    None => format!(
+                                        "Startup: NTP timing · START lead={} ms.",
+                                        effective_start_delay_ms
+                                    ),
+                                });
+                            }
+                            let now_ntp = match system_time_to_ntp(SystemTime::now()) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(format!("NTP clock conversion failed: {error:?}"));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            };
+                            let start_ntp = now_ntp
+                                .saturating_add(ms_to_ntp(effective_start_delay_ms));
                             if let Err(error) = sender.arm_cold_start(
                                 start_ntp,
                                 latency_max,
@@ -516,7 +573,7 @@ impl WindowsAudioWorker {
                             if let Ok(mut events) = startup_events_thread.lock() {
                                 events.push(format!(
                                     "Startup: cold START armed · delay={} ms · lead_frames={} · pending_bytes={}.",
-                                    cold_start_delay_ms,
+                                    effective_start_delay_ms,
                                     lead_frames,
                                     chunker.pending_bytes()
                                 ));
