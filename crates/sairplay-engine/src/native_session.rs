@@ -22,6 +22,8 @@ const SOLO_COLD_START_LEAD_MS: u64 = 400;
 
 #[cfg(windows)]
 use crate::{NativeMetadataControl, WindowsAudioTarget, WindowsAudioWorker, WindowsAudioWorkerError};
+#[cfg(windows)]
+use crate::windows_multiroom_worker::WindowsGroupMediaSender;
 
 #[derive(Debug, Clone)]
 pub struct NativeSessionConfig {
@@ -624,14 +626,35 @@ impl NativeSession {
                 "audio target cannot be extracted while single-device capture is running".into(),
             ));
         }
-        if self.use_buffered {
-            return Err(NativeSessionError::Flow(
-                "buffered type103 group handoff is not enabled until mixed type96/type103 MultiRoom support lands".into(),
-            ));
-        }
-        let sender = self.sender.take().ok_or_else(|| {
-            NativeSessionError::Flow("realtime sender is already owned by an audio worker".into())
-        })?;
+        let sender = if self.use_buffered {
+            let buffered_sender = self.buffered_sender.take().ok_or_else(|| {
+                NativeSessionError::Flow(
+                    "buffered sender is already owned by an audio worker".into(),
+                )
+            })?;
+            let clock = self.buffered_clock.clone().ok_or_else(|| {
+                NativeSessionError::Flow(
+                    "buffered group target is missing its shared PTP clock".into(),
+                )
+            })?;
+            WindowsGroupMediaSender::buffered(
+                buffered_sender,
+                clock,
+                Arc::clone(&self.control),
+                Arc::clone(&self.next_cseq),
+                self.session_uri.clone(),
+                self.dacp_id.clone(),
+                self.active_remote.clone(),
+            )
+        } else {
+            let realtime_sender = self.sender.take().ok_or_else(|| {
+                NativeSessionError::Flow(
+                    "realtime sender is already owned by an audio worker".into(),
+                )
+            })?;
+            WindowsGroupMediaSender::realtime(realtime_sender)
+        };
+
         Ok(WindowsAudioTarget {
             name: name.into(),
             sender,

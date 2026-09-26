@@ -1,6 +1,8 @@
 use crate::{
-    system_time_to_ntp, Ap2AudioFormat, NativeMetadataControl, Pcm352Chunker, RealtimeMediaSender,
-    WasapiLoopbackCapture, WasapiLoopbackError,
+    buffered_anchor_start, system_time_to_ntp, Ap2AudioFormat, BufferedAnchorStartConfig,
+    BufferedMediaSender, BufferedWriteOutcome, NativeMetadataControl, Pcm352Chunker, PtpClock,
+    RealtimeMediaSender, RtpState, SharedCseq, SharedRtspControl, WasapiLoopbackCapture,
+    WasapiLoopbackError,
 };
 use std::collections::VecDeque;
 use std::fmt;
@@ -19,6 +21,7 @@ pub const AIRPLAY_COLD_GROUP_START_LEAD_MS: u64 = 2_500;
 pub const AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS: u64 = 2_500;
 pub const AIRPLAY_CLOCK_READY_TIMEOUT_MS: u64 = 2_500;
 pub const AIRPLAY_CLOCK_READY_LEAD_MS: u64 = 500;
+pub const AIRPLAY_SPLICE_LEAD_MARGIN_MS: u64 = 150;
 pub const AIRPLAY_CLOCK_STALL_MS: u64 = 5_000;
 pub const AIRPLAY_LATE_JOIN_RING_MIN_SECONDS: f64 = 12.0;
 pub const AIRPLAY_LATE_JOIN_RING_MARGIN_SECONDS: f64 = 2.0;
@@ -39,9 +42,263 @@ impl WindowsGroupAudioKind {
     }
 }
 
+pub(crate) enum WindowsGroupMediaSender {
+    Realtime(RealtimeMediaSender),
+    Buffered {
+        sender: BufferedMediaSender,
+        clock: PtpClock,
+        control: SharedRtspControl,
+        next_cseq: SharedCseq,
+        session_uri: String,
+        dacp_id: String,
+        active_remote: String,
+        ptp_observation_started: Instant,
+        ptp_last_probe_observed: Option<Instant>,
+    },
+}
+
+impl WindowsGroupMediaSender {
+    pub(crate) fn realtime(sender: RealtimeMediaSender) -> Self {
+        Self::Realtime(sender)
+    }
+
+    pub(crate) fn buffered(
+        sender: BufferedMediaSender,
+        clock: PtpClock,
+        control: SharedRtspControl,
+        next_cseq: SharedCseq,
+        session_uri: String,
+        dacp_id: String,
+        active_remote: String,
+    ) -> Self {
+        Self::Buffered {
+            sender,
+            clock,
+            control,
+            next_cseq,
+            session_uri,
+            dacp_id,
+            active_remote,
+            ptp_observation_started: Instant::now(),
+            ptp_last_probe_observed: None,
+        }
+    }
+
+    fn is_buffered(&self) -> bool {
+        matches!(self, Self::Buffered { .. })
+    }
+
+    fn audio_format(&self) -> Ap2AudioFormat {
+        match self {
+            Self::Realtime(sender) => sender.audio_format(),
+            Self::Buffered { sender, .. } => sender.audio_format(),
+        }
+    }
+
+    fn state(&self) -> RtpState {
+        match self {
+            Self::Realtime(sender) => sender.state(),
+            Self::Buffered { sender, .. } => sender.state(),
+        }
+    }
+
+    fn pacing_window_frames(&self) -> u64 {
+        match self {
+            Self::Realtime(sender) => sender.pacing_window_frames(),
+            Self::Buffered { sender, .. } => sender.pacing_window_frames(),
+        }
+    }
+
+    fn uses_ptp_timing(&self) -> bool {
+        match self {
+            Self::Realtime(sender) => sender.uses_ptp_timing(),
+            Self::Buffered { .. } => true,
+        }
+    }
+
+    fn ptp_probe_exchange(&self) -> Option<crate::PtpExchange> {
+        match self {
+            Self::Realtime(sender) => sender.ptp_probe_exchange(),
+            Self::Buffered { clock, .. } => clock.exchange(),
+        }
+    }
+
+    fn observe_ptp_probe_exchange(&mut self) -> Option<crate::PtpExchange> {
+        match self {
+            Self::Realtime(sender) => sender.observe_ptp_probe_exchange(),
+            Self::Buffered {
+                clock,
+                ptp_last_probe_observed,
+                ..
+            } => {
+                let exchange = clock.exchange();
+                if exchange.is_some() {
+                    *ptp_last_probe_observed = Some(Instant::now());
+                }
+                exchange
+            }
+        }
+    }
+
+    fn ptp_probe_stalled(&self, stall_after: Duration) -> bool {
+        match self {
+            Self::Realtime(sender) => sender.ptp_probe_stalled(stall_after),
+            Self::Buffered {
+                clock,
+                ptp_observation_started,
+                ptp_last_probe_observed,
+                ..
+            } => {
+                if clock.exchange().is_some() {
+                    return false;
+                }
+                ptp_last_probe_observed
+                    .unwrap_or(*ptp_observation_started)
+                    .elapsed()
+                    >= stall_after
+            }
+        }
+    }
+
+    fn arm_cold_start_verified(
+        &mut self,
+        requested_start_ntp: u64,
+        latency_max: Option<u32>,
+        lead_frames: u32,
+        rtp_offset: u32,
+        apple_model: bool,
+    ) -> Result<u64, String> {
+        match self {
+            Self::Realtime(sender) => sender
+                .arm_cold_start_verified(
+                    requested_start_ntp,
+                    latency_max,
+                    lead_frames,
+                    rtp_offset,
+                    apple_model,
+                )
+                .map_err(|error| format!("{error:?}")),
+            Self::Buffered {
+                sender,
+                clock,
+                control,
+                next_cseq,
+                session_uri,
+                dacp_id,
+                active_remote,
+                ..
+            } => {
+                // Type103 uses the same START feasibility contract, but its
+                // timeline is committed with SETRATEANCHORTIME instead of a
+                // realtime sync packet.
+                let now_ntp = system_time_to_ntp(SystemTime::now())
+                    .map_err(|error| format!("{error:?}"))?;
+                let mut floor_ntp = now_ntp.saturating_add(ms_to_ntp(250));
+                if let Some(exchange) = clock.exchange() {
+                    floor_ntp = floor_ntp.max(
+                        now_ntp.saturating_add(ms_to_ntp(clock_ready_delay_ms(
+                            exchange,
+                            apple_model,
+                        ))),
+                    );
+                }
+                let committed_start_ntp =
+                    resolve_group_start_ntp(requested_start_ntp, floor_ntp);
+                sender.arm_cold_start(committed_start_ntp);
+
+                let config = BufferedAnchorStartConfig {
+                    session_uri: session_uri.clone(),
+                    dacp_id: dacp_id.clone(),
+                    active_remote: active_remote.clone(),
+                    rtp_time: sender.state().timestamp,
+                    commanded_start_ntp: committed_start_ntp,
+                };
+                let mut channel = control
+                    .lock()
+                    .map_err(|_| "buffered RTSP control mutex poisoned".to_owned())?;
+                buffered_anchor_start(&mut channel, next_cseq.as_ref(), clock, &config)
+                    .map_err(|error| format!("{error:?}"))?;
+                sender.mark_anchored();
+                Ok(committed_start_ntp)
+            }
+        }
+    }
+
+    fn can_accept_frames(&mut self, now_ntp: u64) -> Result<bool, String> {
+        match self {
+            Self::Realtime(sender) => Ok(sender.can_accept_frames(now_ntp)),
+            Self::Buffered { sender, .. } => sender
+                .can_accept_frames(now_ntp)
+                .map_err(|error| format!("{error:?}")),
+        }
+    }
+
+    fn send_pcm_352(
+        &mut self,
+        packet: &[u8],
+        now_ntp: u64,
+        lead_frames: u32,
+    ) -> Result<(), String> {
+        match self {
+            Self::Realtime(sender) => sender
+                .send_pcm_352(packet, now_ntp, lead_frames)
+                .map(|_| ())
+                .map_err(|error| format!("{error:?}")),
+            Self::Buffered { sender, .. } => sender
+                .send_pcm_352(packet)
+                .map(|outcome| match outcome {
+                    BufferedWriteOutcome::Sent | BufferedWriteOutcome::Backpressured => (),
+                })
+                .map_err(|error| format!("{error:?}")),
+        }
+    }
+
+    fn recover_delivery_gap(&mut self, now_ntp: u64, lead_frames: u32) -> Option<u32> {
+        match self {
+            Self::Realtime(sender) => sender.recover_delivery_gap(now_ntp, lead_frames),
+            // Pinned cliairplay: buffered TCP needs no splice recovery; the
+            // receiver owns its buffer and the RTP content line is continuous.
+            Self::Buffered { .. } => None,
+        }
+    }
+
+    fn recover_input_gap(&mut self, now_ntp: u64, lead_frames: u32) -> Option<u32> {
+        match self {
+            Self::Realtime(sender) => sender.recover_input_gap(now_ntp, lead_frames),
+            Self::Buffered { .. } => None,
+        }
+    }
+
+    fn splice_pad_frames(&self) -> u32 {
+        match self {
+            Self::Realtime(sender) => sender.splice_pad_frames(),
+            Self::Buffered { .. } => 0,
+        }
+    }
+
+    fn add_splice_pad(&mut self, frames: u32) {
+        if let Self::Realtime(sender) = self {
+            sender.add_splice_pad(frames);
+        }
+    }
+
+    fn consume_splice_pad(&mut self, frames: u32) {
+        if let Self::Realtime(sender) = self {
+            sender.consume_splice_pad(frames);
+        }
+    }
+
+    fn reanchor_shifted_frames(&self) -> u64 {
+        match self {
+            Self::Realtime(sender) => sender.reanchor_shifted_frames(),
+            Self::Buffered { .. } => 0,
+        }
+    }
+}
+
 pub struct WindowsAudioTarget {
     pub(crate) name: String,
-    pub(crate) sender: RealtimeMediaSender,
+    pub(crate) sender: WindowsGroupMediaSender,
     pub(crate) lead_frames: u32,
     pub(crate) latency_max: Option<u32>,
     pub(crate) rtp_offset: u32,
@@ -152,6 +409,7 @@ pub struct WindowsMultiroomAudioWorker {
     last_discontinuity_frame: Arc<AtomicU64>,
     first_non_silent_frame: Arc<AtomicU64>,
     startup_events: Arc<Mutex<Vec<String>>>,
+    failed_members: Arc<Mutex<Vec<(String, String)>>>,
     active_members: Arc<AtomicU64>,
     join_handle: WindowsMultiroomJoinHandle,
 }
@@ -209,6 +467,8 @@ impl WindowsMultiroomAudioWorker {
         let first_non_silent_frame_thread = Arc::clone(&first_non_silent_frame);
         let startup_events = Arc::new(Mutex::new(Vec::<String>::new()));
         let startup_events_thread = Arc::clone(&startup_events);
+        let failed_members = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let failed_members_thread = Arc::clone(&failed_members);
         let active_members = Arc::new(AtomicU64::new(targets.len() as u64));
         let active_members_thread = Arc::clone(&active_members);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -375,23 +635,72 @@ impl WindowsMultiroomAudioWorker {
                             });
                         }
 
-                        for target in &mut targets {
-                            if let Err(error) = target.sender.arm_cold_start(
-                                start_ntp,
-                                target.latency_max,
-                                target.lead_frames,
-                                target.rtp_offset,
-                            ) {
-                                if let Ok(mut slot) = last_error_thread.lock() {
-                                    *slot = Some(format!(
-                                        "{} cold session START failed: {error:?}",
-                                        target.name
-                                    ));
-                                }
-                                running_thread.store(false, Ordering::SeqCst);
-                                return;
+                        // MSA does not trust the requested START blindly.
+                        // Every member returns the instant it actually committed;
+                        // if any member corrected forward, all members are
+                        // re-STARTed on the largest reported instant (+150 ms
+                        // command fan-out margin), for at most four rounds.
+                        let mut requested_start_ntp = start_ntp;
+                        let mut committed_group_ntp = start_ntp;
+                        let mut converged = false;
+                        let mut rounds = 0usize;
+
+                        for round in 1..=4 {
+                            rounds = round;
+                            let mut latest_committed_ntp = requested_start_ntp;
+                            for target in &mut targets {
+                                let committed = match target.sender.arm_cold_start_verified(
+                                    requested_start_ntp,
+                                    target.latency_max,
+                                    target.lead_frames,
+                                    target.rtp_offset,
+                                    target.apple_model,
+                                ) {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        if let Ok(mut slot) = last_error_thread.lock() {
+                                            *slot = Some(format!(
+                                                "{} cold session START failed: {error:?}",
+                                                target.name
+                                            ));
+                                        }
+                                        running_thread.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+                                };
+                                latest_committed_ntp = latest_committed_ntp.max(committed);
                             }
 
+                            let correction_ntp =
+                                latest_committed_ntp.saturating_sub(requested_start_ntp);
+                            if correction_ntp <= ms_to_ntp(2) {
+                                committed_group_ntp = requested_start_ntp;
+                                converged = true;
+                                break;
+                            }
+
+                            if let Ok(mut events) = startup_events_thread.lock() {
+                                events.push(format!(
+                                    "AirPlay group START corrected: round {round}/4 · member floor moved shared instant +{} ms.",
+                                    ntp_delta_to_ms(correction_ntp)
+                                ));
+                            }
+                            committed_group_ntp = latest_committed_ntp;
+                            if round < 4 {
+                                requested_start_ntp = latest_committed_ntp
+                                    .saturating_add(ms_to_ntp(AIRPLAY_SPLICE_LEAD_MARGIN_MS));
+                            }
+                        }
+
+                        if !converged {
+                            if let Ok(mut events) = startup_events_thread.lock() {
+                                events.push(format!(
+                                    "AirPlay group START did not converge after 4 rounds; latest committed instant retained for diagnostics."
+                                ));
+                            }
+                        }
+
+                        for target in &mut targets {
                             let rtp_timestamp = target.sender.state().timestamp;
                             match target.metadata.send("SAirplay2", "", "", rtp_timestamp) {
                                 Ok(result) if (200..300).contains(&result.status) => {
@@ -421,13 +730,14 @@ impl WindowsMultiroomAudioWorker {
                             }
                         }
                         cold_armed = true;
-                        group_start_ntp = Some(start_ntp);
+                        group_start_ntp = Some(committed_group_ntp);
                         if let Ok(mut events) = startup_events_thread.lock() {
                             events.push(format!(
-                                "AirPlay {} session: {} member(s) ready · shared START={} ms · one WASAPI source.",
+                                "AirPlay {} session: {} member(s) ready · shared START={} ms · verified in {} round(s) · one WASAPI source.",
                                 kind.label(),
                                 targets.len(),
-                                delay_ms
+                                ntp_delta_to_ms(committed_group_ntp.saturating_sub(now_ntp)),
+                                rounds
                             ));
                         }
                     }
@@ -517,7 +827,42 @@ impl WindowsMultiroomAudioWorker {
                             .map(|(index, _)| index)
                             .unwrap_or(0);
                         let gate_lead = targets[gate_index].lead_frames;
-                        if !targets[gate_index].sender.can_accept_frames(ntp) {
+
+                        // MSA fans one PCM chunk to every member and waits for
+                        // all writes before advancing the shared source. With a
+                        // buffered TCP member, its parked tail/backpressure must
+                        // therefore hold the NEXT group packet rather than let
+                        // realtime members run ahead by a sample block.
+                        let mut every_member_ready = true;
+                        let mut gate_failed = Vec::<(usize, String)>::new();
+                        for (index, target) in targets.iter_mut().enumerate() {
+                            match target.sender.can_accept_frames(ntp) {
+                                Ok(true) => {}
+                                Ok(false) => every_member_ready = false,
+                                Err(error) => gate_failed.push((
+                                    index,
+                                    format!("{} pacing/data channel failed: {error}", target.name),
+                                )),
+                            }
+                        }
+                        if !gate_failed.is_empty() {
+                            for (index, message) in gate_failed.into_iter().rev() {
+                                let name = targets
+                                    .get(index)
+                                    .map(|target| target.name.clone())
+                                    .unwrap_or_else(|| "unknown".to_owned());
+                                if let Ok(mut events) = startup_events_thread.lock() {
+                                    events.push(format!("AirPlay member removed: {message}"));
+                                }
+                                if let Ok(mut failed_members) = failed_members_thread.lock() {
+                                    failed_members.push((name, message.clone()));
+                                }
+                                targets.remove(index);
+                            }
+                            active_members_thread.store(targets.len() as u64, Ordering::SeqCst);
+                            continue;
+                        }
+                        if !every_member_ready {
                             thread::sleep(Duration::from_millis(1));
                             break;
                         }
@@ -602,11 +947,22 @@ impl WindowsMultiroomAudioWorker {
                             loop {
                                 let can_send = {
                                     let pending = &mut pending_joins[join_index];
-                                    !pending.queued_packets.is_empty()
-                                        && pending.target.sender.can_accept_frames(now_ntp)
+                                    if pending.queued_packets.is_empty() {
+                                        Ok(false)
+                                    } else {
+                                        pending.target.sender.can_accept_frames(now_ntp)
+                                    }
                                 };
-                                if !can_send {
-                                    break;
+                                match can_send {
+                                    Ok(true) => {}
+                                    Ok(false) => break,
+                                    Err(error) => {
+                                        join_failed = Some(format!(
+                                            "{} late-join pacing/data channel failed: {error}",
+                                            pending_joins[join_index].target.name
+                                        ));
+                                        break;
+                                    }
                                 }
 
                                 let source_packet = pending_joins[join_index]
@@ -682,8 +1038,15 @@ impl WindowsMultiroomAudioWorker {
 
                         if !failed.is_empty() {
                             for (index, message) in failed.into_iter().rev() {
+                                let name = targets
+                                    .get(index)
+                                    .map(|target| target.name.clone())
+                                    .unwrap_or_else(|| "unknown".to_owned());
                                 if let Ok(mut events) = startup_events_thread.lock() {
                                     events.push(format!("AirPlay member removed: {message}"));
+                                }
+                                if let Ok(mut failed_members) = failed_members_thread.lock() {
+                                    failed_members.push((name, message.clone()));
                                 }
                                 targets.remove(index);
                             }
@@ -730,6 +1093,7 @@ impl WindowsMultiroomAudioWorker {
                 last_discontinuity_frame,
                 first_non_silent_frame,
                 startup_events,
+                failed_members,
                 active_members,
                 join_handle,
             }),
@@ -793,6 +1157,13 @@ impl WindowsMultiroomAudioWorker {
         self.startup_events
             .lock()
             .map(|mut events| std::mem::take(&mut *events))
+            .unwrap_or_default()
+    }
+
+    pub fn drain_failed_members(&self) -> Vec<(String, String)> {
+        self.failed_members
+            .lock()
+            .map(|mut failed| std::mem::take(&mut *failed))
             .unwrap_or_default()
     }
 
@@ -1049,6 +1420,7 @@ fn prepare_pending_joins(
                 pending.target.latency_max,
                 pending.target.lead_frames,
                 pending.target.rtp_offset,
+                pending.target.apple_model,
             )
         };
         let committed_start_ntp = match arm_result {
@@ -1264,6 +1636,16 @@ fn ms_to_ntp(ms: u64) -> u64 {
     ((ms as u128) << 32).div_ceil(1000) as u64
 }
 
+fn resolve_group_start_ntp(requested_start_ntp: u64, floor_ntp: u64) -> u64 {
+    if requested_start_ntp >= floor_ntp {
+        requested_start_ntp
+    } else if requested_start_ntp == 0 {
+        floor_ntp
+    } else {
+        floor_ntp.saturating_add(ms_to_ntp(250))
+    }
+}
+
 fn frames_to_ntp(frames: u64, sample_rate: u32) -> u64 {
     ((frames as u128) << 32).div_ceil(sample_rate as u128) as u64
 }
@@ -1295,6 +1677,11 @@ mod mixed_format_tests {
         };
         assert_eq!(clock_ready_delay_ms(seated, false), 1_300);
         assert_eq!(clock_ready_delay_ms(seated, true), 150);
+    }
+
+    #[test]
+    fn msa_group_start_convergence_constants_match_source() {
+        assert_eq!(AIRPLAY_SPLICE_LEAD_MARGIN_MS, 150);
     }
 
     #[test]

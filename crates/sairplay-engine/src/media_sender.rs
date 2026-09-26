@@ -275,13 +275,37 @@ impl RealtimeMediaSender {
     /// commit correction is added later.
     pub fn arm_cold_start_verified(
         &mut self,
-        start_ntp: u64,
+        requested_start_ntp: u64,
         latency_max: Option<u32>,
         lead_frames: u32,
         rtp_offset: u32,
+        apple_model: bool,
     ) -> Result<u64, MediaSendError> {
-        self.arm_cold_start(start_ntp, latency_max, lead_frames, rtp_offset)?;
-        Ok(start_ntp)
+        // Port ap2_clock_floor() + ap2_resolve_start() from pinned
+        // airplay-cli. A START acknowledgement names the instant the sender
+        // actually committed, never merely the caller's request. This is what
+        // lets Music Assistant converge every member of a group on one shared
+        // audible instant.
+        let now_ntp = crate::system_time_to_ntp(SystemTime::now())
+            .unwrap_or(requested_start_ntp);
+        let mut floor_ntp = now_ntp.saturating_add(ms_to_ntp(250));
+        if let Some(exchange) = self.ptp_probe_exchange() {
+            floor_ntp = floor_ntp.max(
+                now_ntp.saturating_add(ms_to_ntp(clock_ready_delay_ms(
+                    exchange,
+                    apple_model,
+                ))),
+            );
+        }
+
+        let committed_start_ntp = resolve_start_ntp(requested_start_ntp, floor_ntp);
+        self.arm_cold_start(
+            committed_start_ntp,
+            latency_max,
+            lead_frames,
+            rtp_offset,
+        )?;
+        Ok(committed_start_ntp)
     }
 
     fn splice_pad_to_lead(
@@ -623,6 +647,37 @@ fn frames_to_ns(frames: u32, sample_rate: u64) -> u64 {
     ((frames as u128 * 1_000_000_000u128) / sample_rate as u128) as u64
 }
 
+fn ms_to_ntp(ms: u64) -> u64 {
+    ((ms as u128) << 32).div_ceil(1000) as u64
+}
+
+fn clock_ready_delay_ms(exchange: PtpExchange, apple_model: bool) -> u64 {
+    const CLOCK_LOCK_MS: u64 = 2_300;
+    const CLOCK_SETTLE_MS: u64 = 250;
+    const CLOCK_SEAT_EXCHANGES: u32 = 3;
+
+    let full = CLOCK_LOCK_MS.saturating_sub(exchange.first_ms);
+    if apple_model && exchange.count >= CLOCK_SEAT_EXCHANGES {
+        let fast = CLOCK_SETTLE_MS.saturating_sub(exchange.third_ms);
+        full.min(fast)
+    } else {
+        full
+    }
+}
+
+fn resolve_start_ntp(requested_start_ntp: u64, floor_ntp: u64) -> u64 {
+    if requested_start_ntp >= floor_ntp {
+        requested_start_ntp
+    } else if requested_start_ntp == 0 {
+        floor_ntp
+    } else {
+        // Source gives a corrected nonzero request one extra minimum lead so
+        // the caller's convergence retry does not chase a moving wall-clock
+        // floor forever.
+        floor_ntp.saturating_add(ms_to_ntp(250))
+    }
+}
+
 fn ms_to_frames(ms: u64, sample_rate: u64) -> u64 {
     ((ms as u128 * sample_rate as u128) / 1_000u128) as u64
 }
@@ -840,6 +895,30 @@ mod tests {
         let now_ts = ntp_to_frames(now, 44_100);
         sender.configure_source_timeline(now, now_ts + 1, Some(66_150), 11_025);
         assert_eq!(sender.recover_delivery_gap(now, 11_025), None);
+    }
+
+    #[test]
+    fn start_resolution_matches_pinned_airplay_cli_floor_semantics() {
+        let floor = 10u64 << 32;
+        let ahead = floor.saturating_add(ms_to_ntp(400));
+        assert_eq!(resolve_start_ntp(ahead, floor), ahead);
+        assert_eq!(resolve_start_ntp(0, floor), floor);
+        assert_eq!(
+            resolve_start_ntp(floor.saturating_sub(ms_to_ntp(1)), floor),
+            floor.saturating_add(ms_to_ntp(250))
+        );
+    }
+
+    #[test]
+    fn clock_floor_uses_apple_fast_seat_after_third_probe() {
+        let exchange = PtpExchange {
+            count: 3,
+            first_ms: 1_000,
+            last_ms: 0,
+            third_ms: 100,
+        };
+        assert_eq!(clock_ready_delay_ms(exchange, false), 1_300);
+        assert_eq!(clock_ready_delay_ms(exchange, true), 150);
     }
 
     #[test]
