@@ -31,10 +31,6 @@ impl Pcm352Chunker {
     pub fn packet_bytes(&self) -> usize { self.packet_bytes }
     pub fn pending_bytes(&self) -> usize { self.pending.len() }
 
-    pub fn pending_nonzero_bytes(&self) -> usize {
-        self.pending.iter().filter(|byte| **byte != 0).count()
-    }
-
     pub fn has_packet(&self) -> bool { self.pending.len() >= self.packet_bytes }
 
     pub fn clear(&mut self) { self.pending.clear(); }
@@ -157,9 +153,8 @@ mod tests {
     fn clear_discards_only_buffered_capture_bytes() {
         let mut c = Pcm352Chunker::new();
         c.push(&[1,2,0,4,0]);
-        assert_eq!(c.pending_nonzero_bytes(), 3);
+        assert_eq!(c.pending_bytes(), 5);
         c.clear();
         assert_eq!(c.pending_bytes(), 0);
-        assert_eq!(c.pending_nonzero_bytes(), 0);
     }
 }
