@@ -423,7 +423,6 @@ pub struct WindowsMultiroomAudioWorker {
     last_error: Arc<Mutex<Option<String>>>,
     discontinuities: Arc<AtomicU64>,
     last_discontinuity_frame: Arc<AtomicU64>,
-    first_non_silent_frame: Arc<AtomicU64>,
     startup_events: Arc<Mutex<Vec<String>>>,
     failed_members: Arc<Mutex<Vec<(String, String)>>>,
     active_members: Arc<AtomicU64>,
@@ -479,8 +478,6 @@ impl WindowsMultiroomAudioWorker {
         let discontinuities_thread = Arc::clone(&discontinuities);
         let last_discontinuity_frame = Arc::new(AtomicU64::new(u64::MAX));
         let last_discontinuity_frame_thread = Arc::clone(&last_discontinuity_frame);
-        let first_non_silent_frame = Arc::new(AtomicU64::new(u64::MAX));
-        let first_non_silent_frame_thread = Arc::clone(&first_non_silent_frame);
         let startup_events = Arc::new(Mutex::new(Vec::<String>::new()));
         let startup_events_thread = Arc::clone(&startup_events);
         let failed_members = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
@@ -570,15 +567,6 @@ impl WindowsMultiroomAudioWorker {
                                 Ordering::SeqCst,
                             );
                         }
-                    }
-                    if let Some(offset) = report.first_non_silent_frame_offset {
-                        let absolute = captured_frames_total.saturating_add(offset);
-                        let _ = first_non_silent_frame_thread.compare_exchange(
-                            u64::MAX,
-                            absolute,
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                        );
                     }
                     let frames = report.frames;
                     captured_frames_total = captured_frames_total.saturating_add(frames as u64);
@@ -1107,7 +1095,6 @@ impl WindowsMultiroomAudioWorker {
                 last_error,
                 discontinuities,
                 last_discontinuity_frame,
-                first_non_silent_frame,
                 startup_events,
                 failed_members,
                 active_members,
@@ -1157,13 +1144,6 @@ impl WindowsMultiroomAudioWorker {
 
     pub fn last_discontinuity_frame(&self) -> Option<u64> {
         match self.last_discontinuity_frame.load(Ordering::SeqCst) {
-            u64::MAX => None,
-            value => Some(value),
-        }
-    }
-
-    pub fn first_non_silent_frame(&self) -> Option<u64> {
-        match self.first_non_silent_frame.load(Ordering::SeqCst) {
             u64::MAX => None,
             value => Some(value),
         }
