@@ -67,8 +67,6 @@ pub struct WasapiDrainReport {
     pub frames: usize,
     pub discontinuities: u64,
     pub discontinuity_frame_offset: Option<u64>,
-    pub first_non_silent_frame_offset: Option<u64>,
-    pub first_nonzero_frame_offset: Option<u64>,
 }
 
 pub struct WasapiLoopbackCapture {
@@ -242,10 +240,6 @@ impl WasapiLoopbackCapture {
                 }
 
                 let silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0;
-                if !silent && report.first_non_silent_frame_offset.is_none() {
-                    report.first_non_silent_frame_offset = Some(drained_before);
-                }
-
                 let byte_len = frames as usize * self.bytes_per_frame;
                 if silent {
                     chunker.push(&vec![0u8; byte_len]);
@@ -255,15 +249,6 @@ impl WasapiLoopbackCapture {
                         return Err(WasapiLoopbackError::InvalidBuffer);
                     }
                     let bytes = std::slice::from_raw_parts(data as *const u8, byte_len);
-                    if report.first_nonzero_frame_offset.is_none() {
-                        for (frame_index, frame) in bytes.chunks_exact(self.bytes_per_frame).enumerate() {
-                            if frame.iter().any(|byte| *byte != 0) {
-                                report.first_nonzero_frame_offset =
-                                    Some(drained_before.saturating_add(frame_index as u64));
-                                break;
-                            }
-                        }
-                    }
                     chunker.push(bytes);
                 }
 
