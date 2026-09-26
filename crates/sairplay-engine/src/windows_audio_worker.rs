@@ -338,8 +338,6 @@ impl WindowsAudioWorker {
             let mut resume_packet_pending = false;
             let mut transition_packet_diag_remaining: u32 = 0;
             let mut transition_packet_diag_index: u32 = 0;
-            let mut inferred_idle = false;
-            let mut idle_keepalive_reported = false;
             let mut transition_epoch: u64 = 0;
             let mut last_ptp_probe_alive: Option<bool> = None;
             let mut last_ptp_snapshot = std::time::Instant::now();
@@ -419,11 +417,11 @@ impl WindowsAudioWorker {
                         }
 
                         // Windows has no explicit player FLUSH/START command pipe.
-                        // A sustained all-zero interval is therefore DIAGNOSTIC ONLY.
-                        // Do not synthesize ap2_session_flush() from silence: upstream
-                        // flushes only on an explicit session command. Treating ordinary
-                        // track-gap silence as FLUSH discards valid queued PCM and can
-                        // strand an otherwise healthy Apple realtime timeline.
+                        // Match MSA: digital-zero PCM is still valid PCM, not an
+                        // implicit PAUSE/FLUSH/START boundary. Only explicit session
+                        // commands or a genuinely dry input path may alter splice
+                        // state. Keep zero intervals diagnostic-only and let the PCM
+                        // continue through the normal packet/pacing path unchanged.
                         if cold_armed {
                             if report.first_nonzero_frame_offset.is_some() {
                                 if let Some(gap_started) = nonzero_gap_started.take() {
@@ -445,39 +443,6 @@ impl WindowsAudioWorker {
                                         transition_packet_diag_index = 0;
                                     }
                                 }
-                                if inferred_idle {
-                                    if let Ok(now_ntp) = system_time_to_ntp(SystemTime::now()) {
-                                        let state = sender.state();
-                                        let head_delta = sender.timeline_head_delta_frames(now_ntp);
-                                        let head_delta_ms =
-                                            head_delta as f64 * 1000.0 / audio_format.sample_rate as f64;
-                                        if let Ok(mut events) = startup_events_thread.lock() {
-                                            events.push(format!(
-                                                "Transition: boundary #{} resume · head_delta_frames={} ({:.1} ms) · seq={} ts={} · pending_bytes={} · pad_debt={} · reanchors={} · {}.",
-                                                transition_epoch,
-                                                head_delta,
-                                                head_delta_ms,
-                                                state.sequence,
-                                                state.timestamp,
-                                                chunker.pending_bytes(),
-                                                sender.splice_pad_frames(),
-                                                sender.timeline_reanchors(),
-                                                ptp_probe_summary(&sender)
-                                            ));
-                                            if head_delta <= 0 {
-                                                events.push(format!(
-                                                    "Diagnostic: warm boundary #{} resumed on a lapsed timeline · head_delta_frames={} ({:.1} ms).",
-                                                    transition_epoch,
-                                                    head_delta,
-                                                    head_delta_ms
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    inferred_idle = false;
-                                    idle_keepalive_reported = false;
-                                    input_starved_since = None;
-                                }
                                 nonzero_gap_reported = false;
                             } else {
                                 let gap_started = nonzero_gap_started
@@ -485,80 +450,15 @@ impl WindowsAudioWorker {
                                 if !nonzero_gap_reported
                                     && gap_started.elapsed() >= Duration::from_millis(250)
                                 {
+                                    transition_epoch = transition_epoch.saturating_add(1);
                                     if let Ok(mut events) = startup_events_thread.lock() {
                                         events.push(format!(
-                                            "Transition: no nonzero PCM for >=250 ms · wasapi_frames={} · engine_non_silent={} · pending_bytes={} · pad_debt={} · reanchors={}.",
+                                            "Diagnostic: digital-zero PCM >=250 ms · zero_gap={} · wasapi_frames={} · pending_bytes={} · pad_debt={} · reanchors={} · timeline unchanged.",
+                                            transition_epoch,
                                             frames,
-                                            report.first_non_silent_frame_offset.is_some(),
                                             chunker.pending_bytes(),
                                             sender.splice_pad_frames(),
                                             sender.timeline_reanchors()
-                                        ));
-                                    }
-                                    inferred_idle = true;
-                                    idle_keepalive_reported = false;
-                                    input_starved_since = None;
-                                    transition_epoch = transition_epoch.saturating_add(1);
-
-                                    let pending_before = chunker.pending_bytes();
-                                    let pending_nonzero_before = chunker.pending_nonzero_bytes();
-                                    let pad_before = sender.splice_pad_frames();
-
-                                    if let Ok(now_ntp) = system_time_to_ntp(SystemTime::now()) {
-                                        let state = sender.state();
-                                        let head_delta = sender.timeline_head_delta_frames(now_ntp);
-                                        let head_delta_ms =
-                                            head_delta as f64 * 1000.0 / audio_format.sample_rate as f64;
-                                        if let Ok(mut events) = startup_events_thread.lock() {
-                                            events.push(format!(
-                                                "Transition: boundary #{} inferred · head_delta_frames={} ({:.1} ms) · seq={} ts={} · pending_bytes={} ({} frames) · pending_nonzero_bytes={} · pad_debt={} · reanchors={} · {}.",
-                                                transition_epoch,
-                                                head_delta,
-                                                head_delta_ms,
-                                                state.sequence,
-                                                state.timestamp,
-                                                pending_before,
-                                                pending_before / 4,
-                                                pending_nonzero_before,
-                                                pad_before,
-                                                sender.timeline_reanchors(),
-                                                ptp_probe_summary(&sender)
-                                            ));
-                                            if head_delta <= 0 {
-                                                events.push(format!(
-                                                    "Diagnostic: warm boundary #{} entered with a lapsed timeline · head_delta_frames={} ({:.1} ms).",
-                                                    transition_epoch,
-                                                    head_delta,
-                                                    head_delta_ms
-                                                ));
-                                            }
-                                            if pending_nonzero_before != 0 {
-                                                events.push(format!(
-                                                    "Diagnostic: warm boundary #{} contained stale nonzero PCM · bytes={} nonzero_bytes={}.",
-                                                    transition_epoch,
-                                                    pending_before,
-                                                    pending_nonzero_before
-                                                ));
-                                            }
-                                        }
-                                    }
-
-                                    // Restore the known-good local half of a warm boundary.
-                                    // Windows has no explicit FLUSH command pipe, so after a
-                                    // sustained all-zero gap we may discard only sender-local
-                                    // PCM/pad that has not reached the wire yet. The receiver
-                                    // queue, RTP sequence/timestamp, crypto and immutable anchor
-                                    // remain untouched; no RTSP FLUSH is sent.
-                                    chunker.clear();
-                                    sender.begin_warm_splice_boundary();
-
-                                    if let Ok(mut events) = startup_events_thread.lock() {
-                                        events.push(format!(
-                                            "Transition: boundary #{} local cleanup · discarded_bytes={} · stale_nonzero_bytes={} · dropped_pad_frames={} · seq/timestamp/anchor preserved.",
-                                            transition_epoch,
-                                            pending_before,
-                                            pending_nonzero_before,
-                                            pad_before
                                         ));
                                     }
                                     nonzero_gap_reported = true;
@@ -645,7 +545,7 @@ impl WindowsAudioWorker {
                                 head_delta as f64 * 1000.0 / audio_format.sample_rate as f64;
                             if let Ok(mut events) = startup_events_thread.lock() {
                                 events.push(format!(
-                                    "Diagnostic: steady timeline · frames={} · seq={} ts={} · head_delta_frames={} ({:.1} ms) · pending_bytes={} · nonzero_bytes={} · pad_debt={} · inferred_idle={} · gap_ms={}.",
+                                    "Diagnostic: steady timeline · frames={} · seq={} ts={} · head_delta_frames={} ({:.1} ms) · pending_bytes={} · nonzero_bytes={} · pad_debt={} · gap_ms={}.",
                                     frames,
                                     state.sequence,
                                     state.timestamp,
@@ -654,7 +554,6 @@ impl WindowsAudioWorker {
                                     chunker.pending_bytes(),
                                     chunker.pending_nonzero_bytes(),
                                     sender.splice_pad_frames(),
-                                    inferred_idle,
                                     nonzero_gap_started
                                         .map(|started| started.elapsed().as_millis())
                                         .unwrap_or(0)
@@ -663,14 +562,11 @@ impl WindowsAudioWorker {
                             last_steady_diag = std::time::Instant::now();
                         }
 
-                        // A sustained all-zero Windows loopback interval is
-                        // the local equivalent of source PAUSED/EOF/track-gap:
-                        // keep the splice line hot and do not re-anchor it.
-                        // This is intentionally gated on actual PCM content
-                        // (first_nonzero), not on a single empty WASAPI poll.
-                        if inferred_idle {
-                            input_starved_since = None;
-                        } else if chunker.has_packet() {
+                        // Match MSA recovery semantics. Digital-zero PCM remains
+                        // ordinary queued content. Delivery-gap recovery applies
+                        // when a complete packet is queued; starvation recovery is
+                        // reserved for a genuinely dry input path (frames == 0).
+                        if chunker.has_packet() {
                             input_starved_since = None;
                             if let Some(added) = sender.recover_delivery_gap(recovery_ntp, lead_frames) {
                                 let startup_window = startup_started
@@ -717,66 +613,9 @@ impl WindowsAudioWorker {
                             }
                         }
 
-                        // Upstream keeps an already-started splice timeline
-                        // bitstream-continuous with encoded silence while
-                        // PAUSED/EOF/idle. Windows loopback has no command pipe,
-                        // so inferred_idle supplies only that missing state.
-                        if inferred_idle && !chunker.has_packet() {
-                            let ntp = match system_time_to_ntp(SystemTime::now()) {
-                                Ok(value) => value,
-                                Err(error) => {
-                                    if let Ok(mut slot) = last_error_thread.lock() {
-                                        *slot = Some(format!("NTP clock conversion failed: {error:?}"));
-                                    }
-                                    running_thread.store(false, Ordering::SeqCst);
-                                    return;
-                                }
-                            };
-                            if sender.can_accept_frames(ntp) {
-                                let silence = vec![0u8; crate::ALAC_FRAMES_PER_PACKET * bytes_per_frame];
-                                match sender.send_pcm_352(&silence, ntp, lead_frames) {
-                                    Ok(result) => {
-                                        let expected_sync =
-                                            result.first_marker || result.sequence_sent % 100 == 0;
-                                        if !result.audio_delivered
-                                            || (expected_sync && !result.sync_sent)
-                                        {
-                                            if let Ok(mut events) = startup_events_thread.lock() {
-                                                events.push(format!(
-                                                    "Diagnostic: idle media delivery anomaly · seq={} ts={} marker={} sync_expected={} sync_sent={} audio_sent={}.",
-                                                    result.sequence_sent,
-                                                    result.timestamp_sent,
-                                                    result.first_marker,
-                                                    expected_sync,
-                                                    result.sync_sent,
-                                                    result.audio_delivered
-                                                ));
-                                            }
-                                        }
-                                        if !idle_keepalive_reported {
-                                            if let Ok(mut events) = startup_events_thread.lock() {
-                                                events.push(format!(
-                                                    "Transition: inferred idle keepalive active · seq={} ts={} audio_sent={} · pending_bytes={} · pad_debt={}.",
-                                                    result.sequence_sent,
-                                                    result.timestamp_sent,
-                                                    result.audio_delivered,
-                                                    chunker.pending_bytes(),
-                                                    sender.splice_pad_frames()
-                                                ));
-                                            }
-                                            idle_keepalive_reported = true;
-                                        }
-                                    }
-                                    Err(error) => {
-                                        if let Ok(mut slot) = last_error_thread.lock() {
-                                            *slot = Some(format!("idle silence keepalive failed: {error:?}"));
-                                        }
-                                        running_thread.store(false, Ordering::SeqCst);
-                                        return;
-                                    }
-                                }
-                            }
-                        }
+                        // No synthetic idle mode from sample values. Explicit MSA
+                        // PAUSE/EOF state is not inferred from Windows PCM content;
+                        // zero PCM reaches the normal send loop as real silence.
 
                         loop {
                             let pad_now = sender.splice_pad_frames().min(352);
@@ -835,7 +674,7 @@ impl WindowsAudioWorker {
                                     if resume_packet_pending {
                                         if let Ok(mut events) = startup_events_thread.lock() {
                                             events.push(format!(
-                                                "Transition: first outbound after PCM resume · boundary={} · seq={} ts={} marker={} sync_sent={} audio_sent={} pad_before={} · pending_after={}.",
+                                                "Transition: first outbound after PCM resume · zero_gap={} · seq={} ts={} marker={} sync_sent={} audio_sent={} pad_before={} · pending_after={}.",
                                                 transition_epoch,
                                                 result.sequence_sent,
                                                 result.timestamp_sent,
@@ -853,7 +692,7 @@ impl WindowsAudioWorker {
                                             transition_packet_diag_index.saturating_add(1);
                                         if let Ok(mut events) = startup_events_thread.lock() {
                                             events.push(format!(
-                                                "Transition: packet diag · format={}-bit/{}Hz · boundary={} · packet={}/32 · seq={} ts={} · alac={} B · wire={} B · head_delta_before={} ({:.2} ms) · wasapi_discontinuities={} · pad_before={} · pending_after={}.",
+                                                "Transition: packet diag · format={}-bit/{}Hz · zero_gap={} · packet={}/32 · seq={} ts={} · alac={} B · wire={} B · head_delta_before={} ({:.2} ms) · wasapi_discontinuities={} · pad_before={} · pending_after={}.",
                                                 audio_format.bit_depth,
                                                 audio_format.sample_rate,
                                                 transition_epoch,
