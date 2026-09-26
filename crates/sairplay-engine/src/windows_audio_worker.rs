@@ -332,7 +332,13 @@ impl WindowsAudioWorker {
             let mut cold_armed = false;
             let mut startup_packet_index: u32 = 0;
             let mut startup_started: Option<std::time::Instant> = None;
-            let mut input_starved_since: Option<std::time::Instant> = None;
+            let mut dry_input_since: Option<std::time::Instant> = None;
+            let mut last_input_gap_recovery: Option<std::time::Instant> = None;
+            let mut dry_idle_keepalive = false;
+            let dry_idle_after_ms = ((lead_frames as u64 * 1000)
+                / audio_format.sample_rate as u64)
+                .saturating_add(2000);
+            let silence_packet = vec![0u8; 352usize * bytes_per_frame];
             let mut nonzero_gap_started: Option<std::time::Instant> = None;
             let mut nonzero_gap_reported = false;
             let mut resume_packet_pending = false;
@@ -563,11 +569,29 @@ impl WindowsAudioWorker {
                         }
 
                         // Match MSA recovery semantics. Digital-zero PCM remains
-                        // ordinary queued content. Delivery-gap recovery applies
-                        // when a complete packet is queued; starvation recovery is
-                        // reserved for a genuinely dry input path (frames == 0).
+                        // ordinary queued content. A short, genuinely dry input path
+                        // is treated like ap2_session_read(..., 250) == 0 while
+                        // PLAYING. Windows loopback has no EOF sentinel, though, so
+                        // after one source-equivalent drain window (lead + 2 s) of
+                        // continuous frames==0 we switch to the MSA input_ended
+                        // behavior: keep the already-armed splice line hot with
+                        // encoded silence, without stacking recovery re-anchors.
                         if chunker.has_packet() {
-                            input_starved_since = None;
+                            if dry_idle_keepalive {
+                                if let Ok(mut events) = startup_events_thread.lock() {
+                                    events.push(format!(
+                                        "Transition: dry-input keepalive ended · dry_ms={} · pending_bytes={} · reanchors={}.",
+                                        dry_input_since
+                                            .map(|started| started.elapsed().as_millis())
+                                            .unwrap_or(0),
+                                        chunker.pending_bytes(),
+                                        sender.timeline_reanchors()
+                                    ));
+                                }
+                            }
+                            dry_input_since = None;
+                            last_input_gap_recovery = None;
+                            dry_idle_keepalive = false;
                             if let Some(added) = sender.recover_delivery_gap(recovery_ntp, lead_frames) {
                                 let startup_window = startup_started
                                     .map(|t| t.elapsed() <= Duration::from_secs(3))
@@ -587,35 +611,98 @@ impl WindowsAudioWorker {
                         } else if frames > 0 {
                             // New PCM arrived but not enough for a complete packet;
                             // this is normal producer cadence, not starvation.
-                            input_starved_since = None;
-                        } else {
-                            // Upstream blocks ap2_session_read(..., 250) and only
-                            // enters starvation recovery after that full timeout.
-                            // WASAPI polling returns ordinary empty drains every
-                            // ~1 ms, so never treat a single empty poll as a gap.
-                            let started = input_starved_since.get_or_insert_with(std::time::Instant::now);
-                            if started.elapsed() >= Duration::from_millis(250) {
-                                if let Some(added) = sender.recover_input_gap(recovery_ntp, lead_frames) {
-                                    let startup_window = startup_started
-                                        .map(|t| t.elapsed() <= Duration::from_secs(3))
-                                        .unwrap_or(false);
-                                    if let Ok(mut events) = startup_events_thread.lock() {
-                                        events.push(format!(
-                                            "{}: input-gap recovery after >=250 ms added {} silence frames · total_pad={} · pending_bytes={}.",
-                                            if startup_window { "Startup" } else { "Transition" },
-                                            added,
-                                            sender.splice_pad_frames(),
-                                            chunker.pending_bytes()
-                                        ));
-                                    }
+                            if dry_idle_keepalive {
+                                if let Ok(mut events) = startup_events_thread.lock() {
+                                    events.push(format!(
+                                        "Transition: dry-input keepalive ended · dry_ms={} · pending_bytes={} · reanchors={}.",
+                                        dry_input_since
+                                            .map(|started| started.elapsed().as_millis())
+                                            .unwrap_or(0),
+                                        chunker.pending_bytes(),
+                                        sender.timeline_reanchors()
+                                    ));
                                 }
-                                input_starved_since = Some(std::time::Instant::now());
+                            }
+                            dry_input_since = None;
+                            last_input_gap_recovery = None;
+                            dry_idle_keepalive = false;
+                        } else {
+                            let now = std::time::Instant::now();
+                            let started = *dry_input_since.get_or_insert(now);
+                            let dry_elapsed = started.elapsed();
+
+                            if !dry_idle_keepalive
+                                && dry_elapsed >= Duration::from_millis(dry_idle_after_ms)
+                            {
+                                // MSA input_ended does not keep warm-splice recovery
+                                // debt alive across the idle wait. Windows has no
+                                // explicit epoch/START here, so drop only local pad
+                                // debt and a sub-packet stale tail; RTP/PTP/seq/ts
+                                // and the immutable receiver anchor remain untouched.
+                                let discarded_bytes = chunker.pending_bytes();
+                                chunker.clear();
+                                sender.begin_warm_splice_boundary();
+                                dry_idle_keepalive = true;
+                                last_input_gap_recovery = None;
+                                if let Ok(mut events) = startup_events_thread.lock() {
+                                    events.push(format!(
+                                        "Transition: dry input >= {} ms · entering EOF-style silence keepalive · discarded_tail_bytes={} · reanchors={}.",
+                                        dry_idle_after_ms,
+                                        discarded_bytes,
+                                        sender.timeline_reanchors()
+                                    ));
+                                }
+                            } else if !dry_idle_keepalive {
+                                let due = last_input_gap_recovery
+                                    .map(|last| last.elapsed() >= Duration::from_millis(250))
+                                    .unwrap_or_else(|| dry_elapsed >= Duration::from_millis(250));
+                                if due {
+                                    if let Some(added) = sender.recover_input_gap(recovery_ntp, lead_frames) {
+                                        let startup_window = startup_started
+                                            .map(|t| t.elapsed() <= Duration::from_secs(3))
+                                            .unwrap_or(false);
+                                        if let Ok(mut events) = startup_events_thread.lock() {
+                                            events.push(format!(
+                                                "{}: input-gap recovery after >=250 ms added {} silence frames · total_pad={} · pending_bytes={}.",
+                                                if startup_window { "Startup" } else { "Transition" },
+                                                added,
+                                                sender.splice_pad_frames(),
+                                                chunker.pending_bytes()
+                                            ));
+                                        }
+                                    }
+                                    last_input_gap_recovery = Some(now);
+                                }
                             }
                         }
 
-                        // No synthetic idle mode from sample values. Explicit MSA
-                        // PAUSE/EOF state is not inferred from Windows PCM content;
-                        // zero PCM reaches the normal send loop as real silence.
+                        if dry_idle_keepalive && frames == 0 && !chunker.has_packet() {
+                            // MSA input_ended: the wire stays hot with ordinary
+                            // encoded silence. No timestamp/sequence/anchor reset,
+                            // and no recover_input_gap() re-anchor storm.
+                            let ntp = match system_time_to_ntp(SystemTime::now()) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(format!("NTP clock conversion failed: {error:?}"));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            };
+                            if sender.can_accept_frames(ntp) {
+                                if let Err(error) = sender.send_pcm_352(&silence_packet, ntp, lead_frames) {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(format!("idle silence send failed: {error:?}"));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            } else {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            continue;
+                        }
 
                         loop {
                             let pad_now = sender.splice_pad_frames().min(352);
