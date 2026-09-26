@@ -1191,7 +1191,7 @@ fn handle_group_commands(
 ) {
     while let Ok(command) = command_rx.try_recv() {
         match command {
-            GroupAudioCommand::Add { mut target, reply } => {
+            GroupAudioCommand::Add { target, reply } => {
                 let target_format = target.sender.audio_format();
                 if target_format.sample_rate != source_format.sample_rate
                     || (target_format.bit_depth > source_format.bit_depth)
@@ -1383,25 +1383,28 @@ fn prepare_pending_joins(
             sample_rate,
         ));
 
-        let committed_start_ntp = {
+        let arm_result = {
             let pending = &mut pending_joins[index];
-            match pending.target.sender.arm_cold_start_verified(
+            pending.target.sender.arm_cold_start_verified(
                 requested_start_ntp,
                 pending.target.latency_max,
                 pending.target.lead_frames,
                 pending.target.rtp_offset,
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    let name = pending.target.name.clone();
-                    let message = format!("{name} late-join START failed: {error:?}");
-                    let pending = pending_joins.remove(index);
-                    let _ = pending.reply.send(Err(message.clone()));
-                    if let Ok(mut events) = startup_events.lock() {
-                        events.push(message);
-                    }
-                    continue;
+            )
+        };
+        let committed_start_ntp = match arm_result {
+            Ok(value) => value,
+            Err(error) => {
+                let pending = pending_joins.remove(index);
+                let message = format!(
+                    "{} late-join START failed: {error:?}",
+                    pending.target.name
+                );
+                let _ = pending.reply.send(Err(message.clone()));
+                if let Ok(mut events) = startup_events.lock() {
+                    events.push(message);
                 }
+                continue;
             }
         };
 
@@ -1468,7 +1471,7 @@ fn prepare_pending_joins(
             let commit_delta = committed_ms as i128 - requested_ms as i128;
             if let Ok(mut events) = startup_events.lock() {
                 events.push(format!(
-                    "{}: late join clock={} · committed packet #{} · prime={} packet(s) · skip={} packet(s) · START ack delta={:+} ms.",
+                    "{}: late join clock={} · committed packet #{} · prime={} packet(s) · skip={} packet(s) · START commit delta={:+} ms.",
                     pending.target.name,
                     readiness,
                     committed_packet,
