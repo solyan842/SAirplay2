@@ -88,7 +88,6 @@ impl WindowsAudioWorker {
 
             let mut chunker = Pcm352Chunker::new_with_bytes_per_frame(bytes_per_frame);
             let mut captured_frames_total = 0u64;
-            let mut source_present = false;
             let mut cold_armed = false;
 
             while running_thread.load(Ordering::SeqCst) {
@@ -123,15 +122,11 @@ impl WindowsAudioWorker {
                         captured_frames_total =
                             captured_frames_total.saturating_add(report.frames as u64);
 
-                        if !source_present {
-                            if report.first_non_silent_frame_offset.is_some() {
-                                source_present = true;
-                            } else {
-                                chunker.clear();
-                                thread::sleep(Duration::from_millis(1));
-                                continue;
-                            }
-                        }
+                        // Pinned cliairplay never uses PCM amplitude as
+                        // stream state. Digital-zero samples are ordinary
+                        // buffered PCM; cold START waits only for one complete
+                        // 352-frame transport packet. A zero-frame read simply
+                        // leaves the receiver rendering from its own buffer.
 
                         if !cold_armed {
                             if !chunker.has_packet() {
