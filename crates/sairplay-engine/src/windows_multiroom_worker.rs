@@ -19,6 +19,7 @@ pub const AIRPLAY_COLD_GROUP_START_LEAD_MS: u64 = 2_500;
 pub const AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS: u64 = 2_500;
 pub const AIRPLAY_CLOCK_READY_TIMEOUT_MS: u64 = 2_500;
 pub const AIRPLAY_CLOCK_READY_LEAD_MS: u64 = 500;
+pub const AIRPLAY_SPLICE_LEAD_MARGIN_MS: u64 = 150;
 pub const AIRPLAY_CLOCK_STALL_MS: u64 = 5_000;
 pub const AIRPLAY_LATE_JOIN_RING_MIN_SECONDS: f64 = 12.0;
 pub const AIRPLAY_LATE_JOIN_RING_MARGIN_SECONDS: f64 = 2.0;
@@ -375,21 +376,57 @@ impl WindowsMultiroomAudioWorker {
                             });
                         }
 
+                        // Match MSA _start_members(): converge the group
+                        // on the largest instant every member can actually
+                        // honor before releasing any PCM.
+                        let mut shared_start_ntp = start_ntp;
+                        for round in 0..4 {
+                            let corrected_ntp = targets.iter().fold(
+                                shared_start_ntp,
+                                |latest, target| {
+                                    latest.max(
+                                        target
+                                            .sender
+                                            .resolve_start_ntp(shared_start_ntp, target.apple_model),
+                                    )
+                                },
+                            );
+                            if corrected_ntp <= shared_start_ntp.saturating_add(ms_to_ntp(2)) {
+                                break;
+                            }
+                            if let Ok(mut events) = startup_events_thread.lock() {
+                                events.push(format!(
+                                    "AirPlay group START corrected on round {} · +{} ms.",
+                                    round + 1,
+                                    ntp_delta_ms(corrected_ntp.saturating_sub(shared_start_ntp))
+                                ));
+                            }
+                            shared_start_ntp = corrected_ntp
+                                .saturating_add(ms_to_ntp(AIRPLAY_SPLICE_LEAD_MARGIN_MS));
+                        }
+
+                        let mut committed_start_ntp = shared_start_ntp;
                         for target in &mut targets {
-                            if let Err(error) = target.sender.arm_cold_start(
-                                start_ntp,
+                            match target.sender.arm_cold_start_verified(
+                                shared_start_ntp,
                                 target.latency_max,
                                 target.lead_frames,
                                 target.rtp_offset,
+                                target.apple_model,
                             ) {
-                                if let Ok(mut slot) = last_error_thread.lock() {
-                                    *slot = Some(format!(
-                                        "{} cold session START failed: {error:?}",
-                                        target.name
-                                    ));
+                                Ok(actual) => {
+                                    committed_start_ntp = committed_start_ntp.max(actual);
                                 }
-                                running_thread.store(false, Ordering::SeqCst);
-                                return;
+                                Err(error) => {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(format!(
+                                            "{} cold session START failed: {error:?}",
+                                            target.name
+                                        ));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
                             }
 
                             let rtp_timestamp = target.sender.state().timestamp;
@@ -421,13 +458,13 @@ impl WindowsMultiroomAudioWorker {
                             }
                         }
                         cold_armed = true;
-                        group_start_ntp = Some(start_ntp);
+                        group_start_ntp = Some(committed_start_ntp);
                         if let Ok(mut events) = startup_events_thread.lock() {
                             events.push(format!(
                                 "AirPlay {} session: {} member(s) ready · shared START={} ms · one WASAPI source.",
                                 kind.label(),
                                 targets.len(),
-                                delay_ms
+                                ntp_delta_ms(committed_start_ntp.saturating_sub(now_ntp))
                             ));
                         }
                     }
@@ -1049,6 +1086,7 @@ fn prepare_pending_joins(
                 pending.target.latency_max,
                 pending.target.lead_frames,
                 pending.target.rtp_offset,
+                pending.target.apple_model,
             )
         };
         let committed_start_ntp = match arm_result {
@@ -1262,6 +1300,10 @@ fn align_splice_pad(targets: &mut [WindowsAudioTarget]) {
 
 fn ms_to_ntp(ms: u64) -> u64 {
     ((ms as u128) << 32).div_ceil(1000) as u64
+}
+
+fn ntp_delta_ms(delta: u64) -> u64 {
+    (((delta as u128) * 1_000) >> 32) as u64
 }
 
 fn frames_to_ntp(frames: u64, sample_rate: u32) -> u64 {
