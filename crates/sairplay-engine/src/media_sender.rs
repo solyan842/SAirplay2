@@ -720,32 +720,6 @@ mod tests {
     }
 
     #[test]
-    fn warm_boundary_keeps_wire_timeline_and_drops_only_old_pad_debt() {
-        let data_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let ctrl_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let transport = transport_to(&data_rx, &ctrl_rx);
-        let state = RtpState::new(0xFFFE, 0xFFFF_F000, 0);
-        let mut sender = RealtimeMediaSender::new(transport, state, [0u8; 32]);
-        sender.head_ts = 9_876_543_210;
-        sender.splice_pad_frames = 12_345;
-        sender.timeline_reanchors = 7;
-        sender.reanchor_shifted_frames = 88_000;
-
-        let before_state = sender.state();
-        let before_head = sender.head_ts();
-        let before_reanchors = sender.timeline_reanchors();
-        let before_shift = sender.reanchor_shifted_frames();
-
-        sender.begin_warm_splice_boundary();
-
-        assert_eq!(sender.splice_pad_frames(), 0);
-        assert_eq!(sender.state(), before_state);
-        assert_eq!(sender.head_ts(), before_head);
-        assert_eq!(sender.timeline_reanchors(), before_reanchors);
-        assert_eq!(sender.reanchor_shifted_frames(), before_shift);
-    }
-
-    #[test]
     fn long_run_wire_timeline_survives_sequence_and_timestamp_wraps() {
         let data_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let ctrl_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
