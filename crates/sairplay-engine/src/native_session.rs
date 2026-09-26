@@ -474,21 +474,10 @@ impl NativeSession {
         )
         .map_err(NativeSessionError::Feedback)?;
 
-        // Match the pinned Music Assistant caller: a solo START is commanded
-        // 400 ms ahead. The 250 ms value remains only the cliairplay minimum
-        // warm/starvation floor; it is not the caller's solo START lead.
-        // The absolute START instant is still deferred until PCM is buffered.
-        let mut cold_start_delay_ms = SOLO_COLD_START_LEAD_MS;
-        let mut clock_ready_at_ntp = None;
-        if let Some(clock) = ptp_clock.as_ref() {
-            if let Some(exchange) = clock.exchange() {
-                let readiness = clock_ready_delay_ms(exchange, config.apple_model);
-                cold_start_delay_ms = cold_start_delay_ms.max(readiness);
-                if let Ok(now_ntp) = system_time_to_ntp(SystemTime::now()) {
-                    clock_ready_at_ntp = Some(now_ntp.saturating_add(ms_to_ntp(readiness)));
-                }
-            }
-        }
+        // Match pinned MSA: 400 ms is only the solo base lead. Receiver-clock
+        // readiness is sampled later, after PCM is present and immediately before
+        // the anchor is planned; never cache a connect-time projection here.
+        let cold_start_delay_ms = SOLO_COLD_START_LEAD_MS;
 
         // Cold START is intentionally deferred until the Windows capture path
         // has one complete transport packet buffered. Upstream's caller gates
