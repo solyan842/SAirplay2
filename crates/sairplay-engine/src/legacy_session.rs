@@ -7,7 +7,7 @@ use crate::{
         GroupStartIoError, GroupStartParticipant,
     },
     group_flush::{parse_group_flush_status, GroupFlushAck},
-    group_pcm_fanout::GroupPcmSource,
+    group_pcm_fanout::{GroupPcmParticipant, GroupPcmSource},
     system_time_to_ntp, volume_percent_to_db, Ap2AudioFormat, VolumeSetResult,
     WasapiLoopbackError, WindowsPcmSession, PCM352_PACKET_BYTES,
 };
@@ -139,6 +139,67 @@ impl LegacyVolumeControl {
 enum LegacyWriterCommand {
     Quiesce(SyncSender<Result<(), String>>),
     Resume,
+}
+
+#[derive(Clone)]
+struct LegacyPcmSink {
+    name: String,
+    pcm_tx: SyncSender<[u8; PCM352_PACKET_BYTES]>,
+    running: Arc<AtomicBool>,
+}
+
+impl LegacyPcmSink {
+    fn new(
+        name: String,
+        pcm_tx: SyncSender<[u8; PCM352_PACKET_BYTES]>,
+        running: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            name,
+            pcm_tx,
+            running,
+        }
+    }
+}
+
+impl GroupPcmParticipant for LegacyPcmSink {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn write_shared_pcm(&mut self, chunk: &[u8]) -> Result<(), String> {
+        let packet: [u8; PCM352_PACKET_BYTES] = chunk
+            .try_into()
+            .map_err(|_| {
+                format!(
+                    "legacy RAOP requires exactly {} PCM bytes, got {}",
+                    PCM352_PACKET_BYTES,
+                    chunk.len()
+                )
+            })?;
+
+        let stall_started = std::time::Instant::now();
+        loop {
+            match self.pcm_tx.try_send(packet) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err("libraop writer disconnected".to_owned());
+                }
+                Err(TrySendError::Full(_)) => {
+                    if !self.running.load(Ordering::SeqCst) {
+                        return Err("legacy PCM session stopped".to_owned());
+                    }
+                    if stall_started.elapsed() >= WRITER_BACKPRESSURE_TIMEOUT {
+                        return Err(format!(
+                            "stopped reading PCM for {} s",
+                            WRITER_BACKPRESSURE_TIMEOUT.as_secs()
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
 }
 
 struct SpawnedMember {
@@ -1225,5 +1286,32 @@ mod cross_transport_tests {
     fn unix_ms_fixed_point_matches_pinned_raop_session_shape() {
         let ntp = unix_ms_to_ntp(50_007);
         assert_eq!((ntp >> 32) * 1000 + (((ntp & 0xFFFF_FFFF) as u128 * 1000) >> 32) as u64, 50_006);
+    }
+}
+
+#[cfg(test)]
+mod legacy_pcm_sink_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_pcm_sink_accepts_exact_raop_packet() {
+        let (tx, rx) = mpsc::sync_channel::<[u8; PCM352_PACKET_BYTES]>(1);
+        let running = Arc::new(AtomicBool::new(true));
+        let mut sink = LegacyPcmSink::new("raop".into(), tx, running);
+        let packet = vec![0x5Au8; PCM352_PACKET_BYTES];
+
+        sink.write_shared_pcm(&packet).unwrap();
+
+        assert_eq!(rx.recv().unwrap().as_slice(), packet.as_slice());
+    }
+
+    #[test]
+    fn legacy_pcm_sink_rejects_non_raop_packet_size() {
+        let (tx, _rx) = mpsc::sync_channel::<[u8; PCM352_PACKET_BYTES]>(1);
+        let running = Arc::new(AtomicBool::new(true));
+        let mut sink = LegacyPcmSink::new("raop".into(), tx, running);
+
+        let error = sink.write_shared_pcm(&[0u8; 16]).unwrap_err();
+        assert!(error.contains("requires exactly"));
     }
 }
