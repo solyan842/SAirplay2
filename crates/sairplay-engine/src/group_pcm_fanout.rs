@@ -75,6 +75,60 @@ pub fn pump_shared_pcm_once(
     Ok(GroupPcmPumpOutcome::Delivered { bytes, failures })
 }
 
+/// Session-level owner for one shared PCM reader and its active transport sinks.
+///
+/// This is intentionally transport-neutral. It owns exactly one `GroupPcmSource`
+/// value, so native and RAOP participants cannot independently advance the
+/// source timeline through this API. Membership removal/lifecycle remains with
+/// the higher-level AirPlay session until mixed transport orchestration is
+/// wired and hardware-validated.
+pub struct GroupPcmCoordinator<S: GroupPcmSource> {
+    source: S,
+    members: Vec<Box<dyn GroupPcmParticipant>>,
+}
+
+impl<S: GroupPcmSource> GroupPcmCoordinator<S> {
+    pub fn new(source: S) -> Self {
+        Self {
+            source,
+            members: Vec::new(),
+        }
+    }
+
+    pub fn add_member(&mut self, member: Box<dyn GroupPcmParticipant>) {
+        self.members.push(member);
+    }
+
+    pub fn member_count(&self) -> usize {
+        self.members.len()
+    }
+
+    pub fn member_names(&self) -> Vec<String> {
+        self.members
+            .iter()
+            .map(|member| member.name().to_owned())
+            .collect()
+    }
+
+    pub fn source(&self) -> &S {
+        &self.source
+    }
+
+    pub fn pump_once(
+        &mut self,
+        want_bytes: usize,
+        timeout: Duration,
+    ) -> Result<GroupPcmPumpOutcome, String> {
+        let members = self
+            .members
+            .iter_mut()
+            .map(|member| member.as_mut() as &mut dyn GroupPcmParticipant)
+            .collect::<Vec<_>>();
+
+        pump_shared_pcm_once(&self.source, want_bytes, timeout, members)
+    }
+}
+
 impl fmt::Display for GroupPcmFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: {}", self.member, self.error)
@@ -334,6 +388,76 @@ mod tests {
         assert_eq!(failures.len(), 2);
         assert!(failures.iter().any(|failure| failure.member == "native-bad"));
         assert!(failures.iter().any(|failure| failure.member == "raop-bad"));
+    }
+
+    #[test]
+    fn coordinator_owns_one_source_reader_for_multiple_transport_sinks() {
+        let reads = Arc::new(Mutex::new(0usize));
+        let source = FakeSource {
+            reads: Arc::clone(&reads),
+            chunk: Some(vec![7u8, 7, 7, 7]),
+        };
+        let seen_native = Arc::new(Mutex::new(Vec::new()));
+        let seen_raop = Arc::new(Mutex::new(Vec::new()));
+
+        let mut coordinator = GroupPcmCoordinator::new(source);
+        coordinator.add_member(Box::new(FakeMember {
+            name: "native",
+            seen: Arc::clone(&seen_native),
+            fail: false,
+        }));
+        coordinator.add_member(Box::new(FakeMember {
+            name: "raop",
+            seen: Arc::clone(&seen_raop),
+            fail: false,
+        }));
+
+        assert_eq!(coordinator.member_count(), 2);
+        assert_eq!(
+            coordinator.member_names(),
+            vec!["native".to_owned(), "raop".to_owned()]
+        );
+
+        let outcome = coordinator
+            .pump_once(4, Duration::from_millis(0))
+            .unwrap();
+
+        assert_eq!(*reads.lock().unwrap(), 1);
+        assert_eq!(
+            outcome,
+            GroupPcmPumpOutcome::Delivered {
+                bytes: 4,
+                failures: Vec::new(),
+            }
+        );
+        assert_eq!(*seen_native.lock().unwrap(), vec![vec![7u8, 7, 7, 7]]);
+        assert_eq!(*seen_raop.lock().unwrap(), vec![vec![7u8, 7, 7, 7]]);
+    }
+
+    #[test]
+    fn coordinator_starvation_keeps_all_sinks_idle() {
+        let reads = Arc::new(Mutex::new(0usize));
+        let source = FakeSource {
+            reads: Arc::clone(&reads),
+            chunk: None,
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+
+        let mut coordinator = GroupPcmCoordinator::new(source);
+        coordinator.add_member(Box::new(FakeMember {
+            name: "native",
+            seen: Arc::clone(&seen),
+            fail: false,
+        }));
+
+        assert_eq!(
+            coordinator
+                .pump_once(4, Duration::from_millis(0))
+                .unwrap(),
+            GroupPcmPumpOutcome::Starved
+        );
+        assert_eq!(*reads.lock().unwrap(), 1);
+        assert!(seen.lock().unwrap().is_empty());
     }
 
 }
