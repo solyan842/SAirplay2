@@ -8,6 +8,7 @@ use crate::{
         run_concurrent_group_start_round, run_group_start_convergence,
         GroupStartParticipant,
     },
+    group_pcm_fanout::GroupPcmSource,
     system_time_to_ntp, Ap2AudioFormat, BufferedAnchorStartConfig, BufferedMediaSender,
     BufferedWriteOutcome, NativeMetadataControl, PtpClock, RealtimeMediaSender, RtpState,
     SharedCseq, SharedRtspControl, WasapiLoopbackError, WindowsPcmSession,
@@ -830,7 +831,7 @@ impl WindowsMultiroomAudioWorker {
                             .min(352);
                         let real_frames_needed = 352usize - pad_now as usize;
                         let real_bytes_needed = real_frames_needed * bytes_per_frame;
-                        if pcm_session.buffered_bytes() < real_bytes_needed {
+                        if GroupPcmSource::buffered_bytes(&pcm_session) < real_bytes_needed {
                             break;
                         }
 
@@ -892,12 +893,13 @@ impl WindowsMultiroomAudioWorker {
                             break;
                         }
 
-                        let packet = match pcm_session
-                            .pop_packet_with_silence_prefix(
-                                pad_now,
-                                Duration::from_millis(0),
-                            )
-                        {
+                        let packet = match read_native_packet_from_source(
+                            &pcm_session,
+                            352usize.saturating_mul(bytes_per_frame),
+                            bytes_per_frame,
+                            pad_now,
+                            Duration::from_millis(0),
+                        ) {
                             Ok(Some(packet)) => packet,
                             Ok(None) => break,
                             Err(error) => {
@@ -1213,6 +1215,30 @@ impl Drop for WindowsMultiroomAudioWorker {
     }
 }
 
+fn read_native_packet_from_source(
+    source: &dyn GroupPcmSource,
+    packet_bytes: usize,
+    bytes_per_frame: usize,
+    pad_frames: u32,
+    timeout: Duration,
+) -> Result<Option<Vec<u8>>, String> {
+    let pad_frames = pad_frames.min(352) as usize;
+    let pad_bytes = pad_frames.saturating_mul(bytes_per_frame);
+    let want = packet_bytes.saturating_sub(pad_bytes);
+    let Some(real) = source.read_shared_pcm(want, timeout)? else {
+        return Ok(None);
+    };
+
+    let mut packet = vec![0u8; packet_bytes];
+    if !real.is_empty() {
+        packet[pad_bytes..pad_bytes + real.len()].copy_from_slice(&real);
+    }
+    Ok(Some(packet))
+}
+
+/// Native packet adaptation remains transport-specific. The shared source
+/// contract supplies ordered PCM bytes only; splice silence and per-target
+/// handoff stay in this worker.
 fn adapt_group_pcm_packet(
     packet: &[u8],
     source: Ap2AudioFormat,
