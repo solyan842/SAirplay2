@@ -130,10 +130,16 @@ impl LegacyVolumeControl {
     }
 }
 
+enum LegacyWriterCommand {
+    Quiesce(SyncSender<Result<(), String>>),
+    Resume,
+}
+
 struct SpawnedMember {
     name: String,
     pid: u32,
     pcm_tx: SyncSender<[u8; PCM352_PACKET_BYTES]>,
+    writer_control_tx: SyncSender<LegacyWriterCommand>,
     connected_rx: Receiver<Result<(), String>>,
     started_rx: Option<Receiver<Result<(u64, u64), String>>>,
     flushed_rx: Option<Receiver<Result<Option<u64>, String>>>,
@@ -147,6 +153,8 @@ struct LegacyCommandControl {
     name: String,
     #[allow(dead_code)]
     pipe: File,
+    #[allow(dead_code)]
+    writer_control_tx: SyncSender<LegacyWriterCommand>,
     #[allow(dead_code)]
     started_rx: Receiver<Result<(u64, u64), String>>,
     #[allow(dead_code)]
@@ -353,6 +361,7 @@ impl LegacyGroupSession {
                 Some(LegacyCommandControl {
                     name: member.name.clone(),
                     pipe,
+                    writer_control_tx: member.writer_control_tx.clone(),
                     started_rx,
                     flushed_rx,
                 })
@@ -762,6 +771,8 @@ fn spawn_member(
 
     let (pcm_tx, pcm_rx) =
         mpsc::sync_channel::<[u8; PCM352_PACKET_BYTES]>(WRITER_QUEUE_PACKETS);
+    let (writer_control_tx, writer_control_rx) =
+        mpsc::sync_channel::<LegacyWriterCommand>(2);
     let writer_name = config.name.clone();
     let writer_events = Arc::clone(&startup_events);
     let writer_running = Arc::clone(&running);
@@ -776,6 +787,7 @@ fn spawn_member(
                 &mut child,
                 stdin,
                 pcm_rx,
+                writer_control_rx,
                 writer_running,
                 writer_error,
                 writer_events,
@@ -791,6 +803,7 @@ fn spawn_member(
         name: config.name,
         pid: child_pid,
         pcm_tx,
+        writer_control_tx,
         connected_rx,
         started_rx: command_session.then_some(started_rx),
         flushed_rx: command_session.then_some(flushed_rx),
@@ -805,11 +818,14 @@ fn legacy_writer_loop(
     child: &mut Child,
     mut stdin: ChildStdin,
     pcm_rx: Receiver<[u8; PCM352_PACKET_BYTES]>,
+    control_rx: Receiver<LegacyWriterCommand>,
     running: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
     startup_events: Arc<Mutex<Vec<String>>>,
     active_members: Arc<AtomicU64>,
 ) {
+    let mut quiesced = false;
+
     while running.load(Ordering::SeqCst) {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -825,6 +841,58 @@ fn legacy_writer_loop(
                 }
                 break;
             }
+        }
+
+        // Music Assistant's stdin_quiesced() first prevents any later write
+        // from interleaving, then waits until every byte already queued by the
+        // parent has reached the OS pipe.  This control path is the equivalent
+        // boundary for the synchronous Windows writer: callers MUST stop the
+        // producer before requesting Quiesce; we drain the bounded Rust queue,
+        // flush ChildStdin, acknowledge, then hold all later writes until
+        // Resume. The helper can safely drain the Windows pipe during that
+        // quiet window.
+        match control_rx.try_recv() {
+            Ok(LegacyWriterCommand::Quiesce(reply)) => {
+                let result = (|| -> Result<(), String> {
+                    loop {
+                        match pcm_rx.try_recv() {
+                            Ok(packet) => stdin
+                                .write_all(&packet)
+                                .map_err(|error| format!("PCM pipe failed while quiescing: {error}"))?,
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                    stdin
+                        .flush()
+                        .map_err(|error| format!("PCM pipe flush failed while quiescing: {error}"))?;
+                    Ok(())
+                })();
+                let failed = result.is_err();
+                let _ = reply.send(result);
+                if failed {
+                    break;
+                }
+                quiesced = true;
+                continue;
+            }
+            Ok(LegacyWriterCommand::Resume) => {
+                quiesced = false;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {}
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        if quiesced {
+            match control_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(LegacyWriterCommand::Resume) => quiesced = false,
+                Ok(LegacyWriterCommand::Quiesce(reply)) => {
+                    let _ = reply.send(Ok(()));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            }
+            continue;
         }
 
         match pcm_rx.recv_timeout(Duration::from_millis(100)) {
@@ -871,6 +939,34 @@ fn legacy_writer_loop(
         }
         running.store(false, Ordering::SeqCst);
     }
+}
+
+#[allow(dead_code)]
+fn quiesce_legacy_writer(
+    control_tx: &SyncSender<LegacyWriterCommand>,
+) -> Result<(), String> {
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    control_tx
+        .send(LegacyWriterCommand::Quiesce(reply_tx))
+        .map_err(|error| format!("cannot request PCM quiesce: {error}"))?;
+    reply_rx
+        .recv_timeout(RAOP_FLUSH_ACK_TIMEOUT)
+        .map_err(|error| {
+            format!(
+                "PCM writer did not quiesce within {} ms: {}",
+                RAOP_FLUSH_ACK_TIMEOUT.as_millis(),
+                error
+            )
+        })?
+}
+
+#[allow(dead_code)]
+fn resume_legacy_writer(
+    control_tx: &SyncSender<LegacyWriterCommand>,
+) -> Result<(), String> {
+    control_tx
+        .send(LegacyWriterCommand::Resume)
+        .map_err(|error| format!("cannot resume PCM writer: {error}"))
 }
 
 fn open_command_pipe_writer(pipe_name: &str) -> std::io::Result<File> {
@@ -1010,6 +1106,11 @@ mod cross_transport_tests {
             ),
             Some((12345, 12700))
         );
+    }
+
+    #[test]
+    fn stdin_quiesce_timeout_matches_music_assistant() {
+        assert_eq!(RAOP_FLUSH_ACK_TIMEOUT, Duration::from_secs(2));
     }
 
     #[test]
