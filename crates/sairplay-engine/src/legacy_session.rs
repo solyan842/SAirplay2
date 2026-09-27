@@ -161,6 +161,53 @@ struct LegacyCommandControl {
     flushed_rx: Receiver<Result<Option<u64>, String>>,
 }
 
+impl LegacyCommandControl {
+    /// Execute the exact parent-side FLUSH transaction used by current Music
+    /// Assistant: hold stdin quiet, send ACTION=FLUSH out-of-band, wait for the
+    /// binary acknowledgement, then release stdin again.
+    ///
+    /// The caller is responsible for defining the content boundary before
+    /// entering this function. For track-based MA that means "old feeder
+    /// stopped". SAirplay2's continuous WASAPI path does not yet expose this
+    /// method because inventing where to cut live system audio would diverge
+    /// from source behavior.
+    #[allow(dead_code)]
+    fn flush_quiesced(&mut self) -> Result<Option<u64>, String> {
+        quiesce_legacy_writer(&self.writer_control_tx)?;
+
+        let transaction = (|| -> Result<Option<u64>, String> {
+            send_flush_command(&mut self.pipe)
+                .map_err(|error| format!("cannot send ACTION=FLUSH: {error}"))?;
+
+            let ack = self
+                .flushed_rx
+                .recv_timeout(RAOP_FLUSH_ACK_TIMEOUT)
+                .map_err(|error| {
+                    format!(
+                        "FLUSH acknowledgement not received within {} ms: {}",
+                        RAOP_FLUSH_ACK_TIMEOUT.as_millis(),
+                        error
+                    )
+                })?;
+
+            ack
+        })();
+
+        // Match the async-context-manager lifetime in Music Assistant:
+        // stdin becomes writable again regardless of whether FLUSH succeeded,
+        // timed out or was rejected. The caller decides whether to cold restart.
+        let resume = resume_legacy_writer(&self.writer_control_tx);
+        match (transaction, resume) {
+            (Ok(head), Ok(())) => Ok(head),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(first), Err(resume_error)) => Err(format!(
+                "{first}; additionally failed to resume PCM writer: {resume_error}"
+            )),
+        }
+    }
+}
+
 pub struct LegacyGroupSession {
     running: Arc<AtomicBool>,
     helper_pids: Vec<u32>,
@@ -1106,6 +1153,11 @@ mod cross_transport_tests {
             ),
             Some((12345, 12700))
         );
+    }
+
+    #[test]
+    fn flush_and_stdin_drain_timeouts_match_current_music_assistant() {
+        assert_eq!(RAOP_FLUSH_ACK_TIMEOUT, Duration::from_secs(2));
     }
 
     #[test]
