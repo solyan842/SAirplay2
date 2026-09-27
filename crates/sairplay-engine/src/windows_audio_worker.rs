@@ -380,6 +380,9 @@ impl WindowsAudioWorker {
             let mut last_ptp_probe_alive: Option<bool> = None;
             let mut last_ptp_snapshot = std::time::Instant::now();
             let mut last_steady_diag = std::time::Instant::now();
+            let mut last_audio_send_at: Option<std::time::Instant> = None;
+            let mut max_audio_send_gap_us: u64 = 0;
+            let mut audio_send_gaps_over_20ms: u64 = 0;
 
             while running_thread.load(Ordering::SeqCst) {
                 match capture.drain_into(&mut chunker) {
@@ -579,17 +582,21 @@ impl WindowsAudioWorker {
                                 head_delta as f64 * 1000.0 / audio_format.sample_rate as f64;
                             if let Ok(mut events) = startup_events_thread.lock() {
                                 events.push(format!(
-                                    "Diagnostic: steady timeline · frames={} · seq={} ts={} · head_delta_frames={} ({:.1} ms) · pending_bytes={} · pad_debt={}.",
+                                    "Diagnostic: steady timeline · frames={} · seq={} ts={} · head_delta_frames={} ({:.1} ms) · pending_bytes={} · pad_debt={} · rtp_send_gap_max={:.1} ms · gaps>20ms={}.",
                                     frames,
                                     state.sequence,
                                     state.timestamp,
                                     head_delta,
                                     head_delta_ms,
                                     chunker.pending_bytes(),
-                                    sender.splice_pad_frames()
+                                    sender.splice_pad_frames(),
+                                    max_audio_send_gap_us as f64 / 1000.0,
+                                    audio_send_gaps_over_20ms
                                 ));
                             }
                             last_steady_diag = std::time::Instant::now();
+                            max_audio_send_gap_us = 0;
+                            audio_send_gaps_over_20ms = 0;
                         }
 
                         // Pinned MSA semantics:
@@ -684,6 +691,33 @@ impl WindowsAudioWorker {
                                 .expect("required real-byte count checked");
                             match sender.send_pcm_352(&packet, ntp, lead_frames) {
                                 Ok(result) => {
+                                    let sent_now = std::time::Instant::now();
+                                    if let Some(previous) = last_audio_send_at {
+                                        let gap_us = sent_now
+                                            .duration_since(previous)
+                                            .as_micros()
+                                            .min(u64::MAX as u128) as u64;
+                                        max_audio_send_gap_us =
+                                            max_audio_send_gap_us.max(gap_us);
+                                        if gap_us >= 20_000 {
+                                            audio_send_gaps_over_20ms =
+                                                audio_send_gaps_over_20ms.saturating_add(1);
+                                            let head_frames =
+                                                sender.timeline_head_delta_frames(ntp);
+                                            let head_ms = head_frames as f64 * 1000.0
+                                                / audio_format.sample_rate as f64;
+                                            if let Ok(mut events) = startup_events_thread.lock() {
+                                                events.push(format!(
+                                                    "Diagnostic: RTP send gap · gap={:.1} ms · seq={} · head={:.1} ms · pending_bytes={}.",
+                                                    gap_us as f64 / 1000.0,
+                                                    result.sequence_sent,
+                                                    head_ms,
+                                                    chunker.pending_bytes()
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    last_audio_send_at = Some(sent_now);
                                     startup_packet_index = startup_packet_index.saturating_add(1);
                                     let expected_sync =
                                         result.first_marker || result.sequence_sent % 100 == 0;
