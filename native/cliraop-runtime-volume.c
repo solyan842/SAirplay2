@@ -222,6 +222,23 @@ static bool command_start_raop(struct raopcl_s *raopcl,
 	return true;
 }
 
+/* Exact RAOP FLUSH semantics from pinned raop_session.c. RAOP deliberately
+ * reports no warm head: current MSA session_warm_head_unix_ms() returns 0 for
+ * the legacy path, so the accepted ack is exactly "[STATUS] flushed". */
+static bool command_flush_raop(struct raopcl_s *raopcl,
+							   playback_status_t *status) {
+	raop_state_t state = raopcl_state(raopcl);
+	if (state != RAOP_STREAMING && state != RAOP_FLUSHED) return false;
+
+	raopcl_stop(raopcl);
+	if (state == RAOP_STREAMING && !raopcl_flush(raopcl)) return false;
+
+	*status = PAUSED;
+	fprintf(stderr, "[STATUS] flushed\n");
+	fflush(stderr);
+	return true;
+}
+
 static bool service_command_pipe(HANDLE pipe,
 								 struct raopcl_s *raopcl,
 								 uint64_t *pending_start_unix_ms,
@@ -270,6 +287,12 @@ static bool service_command_pipe(HANDLE pipe,
 						fflush(stderr);
 					}
 					*pending_start_unix_ms = 0;
+				} else if (!strcmp(key, "ACTION") && !strcmp(value, "FLUSH")) {
+					if (!command_flush_raop(raopcl, status)) {
+						fprintf(stderr,
+								"[STATUS] error code=flush_failed http=0 detail=\"RAOP FLUSH rejected\"\n");
+						fflush(stderr);
+					}
 				}
 			}
 			line = end + 1;
