@@ -8,7 +8,7 @@ use crate::{
         run_concurrent_group_start_round, run_group_start_convergence,
         GroupStartParticipant,
     },
-    group_pcm_fanout::GroupPcmSource,
+    group_pcm_fanout::{GroupPcmParticipant, GroupPcmSource},
     system_time_to_ntp, Ap2AudioFormat, BufferedAnchorStartConfig, BufferedMediaSender,
     BufferedWriteOutcome, NativeMetadataControl, PtpClock, RealtimeMediaSender, RtpState,
     SharedCseq, SharedRtspControl, WasapiLoopbackError, WindowsPcmSession,
@@ -442,6 +442,52 @@ impl WindowsMultiroomJoinHandle {
                 ))
             })?
             .map_err(WindowsMultiroomAudioError::Command)
+    }
+}
+
+struct NativePcmSink<'a> {
+    target: &'a mut WindowsAudioTarget,
+    source_format: Ap2AudioFormat,
+    ntp: u64,
+}
+
+impl<'a> NativePcmSink<'a> {
+    fn new(
+        target: &'a mut WindowsAudioTarget,
+        source_format: Ap2AudioFormat,
+        ntp: u64,
+    ) -> Self {
+        Self {
+            target,
+            source_format,
+            ntp,
+        }
+    }
+}
+
+impl GroupPcmParticipant for NativePcmSink<'_> {
+    fn name(&self) -> &str {
+        &self.target.name
+    }
+
+    fn write_shared_pcm(&mut self, chunk: &[u8]) -> Result<(), String> {
+        let target_format = self.target.sender.audio_format();
+        let target_packet = adapt_group_pcm_packet(
+            chunk,
+            self.source_format,
+            target_format,
+        )
+        .map_err(|error| format!("media format failed: {error}"))?;
+
+        self.target
+            .sender
+            .send_pcm_352(
+                &target_packet,
+                self.ntp,
+                self.target.lead_frames,
+            )
+            .map(|_| ())
+            .map_err(|error| format!("media send failed: {error:?}"))
     }
 }
 
@@ -953,28 +999,10 @@ impl WindowsMultiroomAudioWorker {
                         let mut failed = Vec::<(usize, String)>::new();
 
                         for (index, target) in targets.iter_mut().enumerate() {
-                            let target_format = target.sender.audio_format();
-                            let target_packet = match adapt_group_pcm_packet(
-                                &packet,
-                                source_format,
-                                target_format,
-                            ) {
-                                Ok(packet) => packet,
-                                Err(error) => {
-                                    failed.push((index, format!("{} media format failed: {error}", target.name)));
-                                    continue;
-                                }
-                            };
-                            match target.sender.send_pcm_352(
-                                &target_packet,
-                                ntp,
-                                target.lead_frames,
-                            ) {
-                                Ok(_) => {}
-                                Err(error) => failed.push((
-                                    index,
-                                    format!("{} media send failed: {error:?}", target.name),
-                                )),
+                            let name = target.name.clone();
+                            let mut sink = NativePcmSink::new(target, source_format, ntp);
+                            if let Err(error) = sink.write_shared_pcm(&packet) {
+                                failed.push((index, format!("{name} {error}")));
                             }
                         }
                         let sent_packet_index = packet_index;
