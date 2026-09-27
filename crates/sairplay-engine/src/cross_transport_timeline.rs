@@ -117,10 +117,13 @@ mod tests {
     }
 
     #[test]
-    fn raop_head_projection_adds_exact_chunk_duration() {
+    fn raop_head_projection_matches_pinned_source_integer_truncation() {
+        // Pinned airplay-cli tests this exact contract: a 352-frame chunk
+        // projects seven whole milliseconds at both 44.1 and 48 kHz because
+        // the source converts through fixed-point NTP and truncates to unix ms.
         let playtime = unix_ms_to_ntp(50_000);
-        let head = raop_next_head_unix_ms(playtime, 441, 44_100);
-        assert_eq!(head, 50_010);
+        assert_eq!(raop_next_head_unix_ms(playtime, 352, 44_100), 50_007);
+        assert_eq!(raop_next_head_unix_ms(playtime, 352, 48_000), 50_007);
     }
 
     #[test]
