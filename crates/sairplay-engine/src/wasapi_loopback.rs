@@ -198,12 +198,10 @@ impl WasapiLoopbackCapture {
         }
     }
 
-    /// Drain every currently available WASAPI packet into the fixed 352-frame chunker.
-    /// Returns the number of PCM frames copied (silent frames included).
-    pub fn drain_into(
-        &self,
-        chunker: &mut Pcm352Chunker,
-    ) -> Result<WasapiDrainReport, WasapiLoopbackError> {
+    fn drain_with<F>(&self, mut sink: F) -> Result<WasapiDrainReport, WasapiLoopbackError>
+    where
+        F: FnMut(&[u8]),
+    {
         let mut report = WasapiDrainReport::default();
         let mut drained_before = 0u64;
 
@@ -230,9 +228,6 @@ impl WasapiLoopbackCapture {
                     )))?;
 
                 if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32) != 0 {
-                    // Diagnostic only: Microsoft defines this flag as either a
-                    // stream-state transition or a timing glitch. Record where
-                    // it occurred without modifying PCM or sender behavior.
                     report.discontinuities = report.discontinuities.saturating_add(1);
                     if report.discontinuity_frame_offset.is_none() {
                         report.discontinuity_frame_offset = Some(drained_before);
@@ -242,14 +237,15 @@ impl WasapiLoopbackCapture {
                 let silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0;
                 let byte_len = frames as usize * self.bytes_per_frame;
                 if silent {
-                    chunker.push(&vec![0u8; byte_len]);
+                    let zeros = vec![0u8; byte_len];
+                    sink(&zeros);
                 } else {
                     if data.is_null() && byte_len != 0 {
                         let _ = self.capture_client.ReleaseBuffer(frames);
                         return Err(WasapiLoopbackError::InvalidBuffer);
                     }
                     let bytes = std::slice::from_raw_parts(data as *const u8, byte_len);
-                    chunker.push(bytes);
+                    sink(bytes);
                 }
 
                 self.capture_client
@@ -264,6 +260,27 @@ impl WasapiLoopbackCapture {
         }
 
         Ok(report)
+    }
+
+    /// Drain every currently available WASAPI packet into the fixed 352-frame chunker.
+    /// Returns the number of PCM frames copied (silent frames included).
+    pub fn drain_into(
+        &self,
+        chunker: &mut Pcm352Chunker,
+    ) -> Result<WasapiDrainReport, WasapiLoopbackError> {
+        self.drain_with(|bytes| chunker.push(bytes))
+    }
+
+    /// Drain every currently available WASAPI packet into a raw PCM byte buffer.
+    ///
+    /// This is used by the Windows persistent-session reader so capture owns one
+    /// COM thread while transport sending consumes from a separate bounded ring.
+    pub fn drain_into_bytes(
+        &self,
+        out: &mut Vec<u8>,
+    ) -> Result<WasapiDrainReport, WasapiLoopbackError> {
+        out.clear();
+        self.drain_with(|bytes| out.extend_from_slice(bytes))
     }
 }
 
