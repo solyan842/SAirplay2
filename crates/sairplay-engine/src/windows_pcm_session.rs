@@ -438,6 +438,38 @@ fn finish_with_error(shared: &SharedRing, message: String) {
 mod tests {
     use super::*;
 
+    fn test_session(format: Ap2AudioFormat, bytes: &[u8]) -> WindowsPcmSession {
+        let bytes_per_frame = format.input_bytes_per_frame();
+        let packet_bytes = 352 * bytes_per_frame;
+        let byte_rate = format.sample_rate as usize * bytes_per_frame;
+        let capacity_bytes = byte_rate
+            .saturating_mul(WINDOWS_PCM_SESSION_RING_SECONDS)
+            .max(WINDOWS_PCM_SESSION_RING_MIN_BYTES);
+        let mut data = VecDeque::with_capacity(capacity_bytes);
+        data.extend(bytes.iter().copied());
+        WindowsPcmSession {
+            shared: Arc::new(SharedRing {
+                state: Mutex::new(RingState {
+                    data,
+                    stopped: false,
+                    error: None,
+                }),
+                can_read: Condvar::new(),
+                can_write: Condvar::new(),
+                running: AtomicBool::new(true),
+            }),
+            producer: None,
+            bytes_per_frame,
+            packet_bytes,
+            capacity_bytes,
+            byte_rate,
+            captured_frames: Arc::new(AtomicU64::new(0)),
+            discontinuities: Arc::new(AtomicU64::new(0)),
+            last_discontinuity_frame: Arc::new(AtomicU64::new(u64::MAX)),
+            discontinuity_events: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
     #[test]
     fn ring_capacity_matches_msa_four_second_or_one_mib_floor() {
         let fmt16 = Ap2AudioFormat::ALAC_44100_16_STEREO;
@@ -458,6 +490,35 @@ mod tests {
                 .saturating_mul(WINDOWS_PCM_SESSION_RING_SECONDS)
                 >= WINDOWS_PCM_SESSION_RING_MIN_BYTES
         );
+    }
+
+    #[test]
+    fn timed_empty_read_is_starvation_not_eof() {
+        let session = test_session(Ap2AudioFormat::ALAC_44100_16_STEREO, &[]);
+        let result = session
+            .read_exact_timeout(session.packet_bytes(), Duration::from_millis(1))
+            .unwrap();
+        assert!(result.is_none());
+        assert!(session.shared.running.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn packet_read_preserves_order_and_prefixes_splice_silence() {
+        let format = Ap2AudioFormat::ALAC_44100_16_STEREO;
+        let bytes_per_frame = format.input_bytes_per_frame();
+        let real_frames = 252usize;
+        let input = vec![0x5Au8; real_frames * bytes_per_frame];
+        let session = test_session(format, &input);
+
+        let packet = session
+            .pop_packet_with_silence_prefix(100, Duration::from_millis(0))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(packet.len(), 352 * bytes_per_frame);
+        assert!(packet[..100 * bytes_per_frame].iter().all(|byte| *byte == 0));
+        assert!(packet[100 * bytes_per_frame..].iter().all(|byte| *byte == 0x5A));
+        assert_eq!(session.buffered_bytes(), 0);
     }
 
     #[test]
