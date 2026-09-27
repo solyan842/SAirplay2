@@ -24,6 +24,7 @@ const RAOP_CONFIGURED_LATENCY_FRAMES: u32 = 44_100;
 const RAOP_FIXED_LATENCY_FRAMES: u32 = 11_025;
 const WRITER_QUEUE_PACKETS: usize = 96;
 const RAOP_START_ACK_TIMEOUT: Duration = Duration::from_millis(7_000);
+const RAOP_FLUSH_ACK_TIMEOUT: Duration = Duration::from_millis(2_000);
 // Music Assistant's current source treats a player that does not consume its
 // PCM feed for 35 s as a failed member. Do the same here, but preserve every
 // PCM packet until that deadline instead of guessing a larger queue.
@@ -135,9 +136,21 @@ struct SpawnedMember {
     pcm_tx: SyncSender<[u8; PCM352_PACKET_BYTES]>,
     connected_rx: Receiver<Result<(), String>>,
     started_rx: Option<Receiver<Result<(u64, u64), String>>>,
+    flushed_rx: Option<Receiver<Result<Option<u64>, String>>>,
     command_pipe: Option<File>,
     writer: JoinHandle<()>,
     volume_control: LegacyVolumeControl,
+}
+
+struct LegacyCommandControl {
+    #[allow(dead_code)]
+    name: String,
+    #[allow(dead_code)]
+    pipe: File,
+    #[allow(dead_code)]
+    started_rx: Receiver<Result<(u64, u64), String>>,
+    #[allow(dead_code)]
+    flushed_rx: Receiver<Result<Option<u64>, String>>,
 }
 
 pub struct LegacyGroupSession {
@@ -150,9 +163,11 @@ pub struct LegacyGroupSession {
     startup_events: Arc<Mutex<Vec<String>>>,
     active_members: Arc<AtomicU64>,
     volume_controls: Vec<LegacyVolumeControl>,
-    // Keep the MSA-style Windows command pipes connected for the whole
-    // persistent helper lifetime. Closing one is a local control-channel EOF.
-    _command_pipes: Vec<File>,
+    // Keep the MSA-style Windows command channel and acknowledgements alive
+    // for the whole persistent helper lifetime. FLUSH is deliberately not
+    // exposed to callers yet: MSA requires stdin/session-ring quiescing before
+    // FLUSH, and the legacy producer layer is normalized in the next step.
+    _command_controls: Vec<LegacyCommandControl>,
 }
 
 impl LegacyGroupSession {
@@ -329,9 +344,19 @@ impl LegacyGroupSession {
             .iter()
             .map(|member| (member.name.clone(), member.pcm_tx.clone()))
             .collect::<Vec<_>>();
-        let command_pipes = spawned
+        let command_controls = spawned
             .iter_mut()
-            .filter_map(|member| member.command_pipe.take())
+            .filter_map(|member| {
+                let pipe = member.command_pipe.take()?;
+                let started_rx = member.started_rx.take()?;
+                let flushed_rx = member.flushed_rx.take()?;
+                Some(LegacyCommandControl {
+                    name: member.name.clone(),
+                    pipe,
+                    started_rx,
+                    flushed_rx,
+                })
+            })
             .collect::<Vec<_>>();
         let writers = spawned
             .drain(..)
@@ -511,7 +536,7 @@ impl LegacyGroupSession {
             startup_events,
             active_members,
             volume_controls,
-            _command_pipes: command_pipes,
+            _command_controls: command_controls,
         })
     }
 
@@ -679,6 +704,7 @@ fn spawn_member(
 
     let (connected_tx, connected_rx) = mpsc::sync_channel::<Result<(), String>>(1);
     let (started_tx, started_rx) = mpsc::sync_channel::<Result<(u64, u64), String>>(4);
+    let (flushed_tx, flushed_rx) = mpsc::sync_channel::<Result<Option<u64>, String>>(4);
     let reader_name = config.name.clone();
     let reader_events = Arc::clone(&startup_events);
     thread::Builder::new()
@@ -706,8 +732,12 @@ fn spawn_member(
                     let _ = connected_tx.send(Ok(()));
                 } else if let Some((requested, actual)) = parse_started_status(&line) {
                     let _ = started_tx.send(Ok((requested, actual)));
+                } else if let Some(head_unix_ms) = parse_flushed_status(&line) {
+                    let _ = flushed_tx.send(Ok(head_unix_ms));
                 } else if lower.contains("[status] error code=start_failed") {
                     let _ = started_tx.send(Err(line.clone()));
+                } else if lower.contains("[status] error code=flush_failed") {
+                    let _ = flushed_tx.send(Err(line.clone()));
                 } else if lower.contains("cannot connect to airplay device")
                     || lower.contains("request failed")
                     || lower.contains("auth-setup failed")
@@ -763,6 +793,7 @@ fn spawn_member(
         pcm_tx,
         connected_rx,
         started_rx: command_session.then_some(started_rx),
+        flushed_rx: command_session.then_some(flushed_rx),
         command_pipe,
         writer,
         volume_control: LegacyVolumeControl::new(volume_path),
@@ -875,6 +906,12 @@ fn send_start_command(pipe: &mut File, start_unix_ms: u64) -> std::io::Result<()
     pipe.flush()
 }
 
+#[allow(dead_code)]
+fn send_flush_command(pipe: &mut File) -> std::io::Result<()> {
+    pipe.write_all(b"ACTION=FLUSH\n")?;
+    pipe.flush()
+}
+
 fn parse_started_status(line: &str) -> Option<(u64, u64)> {
     if !line.starts_with("[STATUS] started ") {
         return None;
@@ -889,6 +926,21 @@ fn parse_started_status(line: &str) -> Option<(u64, u64)> {
         }
     }
     Some((requested?, actual?))
+}
+
+/// Parse MSA's accepted FLUSH acknowledgement. Legacy RAOP intentionally has
+/// no head_unix_ms: pinned cliairplay returns 0 from warm_head_unix_ms() for
+/// RAOP. The optional form is retained so the cross-transport controller can
+/// later share one acknowledgement shape with native AirPlay 2.
+fn parse_flushed_status(line: &str) -> Option<Option<u64>> {
+    if !line.starts_with("[STATUS] flushed") {
+        return None;
+    }
+    let head = line
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("head_unix_ms="))
+        .and_then(|value| value.parse::<u64>().ok());
+    Some(head)
 }
 
 fn current_unix_ms() -> Result<u64, String> {
@@ -958,6 +1010,17 @@ mod cross_transport_tests {
             ),
             Some((12345, 12700))
         );
+    }
+
+    #[test]
+    fn parses_msa_raop_flush_ack_without_a_warm_head() {
+        assert_eq!(parse_flushed_status("[STATUS] flushed"), Some(None));
+        assert_eq!(
+            parse_flushed_status("[STATUS] flushed head_unix_ms=12345"),
+            Some(Some(12345))
+        );
+        assert_eq!(parse_flushed_status("[STATUS] started requested_unix_ms=1 at_unix_ms=1"), None);
+        assert_eq!(RAOP_FLUSH_ACK_TIMEOUT, Duration::from_millis(2_000));
     }
 
     #[test]
