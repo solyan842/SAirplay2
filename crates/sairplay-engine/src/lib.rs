@@ -107,7 +107,7 @@ pub use audio_packet::{
 pub use media_sender::{RealtimeMediaSender, MediaSendError, MediaSendResult};
 pub use cross_transport_timeline::{
     raop_next_head_unix_ms, resolve_raop_start_unix_ms, RaopResolvedStart,
-    AIRPLAY_COLD_GROUP_START_LEAD_MS, RAOP_SESSION_MIN_START_LEAD_MS,
+    RAOP_SESSION_MIN_START_LEAD_MS,
 };
 pub use buffered_sender::{BufferedMediaSender, BufferedSendError, BufferedWriteOutcome};
 pub use rate_anchor::{
