@@ -9,6 +9,22 @@
 
 use std::fmt;
 use std::thread;
+use std::time::Duration;
+
+/// One persistent PCM source owned by the group session rather than by any
+/// individual transport lane.
+///
+/// `Ok(None)` is temporary source starvation for the requested interval, not
+/// end-of-stream. This matches the Phase A persistent WASAPI ring contract.
+pub trait GroupPcmSource {
+    fn read_shared_pcm(
+        &self,
+        want_bytes: usize,
+        timeout: Duration,
+    ) -> Result<Option<Vec<u8>>, String>;
+
+    fn buffered_bytes(&self) -> usize;
+}
 
 /// One member sink participating in a shared PCM source session.
 pub trait GroupPcmParticipant: Send {

@@ -1,4 +1,7 @@
-use crate::{Ap2AudioFormat, WasapiLoopbackCapture, WasapiLoopbackError};
+use crate::{
+    group_pcm_fanout::GroupPcmSource, Ap2AudioFormat, WasapiLoopbackCapture,
+    WasapiLoopbackError,
+};
 use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -410,6 +413,20 @@ impl WindowsPcmSession {
     }
 }
 
+impl GroupPcmSource for WindowsPcmSession {
+    fn read_shared_pcm(
+        &self,
+        want_bytes: usize,
+        timeout: Duration,
+    ) -> Result<Option<Vec<u8>>, String> {
+        self.read_exact_timeout(want_bytes, timeout)
+    }
+
+    fn buffered_bytes(&self) -> usize {
+        WindowsPcmSession::buffered_bytes(self)
+    }
+}
+
 impl Drop for WindowsPcmSession {
     fn drop(&mut self) {
         self.stop();
@@ -490,6 +507,19 @@ mod tests {
                 .saturating_mul(WINDOWS_PCM_SESSION_RING_SECONDS)
                 >= WINDOWS_PCM_SESSION_RING_MIN_BYTES
         );
+    }
+
+    #[test]
+    fn common_pcm_source_contract_preserves_starvation_semantics() {
+        let session = test_session(Ap2AudioFormat::ALAC_44100_16_STEREO, &[]);
+        let source: &dyn GroupPcmSource = &session;
+
+        assert_eq!(source.buffered_bytes(), 0);
+        let result = source
+            .read_shared_pcm(session.packet_bytes(), Duration::from_millis(1))
+            .unwrap();
+        assert!(result.is_none());
+        assert!(session.shared.running.load(Ordering::SeqCst));
     }
 
     #[test]
