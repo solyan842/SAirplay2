@@ -50,6 +50,12 @@ pub enum GroupPcmPumpOutcome {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupPcmCoordinatorCycle {
+    pub outcome: GroupPcmPumpOutcome,
+    pub removed_members: Vec<String>,
+}
+
 /// Execute exactly one MSA-style shared-source pump iteration:
 ///
 /// 1. read the source once;
@@ -95,8 +101,18 @@ impl<S: GroupPcmSource> GroupPcmCoordinator<S> {
         }
     }
 
-    pub fn add_member(&mut self, member: Box<dyn GroupPcmParticipant>) {
+    pub fn add_member(
+        &mut self,
+        member: Box<dyn GroupPcmParticipant>,
+    ) -> Result<(), String> {
+        let name = member.name().to_owned();
+        if self.members.iter().any(|existing| existing.name() == name) {
+            return Err(format!(
+                "duplicate shared PCM participant identity: {name}"
+            ));
+        }
         self.members.push(member);
+        Ok(())
     }
 
     pub fn member_count(&self) -> usize {
@@ -118,14 +134,41 @@ impl<S: GroupPcmSource> GroupPcmCoordinator<S> {
         &mut self,
         want_bytes: usize,
         timeout: Duration,
-    ) -> Result<GroupPcmPumpOutcome, String> {
+    ) -> Result<GroupPcmCoordinatorCycle, String> {
         let members = self
             .members
             .iter_mut()
             .map(|member| member.as_mut() as &mut dyn GroupPcmParticipant)
             .collect::<Vec<_>>();
 
-        pump_shared_pcm_once(&self.source, want_bytes, timeout, members)
+        let outcome = pump_shared_pcm_once(&self.source, want_bytes, timeout, members)?;
+        let mut removed_members = Vec::new();
+
+        if let GroupPcmPumpOutcome::Delivered { failures, .. } = &outcome {
+            // Match MSA's write-cycle ordering: gather every member result for
+            // this source chunk first, then remove failed players immediately
+            // from the active set before the next source read. Transport/process
+            // cleanup remains the higher-level session's responsibility.
+            let failed_names = failures
+                .iter()
+                .filter(|failure| failure.member != "AirPlay group")
+                .map(|failure| failure.member.as_str())
+                .collect::<Vec<_>>();
+
+            self.members.retain(|member| {
+                if failed_names.iter().any(|failed| *failed == member.name()) {
+                    removed_members.push(member.name().to_owned());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
+        Ok(GroupPcmCoordinatorCycle {
+            outcome,
+            removed_members,
+        })
     }
 }
 
@@ -157,7 +200,7 @@ pub fn fanout_shared_pcm_chunk(
                         member: name,
                         error,
                     })
-            }));
+            })).unwrap();
         }
 
         let mut failures = Vec::new();
@@ -316,9 +359,12 @@ mod tests {
         assert_eq!(*reads.lock().unwrap(), 1);
         assert_eq!(
             outcome,
-            GroupPcmPumpOutcome::Delivered {
-                bytes: 4,
-                failures: Vec::new(),
+            GroupPcmCoordinatorCycle {
+                outcome: GroupPcmPumpOutcome::Delivered {
+                    bytes: 4,
+                    failures: Vec::new(),
+                },
+                removed_members: Vec::new(),
             }
         );
         assert_eq!(*seen_a.lock().unwrap(), vec![vec![4u8, 5, 6, 7]]);
@@ -405,12 +451,12 @@ mod tests {
             name: "native",
             seen: Arc::clone(&seen_native),
             fail: false,
-        }));
+        })).unwrap();
         coordinator.add_member(Box::new(FakeMember {
             name: "raop",
             seen: Arc::clone(&seen_raop),
             fail: false,
-        }));
+        })).unwrap();
 
         assert_eq!(coordinator.member_count(), 2);
         assert_eq!(
@@ -448,16 +494,89 @@ mod tests {
             name: "native",
             seen: Arc::clone(&seen),
             fail: false,
-        }));
+        })).unwrap();
 
         assert_eq!(
             coordinator
                 .pump_once(4, Duration::from_millis(0))
                 .unwrap(),
-            GroupPcmPumpOutcome::Starved
+            GroupPcmCoordinatorCycle {
+                outcome: GroupPcmPumpOutcome::Starved,
+                removed_members: Vec::new(),
+            }
         );
         assert_eq!(*reads.lock().unwrap(), 1);
         assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn coordinator_prunes_failed_member_before_next_source_read() {
+        let reads = Arc::new(Mutex::new(0usize));
+        let source = FakeSource {
+            reads: Arc::clone(&reads),
+            chunk: Some(vec![3u8, 3]),
+        };
+        let seen_ok = Arc::new(Mutex::new(Vec::new()));
+        let seen_bad = Arc::new(Mutex::new(Vec::new()));
+
+        let mut coordinator = GroupPcmCoordinator::new(source);
+        coordinator
+            .add_member(Box::new(FakeMember {
+                name: "native-ok",
+                seen: Arc::clone(&seen_ok),
+                fail: false,
+            }))
+            .unwrap();
+        coordinator
+            .add_member(Box::new(FakeMember {
+                name: "raop-bad",
+                seen: Arc::clone(&seen_bad),
+                fail: true,
+            }))
+            .unwrap();
+
+        let first = coordinator
+            .pump_once(2, Duration::from_millis(0))
+            .unwrap();
+        assert_eq!(first.removed_members, vec!["raop-bad".to_owned()]);
+        assert_eq!(coordinator.member_names(), vec!["native-ok".to_owned()]);
+
+        let second = coordinator
+            .pump_once(2, Duration::from_millis(0))
+            .unwrap();
+        assert!(second.removed_members.is_empty());
+        assert_eq!(*reads.lock().unwrap(), 2);
+        assert_eq!(seen_ok.lock().unwrap().len(), 2);
+        assert_eq!(seen_bad.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn coordinator_rejects_duplicate_member_identity() {
+        let source = FakeSource {
+            reads: Arc::new(Mutex::new(0usize)),
+            chunk: None,
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut coordinator = GroupPcmCoordinator::new(source);
+
+        coordinator
+            .add_member(Box::new(FakeMember {
+                name: "same-device",
+                seen: Arc::clone(&seen),
+                fail: false,
+            }))
+            .unwrap();
+
+        let error = coordinator
+            .add_member(Box::new(FakeMember {
+                name: "same-device",
+                seen,
+                fail: false,
+            }))
+            .unwrap_err();
+
+        assert!(error.contains("duplicate shared PCM participant identity"));
+        assert_eq!(coordinator.member_count(), 1);
     }
 
 }
