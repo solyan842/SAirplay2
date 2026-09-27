@@ -676,10 +676,11 @@ impl WindowsMultiroomAudioWorker {
                         let convergence = match run_group_start_convergence(
                             initial_start_unix_ms,
                             |target_unix_ms| {
-                                let round_members = participants
-                                    .iter_mut()
-                                    .map(|member| &mut **member)
-                                    .collect::<Vec<_>>();
+                                let mut round_members: Vec<&mut dyn GroupStartParticipant> =
+                                    Vec::with_capacity(participants.len());
+                                for member in participants.iter_mut() {
+                                    round_members.push(&mut **member);
+                                }
                                 run_concurrent_group_start_round(
                                     round_members,
                                     target_unix_ms,
