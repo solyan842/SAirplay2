@@ -1778,7 +1778,7 @@ impl SairplayApp {
                     .saturating_sub(prev.requested_over_1472);
                 if requested_delta != 0 || expired_delta != 0 {
                     self.log.push(format!(
-                        "Diagnostic: retransmit member · {} · requested +{} (total {}) · answered +{} (total {}) · expired +{} (total {}) · requested_wire>1472 +{} (total {}) · max_requested_wire={} B.",
+                        "Diagnostic: retransmit member · {} · requested +{} (total {}) · answered +{} (total {}) · expired +{} (total {}) · request_age={} ms (max {} ms) · response={} us (max {} us) · requested_wire>1472 +{} (total {}) · max_requested_wire={} B.",
                         name,
                         requested_delta,
                         member_rtx.requested,
@@ -1786,6 +1786,10 @@ impl SairplayApp {
                         member_rtx.answered,
                         expired_delta,
                         member_rtx.expired,
+                        member_rtx.last_request_age_ms,
+                        member_rtx.max_request_age_ms,
+                        member_rtx.last_response_us,
+                        member_rtx.max_response_us,
                         over_mtu_delta,
                         member_rtx.requested_over_1472,
                         member_rtx.max_requested_wire_len
@@ -1814,13 +1818,17 @@ impl SairplayApp {
             let expired_delta = rtx.expired.saturating_sub(prev.expired);
             if requested_delta != 0 || expired_delta != 0 {
                 self.log.push(format!(
-                    "Diagnostic: retransmit activity · requested +{} (total {}) · answered +{} (total {}) · expired +{} (total {}) · requested_wire>1472={} · max_requested_wire={} B.",
+                    "Diagnostic: retransmit activity · requested +{} (total {}) · answered +{} (total {}) · expired +{} (total {}) · request_age={} ms (max {} ms) · response={} us (max {} us) · requested_wire>1472={} · max_requested_wire={} B.",
                     requested_delta,
                     rtx.requested,
                     answered_delta,
                     rtx.answered,
                     expired_delta,
                     rtx.expired,
+                    rtx.last_request_age_ms,
+                    rtx.max_request_age_ms,
+                    rtx.last_response_us,
+                    rtx.max_response_us,
                     rtx.requested_over_1472,
                     rtx.max_requested_wire_len
                 ));
