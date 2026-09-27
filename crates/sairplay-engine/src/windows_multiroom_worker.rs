@@ -4,6 +4,7 @@ use crate::{
         evaluate_group_start_round, ntp_epoch_to_unix_ms, unix_ms_to_ntp_epoch,
         GroupStartRoundDecision, AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
     },
+    group_start_orchestrator::{run_concurrent_group_start_round, GroupStartParticipant},
     system_time_to_ntp, Ap2AudioFormat, BufferedAnchorStartConfig, BufferedMediaSender,
     BufferedWriteOutcome, NativeMetadataControl, PtpClock, RealtimeMediaSender, RtpState,
     SharedCseq, SharedRtspControl, WasapiLoopbackError, WindowsPcmSession,
@@ -309,6 +310,25 @@ pub struct WindowsAudioTarget {
     pub(crate) cold_start_delay_ms: u64,
     pub(crate) apple_model: bool,
     pub(crate) metadata: NativeMetadataControl,
+}
+
+impl GroupStartParticipant for WindowsAudioTarget {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn start_at_unix_ms(&mut self, requested_start_unix_ms: u64) -> Result<u64, String> {
+        let requested_start_ntp = unix_ms_to_ntp_epoch(requested_start_unix_ms);
+        self.sender
+            .arm_cold_start_verified(
+                requested_start_ntp,
+                self.latency_max,
+                self.lead_frames,
+                self.rtp_offset,
+                self.apple_model,
+            )
+            .map(ntp_epoch_to_unix_ms)
+    }
 }
 
 #[derive(Debug)]
@@ -1535,60 +1555,13 @@ fn command_native_start_round(
     targets: &mut [WindowsAudioTarget],
     requested_start_unix_ms: u64,
 ) -> Result<Vec<(i64, u64)>, (String, String)> {
-    let requested_start_ntp = unix_ms_to_ntp_epoch(requested_start_unix_ms);
+    let participants = targets
+        .iter_mut()
+        .map(|target| target as &mut dyn GroupStartParticipant)
+        .collect::<Vec<_>>();
 
-    // Match MSA's TaskGroup shape: every member receives the same commanded
-    // audible instant in one round, and all verified answers are gathered
-    // before the convergence decision is made. Each scoped worker owns only
-    // its member sender; metadata and the shared WASAPI source are untouched.
-    let raw_acks = thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(targets.len());
-
-        for target in targets.iter_mut() {
-            let name = target.name.clone();
-            let latency_max = target.latency_max;
-            let lead_frames = target.lead_frames;
-            let rtp_offset = target.rtp_offset;
-            let apple_model = target.apple_model;
-            let sender = &mut target.sender;
-
-            handles.push(scope.spawn(move || {
-                sender
-                    .arm_cold_start_verified(
-                        requested_start_ntp,
-                        latency_max,
-                        lead_frames,
-                        rtp_offset,
-                        apple_model,
-                    )
-                    .map(|committed_ntp| (name.clone(), committed_ntp))
-                    .map_err(|error| (name, error))
-            }));
-        }
-
-        let mut round_acks = Vec::with_capacity(handles.len());
-        for handle in handles {
-            match handle.join() {
-                Ok(Ok(value)) => round_acks.push(value),
-                Ok(Err(error)) => return Err(error),
-                Err(_) => {
-                    return Err((
-                        "native AirPlay group".to_owned(),
-                        "concurrent START worker panicked".to_owned(),
-                    ));
-                }
-            }
-        }
-        Ok::<Vec<(String, u64)>, (String, String)>(round_acks)
-    })?;
-
-    // Native AP2 has no Windows per-member sync-adjust control yet, so the
-    // common MSA acknowledgement tuple carries adjustment=0. The instant itself
-    // is normalized from NTP epoch to Unix milliseconds here at the boundary.
-    Ok(raw_acks
-        .into_iter()
-        .map(|(_name, committed_ntp)| (0, ntp_epoch_to_unix_ms(committed_ntp)))
-        .collect())
+    run_concurrent_group_start_round(participants, requested_start_unix_ms)
+        .map_err(|error| (error.member, error.error))
 }
 
 fn ntp_delta_to_ms(value: u64) -> u64 {

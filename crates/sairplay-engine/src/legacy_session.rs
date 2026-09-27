@@ -5,6 +5,7 @@ use crate::{
         evaluate_group_start_round, GroupStartRoundDecision,
         AIRPLAY_COLD_GROUP_START_LEAD_MS, AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
     },
+    group_start_orchestrator::{run_concurrent_group_start_round, GroupStartParticipant},
     system_time_to_ntp, volume_percent_to_db, Pcm352Chunker, VolumeSetResult,
     WasapiLoopbackCapture, WasapiLoopbackError, PCM352_PACKET_BYTES,
 };
@@ -149,6 +150,44 @@ struct SpawnedMember {
     command_pipe: Option<File>,
     writer: JoinHandle<()>,
     volume_control: LegacyVolumeControl,
+}
+
+impl GroupStartParticipant for SpawnedMember {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn start_at_unix_ms(&mut self, requested_start_unix_ms: u64) -> Result<u64, String> {
+        let pipe = self
+            .command_pipe
+            .as_mut()
+            .ok_or_else(|| "runtime command pipe missing".to_owned())?;
+        let rx = self
+            .started_rx
+            .as_ref()
+            .ok_or_else(|| "START acknowledgement channel missing".to_owned())?;
+
+        send_start_command(pipe, requested_start_unix_ms)
+            .map_err(|error| format!("cannot send START command: {error}"))?;
+
+        let ack = rx.recv_timeout(RAOP_START_ACK_TIMEOUT).map_err(|error| {
+            format!(
+                "START acknowledgement not received within {} ms: {}",
+                RAOP_START_ACK_TIMEOUT.as_millis(),
+                error
+            )
+        })?;
+        let (requested, actual) = ack?;
+
+        if requested != requested_start_unix_ms {
+            return Err(format!(
+                "helper acknowledged request {} instead of {}",
+                requested, requested_start_unix_ms
+            ));
+        }
+
+        Ok(actual)
+    }
 }
 
 struct LegacyCommandControl {
@@ -1045,84 +1084,16 @@ fn command_legacy_start_round(
     members: &mut [SpawnedMember],
     requested_start_unix_ms: u64,
 ) -> Result<Vec<(i64, u64)>, LegacyGroupError> {
-    // Match MSA's TaskGroup semantics: command and acknowledgement wait are
-    // per-member tasks in the same round. The helper pipes are independent, so
-    // each scoped worker owns exactly one member for the round and every 7 s
-    // acknowledgement timeout runs concurrently instead of serially.
-    let raw_acks = thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(members.len());
+    let participants = members
+        .iter_mut()
+        .map(|member| member as &mut dyn GroupStartParticipant)
+        .collect::<Vec<_>>();
 
-        for member in members {
-            handles.push(scope.spawn(move || -> Result<(String, u64), (String, String)> {
-                let name = member.name.clone();
-                let pipe = member.command_pipe.as_mut().ok_or_else(|| {
-                    (name.clone(), "runtime command pipe missing".to_owned())
-                })?;
-                let rx = member.started_rx.as_ref().ok_or_else(|| {
-                    (
-                        name.clone(),
-                        "START acknowledgement channel missing".to_owned(),
-                    )
-                })?;
-
-                send_start_command(pipe, requested_start_unix_ms).map_err(|error| {
-                    (
-                        name.clone(),
-                        format!("cannot send START command: {error}"),
-                    )
-                })?;
-
-                let ack = rx.recv_timeout(RAOP_START_ACK_TIMEOUT).map_err(|error| {
-                    (
-                        name.clone(),
-                        format!(
-                            "START acknowledgement not received within {} ms: {}",
-                            RAOP_START_ACK_TIMEOUT.as_millis(),
-                            error
-                        ),
-                    )
-                })?;
-                let (requested, actual) =
-                    ack.map_err(|error| (name.clone(), error))?;
-
-                if requested != requested_start_unix_ms {
-                    return Err((
-                        name,
-                        format!(
-                            "helper acknowledged request {} instead of {}",
-                            requested, requested_start_unix_ms
-                        ),
-                    ));
-                }
-
-                Ok((name, actual))
-            }));
-        }
-
-        let mut round_acks = Vec::with_capacity(handles.len());
-        for handle in handles {
-            match handle.join() {
-                Ok(Ok(value)) => round_acks.push(value),
-                Ok(Err(error)) => return Err(error),
-                Err(_) => {
-                    return Err((
-                        "legacy group".to_owned(),
-                        "concurrent START worker panicked".to_owned(),
-                    ))
-                }
-            }
-        }
-        Ok::<Vec<(String, u64)>, (String, String)>(round_acks)
-    })
-    .map_err(|(name, error)| LegacyGroupError::Start { name, error })?;
-
-    // sync_adjust is not exposed for the Windows legacy route yet. Keep the ack
-    // shape identical to the cross-transport contract so that future mixed
-    // orchestration can substitute the real per-member adjustment directly.
-    Ok(raw_acks
-        .into_iter()
-        .map(|(_name, actual)| (0, actual))
-        .collect())
+    run_concurrent_group_start_round(participants, requested_start_unix_ms)
+        .map_err(|error| LegacyGroupError::Start {
+            name: error.member,
+            error: error.error,
+        })
 }
 
 fn send_start_command(pipe: &mut File, start_unix_ms: u64) -> std::io::Result<()> {
