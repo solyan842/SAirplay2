@@ -610,7 +610,6 @@ impl LegacyGroupSession {
                                 break;
                             }
                         }
-                    }
                 }
 
                 pcm_session.stop();
