@@ -3276,30 +3276,50 @@ impl eframe::App for SairplayApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    let footer_color = egui::Color32::from_rgb(73, 91, 122);
                     ui.label(
-                        egui::RichText::new("@2026 SolYan S-Airplay2")
+                        egui::RichText::new("@2026")
                             .small()
-                            .color(egui::Color32::from_rgb(73, 91, 122)),
+                            .color(footer_color),
                     );
-                    ui.label(egui::RichText::new("·").small());
-                    ui.add(
-                        egui::Hyperlink::from_label_and_url(
-                            egui::RichText::new("Website").small().underline(),
-                            "https://youtube.com/@solyan-music",
+                    if ui
+                        .link(
+                            egui::RichText::new("SolYan")
+                                .small()
+                                .underline(),
                         )
-                        .open_in_new_tab(true),
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(self.log.join("\n"));
+                    }
+                    ui.label(
+                        egui::RichText::new("S-Airplay2")
+                            .small()
+                            .color(footer_color),
                     );
 
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-                            if ui
-                                .link(egui::RichText::new("Log").small().underline())
-                                .on_hover_text(self.t("Sao chép toàn bộ Log", "Copy full log"))
-                                .clicked()
-                            {
-                                ui.ctx().copy_text(self.log.join("\n"));
-                            }
+                            ui.add(
+                                egui::Hyperlink::from_label_and_url(
+                                    egui::RichText::new("Email").small().underline(),
+                                    "mailto:yansign841@gmail.com",
+                                )
+                                .open_in_new_tab(false),
+                            );
+                            ui.label(
+                                egui::RichText::new("|")
+                                    .small()
+                                    .color(footer_color),
+                            );
+                            ui.add(
+                                egui::Hyperlink::from_label_and_url(
+                                    egui::RichText::new("Website").small().underline(),
+                                    "https://youtube.com/@solyan-music",
+                                )
+                                .open_in_new_tab(true),
+                            );
                         },
                     );
                 });
