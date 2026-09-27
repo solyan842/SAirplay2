@@ -1,10 +1,12 @@
 #![cfg(windows)]
 
 use crate::{
-    system_time_to_ntp, volume_percent_to_db, Pcm352Chunker, VolumeSetResult,
-    WasapiLoopbackCapture, WasapiLoopbackError, PCM352_PACKET_BYTES,
+    cross_transport_timeline::AIRPLAY_COLD_GROUP_START_LEAD_MS, system_time_to_ntp,
+    volume_percent_to_db, Pcm352Chunker, VolumeSetResult, WasapiLoopbackCapture,
+    WasapiLoopbackError, PCM352_PACKET_BYTES,
 };
 use std::fmt;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -15,18 +17,18 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const LIBRAOP_PINNED_COMMIT: &str = "dadcfcaa26d988cdd3e3501ddf8286c224f1b494";
 const RAOP_CONFIGURED_LATENCY_FRAMES: u32 = 44_100;
 const RAOP_FIXED_LATENCY_FRAMES: u32 = 11_025;
-const RAOP_GROUP_START_LEAD_MS: u64 = 5_000;
 const WRITER_QUEUE_PACKETS: usize = 96;
 // Music Assistant's current source treats a player that does not consume its
 // PCM feed for 35 s as a failed member. Do the same here, but preserve every
 // PCM packet until that deadline instead of guessing a larger queue.
 const WRITER_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(35);
 static LEGACY_VOLUME_FILE_ID: AtomicU64 = AtomicU64::new(1);
+static LEGACY_COMMAND_PIPE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct LegacyMemberConfig {
@@ -69,6 +71,7 @@ pub enum LegacyGroupError {
     HelperMissing(PathBuf),
     Spawn { name: String, error: String },
     Connect { name: String, error: String },
+    Start { name: String, error: String },
     Capture(WasapiLoopbackError),
     Time(String),
 }
@@ -87,6 +90,9 @@ impl fmt::Display for LegacyGroupError {
             }
             Self::Connect { name, error } => {
                 write!(f, "{name}: libraop did not reach connected state: {error}")
+            }
+            Self::Start { name, error } => {
+                write!(f, "{name}: libraop did not commit commanded START: {error}")
             }
             Self::Capture(error) => write!(f, "{error}"),
             Self::Time(error) => write!(f, "{error}"),
@@ -127,6 +133,8 @@ struct SpawnedMember {
     pid: u32,
     pcm_tx: SyncSender<[u8; PCM352_PACKET_BYTES]>,
     connected_rx: Receiver<Result<(), String>>,
+    started_rx: Option<Receiver<Result<(u64, u64), String>>>,
+    command_pipe: Option<File>,
     writer: JoinHandle<()>,
     volume_control: LegacyVolumeControl,
 }
@@ -152,11 +160,6 @@ impl LegacyGroupSession {
         let member_count = configs.len();
         let scheduled_group_start = member_count > 1;
         let helper = helper_path()?;
-        let now_ntp = system_time_to_ntp(SystemTime::now())
-            .map_err(|error| LegacyGroupError::Time(format!(
-                "NTP clock conversion failed: {error:?}"
-            )))?;
-        let start_ntp = now_ntp.saturating_add(ms_to_ntp(RAOP_GROUP_START_LEAD_MS));
 
         let running = Arc::new(AtomicBool::new(true));
         let last_error = Arc::new(Mutex::new(None));
@@ -170,7 +173,7 @@ impl LegacyGroupSession {
             spawned.push(spawn_member(
                 &helper,
                 config,
-                scheduled_group_start.then_some(start_ntp),
+                scheduled_group_start,
                 Arc::clone(&running),
                 Arc::clone(&last_error),
                 Arc::clone(&startup_events),
@@ -213,6 +216,72 @@ impl LegacyGroupSession {
             return Err(LegacyGroupError::Connect { name, error });
         }
 
+        // MSA source order: establish every receiver connection first, then
+        // command one shared audible START. This removes the old guessed
+        // pre-connect 5-second anchor and uses the current server's 2500 ms
+        // cold-group planning floor only after all members are ready.
+        let committed_group_start_unix_ms = if scheduled_group_start {
+            let requested_start_unix_ms = current_unix_ms()
+                .map_err(LegacyGroupError::Time)?
+                .saturating_add(AIRPLAY_COLD_GROUP_START_LEAD_MS);
+
+            for member in &mut spawned {
+                let pipe = member.command_pipe.as_mut().ok_or_else(|| LegacyGroupError::Start {
+                    name: member.name.clone(),
+                    error: "runtime command pipe missing".into(),
+                })?;
+                send_start_command(pipe, requested_start_unix_ms).map_err(|error| {
+                    LegacyGroupError::Start {
+                        name: member.name.clone(),
+                        error: error.to_string(),
+                    }
+                })?;
+            }
+
+            let mut committed = requested_start_unix_ms;
+            for member in &mut spawned {
+                let rx = member.started_rx.as_ref().ok_or_else(|| LegacyGroupError::Start {
+                    name: member.name.clone(),
+                    error: "START acknowledgement channel missing".into(),
+                })?;
+                let (requested, actual) = rx.recv().map_err(|error| LegacyGroupError::Start {
+                    name: member.name.clone(),
+                    error: error.to_string(),
+                })??;
+                if requested != requested_start_unix_ms {
+                    return Err(LegacyGroupError::Start {
+                        name: member.name.clone(),
+                        error: format!(
+                            "helper acknowledged request {} instead of {}",
+                            requested, requested_start_unix_ms
+                        ),
+                    });
+                }
+                if actual.abs_diff(requested_start_unix_ms) > 2 {
+                    return Err(LegacyGroupError::Start {
+                        name: member.name.clone(),
+                        error: format!(
+                            "receiver corrected cold START from {} to {}; mixed/group convergence is not enabled until every transport exposes the same verified contract",
+                            requested_start_unix_ms, actual
+                        ),
+                    });
+                }
+                committed = committed.max(actual);
+            }
+
+            if let Ok(mut events) = startup_events.lock() {
+                events.push(format!(
+                    "Legacy group START committed after all members connected · requested={} · committed={} · lead={} ms.",
+                    requested_start_unix_ms,
+                    committed,
+                    AIRPLAY_COLD_GROUP_START_LEAD_MS
+                ));
+            }
+            Some(committed)
+        } else {
+            None
+        };
+
         let running_thread = Arc::clone(&running);
         let error_thread = Arc::clone(&last_error);
         let disc_thread = Arc::clone(&discontinuities);
@@ -234,18 +303,16 @@ impl LegacyGroupSession {
             .map(|member| member.writer)
             .collect::<Vec<_>>();
 
-        // Source behavior for a single RAOP receiver is immediate playback:
-        // cliraop enters PLAYING after connect and raopcl_accept_frames() owns
-        // all pacing. Do not impose our shared NTP anchor on that path.
-        //
-        // Only a real legacy group needs -n and a common audible anchor.
-        let feed_ntp = if scheduled_group_start {
+        // Solo keeps the already-validated immediate libraop path. A real
+        // group is now commanded only after connection readiness, and the PCM
+        // feed begins one configured+fixed receiver-latency window before the
+        // verified audible instant, as on the existing libraop transport.
+        let feed_ntp = committed_group_start_unix_ms.map(|start_unix_ms| {
             let total_latency_frames =
                 RAOP_CONFIGURED_LATENCY_FRAMES + RAOP_FIXED_LATENCY_FRAMES;
-            Some(start_ntp.saturating_sub(frames_to_ntp(total_latency_frames)))
-        } else {
-            None
-        };
+            unix_ms_to_ntp(start_unix_ms)
+                .saturating_sub(frames_to_ntp(total_latency_frames))
+        });
 
         let worker = thread::Builder::new()
             .name("sairplay-legacy-audio".into())
@@ -484,7 +551,7 @@ impl Drop for LegacyGroupSession {
 fn spawn_member(
     helper: &Path,
     config: LegacyMemberConfig,
-    start_ntp: Option<u64>,
+    command_session: bool,
     running: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
     startup_events: Arc<Mutex<Vec<String>>>,
@@ -500,6 +567,14 @@ fn spawn_member(
             name: config.name.clone(),
             error: format!("cannot initialize legacy volume control: {error}"),
         })?;
+
+    let command_pipe_name = command_session.then(|| {
+        format!(
+            r"\\.\pipe\sairplay2-raop-{}-{}",
+            std::process::id(),
+            LEGACY_COMMAND_PIPE_ID.fetch_add(1, Ordering::SeqCst)
+        )
+    });
 
     let mut command = Command::new(helper);
     command
@@ -518,8 +593,8 @@ fn spawn_member(
         .arg("-d")
         .arg("3");
 
-    if let Some(start_ntp) = start_ntp {
-        command.arg("-n").arg(start_ntp.to_string());
+    if let Some(pipe_name) = command_pipe_name.as_deref() {
+        command.arg("-C").arg(pipe_name);
     }
 
     if config.compressed_alac {
@@ -548,6 +623,15 @@ fn spawn_member(
     })?;
     let child_pid = child.id();
 
+    let command_pipe = if let Some(pipe_name) = command_pipe_name.as_deref() {
+        Some(open_command_pipe_writer(pipe_name).map_err(|error| LegacyGroupError::Spawn {
+            name: config.name.clone(),
+            error: format!("cannot attach runtime command pipe: {error}"),
+        })?)
+    } else {
+        None
+    };
+
     let stdin = child.stdin.take().ok_or_else(|| LegacyGroupError::Spawn {
         name: config.name.clone(),
         error: "helper stdin pipe was not created".into(),
@@ -558,6 +642,7 @@ fn spawn_member(
     })?;
 
     let (connected_tx, connected_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let (started_tx, started_rx) = mpsc::sync_channel::<Result<(u64, u64), String>>(4);
     let reader_name = config.name.clone();
     let reader_events = Arc::clone(&startup_events);
     thread::Builder::new()
@@ -583,6 +668,10 @@ fn spawn_member(
                 if !connected && lower.contains("connected to") {
                     connected = true;
                     let _ = connected_tx.send(Ok(()));
+                } else if let Some((requested, actual)) = parse_started_status(&line) {
+                    let _ = started_tx.send(Ok((requested, actual)));
+                } else if lower.contains("[status] error code=start_failed") {
+                    let _ = started_tx.send(Err(line.clone()));
                 } else if lower.contains("cannot connect to airplay device")
                     || lower.contains("request failed")
                     || lower.contains("auth-setup failed")
@@ -637,6 +726,8 @@ fn spawn_member(
         pid: child_pid,
         pcm_tx,
         connected_rx,
+        started_rx: command_session.then_some(started_rx),
+        command_pipe,
         writer,
         volume_control: LegacyVolumeControl::new(volume_path),
     })
@@ -715,6 +806,62 @@ fn legacy_writer_loop(
     }
 }
 
+fn open_command_pipe_writer(pipe_name: &str) -> std::io::Result<File> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match OpenOptions::new().write(true).open(pipe_name) {
+            Ok(file) => return Ok(file),
+            Err(error) if std::time::Instant::now() < deadline => {
+                // The helper creates the Windows named-pipe server before its
+                // receiver RTSP connect. Retry only the local attach race.
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::WouldBlock
+                ) {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn send_start_command(pipe: &mut File, start_unix_ms: u64) -> std::io::Result<()> {
+    write!(
+        pipe,
+        "START_UNIX_MS={}\nACTION=START\n",
+        start_unix_ms
+    )?;
+    pipe.flush()
+}
+
+fn parse_started_status(line: &str) -> Option<(u64, u64)> {
+    if !line.starts_with("[STATUS] started ") {
+        return None;
+    }
+    let mut requested = None;
+    let mut actual = None;
+    for field in line.split_whitespace().skip(2) {
+        if let Some(value) = field.strip_prefix("requested_unix_ms=") {
+            requested = value.parse::<u64>().ok();
+        } else if let Some(value) = field.strip_prefix("at_unix_ms=") {
+            actual = value.parse::<u64>().ok();
+        }
+    }
+    Some((requested?, actual?))
+}
+
+fn current_unix_ms() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .map_err(|error| format!("system clock is before Unix epoch: {error}"))
+}
+
 fn kill_helper_tree(pid: u32) {
     // /T also terminates descendants created by the helper, /F guarantees a
     // blocked RTSP/stdin helper cannot keep SAirplay2 alive after Stop/Exit.
@@ -740,6 +887,10 @@ fn helper_path() -> Result<PathBuf, LegacyGroupError> {
     }
 }
 
+fn unix_ms_to_ntp(ms: u64) -> u64 {
+    ((ms / 1000) << 32) | ((((ms % 1000) as u128) << 32) / 1000) as u64
+}
+
 fn ms_to_ntp(ms: u64) -> u64 {
     ((ms as u128) << 32).div_ceil(1000) as u64
 }
@@ -750,4 +901,38 @@ fn frames_to_ntp(frames: u32) -> u64 {
 
 fn ntp_delta_to_ms(delta: u64) -> u64 {
     (((delta as u128) * 1000) >> 32) as u64
+}
+
+
+#[cfg(test)]
+mod cross_transport_tests {
+    use super::*;
+
+    #[test]
+    fn parses_msa_started_ack_exactly() {
+        assert_eq!(
+            parse_started_status(
+                "[STATUS] started requested_unix_ms=12345 at_unix_ms=12345"
+            ),
+            Some((12345, 12345))
+        );
+        assert_eq!(
+            parse_started_status(
+                "[STATUS] started requested_unix_ms=12345 at_unix_ms=12700"
+            ),
+            Some((12345, 12700))
+        );
+    }
+
+    #[test]
+    fn ignores_non_start_status_lines() {
+        assert_eq!(parse_started_status("[STATUS] flushed"), None);
+        assert_eq!(parse_started_status("connected to 10.0.0.1"), None);
+    }
+
+    #[test]
+    fn unix_ms_fixed_point_matches_pinned_raop_session_shape() {
+        let ntp = unix_ms_to_ntp(50_007);
+        assert_eq!((ntp >> 32) * 1000 + (((ntp & 0xFFFF_FFFF) as u128 * 1000) >> 32) as u64, 50_006);
+    }
 }
