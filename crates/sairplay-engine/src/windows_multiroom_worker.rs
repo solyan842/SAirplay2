@@ -1,8 +1,12 @@
 use crate::{
-    buffered_anchor_start, system_time_to_ntp, Ap2AudioFormat, BufferedAnchorStartConfig,
-    BufferedMediaSender, BufferedWriteOutcome, NativeMetadataControl, PtpClock,
-    RealtimeMediaSender, RtpState, SharedCseq, SharedRtspControl, WasapiLoopbackError,
-    WindowsPcmSession,
+    buffered_anchor_start,
+    cross_transport_timeline::{
+        evaluate_group_start_round, ntp_epoch_to_unix_ms, unix_ms_to_ntp_epoch,
+        GroupStartRoundDecision, AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
+    },
+    system_time_to_ntp, Ap2AudioFormat, BufferedAnchorStartConfig, BufferedMediaSender,
+    BufferedWriteOutcome, NativeMetadataControl, PtpClock, RealtimeMediaSender, RtpState,
+    SharedCseq, SharedRtspControl, WasapiLoopbackError, WindowsPcmSession,
 };
 use std::collections::VecDeque;
 use std::fmt;
@@ -634,70 +638,74 @@ impl WindowsMultiroomAudioWorker {
                             });
                         }
 
-                        // MSA does not trust the requested START blindly.
-                        // Every member returns the instant it actually committed;
-                        // if any member corrected forward, all members are
-                        // re-STARTed on the largest reported instant (+150 ms
-                        // command fan-out margin), for at most four rounds.
-                        let mut requested_start_ntp = start_ntp;
-                        let mut committed_group_ntp = start_ntp;
+                        // MSA does not trust the requested START blindly. Native
+                        // AP2/PTP speaks standards-based NTP (1900 epoch), while
+                        // the cross-transport contract speaks Unix milliseconds.
+                        // Convert at the boundary, fan the round out concurrently,
+                        // then let the exact same evaluator used by RAOP decide
+                        // converge/retry/last-ack semantics.
+                        let mut requested_start_unix_ms = ntp_epoch_to_unix_ms(start_ntp);
+                        let mut committed_group_unix_ms = requested_start_unix_ms;
                         let mut converged = false;
                         let mut rounds = 0usize;
 
-                        for round in 1..=4 {
+                        for round in 1..=AIRPLAY_START_CONVERGENCE_MAX_ROUNDS {
                             rounds = round;
-                            let mut latest_committed_ntp = requested_start_ntp;
-                            for target in &mut targets {
-                                let committed = match target.sender.arm_cold_start_verified(
-                                    requested_start_ntp,
-                                    target.latency_max,
-                                    target.lead_frames,
-                                    target.rtp_offset,
-                                    target.apple_model,
-                                ) {
-                                    Ok(value) => value,
-                                    Err(error) => {
-                                        if let Ok(mut slot) = last_error_thread.lock() {
-                                            *slot = Some(format!(
-                                                "{} cold session START failed: {error:?}",
-                                                target.name
-                                            ));
-                                        }
-                                        running_thread.store(false, Ordering::SeqCst);
-                                        return;
+                            let member_acks = match command_native_start_round(
+                                &mut targets,
+                                requested_start_unix_ms,
+                            ) {
+                                Ok(value) => value,
+                                Err((name, error)) => {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(format!(
+                                            "{name} cold session START failed: {error}"
+                                        ));
                                     }
-                                };
-                                latest_committed_ntp = latest_committed_ntp.max(committed);
-                            }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            };
 
-                            let correction_ntp =
-                                latest_committed_ntp.saturating_sub(requested_start_ntp);
-                            if correction_ntp <= ms_to_ntp(2) {
-                                committed_group_ntp = requested_start_ntp;
-                                converged = true;
-                                break;
-                            }
-
-                            if let Ok(mut events) = startup_events_thread.lock() {
-                                events.push(format!(
-                                    "AirPlay group START corrected: round {round}/4 · member floor moved shared instant +{} ms.",
-                                    ntp_delta_to_ms(correction_ntp)
-                                ));
-                            }
-                            committed_group_ntp = latest_committed_ntp;
-                            if round < 4 {
-                                requested_start_ntp = latest_committed_ntp
-                                    .saturating_add(ms_to_ntp(AIRPLAY_SPLICE_LEAD_MARGIN_MS));
+                            match evaluate_group_start_round(
+                                requested_start_unix_ms,
+                                &member_acks,
+                            ) {
+                                GroupStartRoundDecision::Converged { anchor_unix_ms }
+                                | GroupStartRoundDecision::SoloCorrected { anchor_unix_ms } => {
+                                    committed_group_unix_ms = anchor_unix_ms;
+                                    converged = true;
+                                    break;
+                                }
+                                GroupStartRoundDecision::Retry {
+                                    next_target_unix_ms,
+                                    corrected_unix_ms,
+                                } => {
+                                    committed_group_unix_ms = corrected_unix_ms;
+                                    if let Ok(mut events) = startup_events_thread.lock() {
+                                        events.push(format!(
+                                            "AirPlay group START corrected: round {round}/{} · member floor moved shared instant +{} ms.",
+                                            AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
+                                            corrected_unix_ms.saturating_sub(requested_start_unix_ms)
+                                        ));
+                                    }
+                                    if round < AIRPLAY_START_CONVERGENCE_MAX_ROUNDS {
+                                        requested_start_unix_ms = next_target_unix_ms;
+                                    }
+                                }
                             }
                         }
 
                         if !converged {
                             if let Ok(mut events) = startup_events_thread.lock() {
                                 events.push(format!(
-                                    "AirPlay group START did not converge after 4 rounds; latest committed instant retained for diagnostics."
+                                    "AirPlay group START did not converge after {} rounds; latest committed instant retained for diagnostics.",
+                                    AIRPLAY_START_CONVERGENCE_MAX_ROUNDS
                                 ));
                             }
                         }
+                        let committed_group_ntp =
+                            unix_ms_to_ntp_epoch(committed_group_unix_ms);
 
                         for target in &mut targets {
                             let rtp_timestamp = target.sender.state().timestamp;
@@ -1523,6 +1531,66 @@ fn prepare_pending_joins(
     }
 }
 
+fn command_native_start_round(
+    targets: &mut [WindowsAudioTarget],
+    requested_start_unix_ms: u64,
+) -> Result<Vec<(i64, u64)>, (String, String)> {
+    let requested_start_ntp = unix_ms_to_ntp_epoch(requested_start_unix_ms);
+
+    // Match MSA's TaskGroup shape: every member receives the same commanded
+    // audible instant in one round, and all verified answers are gathered
+    // before the convergence decision is made. Each scoped worker owns only
+    // its member sender; metadata and the shared WASAPI source are untouched.
+    let raw_acks = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(targets.len());
+
+        for target in targets.iter_mut() {
+            let name = target.name.clone();
+            let latency_max = target.latency_max;
+            let lead_frames = target.lead_frames;
+            let rtp_offset = target.rtp_offset;
+            let apple_model = target.apple_model;
+            let sender = &mut target.sender;
+
+            handles.push(scope.spawn(move || {
+                sender
+                    .arm_cold_start_verified(
+                        requested_start_ntp,
+                        latency_max,
+                        lead_frames,
+                        rtp_offset,
+                        apple_model,
+                    )
+                    .map(|committed_ntp| (name.clone(), committed_ntp))
+                    .map_err(|error| (name, error))
+            }));
+        }
+
+        let mut round_acks = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(value)) => round_acks.push(value),
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    return Err((
+                        "native AirPlay group".to_owned(),
+                        "concurrent START worker panicked".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok::<Vec<(String, u64)>, (String, String)>(round_acks)
+    })?;
+
+    // Native AP2 has no Windows per-member sync-adjust control yet, so the
+    // common MSA acknowledgement tuple carries adjustment=0. The instant itself
+    // is normalized from NTP epoch to Unix milliseconds here at the boundary.
+    Ok(raw_acks
+        .into_iter()
+        .map(|(_name, committed_ntp)| (0, ntp_epoch_to_unix_ms(committed_ntp)))
+        .collect())
+}
+
 fn ntp_delta_to_ms(value: u64) -> u64 {
     (((value as u128) * 1000) >> 32) as u64
 }
@@ -1688,6 +1756,7 @@ mod mixed_format_tests {
     #[test]
     fn msa_group_start_convergence_constants_match_source() {
         assert_eq!(AIRPLAY_SPLICE_LEAD_MARGIN_MS, 150);
+        assert_eq!(AIRPLAY_START_CONVERGENCE_MAX_ROUNDS, 4);
     }
 
     #[test]

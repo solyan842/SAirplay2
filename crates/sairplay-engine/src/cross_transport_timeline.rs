@@ -16,6 +16,10 @@ pub const AIRPLAY_SPLICE_LEAD_MARGIN_MS: u64 = 150;
 pub const AIRPLAY_START_CONVERGENCE_TOLERANCE_MS: u64 = 2;
 pub const AIRPLAY_START_CONVERGENCE_MAX_ROUNDS: usize = 4;
 
+/// Seconds between the NTP epoch (1900) used by native AirPlay timing and
+/// the Unix epoch used by Music Assistant's group START contract.
+const NTP_UNIX_EPOCH_DELTA_SECONDS: u64 = 2_208_988_800;
+
 /// Pure decision returned after one Music Assistant group START round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupStartRoundDecision {
@@ -66,6 +70,33 @@ pub fn evaluate_group_start_round(
         next_target_unix_ms: corrected.saturating_add(AIRPLAY_SPLICE_LEAD_MARGIN_MS),
         corrected_unix_ms: corrected,
     }
+}
+
+/// Convert a standards-based NTP timestamp (1900 epoch, 32.32 fixed point)
+/// into the Unix milliseconds used by Music Assistant START acknowledgements.
+///
+/// Native AirPlay/PTP paths use real NTP epoch timestamps. RAOP/libraop's
+/// historical playtime values are Unix-based fixed point and must NOT be fed
+/// through this converter; their helper already reports Unix milliseconds.
+pub fn ntp_epoch_to_unix_ms(ntp: u64) -> u64 {
+    let seconds = (ntp >> 32).saturating_sub(NTP_UNIX_EPOCH_DELTA_SECONDS);
+    seconds
+        .saturating_mul(1000)
+        .saturating_add((((ntp & 0xFFFF_FFFF) as u128 * 1000) >> 32) as u64)
+}
+
+/// Encode Unix milliseconds as a standards-based NTP timestamp (1900 epoch).
+/// The fractional field rounds upward so converting the result back to integer
+/// milliseconds preserves the commanded Music Assistant instant exactly.
+pub fn unix_ms_to_ntp_epoch(unix_ms: u64) -> u64 {
+    let seconds = unix_ms / 1000;
+    let remainder_ms = unix_ms % 1000;
+    let fraction = if remainder_ms == 0 {
+        0
+    } else {
+        (((remainder_ms as u128) << 32).div_ceil(1000)) as u64
+    };
+    (seconds.saturating_add(NTP_UNIX_EPOCH_DELTA_SECONDS) << 32) | fraction
 }
 
 /// Result of resolving a commanded RAOP audible START against the moving
@@ -136,6 +167,16 @@ mod tests {
 
     fn unix_ms_to_ntp(ms: u64) -> u64 {
         ((ms / 1000) << 32) | ((((ms % 1000) as u128) << 32) / 1000) as u64
+    }
+
+    #[test]
+    fn native_ntp_epoch_roundtrips_music_assistant_unix_ms() {
+        for unix_ms in [0, 1, 999, 1_000, 1_234_567_890_123] {
+            assert_eq!(
+                ntp_epoch_to_unix_ms(unix_ms_to_ntp_epoch(unix_ms)),
+                unix_ms
+            );
+        }
     }
 
     #[test]
