@@ -11,6 +11,7 @@ use crate::{
     system_time_to_ntp, volume_percent_to_db, Ap2AudioFormat, VolumeSetResult,
     WasapiLoopbackError, WindowsPcmSession, PCM352_PACKET_BYTES,
 };
+use crate::windows_pcm_session::WindowsPcmSourceHandle;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -332,6 +333,23 @@ pub struct LegacyGroupSession {
 
 impl LegacyGroupSession {
     pub fn connect(configs: Vec<LegacyMemberConfig>) -> Result<Self, LegacyGroupError> {
+        Self::connect_with_optional_pcm_source(configs, None)
+    }
+
+    /// Future common-session seam: consume an externally owned persistent PCM
+    /// source without opening another WASAPI capture. The caller keeps producer
+    /// lifetime ownership. Current public connect() behavior remains unchanged.
+    pub fn connect_with_pcm_source(
+        configs: Vec<LegacyMemberConfig>,
+        pcm_source: WindowsPcmSourceHandle,
+    ) -> Result<Self, LegacyGroupError> {
+        Self::connect_with_optional_pcm_source(configs, Some(pcm_source))
+    }
+
+    fn connect_with_optional_pcm_source(
+        configs: Vec<LegacyMemberConfig>,
+        injected_pcm_source: Option<WindowsPcmSourceHandle>,
+    ) -> Result<Self, LegacyGroupError> {
         if configs.is_empty() {
             return Err(LegacyGroupError::EmptyGroup);
         }
@@ -568,20 +586,27 @@ impl LegacyGroupSession {
                     return;
                 }
 
-                let mut pcm_session = match WindowsPcmSession::start(
-                    Ap2AudioFormat::ALAC_44100_16_STEREO,
-                ) {
-                    Ok(session) => session,
-                    Err(error) => {
-                        if let Ok(mut slot) = error_thread.lock() {
-                            *slot = Some(error.to_string());
+                let mut local_pcm_owner = None;
+                let pcm_session = if let Some(source) = injected_pcm_source {
+                    source
+                } else {
+                    match WindowsPcmSession::start(Ap2AudioFormat::ALAC_44100_16_STEREO) {
+                        Ok(session) => {
+                            let source = session.source_handle();
+                            local_pcm_owner = Some(session);
+                            source
                         }
-                        running_thread.store(false, Ordering::SeqCst);
-                        drop(pcm_sinks);
-                        for writer in writers {
-                            let _ = writer.join();
+                        Err(error) => {
+                            if let Ok(mut slot) = error_thread.lock() {
+                                *slot = Some(error.to_string());
+                            }
+                            running_thread.store(false, Ordering::SeqCst);
+                            drop(pcm_sinks);
+                            for writer in writers {
+                                let _ = writer.join();
+                            }
+                            return;
                         }
-                        return;
                     }
                 };
 
@@ -654,7 +679,9 @@ impl LegacyGroupSession {
                     active_thread.store(pcm_sinks.len() as u64, Ordering::SeqCst);
                 }
 
-                pcm_session.stop();
+                if let Some(mut owner) = local_pcm_owner {
+                    owner.stop();
+                }
                 running_thread.store(false, Ordering::SeqCst);
                 drop(pcm_sinks);
                 for writer in writers {
