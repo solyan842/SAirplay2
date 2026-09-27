@@ -149,6 +149,9 @@ pub struct LegacyGroupSession {
     startup_events: Arc<Mutex<Vec<String>>>,
     active_members: Arc<AtomicU64>,
     volume_controls: Vec<LegacyVolumeControl>,
+    // Keep the MSA-style Windows command pipes connected for the whole
+    // persistent helper lifetime. Closing one is a local control-channel EOF.
+    _command_pipes: Vec<File>,
 }
 
 impl LegacyGroupSession {
@@ -220,7 +223,11 @@ impl LegacyGroupSession {
         // command one shared audible START. This removes the old guessed
         // pre-connect 5-second anchor and uses the current server's 2500 ms
         // cold-group planning floor only after all members are ready.
-        let committed_group_start_unix_ms = if scheduled_group_start {
+        let start_result = (|| -> Result<Option<u64>, LegacyGroupError> {
+            if !scheduled_group_start {
+                return Ok(None);
+            }
+
             let requested_start_unix_ms = current_unix_ms()
                 .map_err(LegacyGroupError::Time)?
                 .saturating_add(AIRPLAY_COLD_GROUP_START_LEAD_MS);
@@ -244,10 +251,14 @@ impl LegacyGroupSession {
                     name: member.name.clone(),
                     error: "START acknowledgement channel missing".into(),
                 })?;
-                let (requested, actual) = rx.recv().map_err(|error| LegacyGroupError::Start {
+                let ack = rx.recv().map_err(|error| LegacyGroupError::Start {
                     name: member.name.clone(),
                     error: error.to_string(),
-                })??;
+                })?;
+                let (requested, actual) = ack.map_err(|error| LegacyGroupError::Start {
+                    name: member.name.clone(),
+                    error,
+                })?;
                 if requested != requested_start_unix_ms {
                     return Err(LegacyGroupError::Start {
                         name: member.name.clone(),
@@ -261,7 +272,7 @@ impl LegacyGroupSession {
                     return Err(LegacyGroupError::Start {
                         name: member.name.clone(),
                         error: format!(
-                            "receiver corrected cold START from {} to {}; mixed/group convergence is not enabled until every transport exposes the same verified contract",
+                            "receiver corrected cold START from {} to {}; group convergence remains disabled until the same verified retry contract exists across transports",
                             requested_start_unix_ms, actual
                         ),
                     });
@@ -277,9 +288,22 @@ impl LegacyGroupSession {
                     AIRPLAY_COLD_GROUP_START_LEAD_MS
                 ));
             }
-            Some(committed)
-        } else {
-            None
+            Ok(Some(committed))
+        })();
+
+        let committed_group_start_unix_ms = match start_result {
+            Ok(value) => value,
+            Err(error) => {
+                running.store(false, Ordering::SeqCst);
+                for member in &spawned {
+                    kill_helper_tree(member.pid);
+                }
+                for member in spawned {
+                    drop(member.pcm_tx);
+                    let _ = member.writer.join();
+                }
+                return Err(error);
+            }
         };
 
         let running_thread = Arc::clone(&running);
@@ -297,6 +321,10 @@ impl LegacyGroupSession {
         let mut senders = spawned
             .iter()
             .map(|member| (member.name.clone(), member.pcm_tx.clone()))
+            .collect::<Vec<_>>();
+        let command_pipes = spawned
+            .iter_mut()
+            .filter_map(|member| member.command_pipe.take())
             .collect::<Vec<_>>();
         let writers = spawned
             .drain(..)
@@ -476,6 +504,7 @@ impl LegacyGroupSession {
             startup_events,
             active_members,
             volume_controls,
+            _command_pipes: command_pipes,
         })
     }
 
