@@ -403,6 +403,14 @@ impl NativeGroupSession {
                 .saturating_add(stats.requested_over_1472);
             total.max_requested_wire_len =
                 total.max_requested_wire_len.max(stats.max_requested_wire_len);
+            total.last_request_age_ms =
+                total.last_request_age_ms.max(stats.last_request_age_ms);
+            total.max_request_age_ms =
+                total.max_request_age_ms.max(stats.max_request_age_ms);
+            total.last_response_us =
+                total.last_response_us.max(stats.last_response_us);
+            total.max_response_us =
+                total.max_response_us.max(stats.max_response_us);
             total
         })
     }
