@@ -19,6 +19,7 @@ use std::sync::{
 use std::time::Duration;
 
 const SOLO_COLD_START_LEAD_MS: u64 = 400;
+const DEFAULT_NATIVE_RENDER_LEAD_FRAMES_44100: u32 = 88_200;
 
 #[cfg(windows)]
 use crate::{NativeMetadataControl, WindowsAudioTarget, WindowsAudioWorker, WindowsAudioWorkerError};
@@ -67,7 +68,7 @@ impl NativeSessionConfig {
             // Pinned airplay-cli owns a 2000 ms anchor-to-render lead.
             // This is deliberately NOT AP2_MIN_WARM_LEAD_MS (250 ms) and
             // NOT the realtime splice queue depth (600 ms).
-            lead_frames: 88_200,
+            lead_frames: DEFAULT_NATIVE_RENDER_LEAD_FRAMES_44100,
             supports_ptp: false,
             supports_buffered_audio: false,
             buffered_denied: false,
@@ -898,6 +899,14 @@ mod tests {
     #[test]
     fn solo_cold_start_lead_matches_pinned_music_assistant() {
         assert_eq!(SOLO_COLD_START_LEAD_MS, 400);
+    }
+
+    #[test]
+    fn native_render_lead_is_two_seconds_and_not_the_start_floor() {
+        let config = NativeSessionConfig::new("127.0.0.1", 7000);
+        assert_eq!(DEFAULT_NATIVE_RENDER_LEAD_FRAMES_44100, 88_200);
+        assert_eq!(config.lead_frames, 88_200);
+        assert_ne!(config.lead_frames, 11_025);
     }
 
     #[test]
