@@ -322,9 +322,10 @@ impl WindowsAudioWorker {
 
     /// Starts a dedicated Windows audio thread.
     ///
-    /// The worker owns the WASAPI COM apartment, capture client, chunker and
-    /// realtime sender on the same thread. This avoids crossing COM apartment
-    /// boundaries from the GUI thread.
+    /// The transport worker consumes PCM from a persistent session ring. A
+    /// dedicated producer thread owns the WASAPI COM apartment/capture client,
+    /// so capture keeps draining while START planning, ALAC or network sends
+    /// block here; no COM interface crosses thread boundaries.
     pub fn start(
         mut sender: RealtimeMediaSender,
         lead_frames: u32,
