@@ -494,9 +494,15 @@ impl LegacyGroupSession {
             .iter()
             .map(|member| member.volume_control.clone())
             .collect::<Vec<_>>();
-        let mut senders = spawned
+        let mut pcm_sinks = spawned
             .iter()
-            .map(|member| (member.name.clone(), member.pcm_tx.clone()))
+            .map(|member| {
+                LegacyPcmSink::new(
+                    member.name.clone(),
+                    member.pcm_tx.clone(),
+                    Arc::clone(&running),
+                )
+            })
             .collect::<Vec<_>>();
         let command_controls = spawned
             .iter_mut()
@@ -555,7 +561,7 @@ impl LegacyGroupSession {
                 }
 
                 if !running_thread.load(Ordering::SeqCst) {
-                    drop(senders);
+                    drop(pcm_sinks);
                     for writer in writers {
                         let _ = writer.join();
                     }
@@ -571,7 +577,7 @@ impl LegacyGroupSession {
                             *slot = Some(error.to_string());
                         }
                         running_thread.store(false, Ordering::SeqCst);
-                        drop(senders);
+                        drop(pcm_sinks);
                         for writer in writers {
                             let _ = writer.join();
                         }
@@ -622,60 +628,35 @@ impl LegacyGroupSession {
                     };
 
                     // Legacy RAOP remains locked to the 16-bit / 44.1 kHz
-                    // 1408-byte packet contract. Only source ownership moved
-                    // behind the common GroupPcmSource boundary.
-                        let mut index = 0usize;
-                        while index < senders.len() {
-                            let stall_started = std::time::Instant::now();
-                            loop {
-                                let (name, tx) = &senders[index];
-                                match tx.try_send(packet) {
-                                    Ok(()) => {
-                                        index += 1;
-                                        break;
-                                    }
-                                    Err(TrySendError::Disconnected(_)) => {
-                                        if let Ok(mut events) = events_thread.lock() {
-                                            events.push(format!(
-                                                "{name}: libraop writer disconnected; removed from legacy group."
-                                            ));
-                                        }
-                                        senders.remove(index);
-                                        break;
-                                    }
-                                    Err(TrySendError::Full(_)) => {
-                                        // cliraop/libraop is pull-paced by
-                                        // raopcl_accept_frames(). A full queue
-                                        // is therefore normal backpressure, not
-                                        // packet loss. Hold this exact packet
-                                        // until the source consumes it. Only
-                                        // evict after the same 35 s write
-                                        // timeout used by Music Assistant.
-                                        if !running_thread.load(Ordering::SeqCst) {
-                                            break;
-                                        }
-                                        if stall_started.elapsed() >= WRITER_BACKPRESSURE_TIMEOUT {
-                                            if let Ok(mut events) = events_thread.lock() {
-                                                events.push(format!(
-                                                    "{name}: stopped reading PCM for 35 s; removed from legacy group."
-                                                ));
-                                            }
-                                            senders.remove(index);
-                                            break;
-                                        }
-                                        thread::sleep(Duration::from_millis(1));
-                                    }
-                                }
+                    // 1408-byte packet contract. Runtime writes now go through
+                    // the same GroupPcmParticipant boundary used by the common
+                    // cross-transport fan-out contract.
+                    let mut index = 0usize;
+                    while index < pcm_sinks.len() {
+                        let name = pcm_sinks[index].name.clone();
+                        match pcm_sinks[index].write_shared_pcm(&packet) {
+                            Ok(()) => {
+                                index += 1;
                             }
-                            if !running_thread.load(Ordering::SeqCst) {
-                                break;
+                            Err(error) => {
+                                if let Ok(mut events) = events_thread.lock() {
+                                    events.push(format!(
+                                        "{name}: {error}; removed from legacy group."
+                                    ));
+                                }
+                                pcm_sinks.remove(index);
                             }
                         }
+                        if !running_thread.load(Ordering::SeqCst) {
+                            break;
+                        }
+                    }
+                    active_thread.store(pcm_sinks.len() as u64, Ordering::SeqCst);
                 }
 
                 pcm_session.stop();
                 running_thread.store(false, Ordering::SeqCst);
-                drop(senders);
+                drop(pcm_sinks);
                 for writer in writers {
                     let _ = writer.join();
                 }
