@@ -5,7 +5,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
@@ -58,6 +58,7 @@ pub struct RetransmitRing {
 struct RtxSlot {
     seq: u16,
     packet: Vec<u8>,
+    stored_at: Instant,
 }
 
 impl RetransmitRing {
@@ -72,17 +73,17 @@ impl RetransmitRing {
             slots[seq as usize % RTX_RING_SLOTS] = Some(RtxSlot {
                 seq,
                 packet: packet.to_vec(),
+                stored_at: Instant::now(),
             });
         }
     }
 
-    fn lookup(&self, seq: u16) -> Option<Vec<u8>> {
+    fn lookup(&self, seq: u16) -> Option<RtxSlot> {
         self.slots
             .lock()
             .ok()
             .and_then(|slots| slots[seq as usize % RTX_RING_SLOTS].clone())
             .filter(|slot| slot.seq == seq)
-            .map(|slot| slot.packet)
     }
 }
 
@@ -99,6 +100,15 @@ pub struct RetransmitStats {
     /// IPv4/Ethernet non-fragmenting payload ceiling (1500 MTU - 20 IP - 8 UDP).
     pub requested_over_1472: u64,
     pub max_requested_wire_len: u64,
+    /// Age of the most recently answered original packet when the receiver
+    /// requested it. This distinguishes "still in the 512-slot ring" from
+    /// "requested early enough to be useful before its render deadline".
+    pub last_request_age_ms: u64,
+    pub max_request_age_ms: u64,
+    /// Time spent preparing + sending the most recent retransmit response after
+    /// the request was received by this worker.
+    pub last_response_us: u64,
+    pub max_response_us: u64,
 }
 
 pub struct RetransmitWorker {
@@ -109,6 +119,10 @@ pub struct RetransmitWorker {
     expired: Arc<AtomicU64>,
     requested_over_1472: Arc<AtomicU64>,
     max_requested_wire_len: Arc<AtomicU64>,
+    last_request_age_ms: Arc<AtomicU64>,
+    max_request_age_ms: Arc<AtomicU64>,
+    last_response_us: Arc<AtomicU64>,
+    max_response_us: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -125,11 +139,19 @@ impl RetransmitWorker {
         let expired = Arc::new(AtomicU64::new(0));
         let requested_over_1472 = Arc::new(AtomicU64::new(0));
         let max_requested_wire_len = Arc::new(AtomicU64::new(0));
+        let last_request_age_ms = Arc::new(AtomicU64::new(0));
+        let max_request_age_ms = Arc::new(AtomicU64::new(0));
+        let last_response_us = Arc::new(AtomicU64::new(0));
+        let max_response_us = Arc::new(AtomicU64::new(0));
         let requested_thread = Arc::clone(&requested);
         let answered_thread = Arc::clone(&answered);
         let expired_thread = Arc::clone(&expired);
         let requested_over_1472_thread = Arc::clone(&requested_over_1472);
         let max_requested_wire_len_thread = Arc::clone(&max_requested_wire_len);
+        let last_request_age_ms_thread = Arc::clone(&last_request_age_ms);
+        let max_request_age_ms_thread = Arc::clone(&max_request_age_ms);
+        let last_response_us_thread = Arc::clone(&last_response_us);
+        let max_response_us_thread = Arc::clone(&max_response_us);
 
         let worker = thread::Builder::new()
             .name("sairplay-rtx".into())
@@ -170,24 +192,36 @@ impl RetransmitWorker {
                         requested_thread.fetch_add(count as u64, Ordering::SeqCst);
                         for k in 0..count {
                             let seq = first.wrapping_add(k as u16);
-                            let Some(packet) = ring.lookup(seq) else {
+                            let Some(slot) = ring.lookup(seq) else {
                                 expired_thread.fetch_add(1, Ordering::SeqCst);
                                 continue;
                             };
-                            let wire_len = packet.len() as u64;
+                            let request_age_ms =
+                                slot.stored_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                            last_request_age_ms_thread.store(request_age_ms, Ordering::SeqCst);
+                            max_request_age_ms_thread.fetch_max(request_age_ms, Ordering::SeqCst);
+
+                            let wire_len = slot.packet.len() as u64;
                             if wire_len > 1472 {
                                 requested_over_1472_thread.fetch_add(1, Ordering::SeqCst);
                             }
                             max_requested_wire_len_thread.fetch_max(wire_len, Ordering::SeqCst);
-                            let mut out = Vec::with_capacity(4 + packet.len());
+                            let response_started = Instant::now();
+                            let mut out = Vec::with_capacity(4 + slot.packet.len());
                             out.extend_from_slice(&[
                                 0x80,
                                 0xD6,
                                 (req_seq >> 8) as u8,
                                 req_seq as u8,
                             ]);
-                            out.extend_from_slice(&packet);
+                            out.extend_from_slice(&slot.packet);
                             if socket.send_to(&out, from).is_ok() {
+                                let response_us = response_started
+                                    .elapsed()
+                                    .as_micros()
+                                    .min(u64::MAX as u128) as u64;
+                                last_response_us_thread.store(response_us, Ordering::SeqCst);
+                                max_response_us_thread.fetch_max(response_us, Ordering::SeqCst);
                                 answered_thread.fetch_add(1, Ordering::SeqCst);
                             }
                         }
@@ -205,6 +239,10 @@ impl RetransmitWorker {
             expired,
             requested_over_1472,
             max_requested_wire_len,
+            last_request_age_ms,
+            max_request_age_ms,
+            last_response_us,
+            max_response_us,
             worker: Some(worker),
         })
     }
@@ -220,6 +258,10 @@ impl RetransmitWorker {
             expired: self.expired.load(Ordering::SeqCst),
             requested_over_1472: self.requested_over_1472.load(Ordering::SeqCst),
             max_requested_wire_len: self.max_requested_wire_len.load(Ordering::SeqCst),
+            last_request_age_ms: self.last_request_age_ms.load(Ordering::SeqCst),
+            max_request_age_ms: self.max_request_age_ms.load(Ordering::SeqCst),
+            last_response_us: self.last_response_us.load(Ordering::SeqCst),
+            max_response_us: self.max_response_us.load(Ordering::SeqCst),
         }
     }
 
@@ -249,7 +291,10 @@ mod tests {
         ring.store(7, b"seven");
         ring.store((7u16).wrapping_add(RTX_RING_SLOTS as u16), b"new");
         assert!(ring.lookup(7).is_none());
-        assert_eq!(ring.lookup(519).as_deref(), Some(b"new".as_slice()));
+        assert_eq!(
+            ring.lookup(519).map(|slot| slot.packet),
+            Some(b"new".to_vec())
+        );
     }
 
     #[test]
