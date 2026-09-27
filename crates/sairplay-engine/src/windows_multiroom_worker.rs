@@ -460,7 +460,36 @@ pub struct WindowsMultiroomAudioWorker {
 }
 
 impl WindowsMultiroomAudioWorker {
-    pub fn start(kind: WindowsGroupAudioKind, mut targets: Vec<WindowsAudioTarget>) -> Result<Self, WindowsMultiroomAudioError> {
+    pub fn start(
+        kind: WindowsGroupAudioKind,
+        targets: Vec<WindowsAudioTarget>,
+    ) -> Result<Self, WindowsMultiroomAudioError> {
+        Self::start_with_optional_pcm_source(kind, targets, None)
+    }
+
+    /// Future common-session seam: consume an externally owned persistent PCM
+    /// source without opening another WASAPI capture. The caller retains the
+    /// producer lifetime. The source format must exactly match the format this
+    /// native group would negotiate today; heterogeneous resampling remains
+    /// a separate Phase C concern.
+    pub fn start_with_pcm_source(
+        kind: WindowsGroupAudioKind,
+        targets: Vec<WindowsAudioTarget>,
+        pcm_source: WindowsPcmSourceHandle,
+        source_format: Ap2AudioFormat,
+    ) -> Result<Self, WindowsMultiroomAudioError> {
+        Self::start_with_optional_pcm_source(
+            kind,
+            targets,
+            Some((pcm_source, source_format)),
+        )
+    }
+
+    fn start_with_optional_pcm_source(
+        kind: WindowsGroupAudioKind,
+        mut targets: Vec<WindowsAudioTarget>,
+        injected_pcm_source: Option<(WindowsPcmSourceHandle, Ap2AudioFormat)>,
+    ) -> Result<Self, WindowsMultiroomAudioError> {
         if targets.is_empty() {
             return Err(WindowsMultiroomAudioError::EmptyGroup);
         }
@@ -498,6 +527,18 @@ impl WindowsMultiroomAudioWorker {
         } else {
             Ap2AudioFormat::ALAC_44100_16_STEREO
         };
+        if let Some((_, injected_format)) = injected_pcm_source.as_ref() {
+            if *injected_format != source_format {
+                return Err(WindowsMultiroomAudioError::Media(format!(
+                    "shared PCM source format mismatch: group requires {}-bit/{} Hz but injected source is {}-bit/{} Hz",
+                    source_format.bit_depth,
+                    source_format.sample_rate,
+                    injected_format.bit_depth,
+                    injected_format.sample_rate,
+                )));
+            }
+        }
+
         let bytes_per_frame = source_format.input_bytes_per_frame();
 
         let running = Arc::new(AtomicBool::new(true));
@@ -520,9 +561,15 @@ impl WindowsMultiroomAudioWorker {
             command_tx: command_tx.clone(),
         };
 
-        let mut pcm_session = WindowsPcmSession::start(source_format)
-            .map_err(WindowsMultiroomAudioError::Capture)?;
-        let pcm_source: WindowsPcmSourceHandle = pcm_session.source_handle();
+        let (pcm_source, mut pcm_session) = match injected_pcm_source {
+            Some((source, _)) => (source, None),
+            None => {
+                let session = WindowsPcmSession::start(source_format)
+                    .map_err(WindowsMultiroomAudioError::Capture)?;
+                let source = session.source_handle();
+                (source, Some(session))
+            }
+        };
 
         let worker_name = match kind {
             WindowsGroupAudioKind::StereoPair => "sairplay-stereo-pair-audio",
@@ -1120,7 +1167,7 @@ impl WindowsMultiroomAudioWorker {
             Ok(Ok(())) => Ok(Self {
                 kind,
                 running,
-                pcm_session: Some(pcm_session),
+                pcm_session,
                 worker: Some(worker),
                 last_error,
                 discontinuities,
@@ -1132,7 +1179,9 @@ impl WindowsMultiroomAudioWorker {
             }),
             Ok(Err(message)) => {
                 let _ = worker.join();
-                pcm_session.stop();
+                if let Some(mut session) = pcm_session.take() {
+                    session.stop();
+                }
                 Err(WindowsMultiroomAudioError::Capture(
                     WasapiLoopbackError::Windows(message),
                 ))
@@ -1140,7 +1189,9 @@ impl WindowsMultiroomAudioWorker {
             Err(error) => {
                 running.store(false, Ordering::SeqCst);
                 let _ = worker.join();
-                pcm_session.stop();
+                if let Some(mut session) = pcm_session.take() {
+                    session.stop();
+                }
                 Err(WindowsMultiroomAudioError::Capture(
                     WasapiLoopbackError::Windows(format!(
                         "MultiRoom WASAPI worker startup timeout: {error}"
