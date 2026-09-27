@@ -1,9 +1,12 @@
 #![cfg(windows)]
 
 use crate::{
-    cross_transport_timeline::AIRPLAY_COLD_GROUP_START_LEAD_MS, system_time_to_ntp,
-    volume_percent_to_db, Pcm352Chunker, VolumeSetResult, WasapiLoopbackCapture,
-    WasapiLoopbackError, PCM352_PACKET_BYTES,
+    cross_transport_timeline::{
+        evaluate_group_start_round, GroupStartRoundDecision,
+        AIRPLAY_COLD_GROUP_START_LEAD_MS, AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
+    },
+    system_time_to_ntp, volume_percent_to_db, Pcm352Chunker, VolumeSetResult,
+    WasapiLoopbackCapture, WasapiLoopbackError, PCM352_PACKET_BYTES,
 };
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -291,81 +294,79 @@ impl LegacyGroupSession {
         }
 
         // MSA source order: establish every receiver connection first, then
-        // command one shared audible START. This removes the old guessed
-        // pre-connect 5-second anchor and uses the current server's 2500 ms
-        // cold-group planning floor only after all members are ready.
+        // fan one shared audible START out to every member. Each round waits for
+        // all TRUE scheduled-instant acknowledgements concurrently, removes any
+        // per-member sync adjustment (legacy currently has none, so 0), and
+        // feeds the common cross-transport convergence contract. A correction
+        // re-anchors every member at largest_ack + 150 ms for at most four
+        // rounds; if the fourth round still corrects, retain where members
+        // actually landed rather than recording a retry that was never sent.
         let start_result = (|| -> Result<Option<u64>, LegacyGroupError> {
             if !scheduled_group_start {
                 return Ok(None);
             }
 
-            let requested_start_unix_ms = current_unix_ms()
+            let initial_start_unix_ms = current_unix_ms()
                 .map_err(LegacyGroupError::Time)?
                 .saturating_add(AIRPLAY_COLD_GROUP_START_LEAD_MS);
+            let mut target_unix_ms = initial_start_unix_ms;
+            let mut committed_unix_ms = initial_start_unix_ms;
+            let mut converged = false;
+            let mut rounds = 0usize;
 
-            for member in &mut spawned {
-                let pipe = member.command_pipe.as_mut().ok_or_else(|| LegacyGroupError::Start {
-                    name: member.name.clone(),
-                    error: "runtime command pipe missing".into(),
-                })?;
-                send_start_command(pipe, requested_start_unix_ms).map_err(|error| {
-                    LegacyGroupError::Start {
-                        name: member.name.clone(),
-                        error: error.to_string(),
+            for round in 1..=AIRPLAY_START_CONVERGENCE_MAX_ROUNDS {
+                rounds = round;
+                let member_acks =
+                    command_legacy_start_round(&mut spawned, target_unix_ms)?;
+
+                match evaluate_group_start_round(target_unix_ms, &member_acks) {
+                    GroupStartRoundDecision::Converged { anchor_unix_ms }
+                    | GroupStartRoundDecision::SoloCorrected { anchor_unix_ms } => {
+                        committed_unix_ms = anchor_unix_ms;
+                        converged = true;
+                        break;
                     }
-                })?;
+                    GroupStartRoundDecision::Retry {
+                        next_target_unix_ms,
+                        corrected_unix_ms,
+                    } => {
+                        committed_unix_ms = corrected_unix_ms;
+                        if let Ok(mut events) = startup_events.lock() {
+                            events.push(format!(
+                                "Legacy group START corrected: round {round}/{} · requested={} · largest_ack={} · retry={}.",
+                                AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
+                                target_unix_ms,
+                                corrected_unix_ms,
+                                next_target_unix_ms
+                            ));
+                        }
+                        if round < AIRPLAY_START_CONVERGENCE_MAX_ROUNDS {
+                            target_unix_ms = next_target_unix_ms;
+                        }
+                    }
+                }
             }
 
-            let mut committed = requested_start_unix_ms;
-            for member in &mut spawned {
-                let rx = member.started_rx.as_ref().ok_or_else(|| LegacyGroupError::Start {
-                    name: member.name.clone(),
-                    error: "START acknowledgement channel missing".into(),
-                })?;
-                let ack = rx
-                    .recv_timeout(RAOP_START_ACK_TIMEOUT)
-                    .map_err(|error| LegacyGroupError::Start {
-                        name: member.name.clone(),
-                        error: format!(
-                            "START acknowledgement not received within {} ms: {}",
-                            RAOP_START_ACK_TIMEOUT.as_millis(),
-                            error
-                        ),
-                    })?;
-                let (requested, actual) = ack.map_err(|error| LegacyGroupError::Start {
-                    name: member.name.clone(),
-                    error,
-                })?;
-                if requested != requested_start_unix_ms {
-                    return Err(LegacyGroupError::Start {
-                        name: member.name.clone(),
-                        error: format!(
-                            "helper acknowledged request {} instead of {}",
-                            requested, requested_start_unix_ms
-                        ),
-                    });
+            if !converged {
+                if let Ok(mut events) = startup_events.lock() {
+                    events.push(format!(
+                        "Legacy group START did not converge after {} rounds · retaining last acknowledged instant {}.",
+                        AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
+                        committed_unix_ms
+                    ));
                 }
-                if actual.abs_diff(requested_start_unix_ms) > 2 {
-                    return Err(LegacyGroupError::Start {
-                        name: member.name.clone(),
-                        error: format!(
-                            "receiver corrected cold START from {} to {}; group convergence remains disabled until the same verified retry contract exists across transports",
-                            requested_start_unix_ms, actual
-                        ),
-                    });
-                }
-                committed = committed.max(actual);
             }
 
             if let Ok(mut events) = startup_events.lock() {
                 events.push(format!(
-                    "Legacy group START committed after all members connected · requested={} · committed={} · lead={} ms.",
-                    requested_start_unix_ms,
-                    committed,
+                    "Legacy group START committed after all members connected · initial={} · committed={} · rounds={} · lead={} ms.",
+                    initial_start_unix_ms,
+                    committed_unix_ms,
+                    rounds,
                     AIRPLAY_COLD_GROUP_START_LEAD_MS
                 ));
             }
-            Ok(Some(committed))
+            Ok(Some(committed_unix_ms))
         })();
 
         let committed_group_start_unix_ms = match start_result {
@@ -1038,6 +1039,90 @@ fn open_command_pipe_writer(pipe_name: &str) -> std::io::Result<File> {
             Err(error) => return Err(error),
         }
     }
+}
+
+fn command_legacy_start_round(
+    members: &mut [SpawnedMember],
+    requested_start_unix_ms: u64,
+) -> Result<Vec<(i64, u64)>, LegacyGroupError> {
+    // Match MSA's TaskGroup semantics: command and acknowledgement wait are
+    // per-member tasks in the same round. The helper pipes are independent, so
+    // each scoped worker owns exactly one member for the round and every 7 s
+    // acknowledgement timeout runs concurrently instead of serially.
+    let raw_acks = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(members.len());
+
+        for member in members {
+            handles.push(scope.spawn(move || -> Result<(String, u64), (String, String)> {
+                let name = member.name.clone();
+                let pipe = member.command_pipe.as_mut().ok_or_else(|| {
+                    (name.clone(), "runtime command pipe missing".to_owned())
+                })?;
+                let rx = member.started_rx.as_ref().ok_or_else(|| {
+                    (
+                        name.clone(),
+                        "START acknowledgement channel missing".to_owned(),
+                    )
+                })?;
+
+                send_start_command(pipe, requested_start_unix_ms).map_err(|error| {
+                    (
+                        name.clone(),
+                        format!("cannot send START command: {error}"),
+                    )
+                })?;
+
+                let ack = rx.recv_timeout(RAOP_START_ACK_TIMEOUT).map_err(|error| {
+                    (
+                        name.clone(),
+                        format!(
+                            "START acknowledgement not received within {} ms: {}",
+                            RAOP_START_ACK_TIMEOUT.as_millis(),
+                            error
+                        ),
+                    )
+                })?;
+                let (requested, actual) =
+                    ack.map_err(|error| (name.clone(), error))?;
+
+                if requested != requested_start_unix_ms {
+                    return Err((
+                        name,
+                        format!(
+                            "helper acknowledged request {} instead of {}",
+                            requested, requested_start_unix_ms
+                        ),
+                    ));
+                }
+
+                Ok((name, actual))
+            }));
+        }
+
+        let mut round_acks = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(value)) => round_acks.push(value),
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    return Err((
+                        "legacy group".to_owned(),
+                        "concurrent START worker panicked".to_owned(),
+                    ))
+                }
+            }
+        }
+        Ok::<Vec<(String, u64)>, (String, String)>(round_acks)
+    })
+    .map_err(|(name, error)| LegacyGroupError::Start { name, error })?;
+
+    // sync_adjust is not exposed for the Windows legacy route yet. Keep the ack
+    // shape identical to the cross-transport contract so that future mixed
+    // orchestration can substitute the real per-member adjustment directly.
+    Ok(raw_acks
+        .into_iter()
+        .map(|(_name, actual)| (0, actual))
+        .collect())
 }
 
 fn send_start_command(pipe: &mut File, start_unix_ms: u64) -> std::io::Result<()> {
