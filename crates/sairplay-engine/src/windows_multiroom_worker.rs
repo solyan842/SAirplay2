@@ -12,8 +12,8 @@ use crate::{
     system_time_to_ntp, Ap2AudioFormat, BufferedAnchorStartConfig, BufferedMediaSender,
     BufferedWriteOutcome, NativeMetadataControl, PtpClock, RealtimeMediaSender, RtpState,
     SharedCseq, SharedRtspControl, WasapiLoopbackError, WindowsPcmSession,
-    WindowsPcmSourceHandle,
 };
+use crate::windows_pcm_session::WindowsPcmSourceHandle;
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{
