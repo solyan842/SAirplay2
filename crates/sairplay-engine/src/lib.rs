@@ -42,6 +42,8 @@ pub mod pcm_chunker;
 #[cfg(windows)]
 pub mod wasapi_loopback;
 #[cfg(windows)]
+pub mod windows_pcm_session;
+#[cfg(windows)]
 pub mod windows_audio_worker;
 #[cfg(windows)]
 pub mod windows_multiroom_worker;
@@ -124,6 +126,11 @@ pub use alac_encoder::Alac24Encoder;
 pub use pcm_chunker::{Pcm352Chunker, PCM352_PACKET_BYTES};
 #[cfg(windows)]
 pub use wasapi_loopback::{WasapiDrainReport, WasapiLoopbackCapture, WasapiLoopbackError};
+#[cfg(windows)]
+pub use windows_pcm_session::{
+    WindowsPcmDiscontinuity, WindowsPcmSession, WINDOWS_PCM_SESSION_RING_MIN_BYTES,
+    WINDOWS_PCM_SESSION_RING_SECONDS,
+};
 #[cfg(windows)]
 pub use windows_audio_worker::{WindowsAudioWorker, WindowsAudioWorkerError};
 #[cfg(windows)]
