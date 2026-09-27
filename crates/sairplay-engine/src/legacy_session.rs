@@ -7,8 +7,9 @@ use crate::{
         GroupStartIoError, GroupStartParticipant,
     },
     group_flush::{parse_group_flush_status, GroupFlushAck},
-    system_time_to_ntp, volume_percent_to_db, Pcm352Chunker, VolumeSetResult,
-    WasapiLoopbackCapture, WasapiLoopbackError, PCM352_PACKET_BYTES,
+    group_pcm_fanout::GroupPcmSource,
+    system_time_to_ntp, volume_percent_to_db, Ap2AudioFormat, VolumeSetResult,
+    WasapiLoopbackError, WindowsPcmSession, PCM352_PACKET_BYTES,
 };
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -500,8 +501,10 @@ impl LegacyGroupSession {
                     return;
                 }
 
-                let capture = match WasapiLoopbackCapture::open_default() {
-                    Ok(capture) => capture,
+                let mut pcm_session = match WindowsPcmSession::start(
+                    Ap2AudioFormat::ALAC_44100_16_STEREO,
+                ) {
+                    Ok(session) => session,
                     Err(error) => {
                         if let Ok(mut slot) = error_thread.lock() {
                             *slot = Some(error.to_string());
@@ -515,44 +518,51 @@ impl LegacyGroupSession {
                     }
                 };
 
-                let mut chunker = Pcm352Chunker::new();
-                let mut captured_frames_total = 0u64;
+                let mut captured_frames_seen = 0u64;
 
                 while running_thread.load(Ordering::SeqCst)
                     && active_thread.load(Ordering::SeqCst) != 0
                 {
-                    let report = match capture.drain_into(&mut chunker) {
-                        Ok(report) => report,
+                    for event in pcm_session.drain_discontinuity_events() {
+                        disc_thread.store(event.cumulative, Ordering::SeqCst);
+                        if let Some(frame) = event.absolute_frame {
+                            last_disc_thread.store(frame, Ordering::SeqCst);
+                        }
+                    }
+
+                    let captured_frames_now = pcm_session.captured_frames();
+                    let frames = captured_frames_now.saturating_sub(captured_frames_seen);
+                    captured_frames_seen = captured_frames_now;
+
+                    let packet = match GroupPcmSource::read_shared_pcm(
+                        &pcm_session,
+                        PCM352_PACKET_BYTES,
+                        Duration::from_millis(0),
+                    ) {
+                        Ok(Some(packet)) => {
+                            let packet: [u8; PCM352_PACKET_BYTES] = packet
+                                .try_into()
+                                .expect("legacy shared PCM source returned exact packet size");
+                            packet
+                        }
+                        Ok(None) => {
+                            if frames == 0 {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            continue;
+                        }
                         Err(error) => {
                             if let Ok(mut slot) = error_thread.lock() {
-                                *slot = Some(error.to_string());
+                                *slot = Some(error);
                             }
                             running_thread.store(false, Ordering::SeqCst);
                             break;
                         }
                     };
 
-                    if report.discontinuities != 0 {
-                        disc_thread.fetch_add(report.discontinuities, Ordering::SeqCst);
-                        if let Some(offset) = report.discontinuity_frame_offset {
-                            last_disc_thread.store(
-                                captured_frames_total.saturating_add(offset),
-                                Ordering::SeqCst,
-                            );
-                        }
-                    }
-                    captured_frames_total =
-                        captured_frames_total.saturating_add(report.frames as u64);
-
-                    while let Some(packet) = chunker.pop_packet() {
-                        // Legacy RAOP remains locked to the 16-bit / 44.1 kHz
-                        // 1408-byte packet contract. The format-aware native
-                        // chunker returns Vec<u8>, so convert back to the fixed
-                        // legacy packet shape here and keep the RAOP writer
-                        // pipeline unchanged.
-                        let packet: [u8; PCM352_PACKET_BYTES] = packet
-                            .try_into()
-                            .expect("legacy chunker is fixed to 16-bit stereo");
+                    // Legacy RAOP remains locked to the 16-bit / 44.1 kHz
+                    // 1408-byte packet contract. Only source ownership moved
+                    // behind the common GroupPcmSource boundary.
                         let mut index = 0usize;
                         while index < senders.len() {
                             let stall_started = std::time::Instant::now();
@@ -601,12 +611,9 @@ impl LegacyGroupSession {
                             }
                         }
                     }
-
-                    if report.frames == 0 {
-                        thread::sleep(Duration::from_millis(1));
-                    }
                 }
 
+                pcm_session.stop();
                 running_thread.store(false, Ordering::SeqCst);
                 drop(senders);
                 for writer in writers {
