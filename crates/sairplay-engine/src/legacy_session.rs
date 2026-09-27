@@ -6,6 +6,7 @@ use crate::{
         run_concurrent_group_start_round, run_group_start_convergence,
         GroupStartIoError, GroupStartParticipant,
     },
+    group_flush::{parse_group_flush_status, GroupFlushAck},
     system_time_to_ntp, volume_percent_to_db, Pcm352Chunker, VolumeSetResult,
     WasapiLoopbackCapture, WasapiLoopbackError, PCM352_PACKET_BYTES,
 };
@@ -146,7 +147,7 @@ struct SpawnedMember {
     writer_control_tx: SyncSender<LegacyWriterCommand>,
     connected_rx: Receiver<Result<(), String>>,
     started_rx: Option<Receiver<Result<(u64, u64), String>>>,
-    flushed_rx: Option<Receiver<Result<Option<u64>, String>>>,
+    flushed_rx: Option<Receiver<Result<GroupFlushAck, String>>>,
     command_pipe: Option<File>,
     writer: JoinHandle<()>,
     volume_control: LegacyVolumeControl,
@@ -200,7 +201,7 @@ struct LegacyCommandControl {
     #[allow(dead_code)]
     started_rx: Receiver<Result<(u64, u64), String>>,
     #[allow(dead_code)]
-    flushed_rx: Receiver<Result<Option<u64>, String>>,
+    flushed_rx: Receiver<Result<GroupFlushAck, String>>,
 }
 
 impl LegacyCommandControl {
@@ -214,10 +215,10 @@ impl LegacyCommandControl {
     /// method because inventing where to cut live system audio would diverge
     /// from source behavior.
     #[allow(dead_code)]
-    fn flush_quiesced(&mut self) -> Result<Option<u64>, String> {
+    fn flush_quiesced(&mut self) -> Result<GroupFlushAck, String> {
         quiesce_legacy_writer(&self.writer_control_tx)?;
 
-        let transaction = (|| -> Result<Option<u64>, String> {
+        let transaction = (|| -> Result<GroupFlushAck, String> {
             send_flush_command(&mut self.pipe)
                 .map_err(|error| format!("cannot send ACTION=FLUSH: {error}"))?;
 
@@ -796,7 +797,7 @@ fn spawn_member(
 
     let (connected_tx, connected_rx) = mpsc::sync_channel::<Result<(), String>>(1);
     let (started_tx, started_rx) = mpsc::sync_channel::<Result<(u64, u64), String>>(4);
-    let (flushed_tx, flushed_rx) = mpsc::sync_channel::<Result<Option<u64>, String>>(4);
+    let (flushed_tx, flushed_rx) = mpsc::sync_channel::<Result<GroupFlushAck, String>>(4);
     let reader_name = config.name.clone();
     let reader_events = Arc::clone(&startup_events);
     thread::Builder::new()
@@ -1111,15 +1112,8 @@ fn parse_started_status(line: &str) -> Option<(u64, u64)> {
 /// no head_unix_ms: pinned cliairplay returns 0 from warm_head_unix_ms() for
 /// RAOP. The optional form is retained so the cross-transport controller can
 /// later share one acknowledgement shape with native AirPlay 2.
-fn parse_flushed_status(line: &str) -> Option<Option<u64>> {
-    if !line.starts_with("[STATUS] flushed") {
-        return None;
-    }
-    let head = line
-        .split_whitespace()
-        .find_map(|field| field.strip_prefix("head_unix_ms="))
-        .and_then(|value| value.parse::<u64>().ok());
-    Some(head)
+fn parse_flushed_status(line: &str) -> Option<GroupFlushAck> {
+    parse_group_flush_status(line)
 }
 
 fn current_unix_ms() -> Result<u64, String> {
@@ -1203,10 +1197,13 @@ mod cross_transport_tests {
 
     #[test]
     fn parses_msa_raop_flush_ack_without_a_warm_head() {
-        assert_eq!(parse_flushed_status("[STATUS] flushed"), Some(None));
+        assert_eq!(
+            parse_flushed_status("[STATUS] flushed"),
+            Some(GroupFlushAck::no_head_constraint())
+        );
         assert_eq!(
             parse_flushed_status("[STATUS] flushed head_unix_ms=12345"),
-            Some(Some(12345))
+            Some(GroupFlushAck::with_head(12345))
         );
         assert_eq!(parse_flushed_status("[STATUS] started requested_unix_ms=1 at_unix_ms=1"), None);
         assert_eq!(RAOP_FLUSH_ACK_TIMEOUT, Duration::from_millis(2_000));
