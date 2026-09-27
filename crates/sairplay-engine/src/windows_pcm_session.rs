@@ -36,6 +36,113 @@ struct SharedRing {
     running: AtomicBool,
 }
 
+#[derive(Clone)]
+pub struct WindowsPcmSourceHandle {
+    shared: Arc<SharedRing>,
+    captured_frames: Arc<AtomicU64>,
+    discontinuities: Arc<AtomicU64>,
+    last_discontinuity_frame: Arc<AtomicU64>,
+    discontinuity_events: Arc<Mutex<Vec<WindowsPcmDiscontinuity>>>,
+}
+
+impl WindowsPcmSourceHandle {
+    pub fn captured_frames(&self) -> u64 {
+        self.captured_frames.load(Ordering::SeqCst)
+    }
+
+    pub fn discontinuity_count(&self) -> u64 {
+        self.discontinuities.load(Ordering::SeqCst)
+    }
+
+    pub fn last_discontinuity_frame(&self) -> Option<u64> {
+        match self.last_discontinuity_frame.load(Ordering::SeqCst) {
+            u64::MAX => None,
+            value => Some(value),
+        }
+    }
+
+    pub fn drain_discontinuity_events(&self) -> Vec<WindowsPcmDiscontinuity> {
+        match self.discontinuity_events.lock() {
+            Ok(mut events) => std::mem::take(&mut *events),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn read_exact_timeout(
+        &self,
+        want: usize,
+        timeout: Duration,
+    ) -> Result<Option<Vec<u8>>, String> {
+        if want == 0 {
+            return Ok(Some(Vec::new()));
+        }
+
+        let deadline = Instant::now() + timeout;
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| "Windows PCM session ring mutex poisoned".to_string())?;
+
+        loop {
+            if let Some(error) = state.error.clone() {
+                return Err(error);
+            }
+
+            if state.data.len() >= want {
+                let mut out = Vec::with_capacity(want);
+                for _ in 0..want {
+                    out.push(
+                        state
+                            .data
+                            .pop_front()
+                            .expect("ring length checked before pop"),
+                    );
+                }
+                self.shared.can_write.notify_all();
+                return Ok(Some(out));
+            }
+
+            if state.stopped || !self.shared.running.load(Ordering::SeqCst) {
+                return Err("Windows PCM session reader stopped".into());
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next, wait) = self
+                .shared
+                .can_read
+                .wait_timeout(state, remaining)
+                .map_err(|_| "Windows PCM session ring wait poisoned".to_string())?;
+            state = next;
+            if wait.timed_out() && state.data.len() < want {
+                return Ok(None);
+            }
+        }
+    }
+}
+
+impl GroupPcmSource for WindowsPcmSourceHandle {
+    fn read_shared_pcm(
+        &self,
+        want_bytes: usize,
+        timeout: Duration,
+    ) -> Result<Option<Vec<u8>>, String> {
+        self.read_exact_timeout(want_bytes, timeout)
+    }
+
+    fn buffered_bytes(&self) -> usize {
+        self.shared
+            .state
+            .lock()
+            .map(|state| state.data.len())
+            .unwrap_or(0)
+    }
+}
+
 pub struct WindowsPcmSession {
     shared: Arc<SharedRing>,
     producer: Option<JoinHandle<()>>,
@@ -224,6 +331,22 @@ impl WindowsPcmSession {
                     "persistent WASAPI reader startup timeout: {error}"
                 )))
             }
+        }
+    }
+
+    /// Cloneable reader-side view of this persistent PCM session.
+    ///
+    /// The owning WindowsPcmSession retains producer lifetime and stop/join
+    /// responsibility. A future group orchestrator can therefore own one
+    /// producer while handing the same source handle to multiple transport
+    /// lanes without opening another WASAPI capture.
+    pub fn source_handle(&self) -> WindowsPcmSourceHandle {
+        WindowsPcmSourceHandle {
+            shared: Arc::clone(&self.shared),
+            captured_frames: Arc::clone(&self.captured_frames),
+            discontinuities: Arc::clone(&self.discontinuities),
+            last_discontinuity_frame: Arc::clone(&self.last_discontinuity_frame),
+            discontinuity_events: Arc::clone(&self.discontinuity_events),
         }
     }
 
@@ -419,11 +542,11 @@ impl GroupPcmSource for WindowsPcmSession {
         want_bytes: usize,
         timeout: Duration,
     ) -> Result<Option<Vec<u8>>, String> {
-        self.read_exact_timeout(want_bytes, timeout)
+        self.source_handle().read_shared_pcm(want_bytes, timeout)
     }
 
     fn buffered_bytes(&self) -> usize {
-        WindowsPcmSession::buffered_bytes(self)
+        self.source_handle().buffered_bytes()
     }
 }
 
@@ -507,6 +630,25 @@ mod tests {
                 .saturating_mul(WINDOWS_PCM_SESSION_RING_SECONDS)
                 >= WINDOWS_PCM_SESSION_RING_MIN_BYTES
         );
+    }
+
+    #[test]
+    fn cloned_source_handle_reads_the_owner_ring_without_owning_producer_lifetime() {
+        let input = vec![0x33u8; 32];
+        let session = test_session(Ap2AudioFormat::ALAC_44100_16_STEREO, &input);
+        let handle = session.source_handle();
+        let clone = handle.clone();
+
+        assert_eq!(handle.buffered_bytes(), 32);
+        assert_eq!(
+            clone
+                .read_shared_pcm(16, Duration::from_millis(0))
+                .unwrap()
+                .unwrap(),
+            vec![0x33u8; 16]
+        );
+        assert_eq!(handle.buffered_bytes(), 16);
+        assert!(session.shared.running.load(Ordering::SeqCst));
     }
 
     #[test]
