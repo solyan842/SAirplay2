@@ -32,6 +32,7 @@ pub mod rtp_packets;
 pub mod audio_packet;
 pub mod media_sender;
 pub mod buffered_sender;
+pub mod cross_transport_timeline;
 pub mod rate_anchor;
 pub mod flush_buffered;
 pub mod retransmit;
@@ -104,6 +105,10 @@ pub use audio_packet::{
     build_encrypted_realtime_packet, AudioPacketError, RTP_PAYLOAD_TYPE_BUFFERED,
 };
 pub use media_sender::{RealtimeMediaSender, MediaSendError, MediaSendResult};
+pub use cross_transport_timeline::{
+    raop_next_head_unix_ms, resolve_raop_start_unix_ms, RaopResolvedStart,
+    AIRPLAY_COLD_GROUP_START_LEAD_MS, RAOP_SESSION_MIN_START_LEAD_MS,
+};
 pub use buffered_sender::{BufferedMediaSender, BufferedSendError, BufferedWriteOutcome};
 pub use rate_anchor::{
     buffered_anchor_start, build_setrateanchortime_plist, send_setrateanchortime,
