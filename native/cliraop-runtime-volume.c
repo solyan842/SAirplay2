@@ -62,6 +62,12 @@ struct debug_s {
 			{ lSDEBUG, lSDEBUG, lERROR },
 		};
 
+typedef enum {
+	STOPPED = 0,
+	PAUSED,
+	PLAYING,
+} playback_status_t;
+
 /*----------------------------------------------------------------------------*/
 static int print_usage(char *argv[])
 {
@@ -189,7 +195,7 @@ static void resolve_commanded_start(uint64_t requested_unix_ms,
 static bool command_start_raop(struct raopcl_s *raopcl,
 							   uint64_t requested_unix_ms,
 							   bool *first_start_done,
-							   int *status) {
+							   playback_status_t *status) {
 	raop_state_t state = raopcl_state(raopcl);
 	if (!*first_start_done) {
 		/* Exact first-START semantics of pinned raop_session_commit(). */
@@ -208,7 +214,7 @@ static bool command_start_raop(struct raopcl_s *raopcl,
 	if (!raopcl_start_at(raopcl, audible_ntp - latency_ntp)) return false;
 
 	*first_start_done = true;
-	*status = 2; /* PLAYING */
+	*status = PLAYING;
 	fprintf(stderr,
 			"[STATUS] started requested_unix_ms=%" PRIu64 " at_unix_ms=%" PRIu64 "\n",
 			requested_unix_ms, at_unix_ms);
@@ -220,7 +226,7 @@ static bool service_command_pipe(HANDLE pipe,
 								 struct raopcl_s *raopcl,
 								 uint64_t *pending_start_unix_ms,
 								 bool *first_start_done,
-								 int *status,
+								 playback_status_t *status,
 								 char *buffer,
 								 size_t *used) {
 	DWORD available = 0;
@@ -300,7 +306,7 @@ int main(int argc, char *argv[]) {
 	int infile;
 	uint8_t *buf;
 	int i, n = -1, level = 2;
-	enum {STOPPED, PAUSED, PLAYING } status;
+	playback_status_t status;
 	raop_crypto_t crypto = RAOP_CLEAR;
 	uint64_t start = 0, start_at = 0, last = 0, frames = 0, last_volume_check = 0;
 	bool interactive = false, alac = false, pairing = false;
@@ -497,7 +503,7 @@ int main(int argc, char *argv[]) {
 		if (command_pipe != INVALID_HANDLE_VALUE) {
 			if (!service_command_pipe(
 					command_pipe, raopcl, &pending_start_unix_ms,
-					&first_start_done, (int *)&status,
+					&first_start_done, &status,
 					command_buf, &command_used)) {
 				status = STOPPED;
 				break;
