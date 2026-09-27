@@ -64,7 +64,10 @@ impl NativeSessionConfig {
             auth_credentials: None,
             dacp_id: "A1B2C3D4E5F60708".into(),
             active_remote: "123456789".into(),
-            lead_frames: 11_025,
+            // Pinned airplay-cli owns a 2000 ms anchor-to-render lead.
+            // This is deliberately NOT AP2_MIN_WARM_LEAD_MS (250 ms) and
+            // NOT the realtime splice queue depth (600 ms).
+            lead_frames: 88_200,
             supports_ptp: false,
             supports_buffered_audio: false,
             buffered_denied: false,
@@ -397,9 +400,13 @@ impl NativeSession {
             );
         }
 
-        // Realtime clamps configured lead to receiver latencyMin/Max. Buffered
-        // omits those fields by design and schedules playback entirely by the
-        // PTP rate anchor, so there is no receiver latency window to clamp.
+        // Pinned airplay-cli keeps three different timing quantities:
+        // - render lead: 2000 ms by default (this value), receiver-clamped;
+        // - minimum commanded START feasibility floor: 250 ms;
+        // - realtime splice/pacing depth: 600 ms by default.
+        // Do not collapse them into one "latency". Realtime clamps only the
+        // render lead to receiver latencyMin/Max. Buffered omits those fields
+        // by design and schedules playback by its PTP rate anchor.
         let requested_lead = ((config.lead_frames as u64
             * audio_format.sample_rate as u64)
             / 44_100) as u32;
