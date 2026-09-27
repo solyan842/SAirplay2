@@ -36,6 +36,7 @@ struct SharedRing {
 pub struct WindowsPcmSession {
     shared: Arc<SharedRing>,
     producer: Option<JoinHandle<()>>,
+    bytes_per_frame: usize,
     packet_bytes: usize,
     capacity_bytes: usize,
     byte_rate: usize,
@@ -195,6 +196,7 @@ impl WindowsPcmSession {
             Ok(Ok(())) => Ok(Self {
                 shared,
                 producer: Some(producer),
+                bytes_per_frame,
                 packet_bytes,
                 capacity_bytes,
                 byte_rate,
@@ -222,8 +224,16 @@ impl WindowsPcmSession {
         }
     }
 
+    pub fn bytes_per_frame(&self) -> usize {
+        self.bytes_per_frame
+    }
+
     pub fn packet_bytes(&self) -> usize {
         self.packet_bytes
+    }
+
+    pub fn has_packet(&self) -> bool {
+        self.buffered_bytes() >= self.packet_bytes
     }
 
     pub fn capacity_bytes(&self) -> usize {
@@ -346,6 +356,27 @@ impl WindowsPcmSession {
                 return Ok(None);
             }
         }
+    }
+
+    /// Consume one 352-frame packet, optionally prefixing source-equivalent
+    /// splice silence. Real PCM remains ordered in the persistent session ring.
+    pub fn pop_packet_with_silence_prefix(
+        &self,
+        pad_frames: u32,
+        timeout: Duration,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let pad_frames = pad_frames.min(352) as usize;
+        let pad_bytes = pad_frames.saturating_mul(self.bytes_per_frame);
+        let want = self.packet_bytes.saturating_sub(pad_bytes);
+        let Some(real) = self.read_exact_timeout(want, timeout)? else {
+            return Ok(None);
+        };
+
+        let mut packet = vec![0u8; self.packet_bytes];
+        if !real.is_empty() {
+            packet[pad_bytes..pad_bytes + real.len()].copy_from_slice(&real);
+        }
+        Ok(Some(packet))
     }
 
     pub fn captured_frames(&self) -> u64 {
