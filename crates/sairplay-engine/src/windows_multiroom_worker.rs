@@ -1,8 +1,8 @@
 use crate::{
     buffered_anchor_start, system_time_to_ntp, Ap2AudioFormat, BufferedAnchorStartConfig,
-    BufferedMediaSender, BufferedWriteOutcome, NativeMetadataControl, Pcm352Chunker, PtpClock,
-    RealtimeMediaSender, RtpState, SharedCseq, SharedRtspControl, WasapiLoopbackCapture,
-    WasapiLoopbackError,
+    BufferedMediaSender, BufferedWriteOutcome, NativeMetadataControl, PtpClock,
+    RealtimeMediaSender, RtpState, SharedCseq, SharedRtspControl, WasapiLoopbackError,
+    WindowsPcmSession,
 };
 use std::collections::VecDeque;
 use std::fmt;
@@ -497,10 +497,10 @@ impl WindowsMultiroomAudioWorker {
         let worker = thread::Builder::new()
             .name(worker_name.into())
             .spawn(move || {
-                let capture = match WasapiLoopbackCapture::open_default_for_format(source_format) {
-                    Ok(capture) => {
+                let mut pcm_session = match WindowsPcmSession::start(source_format) {
+                    Ok(session) => {
                         let _ = ready_tx.send(Ok(()));
-                        capture
+                        session
                     }
                     Err(error) => {
                         let message = error.to_string();
@@ -513,8 +513,7 @@ impl WindowsMultiroomAudioWorker {
                     }
                 };
 
-                let mut chunker = Pcm352Chunker::new_with_bytes_per_frame(bytes_per_frame);
-                let mut captured_frames_total = 0u64;
+                let mut captured_frames_seen = 0u64;
                 let mut cold_armed = false;
                 let mut group_start_ntp: Option<u64> = None;
                 let mut input_starved_since: Option<Instant> = None;
@@ -548,35 +547,31 @@ impl WindowsMultiroomAudioWorker {
                         &late_join_ring,
                     );
 
-                    let report = match capture.drain_into(&mut chunker) {
-                        Ok(report) => report,
-                        Err(error) => {
-                            if let Ok(mut slot) = last_error_thread.lock() {
-                                *slot = Some(error.to_string());
-                            }
-                            running_thread.store(false, Ordering::SeqCst);
-                            return;
+                    for event in pcm_session.drain_discontinuity_events() {
+                        discontinuities_thread.store(event.cumulative, Ordering::SeqCst);
+                        if let Some(frame) = event.absolute_frame {
+                            last_discontinuity_frame_thread.store(frame, Ordering::SeqCst);
                         }
-                    };
-
-                    if report.discontinuities != 0 {
-                        discontinuities_thread.fetch_add(report.discontinuities, Ordering::SeqCst);
-                        if let Some(offset) = report.discontinuity_frame_offset {
-                            last_discontinuity_frame_thread.store(
-                                captured_frames_total.saturating_add(offset),
-                                Ordering::SeqCst,
-                            );
+                        if let Ok(mut events) = startup_events_thread.lock() {
+                            events.push(format!(
+                                "AirPlay group WASAPI discontinuity · count={} · cumulative={} · frame={:?} · session_buffer={} ms.",
+                                event.count,
+                                event.cumulative,
+                                event.absolute_frame,
+                                pcm_session.buffered_ms()
+                            ));
                         }
                     }
-                    let frames = report.frames;
-                    captured_frames_total = captured_frames_total.saturating_add(frames as u64);
+                    let captured_frames_now = pcm_session.captured_frames();
+                    let frames = captured_frames_now.saturating_sub(captured_frames_seen) as usize;
+                    captured_frames_seen = captured_frames_now;
 
                     // Match MSA: PCM amplitude never defines stream state.
                     // Any captured PCM bytes, including digital-zero samples, are
                     // valid input. Cold START is gated only by one complete 352-frame
                     // transport packet being buffered below.
                     if !cold_armed {
-                        if !chunker.has_packet() {
+                        if !pcm_session.has_packet() {
                             if frames == 0 {
                                 thread::sleep(Duration::from_millis(1));
                             }
@@ -757,7 +752,7 @@ impl WindowsMultiroomAudioWorker {
                         }
                     };
 
-                    if chunker.has_packet() {
+                    if pcm_session.has_packet() {
                         input_starved_since = None;
                         for target in &mut targets {
                             let _ = target
@@ -809,7 +804,7 @@ impl WindowsMultiroomAudioWorker {
                             .min(352);
                         let real_frames_needed = 352usize - pad_now as usize;
                         let real_bytes_needed = real_frames_needed * bytes_per_frame;
-                        if chunker.pending_bytes() < real_bytes_needed {
+                        if pcm_session.buffered_bytes() < real_bytes_needed {
                             break;
                         }
 
@@ -871,9 +866,22 @@ impl WindowsMultiroomAudioWorker {
                             break;
                         }
 
-                        let packet = chunker
-                            .pop_packet_with_silence_prefix(pad_now)
-                            .expect("group real-byte count checked");
+                        let packet = match pcm_session
+                            .pop_packet_with_silence_prefix(
+                                pad_now,
+                                Duration::from_millis(0),
+                            )
+                        {
+                            Ok(Some(packet)) => packet,
+                            Ok(None) => break,
+                            Err(error) => {
+                                if let Ok(mut slot) = last_error_thread.lock() {
+                                    *slot = Some(error);
+                                }
+                                running_thread.store(false, Ordering::SeqCst);
+                                return;
+                            }
+                        };
                         let mut failed = Vec::<(usize, String)>::new();
 
                         for (index, target) in targets.iter_mut().enumerate() {
@@ -1074,6 +1082,8 @@ impl WindowsMultiroomAudioWorker {
                         thread::sleep(Duration::from_millis(1));
                     }
                 }
+
+                pcm_session.stop();
 
                 for pending in pending_joins {
                     let _ = pending.reply.send(Err(
