@@ -17,6 +17,7 @@
 
 #if WIN
 #include <conio.h>
+#include <io.h>
 #include <time.h>
 #include <windows.h>
 #else
@@ -222,16 +223,55 @@ static bool command_start_raop(struct raopcl_s *raopcl,
 	return true;
 }
 
+/* Windows equivalent of ap2_session.c::drain_input_fd().
+ *
+ * The current legacy helper has no independent stdin reader thread: this main
+ * loop is the only reader, so the command path already owns the descriptor
+ * while FLUSH is handled. PeekNamedPipe gives the same non-blocking
+ * "read until EAGAIN" boundary as MSA. The 100000 guard is copied from the
+ * pinned source so a producer that ignores the required quiesce cannot wedge
+ * the command path forever.
+ */
+static void drain_input_fd_windows(int infile) {
+	intptr_t raw = _get_osfhandle(infile);
+	if (raw == -1) return;
+
+	HANDLE pipe = (HANDLE)raw;
+	uint8_t scratch[16384];
+
+	for (int guard = 0; guard < 100000; guard++) {
+		DWORD available = 0;
+		if (!PeekNamedPipe(pipe, NULL, 0, NULL, &available, NULL))
+			return;
+		if (!available) return;
+
+		unsigned want = available < sizeof(scratch)
+			? (unsigned)available : (unsigned)sizeof(scratch);
+		int n = _read(infile, scratch, want);
+		if (n <= 0) return;
+	}
+}
+
 /* Exact RAOP FLUSH semantics from pinned raop_session.c. RAOP deliberately
  * reports no warm head: current MSA session_warm_head_unix_ms() returns 0 for
- * the legacy path, so the accepted ack is exactly "[STATUS] flushed". */
+ * the legacy path, so the accepted ack is exactly "[STATUS] flushed".
+ *
+ * The caller must have quiesced its PCM writer before issuing FLUSH. Only then
+ * can this drain establish the same clean old/new content boundary as MSA.
+ */
 static bool command_flush_raop(struct raopcl_s *raopcl,
+							   int infile,
 							   playback_status_t *status) {
 	raop_state_t state = raopcl_state(raopcl);
 	if (state != RAOP_STREAMING && state != RAOP_FLUSHED) return false;
 
 	raopcl_stop(raopcl);
 	if (state == RAOP_STREAMING && !raopcl_flush(raopcl)) return false;
+
+	/* MSA drains every pre-FLUSH byte from the persistent PCM descriptor before
+	 * acknowledging. With the Rust writer quiesced, anything visible here is
+	 * old content and must not become the first sample of the next START. */
+	drain_input_fd_windows(infile);
 
 	*status = PAUSED;
 	fprintf(stderr, "[STATUS] flushed\n");
@@ -241,6 +281,7 @@ static bool command_flush_raop(struct raopcl_s *raopcl,
 
 static bool service_command_pipe(HANDLE pipe,
 								 struct raopcl_s *raopcl,
+								 int infile,
 								 uint64_t *pending_start_unix_ms,
 								 bool *first_start_done,
 								 playback_status_t *status,
@@ -288,7 +329,7 @@ static bool service_command_pipe(HANDLE pipe,
 					}
 					*pending_start_unix_ms = 0;
 				} else if (!strcmp(key, "ACTION") && !strcmp(value, "FLUSH")) {
-					if (!command_flush_raop(raopcl, status)) {
+					if (!command_flush_raop(raopcl, infile, status)) {
 						fprintf(stderr,
 								"[STATUS] error code=flush_failed http=0 detail=\"RAOP FLUSH rejected\"\n");
 						fflush(stderr);
@@ -525,7 +566,7 @@ int main(int argc, char *argv[]) {
 #if WIN
 		if (command_pipe != INVALID_HANDLE_VALUE) {
 			if (!service_command_pipe(
-					command_pipe, raopcl, &pending_start_unix_ms,
+					command_pipe, raopcl, infile, &pending_start_unix_ms,
 					&first_start_done, &status,
 					command_buf, &command_used)) {
 				status = STOPPED;
