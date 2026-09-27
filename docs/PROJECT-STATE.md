@@ -1,19 +1,20 @@
 # SAirplay2 — Project State
 
 Last updated: 2026-09-27  
-Working branch: `dev/hires-source-port`
+Working branch: `dev/msa-cross-transport-foundation`
 
 ## 1. Protected stable
 
 Repository: `solyan842/SAirplay2`
 
-Locked stable commit:
+Locked stable checkpoints:
 
 ```
-a7cb24b1faa6b54abf7d24812b732ed08eb72524
+Stable1: a7cb24b1faa6b54abf7d24812b732ed08eb72524
+Stable2: 83286f7597690297faf7f998f5beaa16a061434b
 ```
 
-**Do not modify or move this stable checkpoint.**
+**Do not modify, move, or merge either stable checkpoint. Stable2 is the current protected stable baseline.**
 
 The active development branch contains later native AirPlay 2, hi-res, group,
 late-join and recovery work. Stable history is intentionally separate.
@@ -299,9 +300,130 @@ are actually referenced by the GUI were retained.
 
 No locked stable code was modified.
 
-## 12. Next work
+## 12. Phase roadmap and source-first execution rule
 
-Current priority is **stability preservation**, not protocol expansion.
+Current phase status:
+
+- **Phase A — persistent Windows PCM/session foundation: COMPLETE and hardware-tested.**
+  Persistent WASAPI producer + bounded ring, source starvation != EOF,
+  2000 ms render lead separated from the 250 ms START feasibility floor,
+  and capture independence from START/PTP/ALAC/network blocking are locked.
+- **Phase B — cross-transport foundation: IN PROGRESS.**
+  Common START convergence, FLUSH/head contracts, shared PCM source/fan-out
+  contracts, RAOP PCM sink, producer/reader ownership split and both native +
+  legacy source-injection seams now exist. Mixed AP2 + RAOP runtime is still
+  deliberately disabled.
+- **Phase C — heterogeneous handoff: NOT STARTED.**
+  Per-member 44.1/48 kHz conversion and wider mixed-format handoff must not be
+  pulled into Phase B.
+- **Phase D — orchestration completion: PENDING.**
+  Full late-join matrix, sync_adjust and related common orchestration.
+- **Phase E — third-party compatibility and controls: PENDING.**
+  Route override/fallback, featureless AP2 handling, buffer-depth and interface
+  controls only after the common engine is stable.
+
+### Permanent design rule
+
+Music Assistant / airplay-cli remains the primary architectural reference for
+session ownership, PCM fan-out, START/FLUSH/timeline semantics, member failure
+isolation and mixed transport orchestration.
+
+Do **not** copy implementation mechanically when SAirplay2 has a different
+problem domain. SAirplay2 keeps its proven Windows-specific strengths where
+appropriate, especially persistent WASAPI capture/ring semantics and desktop
+runtime/GUI integration.
+
+The target architecture is therefore:
+
+**MSA orchestration semantics + SAirplay2 Windows capture/runtime strengths.**
+
+Any intentional deviation from MSA must answer all three questions before code:
+
+1. What does pinned/current MSA do?
+2. Why must SAirplay2 differ for this Windows/system-audio use case?
+3. What source, invariant test or hardware evidence proves the deviation is
+   safer/better?
+
+Without that evidence, follow MSA.
+
+### Critical mixed-transport invariant
+
+Mixed AP2 + RAOP must not be enabled until runtime has one explicit path:
+
+```
+ONE Windows PCM source read
+        -> SAME source chunk
+        -> fan out to all active native + RAOP sinks
+        -> wait for every member write / isolate failures
+        -> advance to the NEXT source chunk
+```
+
+Never implement mixed transport by cloning a `WindowsPcmSourceHandle` and
+letting native and RAOP independently call `read_shared_pcm()`. The ring is a
+single-consumer byte timeline; independent readers would split/steal bytes
+instead of receiving the same source chunk.
+
+### Current Phase B head
+
+Validated predecessor:
+
+`fd268cf33803f9159b8901bcf57cdc61a9f2621e`
+— legacy shared PCM source injection seam — Windows Action #896 PASS.
+
+Current head:
+
+`df02ee9bea251ee49d77f74823ce27a7eff3b5d8`
+— native shared PCM source injection seam — Windows Action #897 PASS.
+
+At this point both transport families can accept an externally owned
+`WindowsPcmSourceHandle`, but this is only an ownership seam. It is **not**
+permission to run two independent readers from the same ring.
+
+### Next architectural step
+
+Before building the common coordinator, separate the native transport's
+source-read responsibilities from its sink/send responsibilities, analogous to
+the existing `LegacyPcmSink`. Preserve native-only splice/pad, bit-depth
+adaptation, late-join history and RTP/PTP behavior behind that sink boundary.
+
+Only after native and RAOP are both true sink surfaces should Phase B add the
+common one-read PCM coordinator and, after CI + hardware evidence, remove the
+mixed-group guard.
+
+### Explicitly forbidden shortcuts
+
+- no stable2 modification or merge;
+- no GUI mixed-group guard removal before the common coordinator exists;
+- no sharing one ring by independent native/RAOP readers;
+- no Naim-specific delay/buffer workaround without new hardware evidence;
+- no forced buffered type103 for Apple/HomePod;
+- no PTP/RTX rewrite;
+- no arbitrary buffer increase;
+- no synthetic EOF/silence semantics for continuous WASAPI;
+- no live FLUSH exposure without a source-defined content boundary;
+- no AppleTV 401 protocol patch without evidence that receiver availability is
+  not the cause;
+- no Phase C resampling hidden inside Phase B.
+
+### Long-project memory rule
+
+This file is the repository source of truth for cross-chat continuity. After
+every important architectural milestone, update this document with:
+
+- current branch/head;
+- last PASS/FAIL Action;
+- phase status;
+- source evidence;
+- hardware evidence;
+- newly locked invariants;
+- explicitly rejected approaches;
+- exact next safe step.
+
+Conversation memory is secondary to the repository state.
+
+## 13. Next work
+
+Current priority is **complete Phase B without breaking the validated native/legacy paths**. Stability preservation remains mandatory; protocol expansion must follow the phase gates above.
 
 Before changing the engine again:
 
