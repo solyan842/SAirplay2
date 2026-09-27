@@ -41,6 +41,40 @@ pub struct GroupPcmFailure {
     pub error: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupPcmPumpOutcome {
+    Starved,
+    Delivered {
+        bytes: usize,
+        failures: Vec<GroupPcmFailure>,
+    },
+}
+
+/// Execute exactly one MSA-style shared-source pump iteration:
+///
+/// 1. read the source once;
+/// 2. treat temporary starvation as no advancement;
+/// 3. deliver the exact same chunk to every active participant;
+/// 4. wait for all writes and return all member failures together.
+///
+/// The caller owns membership removal and the outer loop. Keeping those
+/// responsibilities outside this function avoids inventing mixed-session
+/// lifecycle before native and RAOP orchestration are actually joined.
+pub fn pump_shared_pcm_once(
+    source: &dyn GroupPcmSource,
+    want_bytes: usize,
+    timeout: Duration,
+    members: Vec<&mut dyn GroupPcmParticipant>,
+) -> Result<GroupPcmPumpOutcome, String> {
+    let Some(chunk) = source.read_shared_pcm(want_bytes, timeout)? else {
+        return Ok(GroupPcmPumpOutcome::Starved);
+    };
+
+    let bytes = chunk.len();
+    let failures = fanout_shared_pcm_chunk(members, &chunk);
+    Ok(GroupPcmPumpOutcome::Delivered { bytes, failures })
+}
+
 impl fmt::Display for GroupPcmFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: {}", self.member, self.error)
@@ -91,6 +125,26 @@ pub fn fanout_shared_pcm_chunk(
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    struct FakeSource {
+        reads: Arc<Mutex<usize>>,
+        chunk: Option<Vec<u8>>,
+    }
+
+    impl GroupPcmSource for FakeSource {
+        fn read_shared_pcm(
+            &self,
+            _want_bytes: usize,
+            _timeout: Duration,
+        ) -> Result<Option<Vec<u8>>, String> {
+            *self.reads.lock().unwrap() += 1;
+            Ok(self.chunk.clone())
+        }
+
+        fn buffered_bytes(&self) -> usize {
+            self.chunk.as_ref().map(|chunk| chunk.len()).unwrap_or(0)
+        }
+    }
 
     struct FakeMember {
         name: &'static str,
@@ -176,4 +230,110 @@ mod tests {
         let failures = fanout_shared_pcm_chunk(Vec::new(), &[1u8, 2, 3]);
         assert!(failures.is_empty());
     }
+
+    #[test]
+    fn pump_reads_source_once_then_fans_exact_chunk_to_all_members() {
+        let reads = Arc::new(Mutex::new(0usize));
+        let source = FakeSource {
+            reads: Arc::clone(&reads),
+            chunk: Some(vec![4u8, 5, 6, 7]),
+        };
+        let seen_a = Arc::new(Mutex::new(Vec::new()));
+        let seen_b = Arc::new(Mutex::new(Vec::new()));
+        let mut a = FakeMember {
+            name: "native",
+            seen: Arc::clone(&seen_a),
+            fail: false,
+        };
+        let mut b = FakeMember {
+            name: "raop",
+            seen: Arc::clone(&seen_b),
+            fail: false,
+        };
+
+        let outcome = pump_shared_pcm_once(
+            &source,
+            4,
+            Duration::from_millis(0),
+            vec![&mut a, &mut b],
+        )
+        .unwrap();
+
+        assert_eq!(*reads.lock().unwrap(), 1);
+        assert_eq!(
+            outcome,
+            GroupPcmPumpOutcome::Delivered {
+                bytes: 4,
+                failures: Vec::new(),
+            }
+        );
+        assert_eq!(*seen_a.lock().unwrap(), vec![vec![4u8, 5, 6, 7]]);
+        assert_eq!(*seen_b.lock().unwrap(), vec![vec![4u8, 5, 6, 7]]);
+    }
+
+    #[test]
+    fn pump_starvation_does_not_write_any_member() {
+        let reads = Arc::new(Mutex::new(0usize));
+        let source = FakeSource {
+            reads: Arc::clone(&reads),
+            chunk: None,
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut member = FakeMember {
+            name: "native",
+            seen: Arc::clone(&seen),
+            fail: false,
+        };
+
+        let outcome = pump_shared_pcm_once(
+            &source,
+            4,
+            Duration::from_millis(0),
+            vec![&mut member],
+        )
+        .unwrap();
+
+        assert_eq!(*reads.lock().unwrap(), 1);
+        assert_eq!(outcome, GroupPcmPumpOutcome::Starved);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pump_returns_all_failures_after_one_source_read() {
+        let reads = Arc::new(Mutex::new(0usize));
+        let source = FakeSource {
+            reads: Arc::clone(&reads),
+            chunk: Some(vec![1u8, 2]),
+        };
+        let seen_a = Arc::new(Mutex::new(Vec::new()));
+        let seen_b = Arc::new(Mutex::new(Vec::new()));
+        let mut a = FakeMember {
+            name: "native-bad",
+            seen: Arc::clone(&seen_a),
+            fail: true,
+        };
+        let mut b = FakeMember {
+            name: "raop-bad",
+            seen: Arc::clone(&seen_b),
+            fail: true,
+        };
+
+        let outcome = pump_shared_pcm_once(
+            &source,
+            2,
+            Duration::from_millis(0),
+            vec![&mut a, &mut b],
+        )
+        .unwrap();
+
+        assert_eq!(*reads.lock().unwrap(), 1);
+        let GroupPcmPumpOutcome::Delivered { bytes, failures } = outcome else {
+            panic!("expected delivered outcome");
+        };
+        assert_eq!(bytes, 2);
+        assert_eq!(failures.len(), 2);
+        assert!(failures.iter().any(|failure| failure.member == "native-bad"));
+        assert!(failures.iter().any(|failure| failure.member == "raop-bad"));
+    }
+
 }

@@ -108,6 +108,10 @@ pub use audio_packet::{
     build_encrypted_realtime_packet, AudioPacketError, RTP_PAYLOAD_TYPE_BUFFERED,
 };
 pub use media_sender::{RealtimeMediaSender, MediaSendError, MediaSendResult};
+pub use group_pcm_fanout::{
+    fanout_shared_pcm_chunk, pump_shared_pcm_once, GroupPcmFailure,
+    GroupPcmParticipant, GroupPcmPumpOutcome, GroupPcmSource,
+};
 pub use cross_transport_timeline::{
     raop_next_head_unix_ms, resolve_raop_start_unix_ms, RaopResolvedStart,
     RAOP_SESSION_MIN_START_LEAD_MS,
