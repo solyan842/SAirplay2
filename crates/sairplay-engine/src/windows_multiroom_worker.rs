@@ -1,10 +1,13 @@
 use crate::{
     buffered_anchor_start,
     cross_transport_timeline::{
-        evaluate_group_start_round, ntp_epoch_to_unix_ms, unix_ms_to_ntp_epoch,
-        GroupStartRoundDecision, AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
+        ntp_epoch_to_unix_ms, unix_ms_to_ntp_epoch,
+        AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
     },
-    group_start_orchestrator::{run_concurrent_group_start_round, GroupStartParticipant},
+    group_start_orchestrator::{
+        run_concurrent_group_start_round, run_group_start_convergence,
+        GroupStartParticipant,
+    },
     system_time_to_ntp, Ap2AudioFormat, BufferedAnchorStartConfig, BufferedMediaSender,
     BufferedWriteOutcome, NativeMetadataControl, PtpClock, RealtimeMediaSender, RtpState,
     SharedCseq, SharedRtspControl, WasapiLoopbackError, WindowsPcmSession,
@@ -664,59 +667,52 @@ impl WindowsMultiroomAudioWorker {
                         // Convert at the boundary, fan the round out concurrently,
                         // then let the exact same evaluator used by RAOP decide
                         // converge/retry/last-ack semantics.
-                        let mut requested_start_unix_ms = ntp_epoch_to_unix_ms(start_ntp);
-                        let mut committed_group_unix_ms = requested_start_unix_ms;
-                        let mut converged = false;
-                        let mut rounds = 0usize;
+                        let initial_start_unix_ms = ntp_epoch_to_unix_ms(start_ntp);
+                        let mut participants = targets
+                            .iter_mut()
+                            .map(|target| target as &mut dyn GroupStartParticipant)
+                            .collect::<Vec<_>>();
 
-                        for round in 1..=AIRPLAY_START_CONVERGENCE_MAX_ROUNDS {
-                            rounds = round;
-                            let member_acks = match command_native_start_round(
-                                &mut targets,
-                                requested_start_unix_ms,
-                            ) {
-                                Ok(value) => value,
-                                Err((name, error)) => {
-                                    if let Ok(mut slot) = last_error_thread.lock() {
-                                        *slot = Some(format!(
-                                            "{name} cold session START failed: {error}"
-                                        ));
-                                    }
-                                    running_thread.store(false, Ordering::SeqCst);
-                                    return;
+                        let convergence = match run_group_start_convergence(
+                            initial_start_unix_ms,
+                            |target_unix_ms| {
+                                let round_members = participants
+                                    .iter_mut()
+                                    .map(|member| &mut **member)
+                                    .collect::<Vec<_>>();
+                                run_concurrent_group_start_round(
+                                    round_members,
+                                    target_unix_ms,
+                                )
+                            },
+                        ) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                if let Ok(mut slot) = last_error_thread.lock() {
+                                    *slot = Some(format!(
+                                        "{} cold session START failed: {}",
+                                        error.member, error.error
+                                    ));
                                 }
-                            };
+                                running_thread.store(false, Ordering::SeqCst);
+                                return;
+                            }
+                        };
 
-                            match evaluate_group_start_round(
-                                requested_start_unix_ms,
-                                &member_acks,
-                            ) {
-                                GroupStartRoundDecision::Converged { anchor_unix_ms }
-                                | GroupStartRoundDecision::SoloCorrected { anchor_unix_ms } => {
-                                    committed_group_unix_ms = anchor_unix_ms;
-                                    converged = true;
-                                    break;
-                                }
-                                GroupStartRoundDecision::Retry {
-                                    next_target_unix_ms,
-                                    corrected_unix_ms,
-                                } => {
-                                    committed_group_unix_ms = corrected_unix_ms;
-                                    if let Ok(mut events) = startup_events_thread.lock() {
-                                        events.push(format!(
-                                            "AirPlay group START corrected: round {round}/{} · member floor moved shared instant +{} ms.",
-                                            AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
-                                            corrected_unix_ms.saturating_sub(requested_start_unix_ms)
-                                        ));
-                                    }
-                                    if round < AIRPLAY_START_CONVERGENCE_MAX_ROUNDS {
-                                        requested_start_unix_ms = next_target_unix_ms;
-                                    }
-                                }
+                        for correction in &convergence.corrections {
+                            if let Ok(mut events) = startup_events_thread.lock() {
+                                events.push(format!(
+                                    "AirPlay group START corrected: round {}/{} · member floor moved shared instant +{} ms.",
+                                    correction.round,
+                                    AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
+                                    correction
+                                        .corrected_unix_ms
+                                        .saturating_sub(correction.requested_unix_ms)
+                                ));
                             }
                         }
 
-                        if !converged {
+                        if !convergence.converged {
                             if let Ok(mut events) = startup_events_thread.lock() {
                                 events.push(format!(
                                     "AirPlay group START did not converge after {} rounds; latest committed instant retained for diagnostics.",
@@ -724,8 +720,9 @@ impl WindowsMultiroomAudioWorker {
                                 ));
                             }
                         }
+                        let rounds = convergence.rounds;
                         let committed_group_ntp =
-                            unix_ms_to_ntp_epoch(committed_group_unix_ms);
+                            unix_ms_to_ntp_epoch(convergence.anchor_unix_ms);
 
                         for target in &mut targets {
                             let rtp_timestamp = target.sender.state().timestamp;
@@ -1549,19 +1546,6 @@ fn prepare_pending_joins(
 
         index += 1;
     }
-}
-
-fn command_native_start_round(
-    targets: &mut [WindowsAudioTarget],
-    requested_start_unix_ms: u64,
-) -> Result<Vec<(i64, u64)>, (String, String)> {
-    let participants = targets
-        .iter_mut()
-        .map(|target| target as &mut dyn GroupStartParticipant)
-        .collect::<Vec<_>>();
-
-    run_concurrent_group_start_round(participants, requested_start_unix_ms)
-        .map_err(|error| (error.member, error.error))
 }
 
 fn ntp_delta_to_ms(value: u64) -> u64 {

@@ -1,11 +1,11 @@
 #![cfg(windows)]
 
 use crate::{
-    cross_transport_timeline::{
-        evaluate_group_start_round, GroupStartRoundDecision,
-        AIRPLAY_COLD_GROUP_START_LEAD_MS, AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
+    cross_transport_timeline::AIRPLAY_COLD_GROUP_START_LEAD_MS,
+    group_start_orchestrator::{
+        run_concurrent_group_start_round, run_group_start_convergence,
+        GroupStartIoError, GroupStartParticipant,
     },
-    group_start_orchestrator::{run_concurrent_group_start_round, GroupStartParticipant},
     system_time_to_ntp, volume_percent_to_db, Pcm352Chunker, VolumeSetResult,
     WasapiLoopbackCapture, WasapiLoopbackError, PCM352_PACKET_BYTES,
 };
@@ -348,50 +348,45 @@ impl LegacyGroupSession {
             let initial_start_unix_ms = current_unix_ms()
                 .map_err(LegacyGroupError::Time)?
                 .saturating_add(AIRPLAY_COLD_GROUP_START_LEAD_MS);
-            let mut target_unix_ms = initial_start_unix_ms;
-            let mut committed_unix_ms = initial_start_unix_ms;
-            let mut converged = false;
-            let mut rounds = 0usize;
+            let mut participants = spawned
+                .iter_mut()
+                .map(|member| member as &mut dyn GroupStartParticipant)
+                .collect::<Vec<_>>();
 
-            for round in 1..=AIRPLAY_START_CONVERGENCE_MAX_ROUNDS {
-                rounds = round;
-                let member_acks =
-                    command_legacy_start_round(&mut spawned, target_unix_ms)?;
+            let convergence = run_group_start_convergence(
+                initial_start_unix_ms,
+                |target_unix_ms| {
+                    let round_members = participants
+                        .iter_mut()
+                        .map(|member| &mut **member)
+                        .collect::<Vec<_>>();
+                    run_concurrent_group_start_round(round_members, target_unix_ms)
+                },
+            )
+            .map_err(|error: GroupStartIoError| LegacyGroupError::Start {
+                name: error.member,
+                error: error.error,
+            })?;
 
-                match evaluate_group_start_round(target_unix_ms, &member_acks) {
-                    GroupStartRoundDecision::Converged { anchor_unix_ms }
-                    | GroupStartRoundDecision::SoloCorrected { anchor_unix_ms } => {
-                        committed_unix_ms = anchor_unix_ms;
-                        converged = true;
-                        break;
-                    }
-                    GroupStartRoundDecision::Retry {
-                        next_target_unix_ms,
-                        corrected_unix_ms,
-                    } => {
-                        committed_unix_ms = corrected_unix_ms;
-                        if let Ok(mut events) = startup_events.lock() {
-                            events.push(format!(
-                                "Legacy group START corrected: round {round}/{} · requested={} · largest_ack={} · retry={}.",
-                                AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
-                                target_unix_ms,
-                                corrected_unix_ms,
-                                next_target_unix_ms
-                            ));
-                        }
-                        if round < AIRPLAY_START_CONVERGENCE_MAX_ROUNDS {
-                            target_unix_ms = next_target_unix_ms;
-                        }
-                    }
+            for correction in &convergence.corrections {
+                if let Ok(mut events) = startup_events.lock() {
+                    events.push(format!(
+                        "Legacy group START corrected: round {}/{} · requested={} · largest_ack={} · retry={}.",
+                        correction.round,
+                        crate::cross_transport_timeline::AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
+                        correction.requested_unix_ms,
+                        correction.corrected_unix_ms,
+                        correction.retry_unix_ms
+                    ));
                 }
             }
 
-            if !converged {
+            if !convergence.converged {
                 if let Ok(mut events) = startup_events.lock() {
                     events.push(format!(
                         "Legacy group START did not converge after {} rounds · retaining last acknowledged instant {}.",
-                        AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
-                        committed_unix_ms
+                        crate::cross_transport_timeline::AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
+                        convergence.anchor_unix_ms
                     ));
                 }
             }
@@ -400,12 +395,12 @@ impl LegacyGroupSession {
                 events.push(format!(
                     "Legacy group START committed after all members connected · initial={} · committed={} · rounds={} · lead={} ms.",
                     initial_start_unix_ms,
-                    committed_unix_ms,
-                    rounds,
+                    convergence.anchor_unix_ms,
+                    convergence.rounds,
                     AIRPLAY_COLD_GROUP_START_LEAD_MS
                 ));
             }
-            Ok(Some(committed_unix_ms))
+            Ok(Some(convergence.anchor_unix_ms))
         })();
 
         let committed_group_start_unix_ms = match start_result {
@@ -1078,22 +1073,6 @@ fn open_command_pipe_writer(pipe_name: &str) -> std::io::Result<File> {
             Err(error) => return Err(error),
         }
     }
-}
-
-fn command_legacy_start_round(
-    members: &mut [SpawnedMember],
-    requested_start_unix_ms: u64,
-) -> Result<Vec<(i64, u64)>, LegacyGroupError> {
-    let participants = members
-        .iter_mut()
-        .map(|member| member as &mut dyn GroupStartParticipant)
-        .collect::<Vec<_>>();
-
-    run_concurrent_group_start_round(participants, requested_start_unix_ms)
-        .map_err(|error| LegacyGroupError::Start {
-            name: error.member,
-            error: error.error,
-        })
 }
 
 fn send_start_command(pipe: &mut File, start_unix_ms: u64) -> std::io::Result<()> {

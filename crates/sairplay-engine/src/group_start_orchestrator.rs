@@ -6,6 +6,10 @@
 //! arithmetic remains in `cross_transport_timeline`, and PCM/session ownership
 //! remains transport-specific until a real shared mixed-transport worker exists.
 
+use crate::cross_transport_timeline::{
+    evaluate_group_start_round, GroupStartRoundDecision,
+    AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
+};
 use std::fmt;
 use std::thread;
 
@@ -37,6 +41,74 @@ impl fmt::Display for GroupStartIoError {
 }
 
 impl std::error::Error for GroupStartIoError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupStartCorrection {
+    pub round: usize,
+    pub requested_unix_ms: u64,
+    pub corrected_unix_ms: u64,
+    pub retry_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupStartConvergence {
+    pub anchor_unix_ms: u64,
+    pub rounds: usize,
+    pub converged: bool,
+    pub corrections: Vec<GroupStartCorrection>,
+}
+
+/// Execute Music Assistant's complete group START convergence loop over a
+/// transport-neutral round runner. The runner performs exactly one concurrent
+/// START round and returns true scheduled member instants.
+pub fn run_group_start_convergence<F>(
+    initial_target_unix_ms: u64,
+    mut run_round: F,
+) -> Result<GroupStartConvergence, GroupStartIoError>
+where
+    F: FnMut(u64) -> Result<Vec<(i64, u64)>, GroupStartIoError>,
+{
+    let mut target_unix_ms = initial_target_unix_ms;
+    let mut anchor_unix_ms = initial_target_unix_ms;
+    let mut corrections = Vec::new();
+
+    for round in 1..=AIRPLAY_START_CONVERGENCE_MAX_ROUNDS {
+        let member_acks = run_round(target_unix_ms)?;
+        match evaluate_group_start_round(target_unix_ms, &member_acks) {
+            GroupStartRoundDecision::Converged { anchor_unix_ms: anchor }
+            | GroupStartRoundDecision::SoloCorrected { anchor_unix_ms: anchor } => {
+                return Ok(GroupStartConvergence {
+                    anchor_unix_ms: anchor,
+                    rounds: round,
+                    converged: true,
+                    corrections,
+                });
+            }
+            GroupStartRoundDecision::Retry {
+                next_target_unix_ms,
+                corrected_unix_ms,
+            } => {
+                anchor_unix_ms = corrected_unix_ms;
+                corrections.push(GroupStartCorrection {
+                    round,
+                    requested_unix_ms: target_unix_ms,
+                    corrected_unix_ms,
+                    retry_unix_ms: next_target_unix_ms,
+                });
+                if round < AIRPLAY_START_CONVERGENCE_MAX_ROUNDS {
+                    target_unix_ms = next_target_unix_ms;
+                }
+            }
+        }
+    }
+
+    Ok(GroupStartConvergence {
+        anchor_unix_ms,
+        rounds: AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
+        converged: false,
+        corrections,
+    })
+}
 
 /// Fan one commanded audible instant out to every participant concurrently and
 /// collect the MSA convergence acknowledgement shape:
@@ -137,6 +209,40 @@ mod tests {
         .unwrap();
 
         assert_eq!(acks, vec![(25, 10_025), (-40, 9_960)]);
+    }
+
+    #[test]
+    fn convergence_retries_then_anchors_on_common_round() {
+        let mut rounds = Vec::new();
+        let result = run_group_start_convergence(10_000, |target| {
+            rounds.push(target);
+            if rounds.len() == 1 {
+                Ok(vec![(0, 10_000), (0, 10_240)])
+            } else {
+                Ok(vec![(0, target), (0, target + 1)])
+            }
+        })
+        .unwrap();
+
+        assert_eq!(rounds, vec![10_000, 10_390]);
+        assert_eq!(result.anchor_unix_ms, 10_390);
+        assert_eq!(result.rounds, 2);
+        assert!(result.converged);
+        assert_eq!(result.corrections.len(), 1);
+    }
+
+    #[test]
+    fn convergence_exhaustion_keeps_last_ack_not_unsent_retry() {
+        let mut last_commanded = 0;
+        let result = run_group_start_convergence(10_000, |target| {
+            last_commanded = target;
+            Ok(vec![(0, target + 100), (0, target)])
+        })
+        .unwrap();
+
+        assert!(!result.converged);
+        assert_eq!(result.rounds, AIRPLAY_START_CONVERGENCE_MAX_ROUNDS);
+        assert_eq!(result.anchor_unix_ms, last_commanded + 100);
     }
 
     #[test]
