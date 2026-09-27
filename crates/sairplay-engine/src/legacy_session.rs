@@ -23,6 +23,7 @@ pub const LIBRAOP_PINNED_COMMIT: &str = "dadcfcaa26d988cdd3e3501ddf8286c224f1b49
 const RAOP_CONFIGURED_LATENCY_FRAMES: u32 = 44_100;
 const RAOP_FIXED_LATENCY_FRAMES: u32 = 11_025;
 const WRITER_QUEUE_PACKETS: usize = 96;
+const RAOP_START_ACK_TIMEOUT: Duration = Duration::from_millis(7_000);
 // Music Assistant's current source treats a player that does not consume its
 // PCM feed for 35 s as a failed member. Do the same here, but preserve every
 // PCM packet until that deadline instead of guessing a larger queue.
@@ -251,10 +252,16 @@ impl LegacyGroupSession {
                     name: member.name.clone(),
                     error: "START acknowledgement channel missing".into(),
                 })?;
-                let ack = rx.recv().map_err(|error| LegacyGroupError::Start {
-                    name: member.name.clone(),
-                    error: error.to_string(),
-                })?;
+                let ack = rx
+                    .recv_timeout(RAOP_START_ACK_TIMEOUT)
+                    .map_err(|error| LegacyGroupError::Start {
+                        name: member.name.clone(),
+                        error: format!(
+                            "START acknowledgement not received within {} ms: {}",
+                            RAOP_START_ACK_TIMEOUT.as_millis(),
+                            error
+                        ),
+                    })?;
                 let (requested, actual) = ack.map_err(|error| LegacyGroupError::Start {
                     name: member.name.clone(),
                     error,
