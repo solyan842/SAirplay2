@@ -447,6 +447,7 @@ impl WindowsMultiroomJoinHandle {
 pub struct WindowsMultiroomAudioWorker {
     kind: WindowsGroupAudioKind,
     running: Arc<AtomicBool>,
+    pcm_session: Option<WindowsPcmSession>,
     worker: Option<JoinHandle<()>>,
     last_error: Arc<Mutex<Option<String>>>,
     discontinuities: Arc<AtomicU64>,
@@ -518,6 +519,10 @@ impl WindowsMultiroomAudioWorker {
             command_tx: command_tx.clone(),
         };
 
+        let mut pcm_session = WindowsPcmSession::start(source_format)
+            .map_err(WindowsMultiroomAudioError::Capture)?;
+        let pcm_source: WindowsPcmSourceHandle = pcm_session.source_handle();
+
         let worker_name = match kind {
             WindowsGroupAudioKind::StereoPair => "sairplay-stereo-pair-audio",
             WindowsGroupAudioKind::MultiRoom => "sairplay-multiroom-audio",
@@ -525,21 +530,8 @@ impl WindowsMultiroomAudioWorker {
         let worker = thread::Builder::new()
             .name(worker_name.into())
             .spawn(move || {
-                let mut pcm_session = match WindowsPcmSession::start(source_format) {
-                    Ok(session) => {
-                        let _ = ready_tx.send(Ok(()));
-                        session
-                    }
-                    Err(error) => {
-                        let message = error.to_string();
-                        let _ = ready_tx.send(Err(message.clone()));
-                        if let Ok(mut slot) = last_error_thread.lock() {
-                            *slot = Some(message);
-                        }
-                        running_thread.store(false, Ordering::SeqCst);
-                        return;
-                    }
-                };
+                let pcm_session = pcm_source;
+                let _ = ready_tx.send(Ok(()));
 
                 let mut captured_frames_seen = 0u64;
                 let mut cold_armed = false;
@@ -1111,8 +1103,6 @@ impl WindowsMultiroomAudioWorker {
                     }
                 }
 
-                pcm_session.stop();
-
                 for pending in pending_joins {
                     let _ = pending.reply.send(Err(
                         "multi-room audio worker stopped before late join completed".into(),
@@ -1129,6 +1119,7 @@ impl WindowsMultiroomAudioWorker {
             Ok(Ok(())) => Ok(Self {
                 kind,
                 running,
+                pcm_session: Some(pcm_session),
                 worker: Some(worker),
                 last_error,
                 discontinuities,
@@ -1140,6 +1131,7 @@ impl WindowsMultiroomAudioWorker {
             }),
             Ok(Err(message)) => {
                 let _ = worker.join();
+                pcm_session.stop();
                 Err(WindowsMultiroomAudioError::Capture(
                     WasapiLoopbackError::Windows(message),
                 ))
@@ -1147,6 +1139,7 @@ impl WindowsMultiroomAudioWorker {
             Err(error) => {
                 running.store(false, Ordering::SeqCst);
                 let _ = worker.join();
+                pcm_session.stop();
                 Err(WindowsMultiroomAudioError::Capture(
                     WasapiLoopbackError::Windows(format!(
                         "MultiRoom WASAPI worker startup timeout: {error}"
@@ -1205,6 +1198,9 @@ impl WindowsMultiroomAudioWorker {
         self.running.store(false, Ordering::SeqCst);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+        if let Some(mut pcm_session) = self.pcm_session.take() {
+            pcm_session.stop();
         }
     }
 }

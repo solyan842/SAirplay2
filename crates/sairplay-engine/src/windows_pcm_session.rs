@@ -39,6 +39,8 @@ struct SharedRing {
 #[derive(Clone)]
 pub struct WindowsPcmSourceHandle {
     shared: Arc<SharedRing>,
+    packet_bytes: usize,
+    byte_rate: usize,
     captured_frames: Arc<AtomicU64>,
     discontinuities: Arc<AtomicU64>,
     last_discontinuity_frame: Arc<AtomicU64>,
@@ -46,6 +48,19 @@ pub struct WindowsPcmSourceHandle {
 }
 
 impl WindowsPcmSourceHandle {
+    pub fn has_packet(&self) -> bool {
+        self.buffered_bytes() >= self.packet_bytes
+    }
+
+    pub fn buffered_ms(&self) -> u64 {
+        if self.byte_rate == 0 {
+            return 0;
+        }
+        ((self.buffered_bytes() as u128)
+            .saturating_mul(1_000)
+            .saturating_div(self.byte_rate as u128)) as u64
+    }
+
     pub fn captured_frames(&self) -> u64 {
         self.captured_frames.load(Ordering::SeqCst)
     }
@@ -343,6 +358,8 @@ impl WindowsPcmSession {
     pub fn source_handle(&self) -> WindowsPcmSourceHandle {
         WindowsPcmSourceHandle {
             shared: Arc::clone(&self.shared),
+            packet_bytes: self.packet_bytes,
+            byte_rate: self.byte_rate,
             captured_frames: Arc::clone(&self.captured_frames),
             discontinuities: Arc::clone(&self.discontinuities),
             last_discontinuity_frame: Arc::clone(&self.last_discontinuity_frame),
