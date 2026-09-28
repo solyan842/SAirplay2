@@ -1,3 +1,4 @@
+pub mod msa_ap2_clock;
 pub mod msa_windows_runtime;
 pub mod msa_windows_consumer;
 pub mod msa_windows_capture;
@@ -158,3 +159,8 @@ pub use msa_windows_consumer::{
 };
 
 pub use msa_windows_runtime::MsaWindowsRuntimeSession;
+
+pub use msa_ap2_clock::{
+    msa_ap2_clock_readiness, MsaAp2ClockReadiness, MsaAp2ClockState,
+    MSA_AP2_CLOCK_LOCK_MS, MSA_AP2_CLOCK_SEAT_EXCHANGES, MSA_AP2_CLOCK_SETTLE_MS,
+};
