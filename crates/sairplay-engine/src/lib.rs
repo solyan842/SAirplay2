@@ -98,7 +98,9 @@ pub use group_flush::{
     WarmGroupMemberConstraint,
 };
 pub use group_pcm_fanout::{
-    fanout_shared_pcm_chunk, GroupPcmFailure, GroupPcmParticipant,
+    fanout_shared_pcm_chunk, pump_shared_pcm_once, GroupPcmCoordinator,
+    GroupPcmCoordinatorCycle, GroupPcmFailure, GroupPcmParticipant,
+    GroupPcmPumpOutcome, GroupPcmSource,
 };
 
 pub use timing_policy::{TimingDecision, TimingMode, TimingPreference, TimingReadiness, TimingStartResult};
