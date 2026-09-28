@@ -1,3 +1,4 @@
+pub mod msa_raop_transport;
 pub mod msa_ap2_transport;
 pub mod msa_session_adapter;
 pub mod msa_session;
@@ -95,3 +96,8 @@ pub use msa_session_adapter::{
 };
 
 pub use msa_ap2_transport::{MsaAp2Client, MsaAp2Transport};
+
+pub use msa_raop_transport::{
+    MsaRaopClient, MsaRaopStartMode, MsaRaopState, MsaRaopTransport,
+    MSA_RAOP_MIN_START_LEAD_MS,
+};
