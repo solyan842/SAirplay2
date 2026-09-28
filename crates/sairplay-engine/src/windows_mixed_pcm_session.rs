@@ -22,6 +22,8 @@ pub struct WindowsMixedPcmSession {
     coordinator: GroupPcmCoordinator<WindowsPcmCoordinatorSource>,
     native_groups: Vec<NativeGroupSession>,
     legacy_groups: Vec<LegacyGroupSession>,
+    pump_cycles: u64,
+    diagnostic_events: Vec<String>,
 }
 
 impl WindowsMixedPcmSession {
@@ -37,6 +39,12 @@ impl WindowsMixedPcmSession {
             coordinator,
             native_groups: Vec::new(),
             legacy_groups: Vec::new(),
+            pump_cycles: 0,
+            diagnostic_events: vec![format!(
+                "Mixed PCM source owner started · format={}-bit/{} Hz · coordinator_source=single-handoff.",
+                audio_format.bit_depth,
+                audio_format.sample_rate,
+            )],
         })
     }
 
@@ -177,6 +185,14 @@ impl WindowsMixedPcmSession {
             sink.arm_feed_from_start_unix_ms(convergence.anchor_unix_ms);
         }
 
+        self.diagnostic_events.push(format!(
+            "Mixed START committed · initial={} · anchor={} · rounds={} · converged={}.",
+            initial_target_unix_ms,
+            convergence.anchor_unix_ms,
+            convergence.rounds,
+            convergence.converged,
+        ));
+
         let mut attached = Vec::<String>::new();
         for sink in native_sinks {
             let name = GroupPcmParticipant::name(&sink).to_owned();
@@ -199,6 +215,11 @@ impl WindowsMixedPcmSession {
             attached.push(name);
         }
 
+        self.diagnostic_events.push(format!(
+            "Mixed PCM attached · members={} · names={}.",
+            attached.len(),
+            attached.join(", "),
+        ));
         self.native_groups.push(native_group);
         self.legacy_groups.push(legacy_group);
         Ok(convergence)
@@ -225,7 +246,41 @@ impl WindowsMixedPcmSession {
         want_bytes: usize,
         timeout: Duration,
     ) -> Result<GroupPcmCoordinatorCycle, String> {
-        self.coordinator.pump_once(want_bytes, timeout)
+        let cycle = self.coordinator.pump_once(want_bytes, timeout)?;
+        self.pump_cycles = self.pump_cycles.saturating_add(1);
+
+        match &cycle.outcome {
+            crate::GroupPcmPumpOutcome::Starved => {
+                if self.pump_cycles <= 8 {
+                    self.diagnostic_events.push(format!(
+                        "Mixed PCM cycle #{} · source_read=1 · starved · members={}.",
+                        self.pump_cycles,
+                        self.member_count(),
+                    ));
+                }
+            }
+            crate::GroupPcmPumpOutcome::Delivered { bytes, failures } => {
+                if self.pump_cycles <= 8 || !failures.is_empty() || !cycle.removed_members.is_empty() {
+                    self.diagnostic_events.push(format!(
+                        "Mixed PCM cycle #{} · source_read=1 · bytes={} · fanout_members={} · failures={} · removed={}.",
+                        self.pump_cycles,
+                        bytes,
+                        self.member_count().saturating_add(cycle.removed_members.len()),
+                        failures.len(),
+                        if cycle.removed_members.is_empty() {
+                            "-".to_owned()
+                        } else {
+                            cycle.removed_members.join(", ")
+                        },
+                    ));
+                }
+            }
+        }
+        Ok(cycle)
+    }
+
+    pub fn drain_diagnostic_events(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.diagnostic_events)
     }
 
     pub fn stop(&mut self) {
@@ -242,5 +297,9 @@ impl WindowsMixedPcmSession {
         self.legacy_groups.clear();
         self.native_groups.clear();
         self.owner.stop();
+        self.diagnostic_events.push(format!(
+            "Mixed PCM stopped · pump_cycles={}.",
+            self.pump_cycles,
+        ));
     }
 }
