@@ -200,7 +200,7 @@ pub fn fanout_shared_pcm_chunk(
                         member: name,
                         error,
                     })
-            })).unwrap();
+            }));
         }
 
         let mut failures = Vec::new();
