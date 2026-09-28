@@ -1,8 +1,9 @@
 use crate::{
     Ap2AudioFormat, NativeSession, NativeSessionConfig, NativeVolumeControl, PtpEngine,
     RetransmitStats, WindowsGroupAudioKind, WindowsMultiroomAudioError,
-    WindowsMultiroomAudioWorker, WindowsMultiroomJoinHandle, WindowsPcmSourceHandle,
+    WindowsMultiroomAudioWorker, WindowsMultiroomJoinHandle,
 };
+use crate::windows_pcm_session::WindowsPcmSourceHandle;
 use std::fmt;
 use std::sync::Arc;
 
