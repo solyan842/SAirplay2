@@ -108,7 +108,7 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
     }
 
     fn resume_lifecycle(&mut self) -> Result<(), String> {
-        let transport_result = self.resume_lifecycle();
+        let transport_result = self.transport.resume();
         self.resume_consumer();
         transport_result
     }
