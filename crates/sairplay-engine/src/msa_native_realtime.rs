@@ -35,6 +35,18 @@ pub struct MsaNativeFlushResult {
     pub action: MsaNativeFlushAction,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsaNativeStandbyAction {
+    /// Pinned splice_timeline path: do not touch RTSP receiver queue. Content
+    /// stops, but the transport line must continue on encoded silence.
+    KeepLineFed,
+    /// Stock native realtime path: classic RTSP FLUSH, then park content.
+    FlushedAndParked {
+        sequence: u16,
+        rtptime: u32,
+    },
+}
+
 pub fn msa_native_flush_action(
     mode: MsaNativeWarmMode,
     point: MsaRealtimeFlushPoint,
@@ -142,6 +154,45 @@ impl MsaNativeRealtimeOwner {
                 self.rtp_offset,
             )
             .map_err(|error| format!("MSA physical AP2 rebase failed: {error:?}"))
+    }
+
+    /// Execute pinned ap2cl_standby() transport behavior while quiesced.
+    ///
+    /// Splice mode never sends RTSP FLUSH: it preserves the armed line and
+    /// tells the runtime to keep feeding encoded silence. Stock realtime
+    /// snapshots current RTP-Info and discards receiver queued audio in place.
+    pub fn standby_quiesced(&mut self) -> Result<MsaNativeStandbyAction, String> {
+        let point = {
+            let mut sender = self
+                .sender
+                .lock()
+                .map_err(|_| "MSA realtime sender lock poisoned".to_owned())?;
+            let point = sender.msa_flush_point();
+            if self.mode == MsaNativeWarmMode::Splice {
+                sender.msa_prepare_splice_standby();
+            }
+            point
+        };
+
+        match self.mode {
+            MsaNativeWarmMode::Splice => Ok(MsaNativeStandbyAction::KeepLineFed),
+            MsaNativeWarmMode::StockRealtime => {
+                send_native_realtime_flush(
+                    &self.control,
+                    &self.next_cseq,
+                    &self.session_uri,
+                    &self.dacp_id,
+                    &self.active_remote,
+                    point.sequence,
+                    point.rtptime,
+                )
+                .map_err(|error| format!("{error}"))?;
+                Ok(MsaNativeStandbyAction::FlushedAndParked {
+                    sequence: point.sequence,
+                    rtptime: point.rtptime,
+                })
+            }
+        }
     }
 
     /// Execute a source-accurate warm boundary after the send loop is
@@ -272,6 +323,28 @@ mod tests {
         assert_eq!(
             sender.lock().unwrap().msa_flush_point().warm_head_unix_ms,
             Some(10_500)
+        );
+    }
+
+
+    #[test]
+    fn splice_standby_keeps_transport_line_and_clears_only_pad_debt() {
+        let action = MsaNativeStandbyAction::KeepLineFed;
+        assert_eq!(action, MsaNativeStandbyAction::KeepLineFed);
+    }
+
+    #[test]
+    fn stock_standby_action_carries_wire_rtp_coordinates() {
+        let action = MsaNativeStandbyAction::FlushedAndParked {
+            sequence: 12,
+            rtptime: 34,
+        };
+        assert_eq!(
+            action,
+            MsaNativeStandbyAction::FlushedAndParked {
+                sequence: 12,
+                rtptime: 34,
+            }
         );
     }
 

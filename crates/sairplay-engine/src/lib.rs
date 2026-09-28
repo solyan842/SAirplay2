@@ -190,5 +190,5 @@ pub use msa_windows_consumer::SharedRealtimeMediaSender;
 
 pub use msa_native_realtime::{
     msa_native_flush_action, MsaNativeFlushAction, MsaNativeFlushResult,
-    MsaNativeRealtimeOwner, MsaNativeWarmMode,
+    MsaNativeRealtimeOwner, MsaNativeStandbyAction, MsaNativeWarmMode,
 };

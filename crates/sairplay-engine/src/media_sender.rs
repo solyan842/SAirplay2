@@ -303,6 +303,13 @@ impl RealtimeMediaSender {
         self.splice_pad_frames
     }
 
+    /// Pinned splice STANDBY drops any pending content-gap debt while keeping
+    /// the armed RTP/PTP line itself intact. The carrier loop is responsible
+    /// for continuing encoded silence after this boundary.
+    pub fn msa_prepare_splice_standby(&mut self) {
+        self.splice_pad_frames = 0;
+    }
+
     pub fn consume_splice_pad(&mut self, frames: u32) {
         self.splice_pad_frames = self.splice_pad_frames.saturating_sub(frames);
     }
