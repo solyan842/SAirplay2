@@ -1,3 +1,4 @@
+pub mod msa_ap2_verify;
 pub mod msa_ap2_start;
 pub mod msa_ap2_clock;
 pub mod msa_windows_runtime;
@@ -169,4 +170,10 @@ pub use msa_ap2_clock::{
 pub use msa_ap2_start::{
     msa_ap2_start_floor_unix_ms, msa_resolve_ap2_start, MsaAp2StartResolution,
     MSA_AP2_MIN_WARM_LEAD_MS,
+};
+
+pub use msa_ap2_verify::{
+    msa_ap2_verify_arm, msa_ap2_verify_poll, MsaAp2VerifyArm, MsaAp2VerifyEvent,
+    MsaAp2VerifyResult, MSA_AP2_CLOCK_VERIFY_EXTRA_WINDOW_MS,
+    MSA_AP2_CLOCK_VERIFY_POLL_MS,
 };
