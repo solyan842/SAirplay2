@@ -1362,7 +1362,7 @@ mod legacy_pcm_sink_tests {
     fn legacy_pcm_sink_accepts_exact_raop_packet() {
         let (tx, rx) = mpsc::sync_channel::<[u8; PCM352_PACKET_BYTES]>(1);
         let running = Arc::new(AtomicBool::new(true));
-        let mut sink = LegacyPcmSink::new("raop".into(), tx, running);
+        let mut sink = LegacyPcmSink::new("raop".into(), tx, running, None);
         let packet = vec![0x5Au8; PCM352_PACKET_BYTES];
 
         sink.write_shared_pcm(&packet).unwrap();
@@ -1374,7 +1374,7 @@ mod legacy_pcm_sink_tests {
     fn legacy_pcm_sink_rejects_non_raop_packet_size() {
         let (tx, _rx) = mpsc::sync_channel::<[u8; PCM352_PACKET_BYTES]>(1);
         let running = Arc::new(AtomicBool::new(true));
-        let mut sink = LegacyPcmSink::new("raop".into(), tx, running);
+        let mut sink = LegacyPcmSink::new("raop".into(), tx, running, None);
 
         let error = sink.write_shared_pcm(&[0u8; 16]).unwrap_err();
         assert!(error.contains("requires exactly"));
