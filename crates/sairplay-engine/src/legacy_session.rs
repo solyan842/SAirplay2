@@ -142,8 +142,15 @@ enum LegacyWriterCommand {
     Resume,
 }
 
+/// Owned RAOP PCM sink surface for the future mixed-session coordinator.
+///
+/// Construction stays inside the legacy session because the sender/running
+/// handles belong to the source-built libraop helper lifecycle. Exposing the
+/// sink type does not change the existing legacy reader worker or enable mixed
+/// playback; it only gives the higher-level coordinator a transport-neutral
+/// participant type to own once lifecycle extraction is added.
 #[derive(Clone)]
-struct LegacyPcmSink {
+pub struct LegacyPcmSink {
     name: String,
     pcm_tx: SyncSender<[u8; PCM352_PACKET_BYTES]>,
     running: Arc<AtomicBool>,
