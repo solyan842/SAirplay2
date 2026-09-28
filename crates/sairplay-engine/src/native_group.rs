@@ -277,7 +277,7 @@ impl NativeGroupSession {
             }
             let sinks = targets
                 .into_iter()
-                .map(|target| OwnedNativePcmSink::new(target, source_format, 0))
+                .map(|target| OwnedNativePcmSink::new_unarmed(target, source_format))
                 .collect::<Vec<_>>();
             (None, sinks)
         } else {

@@ -460,7 +460,7 @@ impl WindowsMultiroomJoinHandle {
 pub struct OwnedNativePcmSink {
     target: WindowsAudioTarget,
     source_format: Ap2AudioFormat,
-    ntp: u64,
+    ntp: Option<u64>,
 }
 
 impl OwnedNativePcmSink {
@@ -472,16 +472,35 @@ impl OwnedNativePcmSink {
         Self {
             target,
             source_format,
-            ntp,
+            ntp: Some(ntp),
         }
     }
 
-    pub fn set_ntp(&mut self, ntp: u64) {
-        self.ntp = ntp;
+    pub fn new_unarmed(
+        target: WindowsAudioTarget,
+        source_format: Ap2AudioFormat,
+    ) -> Self {
+        Self {
+            target,
+            source_format,
+            ntp: None,
+        }
     }
 
-    pub fn ntp(&self) -> u64 {
+    pub fn arm_ntp(&mut self, ntp: u64) {
+        self.ntp = Some(ntp);
+    }
+
+    pub fn clear_ntp(&mut self) {
+        self.ntp = None;
+    }
+
+    pub fn ntp(&self) -> Option<u64> {
         self.ntp
+    }
+
+    pub fn is_armed(&self) -> bool {
+        self.ntp.is_some()
     }
 
     pub fn source_format(&self) -> Ap2AudioFormat {
@@ -518,11 +537,15 @@ impl GroupPcmParticipant for OwnedNativePcmSink {
         )
         .map_err(|error| format!("media format failed: {error}"))?;
 
+        let ntp = self
+            .ntp
+            .ok_or_else(|| "native mixed PCM sink is not armed with a packet NTP".to_owned())?;
+
         self.target
             .sender
             .send_pcm_352(
                 &target_packet,
-                self.ntp,
+                ntp,
                 self.target.lead_frames,
             )
             .map(|_| ())
