@@ -115,6 +115,12 @@ impl<S: GroupPcmSource> GroupPcmCoordinator<S> {
         Ok(())
     }
 
+    pub fn remove_member(&mut self, name: &str) -> bool {
+        let before = self.members.len();
+        self.members.retain(|member| member.name() != name);
+        self.members.len() != before
+    }
+
     pub fn member_count(&self) -> usize {
         self.members.len()
     }
@@ -577,6 +583,55 @@ mod tests {
 
         assert!(error.contains("duplicate shared PCM participant identity"));
         assert_eq!(coordinator.member_count(), 1);
+    }
+
+    #[test]
+    fn coordinator_explicit_remove_applies_before_next_source_read() {
+        let reads = Arc::new(Mutex::new(0usize));
+        let source = FakeSource {
+            reads: Arc::clone(&reads),
+            chunk: Some(vec![8u8, 8, 8, 8]),
+        };
+        let seen_native = Arc::new(Mutex::new(Vec::new()));
+        let seen_raop = Arc::new(Mutex::new(Vec::new()));
+
+        let mut coordinator = GroupPcmCoordinator::new(source);
+        coordinator
+            .add_member(Box::new(FakeMember {
+                name: "native",
+                seen: Arc::clone(&seen_native),
+                fail: false,
+            }))
+            .unwrap();
+        coordinator
+            .add_member(Box::new(FakeMember {
+                name: "raop",
+                seen: Arc::clone(&seen_raop),
+                fail: false,
+            }))
+            .unwrap();
+
+        assert!(coordinator.remove_member("raop"));
+        assert!(!coordinator.remove_member("missing"));
+        assert_eq!(coordinator.member_names(), vec!["native".to_owned()]);
+
+        let cycle = coordinator
+            .pump_once(4, Duration::from_millis(0))
+            .unwrap();
+
+        assert_eq!(
+            cycle,
+            GroupPcmCoordinatorCycle {
+                outcome: GroupPcmPumpOutcome::Delivered {
+                    bytes: 4,
+                    failures: Vec::new(),
+                },
+                removed_members: Vec::new(),
+            }
+        );
+        assert_eq!(*reads.lock().unwrap(), 1);
+        assert_eq!(seen_native.lock().unwrap().len(), 1);
+        assert!(seen_raop.lock().unwrap().is_empty());
     }
 
 }
