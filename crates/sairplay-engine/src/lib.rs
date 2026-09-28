@@ -1,3 +1,4 @@
+pub mod msa_windows_consumer;
 pub mod msa_windows_capture;
 pub mod msa_windows_source;
 pub mod msa_failure_isolation;
@@ -146,4 +147,9 @@ pub use msa_windows_source::{
 
 pub use msa_windows_capture::{
     MsaWindowsCaptureError, MsaWindowsCaptureWorker,
+};
+
+pub use msa_windows_consumer::{
+    MsaWindowsConsumerError, MsaWindowsConsumerWorker, MsaWindowsPacketSink,
+    RealtimeMsaPacketSink,
 };
