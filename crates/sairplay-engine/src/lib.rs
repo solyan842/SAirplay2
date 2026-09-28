@@ -1,3 +1,4 @@
+pub mod msa_warm_replace;
 pub mod msa_group_start;
 pub mod msa_raop_transport;
 pub mod msa_ap2_transport;
@@ -108,4 +109,10 @@ pub use msa_group_start::{
     MsaGroupStartMember, MsaGroupStartResult, MSA_CLOCK_READY_LEAD_MS,
     MSA_COLD_GROUP_START_LEAD_MS, MSA_GROUP_START_LEAD_MS,
     MSA_SPLICE_LEAD_MARGIN_MS, MSA_START_MAX_ROUNDS, MSA_START_TOLERANCE_MS,
+};
+
+pub use msa_warm_replace::{
+    msa_flush_group_for_replace, msa_start_warm_replacement, msa_warm_anchor_unix_ms,
+    MsaWarmFlushFailure, MsaWarmMemberSnapshot, MsaWarmReplaceMember,
+    MsaWarmReplaceResult,
 };
