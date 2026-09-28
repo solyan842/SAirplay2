@@ -127,11 +127,18 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
             }
         };
 
-        let epoch = match self.source.lock() {
-            Ok(mut source) => source.core_mut().start_committed()?,
-            Err(_) => {
+        let epoch_result = {
+            let mut source = self
+                .source
+                .lock()
+                .map_err(|_| "MSA Windows source lock poisoned".to_owned())?;
+            source.core_mut().start_committed()
+        };
+        let epoch = match epoch_result {
+            Ok(value) => value,
+            Err(error) => {
                 let _ = self.resume_lifecycle();
-                return Err("MSA Windows source lock poisoned".into());
+                return Err(error);
             }
         };
 
@@ -254,12 +261,16 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
             }
         };
 
-        match self.source.lock() {
-            Ok(mut source) => source.core_mut().flush_committed()?,
-            Err(_) => {
-                let _ = self.resume_lifecycle();
-                return Err("MSA Windows source lock poisoned".into());
-            }
+        let flush_result = {
+            let mut source = self
+                .source
+                .lock()
+                .map_err(|_| "MSA Windows source lock poisoned".to_owned())?;
+            source.core_mut().flush_committed()
+        };
+        if let Err(error) = flush_result {
+            let _ = self.resume_lifecycle();
+            return Err(error);
         }
 
         self.resume_lifecycle()?;
@@ -276,12 +287,16 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
             return Err(error);
         }
 
-        match self.source.lock() {
-            Ok(mut source) => source.core_mut().standby_committed()?,
-            Err(_) => {
-                let _ = self.resume_lifecycle();
-                return Err("MSA Windows source lock poisoned".into());
-            }
+        let standby_result = {
+            let mut source = self
+                .source
+                .lock()
+                .map_err(|_| "MSA Windows source lock poisoned".to_owned())?;
+            source.core_mut().standby_committed()
+        };
+        if let Err(error) = standby_result {
+            let _ = self.resume_lifecycle();
+            return Err(error);
         }
 
         self.resume_lifecycle()
