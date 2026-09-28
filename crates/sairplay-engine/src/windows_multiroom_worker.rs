@@ -537,6 +537,24 @@ impl GroupPcmParticipant for OwnedNativePcmSink {
     }
 
     fn write_shared_pcm(&mut self, chunk: &[u8]) -> Result<(), String> {
+        if self.committed_start_ntp.is_none() {
+            return Err("native mixed PCM sink START is not armed".to_owned());
+        }
+
+        // Preserve the proven native worker pacing contract in external-feed
+        // mode. The common coordinator has already consumed exactly one shared
+        // source packet, so block this member at the transport gate before
+        // committing that packet. The coordinator will not read the next source
+        // packet until every member write for this cycle has completed.
+        let now_ntp = loop {
+            let now_ntp = system_time_to_ntp(SystemTime::now())
+                .map_err(|error| format!("NTP clock conversion failed: {error:?}"))?;
+            if self.can_accept_frames(now_ntp)? {
+                break now_ntp;
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+
         let target_format = self.target.sender.audio_format();
         let target_packet = adapt_group_pcm_packet(
             chunk,
@@ -544,12 +562,6 @@ impl GroupPcmParticipant for OwnedNativePcmSink {
             target_format,
         )
         .map_err(|error| format!("media format failed: {error}"))?;
-
-        if self.committed_start_ntp.is_none() {
-            return Err("native mixed PCM sink START is not armed".to_owned());
-        }
-        let now_ntp = system_time_to_ntp(SystemTime::now())
-            .map_err(|error| format!("NTP clock conversion failed: {error:?}"))?;
 
         self.target
             .sender
