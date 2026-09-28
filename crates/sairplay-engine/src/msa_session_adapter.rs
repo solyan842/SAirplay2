@@ -14,6 +14,9 @@ pub trait MsaSessionTransport {
     ) -> Result<u64, String>;
     fn flush(&mut self) -> Result<Option<u64>, String>;
     fn stop(&mut self) -> Result<(), String>;
+    fn standby_keeps_line_fed(&self) -> bool {
+        false
+    }
     fn resume(&mut self) -> Result<(), String>;
 }
 

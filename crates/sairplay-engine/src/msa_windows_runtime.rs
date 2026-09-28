@@ -85,6 +85,12 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
             .map_err(|_| "MSA Windows source lock poisoned".to_owned())
     }
 
+    fn set_standby_silence(&self, enabled: bool) {
+        if let Some(consumer) = self.consumer.as_ref() {
+            consumer.set_standby_silence(enabled);
+        }
+    }
+
     fn quiesce_consumer(&self) -> Result<(), String> {
         if let Some(consumer) = self.consumer.as_ref() {
             consumer.quiesce()?;
@@ -114,6 +120,7 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
     }
 
     pub fn start(&mut self, requested_start_unix_ms: u64) -> Result<MsaStartAck, String> {
+        self.set_standby_silence(false);
         if self.pending_start.is_some() {
             return Err("cannot START while an MSA deferred START is pending".into());
         }
@@ -158,6 +165,7 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
         &mut self,
         requested_start_unix_ms: u64,
     ) -> Result<MsaPendingStart, String> {
+        self.set_standby_silence(false);
         if self.pending_start.is_some() {
             return Err("MSA deferred START already pending".into());
         }
@@ -251,6 +259,7 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
     }
 
     pub fn flush(&mut self) -> Result<MsaFlushAck, String> {
+        self.set_standby_silence(false);
         self.cancel_deferred_start();
         self.quiesce_lifecycle()?;
         let warm_head = match self.transport.flush() {
@@ -286,6 +295,7 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
             let _ = self.resume_lifecycle();
             return Err(error);
         }
+        let keep_line_fed = self.transport.standby_keeps_line_fed();
 
         let standby_result = {
             let mut source = self
@@ -299,10 +309,12 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
             return Err(error);
         }
 
+        self.set_standby_silence(keep_line_fed);
         self.resume_lifecycle()
     }
 
     pub fn end(&mut self) -> Result<(), String> {
+        self.set_standby_silence(false);
         self.cancel_deferred_start();
         if let Some(mut consumer) = self.consumer.take() {
             consumer.stop();
@@ -330,6 +342,7 @@ mod tests {
         committed: u64,
         fail_start: bool,
         fail_flush: bool,
+        keep_line_fed: bool,
     }
 
     impl MsaSessionTransport for FakeTransport {
@@ -363,6 +376,10 @@ mod tests {
         fn stop(&mut self) -> Result<(), String> {
             self.calls.push("stop");
             Ok(())
+        }
+
+        fn standby_keeps_line_fed(&self) -> bool {
+            self.keep_line_fed
         }
 
         fn resume(&mut self) -> Result<(), String> {

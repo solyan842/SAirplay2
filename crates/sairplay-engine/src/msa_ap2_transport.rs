@@ -25,6 +25,12 @@ pub trait MsaAp2Client {
 
     /// Equivalent of `ap2cl_standby()`: park, do not disconnect.
     fn standby(&mut self) -> Result<(), String>;
+
+    /// Pinned splice_timeline standby keeps the armed carrier alive on
+    /// encoded silence. Stock realtime parks after receiver FLUSH.
+    fn standby_keeps_line_fed(&self) -> bool {
+        false
+    }
 }
 
 /// The session adapter already brackets every lifecycle command with
@@ -96,6 +102,10 @@ impl<C: MsaAp2Client> MsaSessionTransport for MsaAp2Transport<C> {
         self.client.standby()
     }
 
+    fn standby_keeps_line_fed(&self) -> bool {
+        self.client.standby_keeps_line_fed()
+    }
+
     fn resume(&mut self) -> Result<(), String> {
         if !self.quiesced {
             return Err("MSA AP2 transport resume without quiesce".into());
@@ -118,6 +128,7 @@ mod tests {
         fail_start: bool,
         fail_flush: bool,
         fail_standby: bool,
+        keep_line_fed: bool,
     }
 
     impl MsaAp2Client for FakeAp2Client {
@@ -150,6 +161,10 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        fn standby_keeps_line_fed(&self) -> bool {
+            self.keep_line_fed
         }
     }
 

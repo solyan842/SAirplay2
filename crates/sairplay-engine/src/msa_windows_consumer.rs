@@ -92,6 +92,7 @@ pub struct MsaWindowsConsumerWorker {
     packets_sent: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
     in_flight: Arc<AtomicBool>,
+    standby_silence: Arc<AtomicBool>,
 }
 
 impl MsaWindowsConsumerWorker {
@@ -109,6 +110,8 @@ impl MsaWindowsConsumerWorker {
         let paused_thread = Arc::clone(&paused);
         let in_flight = Arc::new(AtomicBool::new(false));
         let in_flight_thread = Arc::clone(&in_flight);
+        let standby_silence = Arc::new(AtomicBool::new(false));
+        let standby_silence_thread = Arc::clone(&standby_silence);
 
         let worker = thread::spawn(move || {
             while running_thread.load(Ordering::SeqCst) {
@@ -145,19 +148,31 @@ impl MsaWindowsConsumerWorker {
                 }
 
                 let packet = match source.lock() {
-                    Ok(mut source) => match source.next_packet(
-                        WINDOWS_PCM_PACKET_BYTES_16_441_STEREO,
-                    ) {
-                        Ok(packet) => packet,
-                        Err(error) => {
-                            if let Ok(mut slot) = last_error_thread.lock() {
-                                *slot = Some(error);
+                    Ok(mut source) => {
+                        let state = source.state();
+                        if state == crate::MsaSessionState::Standby
+                            && standby_silence_thread.load(Ordering::SeqCst)
+                        {
+                            // Pinned splice STANDBY: content is parked, but the
+                            // already-armed carrier line must stay hot. Do not
+                            // consume buffered source PCM here.
+                            Some(vec![0u8; WINDOWS_PCM_PACKET_BYTES_16_441_STEREO])
+                        } else {
+                            match source.next_packet(
+                                WINDOWS_PCM_PACKET_BYTES_16_441_STEREO,
+                            ) {
+                                Ok(packet) => packet,
+                                Err(error) => {
+                                    if let Ok(mut slot) = last_error_thread.lock() {
+                                        *slot = Some(error);
+                                    }
+                                    in_flight_thread.store(false, Ordering::SeqCst);
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
                             }
-                            in_flight_thread.store(false, Ordering::SeqCst);
-                            running_thread.store(false, Ordering::SeqCst);
-                            return;
                         }
-                    },
+                    }
                     Err(_) => {
                         if let Ok(mut slot) = last_error_thread.lock() {
                             *slot = Some("MSA Windows source lock poisoned".into());
@@ -169,8 +184,8 @@ impl MsaWindowsConsumerWorker {
                 };
 
                 let Some(packet) = packet else {
-                    // IDLE/STANDBY or temporary PLAYING starvation: never infer
-                    // a state change and never synthesize a new anchor here.
+                    // IDLE or temporary PLAYING starvation: never infer a
+                    // state change, never synthesize an anchor/silence packet.
                     in_flight_thread.store(false, Ordering::SeqCst);
                     thread::sleep(Duration::from_millis(1));
                     continue;
@@ -197,6 +212,7 @@ impl MsaWindowsConsumerWorker {
             packets_sent,
             paused,
             in_flight,
+            standby_silence,
         }
     }
 
@@ -237,6 +253,14 @@ impl MsaWindowsConsumerWorker {
     pub fn is_quiesced(&self) -> bool {
         self.paused.load(Ordering::SeqCst)
             && !self.in_flight.load(Ordering::SeqCst)
+    }
+
+    pub fn set_standby_silence(&self, enabled: bool) {
+        self.standby_silence.store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn standby_silence_enabled(&self) -> bool {
+        self.standby_silence.load(Ordering::SeqCst)
     }
 
     pub fn stop(&mut self) {
@@ -438,6 +462,67 @@ mod tests {
         assert!(Arc::ptr_eq(&shared, &sink.shared_sender()));
         assert_eq!(shared.lock().unwrap().state().sequence, 10);
         assert_eq!(shared.lock().unwrap().state().timestamp, 20);
+    }
+
+
+    #[test]
+    fn standby_silence_carrier_does_not_consume_buffered_content() {
+        let source = Arc::new(Mutex::new(
+            MsaWindowsSource::new(
+                44_100 * 2 * 2,
+                WINDOWS_PCM_PACKET_BYTES_16_441_STEREO,
+            ).unwrap(),
+        ));
+        {
+            let mut locked = source.lock().unwrap();
+            locked.push_capture_pcm(
+                &vec![9u8; WINDOWS_PCM_PACKET_BYTES_16_441_STEREO],
+            );
+            locked.core_mut().start_committed().unwrap();
+            locked.core_mut().standby_committed().unwrap();
+        }
+
+        let sends = Arc::new(AtomicUsize::new(0));
+        let mut worker = MsaWindowsConsumerWorker::start(
+            Arc::clone(&source),
+            Box::new(FakeSink { sends: Arc::clone(&sends) }),
+        );
+        worker.set_standby_silence(true);
+
+        for _ in 0..100 {
+            if sends.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        worker.stop();
+
+        assert!(sends.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            source.lock().unwrap().buffered_bytes(),
+            WINDOWS_PCM_PACKET_BYTES_16_441_STEREO
+        );
+    }
+
+    #[test]
+    fn standby_without_carrier_policy_sends_nothing() {
+        let source = Arc::new(Mutex::new(
+            MsaWindowsSource::new(
+                44_100 * 2 * 2,
+                WINDOWS_PCM_PACKET_BYTES_16_441_STEREO,
+            ).unwrap(),
+        ));
+        source.lock().unwrap().core_mut().standby_committed().unwrap();
+
+        let sends = Arc::new(AtomicUsize::new(0));
+        let mut worker = MsaWindowsConsumerWorker::start(
+            Arc::clone(&source),
+            Box::new(FakeSink { sends: Arc::clone(&sends) }),
+        );
+        thread::sleep(Duration::from_millis(20));
+        worker.stop();
+
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
     }
 
 }
