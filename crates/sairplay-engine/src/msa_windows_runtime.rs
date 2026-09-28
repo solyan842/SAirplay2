@@ -85,16 +85,44 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
             .map_err(|_| "MSA Windows source lock poisoned".to_owned())
     }
 
+    fn quiesce_consumer(&self) -> Result<(), String> {
+        if let Some(consumer) = self.consumer.as_ref() {
+            consumer.quiesce()?;
+        }
+        Ok(())
+    }
+
+    fn resume_consumer(&self) {
+        if let Some(consumer) = self.consumer.as_ref() {
+            consumer.resume();
+        }
+    }
+
+    fn quiesce_lifecycle(&mut self) -> Result<(), String> {
+        self.quiesce_consumer()?;
+        if let Err(error) = self.transport.quiesce() {
+            self.resume_consumer();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn resume_lifecycle(&mut self) -> Result<(), String> {
+        let transport_result = self.resume_lifecycle();
+        self.resume_consumer();
+        transport_result
+    }
+
     pub fn start(&mut self, requested_start_unix_ms: u64) -> Result<MsaStartAck, String> {
         if self.pending_start.is_some() {
             return Err("cannot START while an MSA deferred START is pending".into());
         }
 
-        self.transport.quiesce()?;
+        self.quiesce_lifecycle()?;
         let committed = match self.transport.commit_start(requested_start_unix_ms) {
             Ok(value) => value,
             Err(error) => {
-                let _ = self.transport.resume();
+                let _ = self.resume_lifecycle();
                 return Err(error);
             }
         };
@@ -102,12 +130,12 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
         let epoch = match self.source.lock() {
             Ok(mut source) => source.core_mut().start_committed()?,
             Err(_) => {
-                let _ = self.transport.resume();
+                let _ = self.resume_lifecycle();
                 return Err("MSA Windows source lock poisoned".into());
             }
         };
 
-        self.transport.resume()?;
+        self.resume_lifecycle()?;
         Ok(MsaStartAck {
             requested_unix_ms: requested_start_unix_ms,
             committed_unix_ms: committed,
@@ -130,15 +158,15 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
             return Err("cannot START an ended MSA Windows session".into());
         }
 
-        self.transport.quiesce()?;
+        self.quiesce_lifecycle()?;
         let committed = match self.transport.commit_start(requested_start_unix_ms) {
             Ok(value) => value,
             Err(error) => {
-                let _ = self.transport.resume();
+                let _ = self.resume_lifecycle();
                 return Err(error);
             }
         };
-        self.transport.resume()?;
+        self.resume_lifecycle()?;
 
         let pending = MsaPendingStart {
             requested_unix_ms: requested_start_unix_ms,
@@ -217,11 +245,11 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
 
     pub fn flush(&mut self) -> Result<MsaFlushAck, String> {
         self.cancel_deferred_start();
-        self.transport.quiesce()?;
+        self.quiesce_lifecycle()?;
         let warm_head = match self.transport.flush() {
             Ok(value) => value,
             Err(error) => {
-                let _ = self.transport.resume();
+                let _ = self.resume_lifecycle();
                 return Err(error);
             }
         };
@@ -229,12 +257,12 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
         match self.source.lock() {
             Ok(mut source) => source.core_mut().flush_committed()?,
             Err(_) => {
-                let _ = self.transport.resume();
+                let _ = self.resume_lifecycle();
                 return Err("MSA Windows source lock poisoned".into());
             }
         }
 
-        self.transport.resume()?;
+        self.resume_lifecycle()?;
         Ok(MsaFlushAck {
             warm_head_unix_ms: warm_head,
         })
@@ -242,21 +270,21 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
 
     pub fn standby(&mut self) -> Result<(), String> {
         self.cancel_deferred_start();
-        self.transport.quiesce()?;
+        self.quiesce_lifecycle()?;
         if let Err(error) = self.transport.stop() {
-            let _ = self.transport.resume();
+            let _ = self.resume_lifecycle();
             return Err(error);
         }
 
         match self.source.lock() {
             Ok(mut source) => source.core_mut().standby_committed()?,
             Err(_) => {
-                let _ = self.transport.resume();
+                let _ = self.resume_lifecycle();
                 return Err("MSA Windows source lock poisoned".into());
             }
         }
 
-        self.transport.resume()
+        self.resume_lifecycle()
     }
 
     pub fn end(&mut self) -> Result<(), String> {

@@ -17,7 +17,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 pub trait MsaWindowsPacketSink: Send + 'static {
     fn can_accept_packet(&mut self, now_ntp: u64) -> bool;
@@ -83,6 +83,8 @@ pub struct MsaWindowsConsumerWorker {
     worker: Option<JoinHandle<()>>,
     last_error: Arc<Mutex<Option<String>>>,
     packets_sent: Arc<AtomicU64>,
+    paused: Arc<AtomicBool>,
+    in_flight: Arc<AtomicBool>,
 }
 
 impl MsaWindowsConsumerWorker {
@@ -96,21 +98,41 @@ impl MsaWindowsConsumerWorker {
         let last_error_thread = Arc::clone(&last_error);
         let packets_sent = Arc::new(AtomicU64::new(0));
         let packets_sent_thread = Arc::clone(&packets_sent);
+        let paused = Arc::new(AtomicBool::new(false));
+        let paused_thread = Arc::clone(&paused);
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let in_flight_thread = Arc::clone(&in_flight);
 
         let worker = thread::spawn(move || {
             while running_thread.load(Ordering::SeqCst) {
+                if paused_thread.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+
+                // Publish in-flight before touching sink/source, then re-check
+                // pause to close the race with lifecycle quiesce.
+                in_flight_thread.store(true, Ordering::SeqCst);
+                if paused_thread.load(Ordering::SeqCst) {
+                    in_flight_thread.store(false, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+
                 let now_ntp = match system_time_to_ntp(SystemTime::now()) {
                     Ok(value) => value,
                     Err(error) => {
                         if let Ok(mut slot) = last_error_thread.lock() {
                             *slot = Some(format!("NTP clock conversion failed: {error:?}"));
                         }
+                        in_flight_thread.store(false, Ordering::SeqCst);
                         running_thread.store(false, Ordering::SeqCst);
                         return;
                     }
                 };
 
                 if !sink.can_accept_packet(now_ntp) {
+                    in_flight_thread.store(false, Ordering::SeqCst);
                     thread::sleep(Duration::from_millis(1));
                     continue;
                 }
@@ -124,6 +146,7 @@ impl MsaWindowsConsumerWorker {
                             if let Ok(mut slot) = last_error_thread.lock() {
                                 *slot = Some(error);
                             }
+                            in_flight_thread.store(false, Ordering::SeqCst);
                             running_thread.store(false, Ordering::SeqCst);
                             return;
                         }
@@ -132,6 +155,7 @@ impl MsaWindowsConsumerWorker {
                         if let Ok(mut slot) = last_error_thread.lock() {
                             *slot = Some("MSA Windows source lock poisoned".into());
                         }
+                        in_flight_thread.store(false, Ordering::SeqCst);
                         running_thread.store(false, Ordering::SeqCst);
                         return;
                     }
@@ -140,6 +164,7 @@ impl MsaWindowsConsumerWorker {
                 let Some(packet) = packet else {
                     // IDLE/STANDBY or temporary PLAYING starvation: never infer
                     // a state change and never synthesize a new anchor here.
+                    in_flight_thread.store(false, Ordering::SeqCst);
                     thread::sleep(Duration::from_millis(1));
                     continue;
                 };
@@ -148,11 +173,13 @@ impl MsaWindowsConsumerWorker {
                     if let Ok(mut slot) = last_error_thread.lock() {
                         *slot = Some(format!("MSA media send failed: {error}"));
                     }
+                    in_flight_thread.store(false, Ordering::SeqCst);
                     running_thread.store(false, Ordering::SeqCst);
                     return;
                 }
 
                 packets_sent_thread.fetch_add(1, Ordering::SeqCst);
+                in_flight_thread.store(false, Ordering::SeqCst);
             }
         });
 
@@ -161,6 +188,8 @@ impl MsaWindowsConsumerWorker {
             worker: Some(worker),
             last_error,
             packets_sent,
+            paused,
+            in_flight,
         }
     }
 
@@ -174,6 +203,33 @@ impl MsaWindowsConsumerWorker {
 
     pub fn last_error(&self) -> Option<String> {
         self.last_error.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Stop the send loop at a packet boundary and wait until any packet
+    /// already inside the sink/source critical section has completed.
+    pub fn quiesce(&self) -> Result<(), String> {
+        self.paused.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        while self.in_flight.load(Ordering::SeqCst) {
+            if !self.running.load(Ordering::SeqCst) {
+                return Err("MSA Windows consumer stopped while quiescing".into());
+            }
+            if Instant::now() >= deadline {
+                return Err("MSA Windows consumer quiesce timed out".into());
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_quiesced(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+            && !self.in_flight.load(Ordering::SeqCst)
     }
 
     pub fn stop(&mut self) {
@@ -294,4 +350,51 @@ mod tests {
         assert_eq!(sends.load(Ordering::SeqCst), 0);
         assert_eq!(source.lock().unwrap().state(), MsaSessionState::Playing);
     }
+
+    #[test]
+    fn quiesce_freezes_packet_count_until_resume() {
+        let source = Arc::new(Mutex::new(
+            MsaWindowsSource::new(
+                44_100 * 2 * 2,
+                WINDOWS_PCM_PACKET_BYTES_16_441_STEREO,
+            ).unwrap(),
+        ));
+        {
+            let mut locked = source.lock().unwrap();
+            locked.push_capture_pcm(
+                &vec![7u8; WINDOWS_PCM_PACKET_BYTES_16_441_STEREO * 32],
+            );
+            locked.core_mut().start_committed().unwrap();
+        }
+
+        let sends = Arc::new(AtomicUsize::new(0));
+        let mut worker = MsaWindowsConsumerWorker::start(
+            Arc::clone(&source),
+            Box::new(FakeSink { sends: Arc::clone(&sends) }),
+        );
+
+        for _ in 0..100 {
+            if sends.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        worker.quiesce().unwrap();
+        assert!(worker.is_quiesced());
+        let frozen = sends.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(sends.load(Ordering::SeqCst), frozen);
+
+        worker.resume();
+        for _ in 0..100 {
+            if sends.load(Ordering::SeqCst) > frozen {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        worker.stop();
+        assert!(sends.load(Ordering::SeqCst) > frozen);
+    }
+
 }
