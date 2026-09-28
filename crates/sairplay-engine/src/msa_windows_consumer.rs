@@ -24,35 +24,42 @@ pub trait MsaWindowsPacketSink: Send + 'static {
     fn send_packet(&mut self, pcm: &[u8], now_ntp: u64) -> Result<(), String>;
 }
 
+pub type SharedRealtimeMediaSender = Arc<Mutex<RealtimeMediaSender>>;
+
 pub struct RealtimeMsaPacketSink {
-    sender: RealtimeMediaSender,
+    sender: SharedRealtimeMediaSender,
     lead_frames: u32,
 }
 
 impl RealtimeMsaPacketSink {
     pub fn new(sender: RealtimeMediaSender, lead_frames: u32) -> Self {
+        Self::from_shared(Arc::new(Mutex::new(sender)), lead_frames)
+    }
+
+    pub fn from_shared(sender: SharedRealtimeMediaSender, lead_frames: u32) -> Self {
         Self {
             sender,
             lead_frames,
         }
     }
 
-    pub fn sender(&self) -> &RealtimeMediaSender {
-        &self.sender
-    }
-
-    pub fn sender_mut(&mut self) -> &mut RealtimeMediaSender {
-        &mut self.sender
+    pub fn shared_sender(&self) -> SharedRealtimeMediaSender {
+        Arc::clone(&self.sender)
     }
 }
 
 impl MsaWindowsPacketSink for RealtimeMsaPacketSink {
     fn can_accept_packet(&mut self, now_ntp: u64) -> bool {
-        self.sender.can_accept_frames(now_ntp)
+        self.sender
+            .lock()
+            .map(|mut sender| sender.can_accept_frames(now_ntp))
+            .unwrap_or(false)
     }
 
     fn send_packet(&mut self, pcm: &[u8], now_ntp: u64) -> Result<(), String> {
         self.sender
+            .lock()
+            .map_err(|_| "MSA realtime sender lock poisoned".to_owned())?
             .send_pcm_352(pcm, now_ntp, self.lead_frames)
             .map(|_| ())
             .map_err(|error: MediaSendError| format!("{error:?}"))
@@ -395,6 +402,36 @@ mod tests {
         }
         worker.stop();
         assert!(sends.load(Ordering::SeqCst) > frozen);
+    }
+
+
+    #[test]
+    fn realtime_sink_and_lifecycle_share_one_sender_instance() {
+        use crate::{MediaTransport, RtpState};
+        use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+
+        let data_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ctrl_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut transport = MediaTransport::bind(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
+        transport.attach_remote(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            crate::StreamPorts {
+                data_port: data_rx.local_addr().unwrap().port(),
+                control_port: ctrl_rx.local_addr().unwrap().port(),
+            },
+        );
+
+        let sender = RealtimeMediaSender::new(
+            transport,
+            RtpState::new(10, 20, 30),
+            [0x33u8; 32],
+        );
+        let shared = Arc::new(Mutex::new(sender));
+        let sink = RealtimeMsaPacketSink::from_shared(Arc::clone(&shared), 11_025);
+
+        assert!(Arc::ptr_eq(&shared, &sink.shared_sender()));
+        assert_eq!(shared.lock().unwrap().state().sequence, 10);
+        assert_eq!(shared.lock().unwrap().state().timestamp, 20);
     }
 
 }

@@ -184,3 +184,5 @@ pub use native_flush::{
 };
 
 pub use media_sender::MsaRealtimeFlushPoint;
+
+pub use msa_windows_consumer::SharedRealtimeMediaSender;
