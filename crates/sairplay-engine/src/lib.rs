@@ -1,3 +1,4 @@
+pub mod msa_windows_capture;
 pub mod msa_windows_source;
 pub mod msa_failure_isolation;
 pub mod msa_late_join_runtime;
@@ -141,4 +142,8 @@ pub use msa_failure_isolation::{
 
 pub use msa_windows_source::{
     MsaWindowsSource, WINDOWS_PCM_PACKET_BYTES_16_441_STEREO,
+};
+
+pub use msa_windows_capture::{
+    MsaWindowsCaptureError, MsaWindowsCaptureWorker,
 };

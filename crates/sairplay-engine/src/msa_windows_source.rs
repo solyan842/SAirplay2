@@ -53,6 +53,12 @@ impl MsaWindowsSource {
     pub fn buffered_bytes(&self) -> usize {
         self.core.buffered_bytes()
     }
+
+    pub fn input_room_bytes(&self) -> usize {
+        self.core
+            .capacity_bytes()
+            .saturating_sub(self.core.buffered_bytes())
+    }
 }
 
 #[cfg(test)]
