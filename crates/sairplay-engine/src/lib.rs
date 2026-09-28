@@ -1,3 +1,4 @@
+pub mod msa_windows_runtime;
 pub mod msa_windows_consumer;
 pub mod msa_windows_capture;
 pub mod msa_windows_source;
@@ -153,3 +154,5 @@ pub use msa_windows_consumer::{
     MsaWindowsConsumerError, MsaWindowsConsumerWorker, MsaWindowsPacketSink,
     RealtimeMsaPacketSink,
 };
+
+pub use msa_windows_runtime::MsaWindowsRuntimeSession;
