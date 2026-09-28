@@ -292,6 +292,38 @@ struct LegacyCommandControl {
     flushed_rx: Receiver<Result<GroupFlushAck, String>>,
 }
 
+impl GroupStartParticipant for LegacyCommandControl {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn start_at_unix_ms(&mut self, requested_start_unix_ms: u64) -> Result<u64, String> {
+        send_start_command(&mut self.pipe, requested_start_unix_ms)
+            .map_err(|error| format!("cannot send START command: {error}"))?;
+
+        let ack = self
+            .started_rx
+            .recv_timeout(RAOP_START_ACK_TIMEOUT)
+            .map_err(|error| {
+                format!(
+                    "START acknowledgement not received within {} ms: {}",
+                    RAOP_START_ACK_TIMEOUT.as_millis(),
+                    error
+                )
+            })?;
+        let (requested, actual) = ack?;
+
+        if requested != requested_start_unix_ms {
+            return Err(format!(
+                "helper acknowledged request {} instead of {}",
+                requested, requested_start_unix_ms
+            ));
+        }
+
+        Ok(actual)
+    }
+}
+
 impl LegacyCommandControl {
     /// Execute the exact parent-side FLUSH transaction used by current Music
     /// Assistant: hold stdin quiet, send ACTION=FLUSH out-of-band, wait for the
@@ -352,10 +384,10 @@ pub struct LegacyGroupSession {
     external_pcm_sinks: Vec<LegacyPcmSink>,
     external_writers: Vec<JoinHandle<()>>,
     // Keep the MSA-style Windows command channel and acknowledgements alive
-    // for the whole persistent helper lifetime. FLUSH is deliberately not
-    // exposed to callers yet: MSA requires stdin/session-ring quiescing before
-    // FLUSH, and the legacy producer layer is normalized in the next step.
-    _command_controls: Vec<LegacyCommandControl>,
+    // for the whole persistent helper lifetime. External-feed sessions borrow
+    // these controls for common cross-transport START; FLUSH remains internal
+    // until the continuous-source boundary is source-aligned.
+    command_controls: Vec<LegacyCommandControl>,
 }
 
 impl LegacyGroupSession {
@@ -393,6 +425,7 @@ impl LegacyGroupSession {
 
         let member_count = configs.len();
         let scheduled_group_start = member_count > 1;
+        let command_session = scheduled_group_start || external_pcm_feed;
         let helper = helper_path()?;
 
         let running = Arc::new(AtomicBool::new(true));
@@ -407,7 +440,7 @@ impl LegacyGroupSession {
             spawned.push(spawn_member(
                 &helper,
                 config,
-                scheduled_group_start,
+                command_session,
                 Arc::clone(&running),
                 Arc::clone(&last_error),
                 Arc::clone(&startup_events),
@@ -459,7 +492,7 @@ impl LegacyGroupSession {
         // rounds; if the fourth round still corrects, retain where members
         // actually landed rather than recording a retry that was never sent.
         let start_result = (|| -> Result<Option<u64>, LegacyGroupError> {
-            if !scheduled_group_start {
+            if external_pcm_feed || !scheduled_group_start {
                 return Ok(None);
             }
 
@@ -747,7 +780,7 @@ impl LegacyGroupSession {
             volume_controls,
             external_pcm_sinks,
             external_writers,
-            _command_controls: command_controls,
+            command_controls,
         })
     }
 
@@ -757,6 +790,19 @@ impl LegacyGroupSession {
         std::mem::take(&mut self.external_pcm_sinks)
             .into_iter()
             .map(|sink| Box::new(sink) as Box<dyn GroupPcmParticipant>)
+            .collect()
+    }
+
+    /// Borrow the external RAOP command controls as common START participants.
+    ///
+    /// connect_external_pcm() guarantees command sessions even for one RAOP
+    /// member. START remains owned by the higher-level mixed orchestrator.
+    pub fn external_start_participants(
+        &mut self,
+    ) -> Vec<&mut dyn GroupStartParticipant> {
+        self.command_controls
+            .iter_mut()
+            .map(|control| control as &mut dyn GroupStartParticipant)
             .collect()
     }
 
