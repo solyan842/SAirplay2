@@ -393,6 +393,12 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
         assert_eq!(sends.load(Ordering::SeqCst), frozen);
 
+        // Ensure resume has fresh work even if the fast fake sink drained all
+        // originally buffered packets before quiesce won the scheduling race.
+        source.lock().unwrap().push_capture_pcm(
+            &vec![8u8; WINDOWS_PCM_PACKET_BYTES_16_441_STEREO],
+        );
+
         worker.resume();
         for _ in 0..100 {
             if sends.load(Ordering::SeqCst) > frozen {
