@@ -739,7 +739,7 @@ mod tests {
         let state = RtpState::new(77, 0x00AA_5500, 0);
         let mut sender = RealtimeMediaSender::new(transport, state, [0x11u8; 32]);
 
-        let unix_ms = 12_345u64;
+        let unix_ms = 12_000u64;
         let ntp_seconds = 2_208_988_800u64 + unix_ms / 1000;
         let remainder_ms = unix_ms % 1000;
         let head_frames = ntp_seconds * 44_100 + remainder_ms * 44_100 / 1000;
@@ -749,7 +749,7 @@ mod tests {
 
         assert_eq!(point.sequence, 77);
         assert_eq!(point.rtptime, 0x00AA_5500);
-        assert_eq!(point.warm_head_unix_ms, Some(12_345));
+        assert_eq!(point.warm_head_unix_ms, Some(12_000));
     }
 
     #[test]
