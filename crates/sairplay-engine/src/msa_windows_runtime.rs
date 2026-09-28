@@ -11,9 +11,10 @@
 //! code from publishing playback state on its own.
 
 use crate::{
-    MsaFlushAck, MsaSessionState, MsaSessionTransport, MsaStartAck,
-    MsaWindowsCaptureError, MsaWindowsCaptureWorker, MsaWindowsConsumerWorker,
-    MsaWindowsPacketSink, MsaWindowsSource,
+    MsaAp2VerifyEvent, MsaAp2VerifyResult, MsaFlushAck, MsaSessionState,
+    MsaSessionTransport, MsaStartAck, MsaWindowsCaptureError,
+    MsaWindowsCaptureWorker, MsaWindowsConsumerWorker, MsaWindowsPacketSink,
+    MsaWindowsSource,
 };
 use std::sync::{Arc, Mutex};
 
@@ -182,6 +183,36 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
 
     pub fn pending_start(&self) -> Option<MsaPendingStart> {
         self.pending_start
+    }
+
+    /// Consume the terminal AP2 clock-verification event for a deferred cold
+    /// join START. The AP2 backend owns any required anchor rebase; this layer
+    /// only publishes PLAYING once the backend emits the final START ack truth.
+    ///
+    /// Idle means verification is still pending. Every terminal event for a
+    /// deferred join must carry start_ack=true exactly once.
+    pub fn apply_deferred_ap2_verification(
+        &mut self,
+        event: MsaAp2VerifyEvent,
+    ) -> Result<Option<MsaStartAck>, String> {
+        if event.result == MsaAp2VerifyResult::Idle {
+            return Ok(None);
+        }
+
+        if self.pending_start.is_none() {
+            return Err("AP2 verification completed without a pending deferred START".into());
+        }
+
+        if !event.start_ack {
+            return Err(
+                "terminal AP2 verification for deferred START omitted START ack".into(),
+            );
+        }
+
+        // Verified and Unverified both keep the original anchor in event.at;
+        // Corrected carries the rebased audible instant. In every case the
+        // event's at_unix_ms is the only truth released to the session owner.
+        self.complete_deferred_start(event.at_unix_ms).map(Some)
     }
 
     pub fn flush(&mut self) -> Result<MsaFlushAck, String> {
@@ -456,6 +487,103 @@ mod tests {
         rt.begin_deferred_start(12_000).unwrap();
 
         assert!(rt.start(13_000).is_err());
+        assert_eq!(rt.state().unwrap(), MsaSessionState::Idle);
+        assert_eq!(rt.source.lock().unwrap().core().epoch(), 0);
+    }
+
+
+    #[test]
+    fn idle_verification_keeps_deferred_start_blocked() {
+        let mut rt = runtime(FakeTransport {
+            committed: 12_345,
+            ..Default::default()
+        });
+        rt.begin_deferred_start(12_000).unwrap();
+
+        let result = rt.apply_deferred_ap2_verification(MsaAp2VerifyEvent {
+            result: MsaAp2VerifyResult::Idle,
+            requested_unix_ms: 0,
+            from_unix_ms: 0,
+            at_unix_ms: 0,
+            margin_ms: 0,
+            content_cut_ms: 0,
+            start_ack: false,
+        }).unwrap();
+
+        assert!(result.is_none());
+        assert!(rt.pending_start().is_some());
+        assert_eq!(rt.state().unwrap(), MsaSessionState::Idle);
+        assert_eq!(rt.source.lock().unwrap().core().epoch(), 0);
+    }
+
+    #[test]
+    fn corrected_verification_ack_releases_playing_at_corrected_truth() {
+        let mut rt = runtime(FakeTransport {
+            committed: 12_345,
+            ..Default::default()
+        });
+        rt.begin_deferred_start(12_000).unwrap();
+
+        let ack = rt.apply_deferred_ap2_verification(MsaAp2VerifyEvent {
+            result: MsaAp2VerifyResult::Corrected,
+            requested_unix_ms: 12_000,
+            from_unix_ms: 12_345,
+            at_unix_ms: 12_700,
+            margin_ms: -355,
+            content_cut_ms: 0,
+            start_ack: true,
+        }).unwrap().unwrap();
+
+        assert_eq!(ack.requested_unix_ms, 12_000);
+        assert_eq!(ack.committed_unix_ms, 12_700);
+        assert_eq!(ack.epoch, 1);
+        assert!(rt.pending_start().is_none());
+        assert_eq!(rt.state().unwrap(), MsaSessionState::Playing);
+    }
+
+    #[test]
+    fn verified_or_unverified_terminal_ack_can_release_original_anchor() {
+        for result in [MsaAp2VerifyResult::Verified, MsaAp2VerifyResult::Unverified] {
+            let mut rt = runtime(FakeTransport {
+                committed: 12_345,
+                ..Default::default()
+            });
+            rt.begin_deferred_start(12_000).unwrap();
+
+            let ack = rt.apply_deferred_ap2_verification(MsaAp2VerifyEvent {
+                result,
+                requested_unix_ms: 12_000,
+                from_unix_ms: 12_345,
+                at_unix_ms: 12_345,
+                margin_ms: 0,
+                content_cut_ms: 0,
+                start_ack: true,
+            }).unwrap().unwrap();
+
+            assert_eq!(ack.committed_unix_ms, 12_345);
+            assert_eq!(rt.state().unwrap(), MsaSessionState::Playing);
+        }
+    }
+
+    #[test]
+    fn terminal_deferred_verification_without_ack_is_rejected() {
+        let mut rt = runtime(FakeTransport {
+            committed: 12_345,
+            ..Default::default()
+        });
+        rt.begin_deferred_start(12_000).unwrap();
+
+        assert!(rt.apply_deferred_ap2_verification(MsaAp2VerifyEvent {
+            result: MsaAp2VerifyResult::Corrected,
+            requested_unix_ms: 12_000,
+            from_unix_ms: 12_345,
+            at_unix_ms: 12_700,
+            margin_ms: -355,
+            content_cut_ms: 355,
+            start_ack: false,
+        }).is_err());
+
+        assert!(rt.pending_start().is_some());
         assert_eq!(rt.state().unwrap(), MsaSessionState::Idle);
         assert_eq!(rt.source.lock().unwrap().core().epoch(), 0);
     }
