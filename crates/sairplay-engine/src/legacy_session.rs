@@ -1,10 +1,15 @@
 #![cfg(windows)]
 
 use crate::{
+    cross_transport_timeline::{
+        evaluate_group_start_round, GroupStartRoundDecision,
+        AIRPLAY_COLD_GROUP_START_LEAD_MS, AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
+    },
     system_time_to_ntp, volume_percent_to_db, Pcm352Chunker, VolumeSetResult,
     WasapiLoopbackCapture, WasapiLoopbackError, PCM352_PACKET_BYTES,
 };
 use std::fmt;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -15,18 +20,20 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const LIBRAOP_PINNED_COMMIT: &str = "dadcfcaa26d988cdd3e3501ddf8286c224f1b494";
 const RAOP_CONFIGURED_LATENCY_FRAMES: u32 = 44_100;
 const RAOP_FIXED_LATENCY_FRAMES: u32 = 11_025;
-const RAOP_GROUP_START_LEAD_MS: u64 = 5_000;
 const WRITER_QUEUE_PACKETS: usize = 96;
+const RAOP_START_ACK_TIMEOUT: Duration = Duration::from_millis(7_000);
+const RAOP_FLUSH_ACK_TIMEOUT: Duration = Duration::from_millis(2_000);
 // Music Assistant's current source treats a player that does not consume its
 // PCM feed for 35 s as a failed member. Do the same here, but preserve every
 // PCM packet until that deadline instead of guessing a larger queue.
 const WRITER_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(35);
 static LEGACY_VOLUME_FILE_ID: AtomicU64 = AtomicU64::new(1);
+static LEGACY_COMMAND_PIPE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct LegacyMemberConfig {
@@ -69,6 +76,7 @@ pub enum LegacyGroupError {
     HelperMissing(PathBuf),
     Spawn { name: String, error: String },
     Connect { name: String, error: String },
+    Start { name: String, error: String },
     Capture(WasapiLoopbackError),
     Time(String),
 }
@@ -87,6 +95,9 @@ impl fmt::Display for LegacyGroupError {
             }
             Self::Connect { name, error } => {
                 write!(f, "{name}: libraop did not reach connected state: {error}")
+            }
+            Self::Start { name, error } => {
+                write!(f, "{name}: libraop did not commit commanded START: {error}")
             }
             Self::Capture(error) => write!(f, "{error}"),
             Self::Time(error) => write!(f, "{error}"),
@@ -122,13 +133,82 @@ impl LegacyVolumeControl {
     }
 }
 
+enum LegacyWriterCommand {
+    Quiesce(SyncSender<Result<(), String>>),
+    Resume,
+}
+
 struct SpawnedMember {
     name: String,
     pid: u32,
     pcm_tx: SyncSender<[u8; PCM352_PACKET_BYTES]>,
+    writer_control_tx: SyncSender<LegacyWriterCommand>,
     connected_rx: Receiver<Result<(), String>>,
+    started_rx: Option<Receiver<Result<(u64, u64), String>>>,
+    flushed_rx: Option<Receiver<Result<Option<u64>, String>>>,
+    command_pipe: Option<File>,
     writer: JoinHandle<()>,
     volume_control: LegacyVolumeControl,
+}
+
+struct LegacyCommandControl {
+    #[allow(dead_code)]
+    name: String,
+    #[allow(dead_code)]
+    pipe: File,
+    #[allow(dead_code)]
+    writer_control_tx: SyncSender<LegacyWriterCommand>,
+    #[allow(dead_code)]
+    started_rx: Receiver<Result<(u64, u64), String>>,
+    #[allow(dead_code)]
+    flushed_rx: Receiver<Result<Option<u64>, String>>,
+}
+
+impl LegacyCommandControl {
+    /// Execute the exact parent-side FLUSH transaction used by current Music
+    /// Assistant: hold stdin quiet, send ACTION=FLUSH out-of-band, wait for the
+    /// binary acknowledgement, then release stdin again.
+    ///
+    /// The caller is responsible for defining the content boundary before
+    /// entering this function. For track-based MA that means "old feeder
+    /// stopped". SAirplay2's continuous WASAPI path does not yet expose this
+    /// method because inventing where to cut live system audio would diverge
+    /// from source behavior.
+    #[allow(dead_code)]
+    fn flush_quiesced(&mut self) -> Result<Option<u64>, String> {
+        quiesce_legacy_writer(&self.writer_control_tx)?;
+
+        let transaction = (|| -> Result<Option<u64>, String> {
+            send_flush_command(&mut self.pipe)
+                .map_err(|error| format!("cannot send ACTION=FLUSH: {error}"))?;
+
+            let ack = self
+                .flushed_rx
+                .recv_timeout(RAOP_FLUSH_ACK_TIMEOUT)
+                .map_err(|error| {
+                    format!(
+                        "FLUSH acknowledgement not received within {} ms: {}",
+                        RAOP_FLUSH_ACK_TIMEOUT.as_millis(),
+                        error
+                    )
+                })?;
+
+            ack
+        })();
+
+        // Match the async-context-manager lifetime in Music Assistant:
+        // stdin becomes writable again regardless of whether FLUSH succeeded,
+        // timed out or was rejected. The caller decides whether to cold restart.
+        let resume = resume_legacy_writer(&self.writer_control_tx);
+        match (transaction, resume) {
+            (Ok(head), Ok(())) => Ok(head),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(first), Err(resume_error)) => Err(format!(
+                "{first}; additionally failed to resume PCM writer: {resume_error}"
+            )),
+        }
+    }
 }
 
 pub struct LegacyGroupSession {
@@ -141,6 +221,11 @@ pub struct LegacyGroupSession {
     startup_events: Arc<Mutex<Vec<String>>>,
     active_members: Arc<AtomicU64>,
     volume_controls: Vec<LegacyVolumeControl>,
+    // Keep the MSA-style Windows command channel and acknowledgements alive
+    // for the whole persistent helper lifetime. FLUSH is deliberately not
+    // exposed to callers yet: MSA requires stdin/session-ring quiescing before
+    // FLUSH, and the legacy producer layer is normalized in the next step.
+    _command_controls: Vec<LegacyCommandControl>,
 }
 
 impl LegacyGroupSession {
@@ -152,11 +237,6 @@ impl LegacyGroupSession {
         let member_count = configs.len();
         let scheduled_group_start = member_count > 1;
         let helper = helper_path()?;
-        let now_ntp = system_time_to_ntp(SystemTime::now())
-            .map_err(|error| LegacyGroupError::Time(format!(
-                "NTP clock conversion failed: {error:?}"
-            )))?;
-        let start_ntp = now_ntp.saturating_add(ms_to_ntp(RAOP_GROUP_START_LEAD_MS));
 
         let running = Arc::new(AtomicBool::new(true));
         let last_error = Arc::new(Mutex::new(None));
@@ -170,7 +250,7 @@ impl LegacyGroupSession {
             spawned.push(spawn_member(
                 &helper,
                 config,
-                scheduled_group_start.then_some(start_ntp),
+                scheduled_group_start,
                 Arc::clone(&running),
                 Arc::clone(&last_error),
                 Arc::clone(&startup_events),
@@ -213,6 +293,97 @@ impl LegacyGroupSession {
             return Err(LegacyGroupError::Connect { name, error });
         }
 
+        // MSA source order: establish every receiver connection first, then
+        // fan one shared audible START out to every member. Each round waits for
+        // all TRUE scheduled-instant acknowledgements concurrently, removes any
+        // per-member sync adjustment (legacy currently has none, so 0), and
+        // feeds the common cross-transport convergence contract. A correction
+        // re-anchors every member at largest_ack + 150 ms for at most four
+        // rounds; if the fourth round still corrects, retain where members
+        // actually landed rather than recording a retry that was never sent.
+        let start_result = (|| -> Result<Option<u64>, LegacyGroupError> {
+            if !scheduled_group_start {
+                return Ok(None);
+            }
+
+            let initial_start_unix_ms = current_unix_ms()
+                .map_err(LegacyGroupError::Time)?
+                .saturating_add(AIRPLAY_COLD_GROUP_START_LEAD_MS);
+            let mut target_unix_ms = initial_start_unix_ms;
+            let mut committed_unix_ms = initial_start_unix_ms;
+            let mut converged = false;
+            let mut rounds = 0usize;
+
+            for round in 1..=AIRPLAY_START_CONVERGENCE_MAX_ROUNDS {
+                rounds = round;
+                let member_acks =
+                    command_legacy_start_round(&mut spawned, target_unix_ms)?;
+
+                match evaluate_group_start_round(target_unix_ms, &member_acks) {
+                    GroupStartRoundDecision::Converged { anchor_unix_ms }
+                    | GroupStartRoundDecision::SoloCorrected { anchor_unix_ms } => {
+                        committed_unix_ms = anchor_unix_ms;
+                        converged = true;
+                        break;
+                    }
+                    GroupStartRoundDecision::Retry {
+                        next_target_unix_ms,
+                        corrected_unix_ms,
+                    } => {
+                        committed_unix_ms = corrected_unix_ms;
+                        if let Ok(mut events) = startup_events.lock() {
+                            events.push(format!(
+                                "Legacy group START corrected: round {round}/{} · requested={} · largest_ack={} · retry={}.",
+                                AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
+                                target_unix_ms,
+                                corrected_unix_ms,
+                                next_target_unix_ms
+                            ));
+                        }
+                        if round < AIRPLAY_START_CONVERGENCE_MAX_ROUNDS {
+                            target_unix_ms = next_target_unix_ms;
+                        }
+                    }
+                }
+            }
+
+            if !converged {
+                if let Ok(mut events) = startup_events.lock() {
+                    events.push(format!(
+                        "Legacy group START did not converge after {} rounds · retaining last acknowledged instant {}.",
+                        AIRPLAY_START_CONVERGENCE_MAX_ROUNDS,
+                        committed_unix_ms
+                    ));
+                }
+            }
+
+            if let Ok(mut events) = startup_events.lock() {
+                events.push(format!(
+                    "Legacy group START committed after all members connected · initial={} · committed={} · rounds={} · lead={} ms.",
+                    initial_start_unix_ms,
+                    committed_unix_ms,
+                    rounds,
+                    AIRPLAY_COLD_GROUP_START_LEAD_MS
+                ));
+            }
+            Ok(Some(committed_unix_ms))
+        })();
+
+        let committed_group_start_unix_ms = match start_result {
+            Ok(value) => value,
+            Err(error) => {
+                running.store(false, Ordering::SeqCst);
+                for member in &spawned {
+                    kill_helper_tree(member.pid);
+                }
+                for member in spawned {
+                    drop(member.pcm_tx);
+                    let _ = member.writer.join();
+                }
+                return Err(error);
+            }
+        };
+
         let running_thread = Arc::clone(&running);
         let error_thread = Arc::clone(&last_error);
         let disc_thread = Arc::clone(&discontinuities);
@@ -229,23 +400,36 @@ impl LegacyGroupSession {
             .iter()
             .map(|member| (member.name.clone(), member.pcm_tx.clone()))
             .collect::<Vec<_>>();
+        let command_controls = spawned
+            .iter_mut()
+            .filter_map(|member| {
+                let pipe = member.command_pipe.take()?;
+                let started_rx = member.started_rx.take()?;
+                let flushed_rx = member.flushed_rx.take()?;
+                Some(LegacyCommandControl {
+                    name: member.name.clone(),
+                    pipe,
+                    writer_control_tx: member.writer_control_tx.clone(),
+                    started_rx,
+                    flushed_rx,
+                })
+            })
+            .collect::<Vec<_>>();
         let writers = spawned
             .drain(..)
             .map(|member| member.writer)
             .collect::<Vec<_>>();
 
-        // Source behavior for a single RAOP receiver is immediate playback:
-        // cliraop enters PLAYING after connect and raopcl_accept_frames() owns
-        // all pacing. Do not impose our shared NTP anchor on that path.
-        //
-        // Only a real legacy group needs -n and a common audible anchor.
-        let feed_ntp = if scheduled_group_start {
+        // Solo keeps the already-validated immediate libraop path. A real
+        // group is now commanded only after connection readiness, and the PCM
+        // feed begins one configured+fixed receiver-latency window before the
+        // verified audible instant, as on the existing libraop transport.
+        let feed_ntp = committed_group_start_unix_ms.map(|start_unix_ms| {
             let total_latency_frames =
                 RAOP_CONFIGURED_LATENCY_FRAMES + RAOP_FIXED_LATENCY_FRAMES;
-            Some(start_ntp.saturating_sub(frames_to_ntp(total_latency_frames)))
-        } else {
-            None
-        };
+            unix_ms_to_ntp(start_unix_ms)
+                .saturating_sub(frames_to_ntp(total_latency_frames))
+        });
 
         let worker = thread::Builder::new()
             .name("sairplay-legacy-audio".into())
@@ -409,6 +593,7 @@ impl LegacyGroupSession {
             startup_events,
             active_members,
             volume_controls,
+            _command_controls: command_controls,
         })
     }
 
@@ -484,7 +669,7 @@ impl Drop for LegacyGroupSession {
 fn spawn_member(
     helper: &Path,
     config: LegacyMemberConfig,
-    start_ntp: Option<u64>,
+    command_session: bool,
     running: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
     startup_events: Arc<Mutex<Vec<String>>>,
@@ -500,6 +685,14 @@ fn spawn_member(
             name: config.name.clone(),
             error: format!("cannot initialize legacy volume control: {error}"),
         })?;
+
+    let command_pipe_name = command_session.then(|| {
+        format!(
+            r"\\.\pipe\sairplay2-raop-{}-{}",
+            std::process::id(),
+            LEGACY_COMMAND_PIPE_ID.fetch_add(1, Ordering::SeqCst)
+        )
+    });
 
     let mut command = Command::new(helper);
     command
@@ -518,8 +711,8 @@ fn spawn_member(
         .arg("-d")
         .arg("3");
 
-    if let Some(start_ntp) = start_ntp {
-        command.arg("-n").arg(start_ntp.to_string());
+    if let Some(pipe_name) = command_pipe_name.as_deref() {
+        command.arg("-C").arg(pipe_name);
     }
 
     if config.compressed_alac {
@@ -548,6 +741,15 @@ fn spawn_member(
     })?;
     let child_pid = child.id();
 
+    let command_pipe = if let Some(pipe_name) = command_pipe_name.as_deref() {
+        Some(open_command_pipe_writer(pipe_name).map_err(|error| LegacyGroupError::Spawn {
+            name: config.name.clone(),
+            error: format!("cannot attach runtime command pipe: {error}"),
+        })?)
+    } else {
+        None
+    };
+
     let stdin = child.stdin.take().ok_or_else(|| LegacyGroupError::Spawn {
         name: config.name.clone(),
         error: "helper stdin pipe was not created".into(),
@@ -558,6 +760,8 @@ fn spawn_member(
     })?;
 
     let (connected_tx, connected_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let (started_tx, started_rx) = mpsc::sync_channel::<Result<(u64, u64), String>>(4);
+    let (flushed_tx, flushed_rx) = mpsc::sync_channel::<Result<Option<u64>, String>>(4);
     let reader_name = config.name.clone();
     let reader_events = Arc::clone(&startup_events);
     thread::Builder::new()
@@ -583,6 +787,14 @@ fn spawn_member(
                 if !connected && lower.contains("connected to") {
                     connected = true;
                     let _ = connected_tx.send(Ok(()));
+                } else if let Some((requested, actual)) = parse_started_status(&line) {
+                    let _ = started_tx.send(Ok((requested, actual)));
+                } else if let Some(head_unix_ms) = parse_flushed_status(&line) {
+                    let _ = flushed_tx.send(Ok(head_unix_ms));
+                } else if lower.contains("[status] error code=start_failed") {
+                    let _ = started_tx.send(Err(line.clone()));
+                } else if lower.contains("[status] error code=flush_failed") {
+                    let _ = flushed_tx.send(Err(line.clone()));
                 } else if lower.contains("cannot connect to airplay device")
                     || lower.contains("request failed")
                     || lower.contains("auth-setup failed")
@@ -607,6 +819,8 @@ fn spawn_member(
 
     let (pcm_tx, pcm_rx) =
         mpsc::sync_channel::<[u8; PCM352_PACKET_BYTES]>(WRITER_QUEUE_PACKETS);
+    let (writer_control_tx, writer_control_rx) =
+        mpsc::sync_channel::<LegacyWriterCommand>(2);
     let writer_name = config.name.clone();
     let writer_events = Arc::clone(&startup_events);
     let writer_running = Arc::clone(&running);
@@ -621,6 +835,7 @@ fn spawn_member(
                 &mut child,
                 stdin,
                 pcm_rx,
+                writer_control_rx,
                 writer_running,
                 writer_error,
                 writer_events,
@@ -636,7 +851,11 @@ fn spawn_member(
         name: config.name,
         pid: child_pid,
         pcm_tx,
+        writer_control_tx,
         connected_rx,
+        started_rx: command_session.then_some(started_rx),
+        flushed_rx: command_session.then_some(flushed_rx),
+        command_pipe,
         writer,
         volume_control: LegacyVolumeControl::new(volume_path),
     })
@@ -647,11 +866,14 @@ fn legacy_writer_loop(
     child: &mut Child,
     mut stdin: ChildStdin,
     pcm_rx: Receiver<[u8; PCM352_PACKET_BYTES]>,
+    control_rx: Receiver<LegacyWriterCommand>,
     running: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
     startup_events: Arc<Mutex<Vec<String>>>,
     active_members: Arc<AtomicU64>,
 ) {
+    let mut quiesced = false;
+
     while running.load(Ordering::SeqCst) {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -667,6 +889,58 @@ fn legacy_writer_loop(
                 }
                 break;
             }
+        }
+
+        // Music Assistant's stdin_quiesced() first prevents any later write
+        // from interleaving, then waits until every byte already queued by the
+        // parent has reached the OS pipe.  This control path is the equivalent
+        // boundary for the synchronous Windows writer: callers MUST stop the
+        // producer before requesting Quiesce; we drain the bounded Rust queue,
+        // flush ChildStdin, acknowledge, then hold all later writes until
+        // Resume. The helper can safely drain the Windows pipe during that
+        // quiet window.
+        match control_rx.try_recv() {
+            Ok(LegacyWriterCommand::Quiesce(reply)) => {
+                let result = (|| -> Result<(), String> {
+                    loop {
+                        match pcm_rx.try_recv() {
+                            Ok(packet) => stdin
+                                .write_all(&packet)
+                                .map_err(|error| format!("PCM pipe failed while quiescing: {error}"))?,
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                    stdin
+                        .flush()
+                        .map_err(|error| format!("PCM pipe flush failed while quiescing: {error}"))?;
+                    Ok(())
+                })();
+                let failed = result.is_err();
+                let _ = reply.send(result);
+                if failed {
+                    break;
+                }
+                quiesced = true;
+                continue;
+            }
+            Ok(LegacyWriterCommand::Resume) => {
+                quiesced = false;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {}
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        if quiesced {
+            match control_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(LegacyWriterCommand::Resume) => quiesced = false,
+                Ok(LegacyWriterCommand::Quiesce(reply)) => {
+                    let _ = reply.send(Ok(()));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            }
+            continue;
         }
 
         match pcm_rx.recv_timeout(Duration::from_millis(100)) {
@@ -715,6 +989,195 @@ fn legacy_writer_loop(
     }
 }
 
+#[allow(dead_code)]
+fn quiesce_legacy_writer(
+    control_tx: &SyncSender<LegacyWriterCommand>,
+) -> Result<(), String> {
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    control_tx
+        .send(LegacyWriterCommand::Quiesce(reply_tx))
+        .map_err(|error| format!("cannot request PCM quiesce: {error}"))?;
+    reply_rx
+        .recv_timeout(RAOP_FLUSH_ACK_TIMEOUT)
+        .map_err(|error| {
+            format!(
+                "PCM writer did not quiesce within {} ms: {}",
+                RAOP_FLUSH_ACK_TIMEOUT.as_millis(),
+                error
+            )
+        })?
+}
+
+#[allow(dead_code)]
+fn resume_legacy_writer(
+    control_tx: &SyncSender<LegacyWriterCommand>,
+) -> Result<(), String> {
+    control_tx
+        .send(LegacyWriterCommand::Resume)
+        .map_err(|error| format!("cannot resume PCM writer: {error}"))
+}
+
+fn open_command_pipe_writer(pipe_name: &str) -> std::io::Result<File> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match OpenOptions::new().write(true).open(pipe_name) {
+            Ok(file) => return Ok(file),
+            Err(error) if std::time::Instant::now() < deadline => {
+                // The helper creates the Windows named-pipe server before its
+                // receiver RTSP connect. Retry only the local attach race.
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::WouldBlock
+                ) {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn command_legacy_start_round(
+    members: &mut [SpawnedMember],
+    requested_start_unix_ms: u64,
+) -> Result<Vec<(i64, u64)>, LegacyGroupError> {
+    // Match MSA's TaskGroup semantics: command and acknowledgement wait are
+    // per-member tasks in the same round. The helper pipes are independent, so
+    // each scoped worker owns exactly one member for the round and every 7 s
+    // acknowledgement timeout runs concurrently instead of serially.
+    let raw_acks = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(members.len());
+
+        for member in members {
+            handles.push(scope.spawn(move || -> Result<(String, u64), (String, String)> {
+                let name = member.name.clone();
+                let pipe = member.command_pipe.as_mut().ok_or_else(|| {
+                    (name.clone(), "runtime command pipe missing".to_owned())
+                })?;
+                let rx = member.started_rx.as_ref().ok_or_else(|| {
+                    (
+                        name.clone(),
+                        "START acknowledgement channel missing".to_owned(),
+                    )
+                })?;
+
+                send_start_command(pipe, requested_start_unix_ms).map_err(|error| {
+                    (
+                        name.clone(),
+                        format!("cannot send START command: {error}"),
+                    )
+                })?;
+
+                let ack = rx.recv_timeout(RAOP_START_ACK_TIMEOUT).map_err(|error| {
+                    (
+                        name.clone(),
+                        format!(
+                            "START acknowledgement not received within {} ms: {}",
+                            RAOP_START_ACK_TIMEOUT.as_millis(),
+                            error
+                        ),
+                    )
+                })?;
+                let (requested, actual) =
+                    ack.map_err(|error| (name.clone(), error))?;
+
+                if requested != requested_start_unix_ms {
+                    return Err((
+                        name,
+                        format!(
+                            "helper acknowledged request {} instead of {}",
+                            requested, requested_start_unix_ms
+                        ),
+                    ));
+                }
+
+                Ok((name, actual))
+            }));
+        }
+
+        let mut round_acks = Vec::with_capacity(handles.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(value)) => round_acks.push(value),
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    return Err((
+                        "legacy group".to_owned(),
+                        "concurrent START worker panicked".to_owned(),
+                    ))
+                }
+            }
+        }
+        Ok::<Vec<(String, u64)>, (String, String)>(round_acks)
+    })
+    .map_err(|(name, error)| LegacyGroupError::Start { name, error })?;
+
+    // sync_adjust is not exposed for the Windows legacy route yet. Keep the ack
+    // shape identical to the cross-transport contract so that future mixed
+    // orchestration can substitute the real per-member adjustment directly.
+    Ok(raw_acks
+        .into_iter()
+        .map(|(_name, actual)| (0, actual))
+        .collect())
+}
+
+fn send_start_command(pipe: &mut File, start_unix_ms: u64) -> std::io::Result<()> {
+    write!(
+        pipe,
+        "START_UNIX_MS={}\nACTION=START\n",
+        start_unix_ms
+    )?;
+    pipe.flush()
+}
+
+#[allow(dead_code)]
+fn send_flush_command(pipe: &mut File) -> std::io::Result<()> {
+    pipe.write_all(b"ACTION=FLUSH\n")?;
+    pipe.flush()
+}
+
+fn parse_started_status(line: &str) -> Option<(u64, u64)> {
+    if !line.starts_with("[STATUS] started ") {
+        return None;
+    }
+    let mut requested = None;
+    let mut actual = None;
+    for field in line.split_whitespace().skip(2) {
+        if let Some(value) = field.strip_prefix("requested_unix_ms=") {
+            requested = value.parse::<u64>().ok();
+        } else if let Some(value) = field.strip_prefix("at_unix_ms=") {
+            actual = value.parse::<u64>().ok();
+        }
+    }
+    Some((requested?, actual?))
+}
+
+/// Parse MSA's accepted FLUSH acknowledgement. Legacy RAOP intentionally has
+/// no head_unix_ms: pinned cliairplay returns 0 from warm_head_unix_ms() for
+/// RAOP. The optional form is retained so the cross-transport controller can
+/// later share one acknowledgement shape with native AirPlay 2.
+fn parse_flushed_status(line: &str) -> Option<Option<u64>> {
+    if !line.starts_with("[STATUS] flushed") {
+        return None;
+    }
+    let head = line
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("head_unix_ms="))
+        .and_then(|value| value.parse::<u64>().ok());
+    Some(head)
+}
+
+fn current_unix_ms() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .map_err(|error| format!("system clock is before Unix epoch: {error}"))
+}
+
 fn kill_helper_tree(pid: u32) {
     // /T also terminates descendants created by the helper, /F guarantees a
     // blocked RTSP/stdin helper cannot keep SAirplay2 alive after Stop/Exit.
@@ -740,6 +1203,10 @@ fn helper_path() -> Result<PathBuf, LegacyGroupError> {
     }
 }
 
+fn unix_ms_to_ntp(ms: u64) -> u64 {
+    ((ms / 1000) << 32) | ((((ms % 1000) as u128) << 32) / 1000) as u64
+}
+
 fn ms_to_ntp(ms: u64) -> u64 {
     ((ms as u128) << 32).div_ceil(1000) as u64
 }
@@ -750,4 +1217,59 @@ fn frames_to_ntp(frames: u32) -> u64 {
 
 fn ntp_delta_to_ms(delta: u64) -> u64 {
     (((delta as u128) * 1000) >> 32) as u64
+}
+
+
+#[cfg(test)]
+mod cross_transport_tests {
+    use super::*;
+
+    #[test]
+    fn parses_msa_started_ack_exactly() {
+        assert_eq!(
+            parse_started_status(
+                "[STATUS] started requested_unix_ms=12345 at_unix_ms=12345"
+            ),
+            Some((12345, 12345))
+        );
+        assert_eq!(
+            parse_started_status(
+                "[STATUS] started requested_unix_ms=12345 at_unix_ms=12700"
+            ),
+            Some((12345, 12700))
+        );
+    }
+
+    #[test]
+    fn flush_and_stdin_drain_timeouts_match_current_music_assistant() {
+        assert_eq!(RAOP_FLUSH_ACK_TIMEOUT, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn stdin_quiesce_timeout_matches_music_assistant() {
+        assert_eq!(RAOP_FLUSH_ACK_TIMEOUT, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn parses_msa_raop_flush_ack_without_a_warm_head() {
+        assert_eq!(parse_flushed_status("[STATUS] flushed"), Some(None));
+        assert_eq!(
+            parse_flushed_status("[STATUS] flushed head_unix_ms=12345"),
+            Some(Some(12345))
+        );
+        assert_eq!(parse_flushed_status("[STATUS] started requested_unix_ms=1 at_unix_ms=1"), None);
+        assert_eq!(RAOP_FLUSH_ACK_TIMEOUT, Duration::from_millis(2_000));
+    }
+
+    #[test]
+    fn ignores_non_start_status_lines() {
+        assert_eq!(parse_started_status("[STATUS] flushed"), None);
+        assert_eq!(parse_started_status("connected to 10.0.0.1"), None);
+    }
+
+    #[test]
+    fn unix_ms_fixed_point_matches_pinned_raop_session_shape() {
+        let ntp = unix_ms_to_ntp(50_007);
+        assert_eq!((ntp >> 32) * 1000 + (((ntp & 0xFFFF_FFFF) as u128 * 1000) >> 32) as u64, 50_006);
+    }
 }

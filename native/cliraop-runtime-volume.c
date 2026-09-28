@@ -17,7 +17,9 @@
 
 #if WIN
 #include <conio.h>
+#include <io.h>
 #include <time.h>
+#include <windows.h>
 #else
 #include <unistd.h>
 #include <termios.h>
@@ -61,6 +63,12 @@ struct debug_s {
 			{ lSDEBUG, lSDEBUG, lERROR },
 		};
 
+typedef enum {
+	STOPPED = 0,
+	PAUSED,
+	PLAYING,
+} playback_status_t;
+
 /*----------------------------------------------------------------------------*/
 static int print_usage(char *argv[])
 {
@@ -73,6 +81,7 @@ static int print_usage(char *argv[])
 			   "\t[-p <port number>]\n"
 			   "\t[-v <volume> (0-100)]\n"
 			   "\t[-V <runtime volume file>]\n"
+			   "\t[-C <runtime command pipe>]\n"
 			   "\t[-l <latency> (frames]\n"
 			   "\t[-w <wait>]  (start after <wait> milliseconds)\n"
 			   "\t[-n <start>] (start at NTP <start> + <wait>)\n"
@@ -155,6 +164,195 @@ static void close_platform(bool interactive) {
 	cross_ssl_free();
 }
 
+#if WIN
+#define RAOP_SESSION_MIN_START_LEAD_MS 200
+#define COMMAND_BUFFER_BYTES 8192
+
+static uint64_t unix_ms_to_ntp(uint64_t ms) {
+	return ((ms / 1000) << 32) | (((ms % 1000) << 32) / 1000);
+}
+
+static uint64_t ntp_to_unix_ms(uint64_t ntp) {
+	return (ntp >> 32) * 1000ULL + (((ntp & 0xFFFFFFFFULL) * 1000ULL) >> 32);
+}
+
+static void resolve_commanded_start(uint64_t requested_unix_ms,
+									uint64_t *audible_ntp,
+									uint64_t *at_unix_ms) {
+	uint64_t lead = MS2NTP(RAOP_SESSION_MIN_START_LEAD_MS);
+	uint64_t floor = raopcl_get_ntp(NULL) + lead;
+	uint64_t requested = requested_unix_ms ? unix_ms_to_ntp(requested_unix_ms) : 0;
+	if (requested_unix_ms && requested >= floor) {
+		*audible_ntp = requested;
+		*at_unix_ms = requested_unix_ms;
+		return;
+	}
+	/* Pinned Music Assistant raop_session.c: a non-zero infeasible request
+	 * gets one extra lead of retry slack; zero takes the floor directly. */
+	*audible_ntp = requested_unix_ms ? floor + lead : floor;
+	*at_unix_ms = ntp_to_unix_ms(*audible_ntp);
+}
+
+static bool command_start_raop(struct raopcl_s *raopcl,
+							   uint64_t requested_unix_ms,
+							   bool *first_start_done,
+							   playback_status_t *status) {
+	raop_state_t state = raopcl_state(raopcl);
+	if (!*first_start_done) {
+		/* Exact first-START semantics of pinned raop_session_commit(). */
+		if (state != RAOP_STREAMING && state != RAOP_FLUSHED) return false;
+		raopcl_stop(raopcl);
+		if (state == RAOP_STREAMING && !raopcl_flush(raopcl)) return false;
+	} else {
+		/* Exact warm START semantics: only valid after a real FLUSH. */
+		if (state != RAOP_FLUSHED) return false;
+	}
+
+	uint64_t audible_ntp = 0, at_unix_ms = 0;
+	resolve_commanded_start(requested_unix_ms, &audible_ntp, &at_unix_ms);
+	uint64_t latency_ntp =
+		TS2NTP(raopcl_latency(raopcl), raopcl_sample_rate(raopcl));
+	if (!raopcl_start_at(raopcl, audible_ntp - latency_ntp)) return false;
+
+	*first_start_done = true;
+	*status = PLAYING;
+	fprintf(stderr,
+			"[STATUS] started requested_unix_ms=%" PRIu64 " at_unix_ms=%" PRIu64 "\n",
+			requested_unix_ms, at_unix_ms);
+	fflush(stderr);
+	return true;
+}
+
+/* Windows equivalent of ap2_session.c::drain_input_fd().
+ *
+ * The current legacy helper has no independent stdin reader thread: this main
+ * loop is the only reader, so the command path already owns the descriptor
+ * while FLUSH is handled. PeekNamedPipe gives the same non-blocking
+ * "read until EAGAIN" boundary as MSA. The 100000 guard is copied from the
+ * pinned source so a producer that ignores the required quiesce cannot wedge
+ * the command path forever.
+ */
+static void drain_input_fd_windows(int infile) {
+	intptr_t raw = _get_osfhandle(infile);
+	if (raw == -1) return;
+
+	HANDLE pipe = (HANDLE)raw;
+	uint8_t scratch[16384];
+
+	for (int guard = 0; guard < 100000; guard++) {
+		DWORD available = 0;
+		if (!PeekNamedPipe(pipe, NULL, 0, NULL, &available, NULL))
+			return;
+		if (!available) return;
+
+		unsigned want = available < sizeof(scratch)
+			? (unsigned)available : (unsigned)sizeof(scratch);
+		int n = _read(infile, scratch, want);
+		if (n <= 0) return;
+	}
+}
+
+/* Exact RAOP FLUSH semantics from pinned raop_session.c. RAOP deliberately
+ * reports no warm head: current MSA session_warm_head_unix_ms() returns 0 for
+ * the legacy path, so the accepted ack is exactly "[STATUS] flushed".
+ *
+ * The caller must have quiesced its PCM writer before issuing FLUSH. Only then
+ * can this drain establish the same clean old/new content boundary as MSA.
+ */
+static bool command_flush_raop(struct raopcl_s *raopcl,
+							   int infile,
+							   playback_status_t *status) {
+	raop_state_t state = raopcl_state(raopcl);
+	if (state != RAOP_STREAMING && state != RAOP_FLUSHED) return false;
+
+	raopcl_stop(raopcl);
+	if (state == RAOP_STREAMING && !raopcl_flush(raopcl)) return false;
+
+	/* MSA drains every pre-FLUSH byte from the persistent PCM descriptor before
+	 * acknowledging. With the Rust writer quiesced, anything visible here is
+	 * old content and must not become the first sample of the next START. */
+	drain_input_fd_windows(infile);
+
+	*status = PAUSED;
+	fprintf(stderr, "[STATUS] flushed\n");
+	fflush(stderr);
+	return true;
+}
+
+static bool service_command_pipe(HANDLE pipe,
+								 struct raopcl_s *raopcl,
+								 int infile,
+								 uint64_t *pending_start_unix_ms,
+								 bool *first_start_done,
+								 playback_status_t *status,
+								 char *buffer,
+								 size_t *used) {
+	DWORD available = 0;
+	if (!PeekNamedPipe(pipe, NULL, 0, NULL, &available, NULL)) {
+		DWORD err = GetLastError();
+		if (err == ERROR_BROKEN_PIPE || err == ERROR_NO_DATA) return false;
+		return true;
+	}
+	if (!available) return true;
+
+	while (available && *used < COMMAND_BUFFER_BYTES - 1) {
+		DWORD room = (DWORD)(COMMAND_BUFFER_BYTES - 1 - *used);
+		DWORD take = available < room ? available : room;
+		DWORD got = 0;
+		if (!ReadFile(pipe, buffer + *used, take, &got, NULL)) {
+			DWORD err = GetLastError();
+			if (err == ERROR_BROKEN_PIPE || err == ERROR_NO_DATA) return false;
+			break;
+		}
+		*used += got;
+		buffer[*used] = '\0';
+
+		char *line = buffer;
+		char *end = NULL;
+		while ((end = strchr(line, '\n')) != NULL) {
+			*end = '\0';
+			if (end > line && end[-1] == '\r') end[-1] = '\0';
+			char *sep = strchr(line, '=');
+			if (sep && sep != line) {
+				*sep = '\0';
+				const char *key = line;
+				const char *value = sep + 1;
+				if (!strcmp(key, "START_UNIX_MS")) {
+					*pending_start_unix_ms = _strtoui64(value, NULL, 10);
+				} else if (!strcmp(key, "ACTION") && !strcmp(value, "START")) {
+					if (!command_start_raop(
+							raopcl, *pending_start_unix_ms,
+							first_start_done, status)) {
+						fprintf(stderr,
+								"[STATUS] error code=start_failed http=0 detail=\"RAOP START rejected\"\n");
+						fflush(stderr);
+					}
+					*pending_start_unix_ms = 0;
+				} else if (!strcmp(key, "ACTION") && !strcmp(value, "FLUSH")) {
+					if (!command_flush_raop(raopcl, infile, status)) {
+						fprintf(stderr,
+								"[STATUS] error code=flush_failed http=0 detail=\"RAOP FLUSH rejected\"\n");
+						fflush(stderr);
+					}
+				}
+			}
+			line = end + 1;
+		}
+		size_t remaining = *used - (size_t)(line - buffer);
+		memmove(buffer, line, remaining);
+		*used = remaining;
+		buffer[*used] = '\0';
+
+		if (!PeekNamedPipe(pipe, NULL, 0, NULL, &available, NULL)) {
+			DWORD err = GetLastError();
+			if (err == ERROR_BROKEN_PIPE || err == ERROR_NO_DATA) return false;
+			break;
+		}
+	}
+	return true;
+}
+#endif
+
 /*----------------------------------------------------------------------------*/
 /*																			  */
 /*----------------------------------------------------------------------------*/
@@ -172,11 +370,19 @@ int main(int argc, char *argv[]) {
 	int infile;
 	uint8_t *buf;
 	int i, n = -1, level = 2;
-	enum {STOPPED, PAUSED, PLAYING } status;
+	playback_status_t status;
 	raop_crypto_t crypto = RAOP_CLEAR;
 	uint64_t start = 0, start_at = 0, last = 0, frames = 0, last_volume_check = 0;
 	bool interactive = false, alac = false, pairing = false;
 	char *secret = NULL, *md = NULL, *et = NULL, *volume_file = NULL;
+	char *command_pipe_name = NULL;
+#if WIN
+	HANDLE command_pipe = INVALID_HANDLE_VALUE;
+	char command_buf[COMMAND_BUFFER_BYTES] = {0};
+	size_t command_used = 0;
+	uint64_t pending_start_unix_ms = 0;
+	bool first_start_done = false;
+#endif
 	bool auth = false;
 	struct in_addr host = { INADDR_ANY };
 
@@ -196,6 +402,8 @@ int main(int argc, char *argv[]) {
 			volume=atoi(argv[++i]);
 		} else if (!strcmp(argv[i],"-V")) {
 			volume_file=argv[++i];
+		} else if (!strcmp(argv[i],"-C")) {
+			command_pipe_name=argv[++i];
 		} else if (!strcmp(argv[i],"-w")) {
 			wait=atoi(argv[++i]);
 		} else if(!strcmp(argv[i],"-l")) {
@@ -289,6 +497,34 @@ int main(int argc, char *argv[]) {
 
 	memcpy(&player.addr.s_addr, player.hostent->h_addr_list[0], player.hostent->h_length);
 
+#if WIN
+	if (command_pipe_name) {
+		/* Windows equivalent of Music Assistant's POSIX --cmdpipe FIFO.
+		 * Audio remains exclusively on stdin; only newline-delimited control
+		 * commands travel here. Create it before receiver connect so the Rust
+		 * controller can attach without serialising member RTSP connects. */
+		command_pipe = CreateNamedPipeA(
+			command_pipe_name,
+			PIPE_ACCESS_INBOUND,
+			PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+			1, 0, COMMAND_BUFFER_BYTES, 0, NULL);
+		if (command_pipe == INVALID_HANDLE_VALUE) {
+			LOG_ERROR("Cannot create runtime command pipe %s (%lu)",
+					  command_pipe_name, GetLastError());
+			goto exit;
+		}
+		BOOL pipe_connected = ConnectNamedPipe(command_pipe, NULL) ?
+			TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+		if (!pipe_connected) {
+			LOG_ERROR("Cannot connect runtime command pipe %s (%lu)",
+					  command_pipe_name, GetLastError());
+			CloseHandle(command_pipe);
+			command_pipe = INVALID_HANDLE_VALUE;
+			goto exit;
+		}
+	}
+#endif
+
 	// connect to player
 	if (!raopcl_connect(raopcl, player.addr, port, true)) {
 		LOG_ERROR("Cannot connect to AirPlay device %s:%hu, check firewall & port", inet_ntoa(player.addr), port);
@@ -315,7 +551,9 @@ int main(int argc, char *argv[]) {
 	}
 
 	start = raopcl_get_ntp(NULL);
-	status = PLAYING;
+	/* MSA command-session shape: when a command pipe exists, connection and
+	 * audio input may be ready but nothing is sent until ACTION=START. */
+	status = command_pipe_name ? PAUSED : PLAYING;
 	runtime_volume = volume;
 
 	buf = malloc(DEFAULT_FRAMES_PER_CHUNK * 4);
@@ -324,6 +562,18 @@ int main(int argc, char *argv[]) {
 		uint64_t playtime, now;
 
 		now = raopcl_get_ntp(NULL);
+
+#if WIN
+		if (command_pipe != INVALID_HANDLE_VALUE) {
+			if (!service_command_pipe(
+					command_pipe, raopcl, infile, &pending_start_unix_ms,
+					&first_start_done, &status,
+					command_buf, &command_used)) {
+				status = STOPPED;
+				break;
+			}
+		}
+#endif
 
 		if (volume_file && now - last_volume_check >= MS2NTP(100)) {
 			FILE *vf;
@@ -404,6 +654,12 @@ int main(int argc, char *argv[]) {
 	raopcl_disconnect(raopcl);
 
 exit:
+#if WIN
+	if (command_pipe != INVALID_HANDLE_VALUE) {
+		DisconnectNamedPipe(command_pipe);
+		CloseHandle(command_pipe);
+	}
+#endif
 	raopcl_destroy(raopcl);
 	close_platform(interactive);
 	return 0;
