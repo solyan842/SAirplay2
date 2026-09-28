@@ -1,3 +1,4 @@
+pub mod msa_group_start;
 pub mod msa_raop_transport;
 pub mod msa_ap2_transport;
 pub mod msa_session_adapter;
@@ -100,4 +101,11 @@ pub use msa_ap2_transport::{MsaAp2Client, MsaAp2Transport};
 pub use msa_raop_transport::{
     MsaRaopClient, MsaRaopStartMode, MsaRaopState, MsaRaopTransport,
     MSA_RAOP_MIN_START_LEAD_MS,
+};
+
+pub use msa_group_start::{
+    msa_initial_group_anchor_unix_ms, msa_start_group, MsaGroupStartFailure,
+    MsaGroupStartMember, MsaGroupStartResult, MSA_CLOCK_READY_LEAD_MS,
+    MSA_COLD_GROUP_START_LEAD_MS, MSA_GROUP_START_LEAD_MS,
+    MSA_SPLICE_LEAD_MARGIN_MS, MSA_START_MAX_ROUNDS, MSA_START_TOLERANCE_MS,
 };
