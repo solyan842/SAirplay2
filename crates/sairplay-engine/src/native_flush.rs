@@ -24,7 +24,7 @@ impl fmt::Display for NativeFlushError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Lock => write!(f, "native FLUSH control lock poisoned"),
-            Self::Transport(error) => write!(f, "native FLUSH transport failed: {error}"),
+            Self::Transport(error) => write!(f, "native FLUSH transport failed: {error:?}"),
             Self::Status(status) => write!(f, "native FLUSH rejected with RTSP {status}"),
         }
     }
