@@ -238,7 +238,12 @@ mod tests {
         let join = std::thread::spawn(move || tcp.accept().unwrap().0);
         let client = std::net::TcpStream::connect(addr).unwrap();
         let _server = join.join().unwrap();
-        let channel = crate::EncryptedRtspChannel::for_test_plaintext(client);
+        let channel = crate::EncryptedRtspChannel::new(
+            client,
+            [0x11u8; 32],
+            [0x22u8; 32],
+            std::time::Duration::from_millis(100),
+        );
         let control = Arc::new(Mutex::new(channel));
         let cseq = Arc::new(std::sync::atomic::AtomicU32::new(1));
 
