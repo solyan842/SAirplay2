@@ -1,3 +1,4 @@
+pub mod msa_native_realtime;
 pub mod native_flush;
 pub mod msa_ap2_verify;
 pub mod msa_ap2_start;
@@ -186,3 +187,8 @@ pub use native_flush::{
 pub use media_sender::MsaRealtimeFlushPoint;
 
 pub use msa_windows_consumer::SharedRealtimeMediaSender;
+
+pub use msa_native_realtime::{
+    msa_native_flush_action, MsaNativeFlushAction, MsaNativeFlushResult,
+    MsaNativeRealtimeOwner, MsaNativeWarmMode,
+};

@@ -94,6 +94,11 @@ impl std::error::Error for NativeSessionError {}
 #[cfg(windows)]
 pub struct MsaWindowsMediaHandoff {
     pub sender: RealtimeMediaSender,
+    pub control: crate::SharedRtspControl,
+    pub next_cseq: crate::SharedCseq,
+    pub session_uri: String,
+    pub dacp_id: String,
+    pub active_remote: String,
     pub lead_frames: u32,
     pub latency_max: Option<u32>,
     pub rtp_offset: u32,
@@ -475,6 +480,11 @@ impl NativeSession {
 
         Ok(MsaWindowsMediaHandoff {
             sender,
+            control: Arc::clone(&self.control),
+            next_cseq: Arc::clone(&self.next_cseq),
+            session_uri: self.session_uri.clone(),
+            dacp_id: self.dacp_id.clone(),
+            active_remote: self.active_remote.clone(),
             lead_frames: self.lead_frames,
             latency_max: self.latency_max,
             rtp_offset: self.rtp_offset,
