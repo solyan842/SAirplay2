@@ -359,12 +359,9 @@ mod tests {
         assert_eq!(*reads.lock().unwrap(), 1);
         assert_eq!(
             outcome,
-            GroupPcmCoordinatorCycle {
-                outcome: GroupPcmPumpOutcome::Delivered {
-                    bytes: 4,
-                    failures: Vec::new(),
-                },
-                removed_members: Vec::new(),
+            GroupPcmPumpOutcome::Delivered {
+                bytes: 4,
+                failures: Vec::new(),
             }
         );
         assert_eq!(*seen_a.lock().unwrap(), vec![vec![4u8, 5, 6, 7]]);
@@ -471,9 +468,12 @@ mod tests {
         assert_eq!(*reads.lock().unwrap(), 1);
         assert_eq!(
             outcome,
-            GroupPcmPumpOutcome::Delivered {
-                bytes: 4,
-                failures: Vec::new(),
+            GroupPcmCoordinatorCycle {
+                outcome: GroupPcmPumpOutcome::Delivered {
+                    bytes: 4,
+                    failures: Vec::new(),
+                },
+                removed_members: Vec::new(),
             }
         );
         assert_eq!(*seen_native.lock().unwrap(), vec![vec![7u8, 7, 7, 7]]);
