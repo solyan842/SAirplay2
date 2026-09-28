@@ -160,7 +160,7 @@ pub use msa_windows_consumer::{
     RealtimeMsaPacketSink,
 };
 
-pub use msa_windows_runtime::MsaWindowsRuntimeSession;
+pub use msa_windows_runtime::{MsaPendingStart, MsaWindowsRuntimeSession};
 
 pub use msa_ap2_clock::{
     msa_ap2_clock_readiness, MsaAp2ClockReadiness, MsaAp2ClockState,

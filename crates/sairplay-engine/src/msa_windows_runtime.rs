@@ -17,11 +17,18 @@ use crate::{
 };
 use std::sync::{Arc, Mutex};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MsaPendingStart {
+    pub requested_unix_ms: u64,
+    pub transport_committed_unix_ms: u64,
+}
+
 pub struct MsaWindowsRuntimeSession<T: MsaSessionTransport> {
     source: Arc<Mutex<MsaWindowsSource>>,
     transport: T,
     capture: Option<MsaWindowsCaptureWorker>,
     consumer: Option<MsaWindowsConsumerWorker>,
+    pending_start: Option<MsaPendingStart>,
 }
 
 impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
@@ -31,6 +38,7 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
             transport,
             capture: None,
             consumer: None,
+            pending_start: None,
         }
     }
 
@@ -77,6 +85,10 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
     }
 
     pub fn start(&mut self, requested_start_unix_ms: u64) -> Result<MsaStartAck, String> {
+        if self.pending_start.is_some() {
+            return Err("cannot START while an MSA deferred START is pending".into());
+        }
+
         self.transport.quiesce()?;
         let committed = match self.transport.commit_start(requested_start_unix_ms) {
             Ok(value) => value,
@@ -102,7 +114,78 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
         })
     }
 
+    /// Commit the transport anchor while deliberately keeping the PCM session
+    /// IDLE. This is the native AP2 cold-join shape where the START ack is
+    /// withheld until receiver-clock verification answers. Because the source
+    /// never enters PLAYING here, the consumer cannot drain or send real PCM.
+    pub fn begin_deferred_start(
+        &mut self,
+        requested_start_unix_ms: u64,
+    ) -> Result<MsaPendingStart, String> {
+        if self.pending_start.is_some() {
+            return Err("MSA deferred START already pending".into());
+        }
+        if self.state()? == MsaSessionState::Ended {
+            return Err("cannot START an ended MSA Windows session".into());
+        }
+
+        self.transport.quiesce()?;
+        let committed = match self.transport.commit_start(requested_start_unix_ms) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = self.transport.resume();
+                return Err(error);
+            }
+        };
+        self.transport.resume()?;
+
+        let pending = MsaPendingStart {
+            requested_unix_ms: requested_start_unix_ms,
+            transport_committed_unix_ms: committed,
+        };
+        self.pending_start = Some(pending);
+        Ok(pending)
+    }
+
+    /// Publish PLAYING only after cold-clock verification has produced the
+    /// audible instant that actually stands. A corrected join therefore
+    /// releases PCM against the corrected ACK truth, not the original guess.
+    pub fn complete_deferred_start(
+        &mut self,
+        acknowledged_unix_ms: u64,
+    ) -> Result<MsaStartAck, String> {
+        let pending = self
+            .pending_start
+            .take()
+            .ok_or_else(|| "no MSA deferred START is pending".to_owned())?;
+
+        let epoch = self
+            .source
+            .lock()
+            .map_err(|_| "MSA Windows source lock poisoned".to_owned())?
+            .core_mut()
+            .start_committed()?;
+
+        Ok(MsaStartAck {
+            requested_unix_ms: pending.requested_unix_ms,
+            committed_unix_ms: acknowledged_unix_ms,
+            epoch,
+        })
+    }
+
+    /// Cancel a deferred START when a superseding FLUSH/STANDBY/END wins.
+    /// The source has remained IDLE throughout, so no rollback of consumed PCM
+    /// is necessary.
+    pub fn cancel_deferred_start(&mut self) -> Option<MsaPendingStart> {
+        self.pending_start.take()
+    }
+
+    pub fn pending_start(&self) -> Option<MsaPendingStart> {
+        self.pending_start
+    }
+
     pub fn flush(&mut self) -> Result<MsaFlushAck, String> {
+        self.cancel_deferred_start();
         self.transport.quiesce()?;
         let warm_head = match self.transport.flush() {
             Ok(value) => value,
@@ -127,6 +210,7 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
     }
 
     pub fn standby(&mut self) -> Result<(), String> {
+        self.cancel_deferred_start();
         self.transport.quiesce()?;
         if let Err(error) = self.transport.stop() {
             let _ = self.transport.resume();
@@ -145,6 +229,7 @@ impl<T: MsaSessionTransport> MsaWindowsRuntimeSession<T> {
     }
 
     pub fn end(&mut self) -> Result<(), String> {
+        self.cancel_deferred_start();
         if let Some(mut consumer) = self.consumer.take() {
             consumer.stop();
         }
@@ -316,4 +401,63 @@ mod tests {
             vec!["quiesce", "start", "resume", "quiesce", "stop", "resume"]
         );
     }
+
+    #[test]
+    fn deferred_start_keeps_source_idle_until_verified_ack() {
+        let mut rt = runtime(FakeTransport {
+            committed: 12_345,
+            ..Default::default()
+        });
+        {
+            let mut source = rt.source.lock().unwrap();
+            source.push_capture_pcm(
+                &vec![8u8; WINDOWS_PCM_PACKET_BYTES_16_441_STEREO],
+            );
+        }
+
+        let pending = rt.begin_deferred_start(12_000).unwrap();
+
+        assert_eq!(pending.transport_committed_unix_ms, 12_345);
+        assert_eq!(rt.state().unwrap(), MsaSessionState::Idle);
+        assert_eq!(
+            rt.source.lock().unwrap().buffered_bytes(),
+            WINDOWS_PCM_PACKET_BYTES_16_441_STEREO
+        );
+
+        let ack = rt.complete_deferred_start(12_600).unwrap();
+        assert_eq!(ack.requested_unix_ms, 12_000);
+        assert_eq!(ack.committed_unix_ms, 12_600);
+        assert_eq!(ack.epoch, 1);
+        assert_eq!(rt.state().unwrap(), MsaSessionState::Playing);
+    }
+
+    #[test]
+    fn flush_supersedes_pending_start_without_publishing_playing() {
+        let mut rt = runtime(FakeTransport {
+            committed: 12_345,
+            ..Default::default()
+        });
+        rt.begin_deferred_start(12_000).unwrap();
+
+        let ack = rt.flush().unwrap();
+
+        assert_eq!(ack.warm_head_unix_ms, Some(50_000));
+        assert!(rt.pending_start().is_none());
+        assert_eq!(rt.state().unwrap(), MsaSessionState::Idle);
+        assert_eq!(rt.source.lock().unwrap().core().epoch(), 0);
+    }
+
+    #[test]
+    fn second_start_is_rejected_while_deferred_start_is_pending() {
+        let mut rt = runtime(FakeTransport {
+            committed: 12_345,
+            ..Default::default()
+        });
+        rt.begin_deferred_start(12_000).unwrap();
+
+        assert!(rt.start(13_000).is_err());
+        assert_eq!(rt.state().unwrap(), MsaSessionState::Idle);
+        assert_eq!(rt.source.lock().unwrap().core().epoch(), 0);
+    }
+
 }
