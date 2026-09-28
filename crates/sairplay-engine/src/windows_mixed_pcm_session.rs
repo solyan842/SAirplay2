@@ -9,13 +9,124 @@ use crate::{
     Ap2AudioFormat, GroupPcmCoordinator, GroupPcmCoordinatorCycle,
     GroupPcmParticipant, LegacyGroupSession, LegacyPcmSink, NativeGroupSession,
     OwnedNativePcmSink, WasapiLoopbackError, WindowsPcmCoordinatorOwner,
-    WindowsPcmCoordinatorSource,
+    WindowsPcmCoordinatorSource, PCM352_PACKET_BYTES,
 };
 use crate::group_start_orchestrator::{
     run_concurrent_group_start_round, run_group_start_convergence,
     GroupStartConvergence, GroupStartIoError, GroupStartParticipant,
 };
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+pub struct WindowsMixedPcmWorker {
+    running: Arc<AtomicBool>,
+    last_error: Arc<Mutex<Option<String>>>,
+    diagnostic_events: Arc<Mutex<Vec<String>>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl WindowsMixedPcmWorker {
+    pub fn start(mut session: WindowsMixedPcmSession) -> Result<Self, String> {
+        if session.member_count() == 0 {
+            return Err("mixed PCM worker requires at least one attached member".to_owned());
+        }
+
+        let running = Arc::new(AtomicBool::new(true));
+        let running_thread = Arc::clone(&running);
+        let last_error = Arc::new(Mutex::new(None));
+        let last_error_thread = Arc::clone(&last_error);
+        let diagnostic_events = Arc::new(Mutex::new(session.drain_diagnostic_events()));
+        let diagnostic_events_thread = Arc::clone(&diagnostic_events);
+
+        let worker = thread::Builder::new()
+            .name("sairplay-mixed-pcm".into())
+            .spawn(move || {
+                while running_thread.load(Ordering::SeqCst) {
+                    if session.member_count() == 0 {
+                        if let Ok(mut events) = diagnostic_events_thread.lock() {
+                            events.push(
+                                "Mixed PCM worker stopped · no active transport members.".to_owned(),
+                            );
+                        }
+                        break;
+                    }
+
+                    match session.pump_once(
+                        PCM352_PACKET_BYTES,
+                        Duration::from_millis(0),
+                    ) {
+                        Ok(cycle) => {
+                            if let Ok(mut events) = diagnostic_events_thread.lock() {
+                                events.extend(session.drain_diagnostic_events());
+                            }
+                            match cycle.outcome {
+                                crate::GroupPcmPumpOutcome::Starved => {
+                                    thread::sleep(Duration::from_millis(1));
+                                }
+                                crate::GroupPcmPumpOutcome::Delivered { .. } => {}
+                            }
+                        }
+                        Err(error) => {
+                            if let Ok(mut slot) = last_error_thread.lock() {
+                                *slot = Some(error.clone());
+                            }
+                            if let Ok(mut events) = diagnostic_events_thread.lock() {
+                                events.push(format!("Mixed PCM worker error · {error}."));
+                                events.extend(session.drain_diagnostic_events());
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                session.stop();
+                if let Ok(mut events) = diagnostic_events_thread.lock() {
+                    events.extend(session.drain_diagnostic_events());
+                }
+                running_thread.store(false, Ordering::SeqCst);
+            })
+            .map_err(|error| format!("failed to spawn mixed PCM worker: {error}"))?;
+
+        Ok(Self {
+            running,
+            last_error,
+            diagnostic_events,
+            worker: Some(worker),
+        })
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    pub fn drain_diagnostic_events(&self) -> Vec<String> {
+        self.diagnostic_events
+            .lock()
+            .map(|mut events| std::mem::take(&mut *events))
+            .unwrap_or_default()
+    }
+
+    pub fn stop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for WindowsMixedPcmWorker {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
 
 pub struct WindowsMixedPcmSession {
     owner: WindowsPcmCoordinatorOwner,

@@ -148,7 +148,7 @@ pub use windows_pcm_session::{
     WINDOWS_PCM_SESSION_RING_SECONDS,
 };
 #[cfg(windows)]
-pub use windows_mixed_pcm_session::WindowsMixedPcmSession;
+pub use windows_mixed_pcm_session::{WindowsMixedPcmSession, WindowsMixedPcmWorker};
 #[cfg(windows)]
 pub use windows_audio_worker::{WindowsAudioWorker, WindowsAudioWorkerError};
 #[cfg(windows)]
