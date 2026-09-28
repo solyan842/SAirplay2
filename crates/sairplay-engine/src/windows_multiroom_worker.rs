@@ -460,19 +460,19 @@ impl WindowsMultiroomJoinHandle {
 pub struct OwnedNativePcmSink {
     target: WindowsAudioTarget,
     source_format: Ap2AudioFormat,
-    ntp: Option<u64>,
+    committed_start_ntp: Option<u64>,
 }
 
 impl OwnedNativePcmSink {
     pub fn new(
         target: WindowsAudioTarget,
         source_format: Ap2AudioFormat,
-        ntp: u64,
+        committed_start_ntp: u64,
     ) -> Self {
         Self {
             target,
             source_format,
-            ntp: Some(ntp),
+            committed_start_ntp: Some(committed_start_ntp),
         }
     }
 
@@ -483,24 +483,20 @@ impl OwnedNativePcmSink {
         Self {
             target,
             source_format,
-            ntp: None,
+            committed_start_ntp: None,
         }
     }
 
-    pub fn arm_ntp(&mut self, ntp: u64) {
-        self.ntp = Some(ntp);
+    pub fn clear_start(&mut self) {
+        self.committed_start_ntp = None;
     }
 
-    pub fn clear_ntp(&mut self) {
-        self.ntp = None;
-    }
-
-    pub fn ntp(&self) -> Option<u64> {
-        self.ntp
+    pub fn committed_start_ntp(&self) -> Option<u64> {
+        self.committed_start_ntp
     }
 
     pub fn is_armed(&self) -> bool {
-        self.ntp.is_some()
+        self.committed_start_ntp.is_some()
     }
 
     pub fn source_format(&self) -> Ap2AudioFormat {
@@ -523,6 +519,18 @@ impl OwnedNativePcmSink {
     }
 }
 
+impl GroupStartParticipant for OwnedNativePcmSink {
+    fn name(&self) -> &str {
+        &self.target.name
+    }
+
+    fn start_at_unix_ms(&mut self, requested_start_unix_ms: u64) -> Result<u64, String> {
+        let committed_unix_ms = self.target.start_at_unix_ms(requested_start_unix_ms)?;
+        self.committed_start_ntp = Some(unix_ms_to_ntp_epoch(committed_unix_ms));
+        Ok(committed_unix_ms)
+    }
+}
+
 impl GroupPcmParticipant for OwnedNativePcmSink {
     fn name(&self) -> &str {
         &self.target.name
@@ -537,15 +545,17 @@ impl GroupPcmParticipant for OwnedNativePcmSink {
         )
         .map_err(|error| format!("media format failed: {error}"))?;
 
-        let ntp = self
-            .ntp
-            .ok_or_else(|| "native mixed PCM sink is not armed with a packet NTP".to_owned())?;
+        if self.committed_start_ntp.is_none() {
+            return Err("native mixed PCM sink START is not armed".to_owned());
+        }
+        let now_ntp = system_time_to_ntp(SystemTime::now())
+            .map_err(|error| format!("NTP clock conversion failed: {error:?}"))?;
 
         self.target
             .sender
             .send_pcm_352(
                 &target_packet,
-                ntp,
+                now_ntp,
                 self.target.lead_frames,
             )
             .map(|_| ())
