@@ -19,6 +19,7 @@ pub mod timeline;
 pub mod cross_transport_timeline;
 pub mod group_start_orchestrator;
 pub mod group_flush;
+pub mod group_pcm_fanout;
 pub mod timing_policy;
 pub mod ntp_timing;
 pub mod ptp_engine;
@@ -95,6 +96,9 @@ pub use group_start_orchestrator::{
 pub use group_flush::{
     parse_group_flush_status, resolve_warm_group_anchor, GroupFlushAck,
     WarmGroupMemberConstraint,
+};
+pub use group_pcm_fanout::{
+    fanout_shared_pcm_chunk, GroupPcmFailure, GroupPcmParticipant,
 };
 
 pub use timing_policy::{TimingDecision, TimingMode, TimingPreference, TimingReadiness, TimingStartResult};
