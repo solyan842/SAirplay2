@@ -6,9 +6,10 @@
 //! explicit and testable by construction.
 
 use crate::{
-    Ap2AudioFormat, GroupPcmCoordinator, GroupPcmCoordinatorCycle,
-    GroupPcmParticipant, WasapiLoopbackError, WindowsPcmCoordinatorOwner,
-    WindowsPcmCoordinatorSource,
+    run_concurrent_group_start_round, run_group_start_convergence, Ap2AudioFormat,
+    GroupPcmCoordinator, GroupPcmCoordinatorCycle, GroupPcmParticipant,
+    GroupStartConvergence, GroupStartIoError, GroupStartParticipant,
+    WasapiLoopbackError, WindowsPcmCoordinatorOwner, WindowsPcmCoordinatorSource,
 };
 use std::time::Duration;
 
@@ -33,6 +34,26 @@ impl WindowsMixedPcmSession {
         member: Box<dyn GroupPcmParticipant>,
     ) -> Result<(), String> {
         self.coordinator.add_member(member)
+    }
+
+    /// Commit one common audible START across transport-neutral members using
+    /// the existing MSA-aligned concurrent round + convergence contract.
+    ///
+    /// PCM ownership remains separate: this method only arms transport timing.
+    /// Callers must not pump mixed PCM until START has succeeded.
+    pub fn arm_common_start(
+        &mut self,
+        initial_target_unix_ms: u64,
+        participants: &mut [&mut dyn GroupStartParticipant],
+    ) -> Result<GroupStartConvergence, GroupStartIoError> {
+        run_group_start_convergence(initial_target_unix_ms, |target_unix_ms| {
+            let mut round_members =
+                Vec::<&mut dyn GroupStartParticipant>::with_capacity(participants.len());
+            for participant in participants.iter_mut() {
+                round_members.push(&mut **participant);
+            }
+            run_concurrent_group_start_round(round_members, target_unix_ms)
+        })
     }
 
     pub fn remove_member(&mut self, name: &str) -> bool {
