@@ -1,3 +1,4 @@
+pub mod msa_session_adapter;
 pub mod msa_session;
 pub mod ap2_info;
 pub mod catalog;
@@ -87,3 +88,7 @@ pub use ptp_engine::{PtpClock, PtpEngine, PtpEngineError, PtpExchange};
 pub use ptp_session_setup::{build_ptp_session_plist, setup_ptp_session, PtpSessionSetupConfig, PtpSessionSetupError, PtpSessionSetupResult};
 
 pub use msa_session::{MsaSessionCore, MsaSessionState};
+
+pub use msa_session_adapter::{
+    MsaFlushAck, MsaSession, MsaSessionTransport, MsaStartAck,
+};
