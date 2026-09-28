@@ -91,6 +91,15 @@ impl fmt::Display for NativeSessionError {
 
 impl std::error::Error for NativeSessionError {}
 
+#[cfg(windows)]
+pub struct MsaWindowsMediaHandoff {
+    pub sender: RealtimeMediaSender,
+    pub lead_frames: u32,
+    pub latency_max: Option<u32>,
+    pub rtp_offset: u32,
+    pub cold_start_delay_ms: u64,
+}
+
 pub struct NativeSession {
     flow: NativeConnectFlow,
     control: crate::SharedRtspControl,
@@ -436,6 +445,41 @@ impl NativeSession {
 
     pub fn next_control_cseq(&self) -> u32 {
         self.next_cseq.load(Ordering::SeqCst)
+    }
+
+    /// Transfer the already-negotiated realtime media sender into the
+    /// SAirplay 2.0 MSA runtime. This is a one-way ownership handoff: once taken,
+    /// the legacy WindowsAudioWorker path cannot start.
+    ///
+    /// This deliberately does NOT claim NativeSession implements the MSA AP2
+    /// lifecycle contract. START/FLUSH/STANDBY still require source-equivalent
+    /// receiver ACK primitives before they may be wired.
+    #[cfg(windows)]
+    pub fn take_msa_windows_media(&mut self) -> Result<MsaWindowsMediaHandoff, NativeSessionError> {
+        if !self.is_ready() {
+            return Err(NativeSessionError::Flow(
+                "MSA media handoff requires native transport Ready".into(),
+            ));
+        }
+        if self.audio_worker.as_ref().is_some_and(|worker| worker.is_running()) {
+            return Err(NativeSessionError::Flow(
+                "cannot hand off media while legacy Windows audio worker is running".into(),
+            ));
+        }
+
+        let sender = self.sender.take().ok_or_else(|| {
+            NativeSessionError::Flow(
+                "realtime sender has already been transferred from NativeSession".into(),
+            )
+        })?;
+
+        Ok(MsaWindowsMediaHandoff {
+            sender,
+            lead_frames: self.lead_frames,
+            latency_max: self.latency_max,
+            rtp_offset: self.rtp_offset,
+            cold_start_delay_ms: self.cold_start_delay_ms,
+        })
     }
 
     #[cfg(windows)]
