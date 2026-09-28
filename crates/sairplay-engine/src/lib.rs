@@ -1,3 +1,4 @@
+pub mod msa_late_join_runtime;
 pub mod msa_late_join;
 pub mod msa_warm_replace;
 pub mod msa_group_start;
@@ -123,4 +124,9 @@ pub use msa_late_join::{
     msa_plan_late_join, MsaLateJoinPlan, MsaLateJoinSnapshot,
     MSA_LATE_JOIN_MIN_HEADROOM_MS, MSA_LATE_JOIN_RING_MARGIN_SECONDS,
     MSA_LATE_JOIN_RING_MAX_BYTES, MSA_LATE_JOIN_RING_MIN_SECONDS,
+};
+
+pub use msa_late_join_runtime::{
+    msa_commit_late_join, msa_prepare_late_join, msa_start_late_join,
+    MsaLateJoinCommitResult, MsaLateJoinRuntime, MsaLateJoinStartRequest,
 };
