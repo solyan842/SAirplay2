@@ -154,6 +154,7 @@ pub struct LegacyPcmSink {
     name: String,
     pcm_tx: SyncSender<[u8; PCM352_PACKET_BYTES]>,
     running: Arc<AtomicBool>,
+    feed_not_before_ntp: Option<u64>,
 }
 
 impl LegacyPcmSink {
@@ -161,11 +162,13 @@ impl LegacyPcmSink {
         name: String,
         pcm_tx: SyncSender<[u8; PCM352_PACKET_BYTES]>,
         running: Arc<AtomicBool>,
+        feed_not_before_ntp: Option<u64>,
     ) -> Self {
         Self {
             name,
             pcm_tx,
             running,
+            feed_not_before_ntp,
         }
     }
 }
@@ -176,6 +179,21 @@ impl GroupPcmParticipant for LegacyPcmSink {
     }
 
     fn write_shared_pcm(&mut self, chunk: &[u8]) -> Result<(), String> {
+        if let Some(feed_ntp) = self.feed_not_before_ntp.take() {
+            while self.running.load(Ordering::SeqCst) {
+                let now_ntp = system_time_to_ntp(SystemTime::now())
+                    .map_err(|error| format!("legacy feed clock conversion failed: {error:?}"))?;
+                if now_ntp >= feed_ntp {
+                    break;
+                }
+                let remaining_ms = ntp_delta_to_ms(feed_ntp - now_ntp);
+                thread::sleep(Duration::from_millis(remaining_ms.clamp(1, 10)));
+            }
+            if !self.running.load(Ordering::SeqCst) {
+                return Err("legacy PCM session stopped".to_owned());
+            }
+        }
+
         let packet: [u8; PCM352_PACKET_BYTES] = chunk
             .try_into()
             .map_err(|_| {
@@ -331,6 +349,8 @@ pub struct LegacyGroupSession {
     startup_events: Arc<Mutex<Vec<String>>>,
     active_members: Arc<AtomicU64>,
     volume_controls: Vec<LegacyVolumeControl>,
+    external_pcm_sinks: Vec<LegacyPcmSink>,
+    external_writers: Vec<JoinHandle<()>>,
     // Keep the MSA-style Windows command channel and acknowledgements alive
     // for the whole persistent helper lifetime. FLUSH is deliberately not
     // exposed to callers yet: MSA requires stdin/session-ring quiescing before
@@ -340,7 +360,7 @@ pub struct LegacyGroupSession {
 
 impl LegacyGroupSession {
     pub fn connect(configs: Vec<LegacyMemberConfig>) -> Result<Self, LegacyGroupError> {
-        Self::connect_with_optional_pcm_source(configs, None)
+        Self::connect_with_optional_pcm_source(configs, None, false)
     }
 
     /// Future common-session seam: consume an externally owned persistent PCM
@@ -350,12 +370,22 @@ impl LegacyGroupSession {
         configs: Vec<LegacyMemberConfig>,
         pcm_source: WindowsPcmSourceHandle,
     ) -> Result<Self, LegacyGroupError> {
-        Self::connect_with_optional_pcm_source(configs, Some(pcm_source))
+        Self::connect_with_optional_pcm_source(configs, Some(pcm_source), false)
+    }
+
+    /// Phase B external-feed seam. This establishes the existing legacy
+    /// transport/helper lifecycle but leaves source reads to a higher-level
+    /// common coordinator. It does not enable mixed playback by itself.
+    pub fn connect_external_pcm(
+        configs: Vec<LegacyMemberConfig>,
+    ) -> Result<Self, LegacyGroupError> {
+        Self::connect_with_optional_pcm_source(configs, None, true)
     }
 
     fn connect_with_optional_pcm_source(
         configs: Vec<LegacyMemberConfig>,
         injected_pcm_source: Option<WindowsPcmSourceHandle>,
+        external_pcm_feed: bool,
     ) -> Result<Self, LegacyGroupError> {
         if configs.is_empty() {
             return Err(LegacyGroupError::EmptyGroup);
@@ -514,6 +544,15 @@ impl LegacyGroupSession {
         let events_thread = Arc::clone(&startup_events);
         let active_thread = Arc::clone(&active_members);
 
+        // Preserve the validated RAOP feed gate even when PCM is supplied by
+        // an external coordinator.
+        let feed_ntp = committed_group_start_unix_ms.map(|start_unix_ms| {
+            let total_latency_frames =
+                RAOP_CONFIGURED_LATENCY_FRAMES + RAOP_FIXED_LATENCY_FRAMES;
+            unix_ms_to_ntp(start_unix_ms)
+                .saturating_sub(frames_to_ntp(total_latency_frames))
+        });
+
         let helper_pids = spawned.iter().map(|member| member.pid).collect::<Vec<_>>();
         let volume_controls = spawned
             .iter()
@@ -526,6 +565,7 @@ impl LegacyGroupSession {
                     member.name.clone(),
                     member.pcm_tx.clone(),
                     Arc::clone(&running),
+                    if external_pcm_feed { feed_ntp } else { None },
                 )
             })
             .collect::<Vec<_>>();
@@ -549,20 +589,12 @@ impl LegacyGroupSession {
             .map(|member| member.writer)
             .collect::<Vec<_>>();
 
-        // Solo keeps the already-validated immediate libraop path. A real
-        // group is now commanded only after connection readiness, and the PCM
-        // feed begins one configured+fixed receiver-latency window before the
-        // verified audible instant, as on the existing libraop transport.
-        let feed_ntp = committed_group_start_unix_ms.map(|start_unix_ms| {
-            let total_latency_frames =
-                RAOP_CONFIGURED_LATENCY_FRAMES + RAOP_FIXED_LATENCY_FRAMES;
-            unix_ms_to_ntp(start_unix_ms)
-                .saturating_sub(frames_to_ntp(total_latency_frames))
-        });
-
-        let worker = thread::Builder::new()
-            .name("sairplay-legacy-audio".into())
-            .spawn(move || {
+        let (worker, external_pcm_sinks, external_writers) = if external_pcm_feed {
+            (None, pcm_sinks, writers)
+        } else {
+            let worker = thread::Builder::new()
+                .name("sairplay-legacy-audio".into())
+                .spawn(move || {
                 if let Some(feed_ntp) = feed_ntp {
                     while running_thread.load(Ordering::SeqCst) {
                         let now_ntp = match system_time_to_ntp(SystemTime::now()) {
@@ -695,24 +727,37 @@ impl LegacyGroupSession {
                     let _ = writer.join();
                 }
             })
-            .map_err(|error| LegacyGroupError::Capture(
-                WasapiLoopbackError::Windows(format!(
-                    "failed to spawn legacy WASAPI worker: {error}"
-                )),
-            ))?;
+                .map_err(|error| LegacyGroupError::Capture(
+                    WasapiLoopbackError::Windows(format!(
+                        "failed to spawn legacy WASAPI worker: {error}"
+                    )),
+                ))?;
+            (Some(worker), Vec::new(), Vec::new())
+        };
 
         Ok(Self {
             running,
             helper_pids,
-            worker: Some(worker),
+            worker,
             last_error,
             discontinuities,
             last_discontinuity_frame,
             startup_events,
             active_members,
             volume_controls,
+            external_pcm_sinks,
+            external_writers,
             _command_controls: command_controls,
         })
+    }
+
+    pub fn take_external_pcm_participants(
+        &mut self,
+    ) -> Vec<Box<dyn GroupPcmParticipant>> {
+        std::mem::take(&mut self.external_pcm_sinks)
+            .into_iter()
+            .map(|sink| Box::new(sink) as Box<dyn GroupPcmParticipant>)
+            .collect()
     }
 
     pub fn is_running(&self) -> bool {
@@ -769,8 +814,13 @@ impl LegacyGroupSession {
             }))
         };
 
+        self.external_pcm_sinks.clear();
+
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
+        }
+        for writer in self.external_writers.drain(..) {
+            let _ = writer.join();
         }
         if let Some(watchdog) = watchdog {
             let _ = watchdog.join();
