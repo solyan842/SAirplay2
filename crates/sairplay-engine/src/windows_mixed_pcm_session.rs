@@ -7,8 +7,9 @@
 
 use crate::{
     Ap2AudioFormat, GroupPcmCoordinator, GroupPcmCoordinatorCycle,
-    GroupPcmParticipant, OwnedNativePcmSink, WasapiLoopbackError,
-    WindowsPcmCoordinatorOwner, WindowsPcmCoordinatorSource,
+    GroupPcmParticipant, LegacyPcmSink, OwnedNativePcmSink,
+    WasapiLoopbackError, WindowsPcmCoordinatorOwner,
+    WindowsPcmCoordinatorSource,
 };
 use crate::group_start_orchestrator::{
     run_concurrent_group_start_round, run_group_start_convergence,
@@ -50,6 +51,21 @@ impl WindowsMixedPcmSession {
         if !member.is_armed() {
             return Err(format!(
                 "{}: native mixed PCM sink must complete common START before attachment",
+                GroupPcmParticipant::name(&member),
+            ));
+        }
+        self.coordinator.add_member(Box::new(member))
+    }
+
+    /// Admit an external RAOP sink only after its feed gate has been derived
+    /// from the TRUE common START anchor.
+    pub fn add_armed_legacy_member(
+        &mut self,
+        member: LegacyPcmSink,
+    ) -> Result<(), String> {
+        if !member.is_feed_armed() {
+            return Err(format!(
+                "{}: legacy mixed PCM sink must be armed from common START before attachment",
                 GroupPcmParticipant::name(&member),
             ));
         }

@@ -155,6 +155,7 @@ pub struct LegacyPcmSink {
     pcm_tx: SyncSender<[u8; PCM352_PACKET_BYTES]>,
     running: Arc<AtomicBool>,
     feed_not_before_ntp: Option<u64>,
+    feed_armed: bool,
 }
 
 impl LegacyPcmSink {
@@ -168,8 +169,27 @@ impl LegacyPcmSink {
             name,
             pcm_tx,
             running,
+            feed_armed: feed_not_before_ntp.is_some(),
             feed_not_before_ntp,
         }
+    }
+
+    /// Arm the external RAOP PCM feed from the TRUE common START anchor.
+    ///
+    /// The source-built helper expects PCM to begin one configured + fixed
+    /// receiver-latency window before the audible START instant.
+    pub fn arm_feed_from_start_unix_ms(&mut self, start_unix_ms: u64) {
+        let total_latency_frames =
+            RAOP_CONFIGURED_LATENCY_FRAMES + RAOP_FIXED_LATENCY_FRAMES;
+        self.feed_not_before_ntp = Some(
+            unix_ms_to_ntp(start_unix_ms)
+                .saturating_sub(frames_to_ntp(total_latency_frames)),
+        );
+        self.feed_armed = true;
+    }
+
+    pub fn is_feed_armed(&self) -> bool {
+        self.feed_armed
     }
 }
 
@@ -784,10 +804,14 @@ impl LegacyGroupSession {
         })
     }
 
+    pub fn take_external_pcm_sinks(&mut self) -> Vec<LegacyPcmSink> {
+        std::mem::take(&mut self.external_pcm_sinks)
+    }
+
     pub fn take_external_pcm_participants(
         &mut self,
     ) -> Vec<Box<dyn GroupPcmParticipant>> {
-        std::mem::take(&mut self.external_pcm_sinks)
+        self.take_external_pcm_sinks()
             .into_iter()
             .map(|sink| Box::new(sink) as Box<dyn GroupPcmParticipant>)
             .collect()
