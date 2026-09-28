@@ -158,6 +158,73 @@ impl GroupPcmSource for WindowsPcmSourceHandle {
     }
 }
 
+/// Non-cloneable reader token reserved for the future mixed-session PCM
+/// coordinator. Keeping this wrapper non-Clone makes the intended ownership
+/// explicit: mixed native + RAOP must advance the Windows ring through one
+/// coordinator reader, never through independent transport readers.
+pub struct WindowsPcmCoordinatorSource {
+    inner: WindowsPcmSourceHandle,
+}
+
+impl GroupPcmSource for WindowsPcmCoordinatorSource {
+    fn read_shared_pcm(
+        &self,
+        want_bytes: usize,
+        timeout: Duration,
+    ) -> Result<Option<Vec<u8>>, String> {
+        self.inner.read_shared_pcm(want_bytes, timeout)
+    }
+
+    fn buffered_bytes(&self) -> usize {
+        self.inner.buffered_bytes()
+    }
+}
+
+/// Own one persistent Windows PCM producer and permit exactly one handoff of
+/// its mixed-session reader token.
+///
+/// Existing native-only and legacy-only paths keep using WindowsPcmSession
+/// directly. This owner exists only to make the future mixed-session ownership
+/// boundary impossible to express as "clone one handle into two workers".
+pub struct WindowsPcmCoordinatorOwner {
+    session: WindowsPcmSession,
+    source: Option<WindowsPcmCoordinatorSource>,
+}
+
+impl WindowsPcmCoordinatorOwner {
+    pub fn start(audio_format: Ap2AudioFormat) -> Result<Self, WasapiLoopbackError> {
+        Self::from_session(WindowsPcmSession::start(audio_format)?)
+    }
+
+    pub fn from_session(session: WindowsPcmSession) -> Result<Self, WasapiLoopbackError> {
+        let source = WindowsPcmCoordinatorSource {
+            inner: session.source_handle(),
+        };
+        Ok(Self {
+            session,
+            source: Some(source),
+        })
+    }
+
+    pub fn take_source(&mut self) -> Result<WindowsPcmCoordinatorSource, String> {
+        self.source
+            .take()
+            .ok_or_else(|| "mixed-session PCM coordinator source already handed off".to_owned())
+    }
+
+    pub fn source_available(&self) -> bool {
+        self.source.is_some()
+    }
+
+    pub fn session(&self) -> &WindowsPcmSession {
+        &self.session
+    }
+
+    pub fn stop(&mut self) {
+        self.session.stop();
+    }
+}
+
 pub struct WindowsPcmSession {
     shared: Arc<SharedRing>,
     producer: Option<JoinHandle<()>>,
@@ -349,12 +416,15 @@ impl WindowsPcmSession {
         }
     }
 
-    /// Cloneable reader-side view of this persistent PCM session.
+    /// Cloneable reader-side view used by the existing single-transport
+    /// worker seams.
     ///
     /// The owning WindowsPcmSession retains producer lifetime and stop/join
-    /// responsibility. A future group orchestrator can therefore own one
-    /// producer while handing the same source handle to multiple transport
-    /// lanes without opening another WASAPI capture.
+    /// responsibility. Do not clone this handle into independent native + RAOP
+    /// readers for mixed playback: they would consume different bytes from the
+    /// same ring. Mixed playback must use the non-cloneable
+    /// WindowsPcmCoordinatorSource handed off once by
+    /// WindowsPcmCoordinatorOwner.
     pub fn source_handle(&self) -> WindowsPcmSourceHandle {
         WindowsPcmSourceHandle {
             shared: Arc::clone(&self.shared),
@@ -724,4 +794,26 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn coordinator_owner_hands_source_out_exactly_once() {
+        let session = test_session(
+            Ap2AudioFormat::ALAC_44100_16_STEREO,
+            &[1u8, 2, 3, 4, 5, 6, 7, 8],
+        );
+        let mut owner = WindowsPcmCoordinatorOwner::from_session(session).unwrap();
+
+        assert!(owner.source_available());
+        let source = owner.take_source().unwrap();
+        assert!(!owner.source_available());
+        assert_eq!(
+            source
+                .read_shared_pcm(4, Duration::from_millis(0))
+                .unwrap()
+                .unwrap(),
+            vec![1u8, 2, 3, 4]
+        );
+        assert!(owner.take_source().is_err());
+        assert_eq!(owner.session().buffered_bytes(), 4);
+    }
+
 }

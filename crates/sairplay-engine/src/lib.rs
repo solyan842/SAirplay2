@@ -141,7 +141,8 @@ pub use pcm_chunker::{Pcm352Chunker, PCM352_PACKET_BYTES};
 pub use wasapi_loopback::{WasapiDrainReport, WasapiLoopbackCapture, WasapiLoopbackError};
 #[cfg(windows)]
 pub use windows_pcm_session::{
-    WindowsPcmDiscontinuity, WindowsPcmSession, WINDOWS_PCM_SESSION_RING_MIN_BYTES,
+    WindowsPcmCoordinatorOwner, WindowsPcmCoordinatorSource, WindowsPcmDiscontinuity,
+    WindowsPcmSession, WindowsPcmSourceHandle, WINDOWS_PCM_SESSION_RING_MIN_BYTES,
     WINDOWS_PCM_SESSION_RING_SECONDS,
 };
 #[cfg(windows)]
