@@ -20,6 +20,7 @@ pub mod cross_transport_timeline;
 pub mod group_start_orchestrator;
 pub mod group_flush;
 pub mod group_pcm_fanout;
+pub mod mixed_pcm_session;
 pub mod timing_policy;
 pub mod ntp_timing;
 pub mod ptp_engine;
@@ -102,6 +103,7 @@ pub use group_pcm_fanout::{
     GroupPcmCoordinatorCycle, GroupPcmFailure, GroupPcmParticipant,
     GroupPcmPumpOutcome, GroupPcmSource,
 };
+pub use mixed_pcm_session::MixedPcmSession;
 
 pub use timing_policy::{TimingDecision, TimingMode, TimingPreference, TimingReadiness, TimingStartResult};
 pub use ntp_timing::{build_timing_response, system_time_to_ntp, NtpTimingError, NtpTimingResponder};
