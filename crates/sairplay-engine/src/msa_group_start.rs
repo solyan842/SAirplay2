@@ -74,13 +74,13 @@ fn start_round(
                 } else {
                     target_unix_ms.saturating_sub(adjust.unsigned_abs())
                 };
-                member
-                    .start_at(commanded, position_ms)
-                    .map(|ack| (name, adjust, ack))
-                    .map_err(|error| MsaGroupStartFailure {
+                match member.start_at(commanded, position_ms) {
+                    Ok(ack) => Ok((name, adjust, ack)),
+                    Err(error) => Err(MsaGroupStartFailure {
                         member: name,
                         error,
-                    })
+                    }),
+                }
             }));
         }
 
