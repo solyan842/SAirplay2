@@ -1,7 +1,8 @@
 use crate::{
-    Ap2AudioFormat, NativeSession, NativeSessionConfig, NativeVolumeControl, PtpEngine,
-    RetransmitStats, WindowsGroupAudioKind, WindowsMultiroomAudioError,
-    WindowsMultiroomAudioWorker, WindowsMultiroomJoinHandle,
+    Ap2AudioFormat, NativeSession, NativeSessionConfig, NativeVolumeControl,
+    OwnedNativePcmSink, PtpEngine, RetransmitStats, WindowsGroupAudioKind,
+    WindowsMultiroomAudioError, WindowsMultiroomAudioWorker,
+    WindowsMultiroomJoinHandle,
 };
 use crate::windows_pcm_session::WindowsPcmSourceHandle;
 use std::fmt;
@@ -133,6 +134,7 @@ pub struct NativeGroupSession {
     kind: NativeGroupKind,
     members: Vec<(String, NativeSession)>,
     audio_worker: Option<WindowsMultiroomAudioWorker>,
+    external_pcm_sinks: Vec<OwnedNativePcmSink>,
     shared_ptp: Option<Arc<PtpEngine>>,
     use_ptp: bool,
 }
@@ -142,7 +144,7 @@ impl NativeGroupSession {
         kind: NativeGroupKind,
         configs: Vec<NativeGroupMemberConfig>,
     ) -> Result<Self, NativeGroupError> {
-        Self::connect_with_optional_pcm_source(kind, configs, None)
+        Self::connect_with_optional_pcm_source(kind, configs, None, None)
     }
 
     /// Future mixed-session ownership seam: consume an externally owned
@@ -159,6 +161,24 @@ impl NativeGroupSession {
             kind,
             configs,
             Some((pcm_source, source_format)),
+            None,
+        )
+    }
+
+    /// Phase B external-feed seam. This establishes native receiver sessions,
+    /// shared PTP ownership and media targets, but intentionally does not start
+    /// the native PCM reader worker. Returned sinks are unarmed until a higher-
+    /// level common timing/session controller assigns their packet NTP timeline.
+    pub fn connect_external_pcm(
+        kind: NativeGroupKind,
+        configs: Vec<NativeGroupMemberConfig>,
+        source_format: Ap2AudioFormat,
+    ) -> Result<Self, NativeGroupError> {
+        Self::connect_with_optional_pcm_source(
+            kind,
+            configs,
+            None,
+            Some(source_format),
         )
     }
 
@@ -166,6 +186,7 @@ impl NativeGroupSession {
         kind: NativeGroupKind,
         mut configs: Vec<NativeGroupMemberConfig>,
         injected_pcm_source: Option<(WindowsPcmSourceHandle, Ap2AudioFormat)>,
+        external_pcm_format: Option<Ap2AudioFormat>,
     ) -> Result<Self, NativeGroupError> {
         if configs.is_empty() {
             return Err(NativeGroupError::EmptyGroup);
@@ -239,24 +260,61 @@ impl NativeGroupSession {
             NativeGroupKind::StereoPair => WindowsGroupAudioKind::StereoPair,
             NativeGroupKind::MultiRoom => WindowsGroupAudioKind::MultiRoom,
         };
-        let audio_worker = match injected_pcm_source {
-            Some((pcm_source, source_format)) => WindowsMultiroomAudioWorker::start_with_pcm_source(
-                worker_kind,
-                targets,
-                pcm_source,
-                source_format,
-            ),
-            None => WindowsMultiroomAudioWorker::start(worker_kind, targets),
-        }
-        .map_err(NativeGroupError::Audio)?;
+
+        let (audio_worker, external_pcm_sinks) = if let Some(source_format) = external_pcm_format {
+            if injected_pcm_source.is_some() {
+                return Err(NativeGroupError::Audio(WindowsMultiroomAudioError::Media(
+                    "native group cannot use injected-reader and external-feed modes together".into(),
+                )));
+            }
+            if targets
+                .iter()
+                .any(|target| target.sender.audio_format().sample_rate != source_format.sample_rate)
+            {
+                return Err(NativeGroupError::Audio(WindowsMultiroomAudioError::Media(
+                    "external native PCM source sample rate must match every target in Phase B".into(),
+                )));
+            }
+            let sinks = targets
+                .into_iter()
+                .map(|target| OwnedNativePcmSink::new(target, source_format, 0))
+                .collect::<Vec<_>>();
+            (None, sinks)
+        } else {
+            let worker = match injected_pcm_source {
+                Some((pcm_source, source_format)) => WindowsMultiroomAudioWorker::start_with_pcm_source(
+                    worker_kind,
+                    targets,
+                    pcm_source,
+                    source_format,
+                ),
+                None => WindowsMultiroomAudioWorker::start(worker_kind, targets),
+            }
+            .map_err(NativeGroupError::Audio)?;
+            (Some(worker), Vec::new())
+        };
 
         Ok(Self {
             kind,
             members,
-            audio_worker: Some(audio_worker),
+            audio_worker,
+            external_pcm_sinks,
             shared_ptp,
             use_ptp,
         })
+    }
+
+    /// Take the native media sinks created by connect_external_pcm().
+    ///
+    /// The returned sinks still require common START/timeline orchestration;
+    /// their initial packet NTP is deliberately zero so this seam cannot be
+    /// mistaken for a ready-to-play mixed session.
+    pub fn take_external_pcm_sinks(&mut self) -> Vec<OwnedNativePcmSink> {
+        std::mem::take(&mut self.external_pcm_sinks)
+    }
+
+    pub fn has_external_pcm_sinks(&self) -> bool {
+        !self.external_pcm_sinks.is_empty()
     }
 
     pub fn kind(&self) -> NativeGroupKind {
