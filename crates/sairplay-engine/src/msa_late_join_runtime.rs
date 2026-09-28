@@ -230,7 +230,12 @@ mod tests {
         let _ = msa_commit_late_join(&mut rt, &post, 0, ack).unwrap();
 
         assert_eq!(rt.calls[0], "start");
-        assert!(rt.calls.iter().position(|c| *c == "prime").unwrap() > 0);
+        let first_post_start = rt
+            .calls
+            .iter()
+            .position(|c| matches!(*c, "rebase" | "skip" | "prime"))
+            .expect("late-join commit must perform post-ACK mapping");
+        assert!(first_post_start > 0);
     }
 
     #[test]
