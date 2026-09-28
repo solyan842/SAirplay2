@@ -6,10 +6,13 @@
 //! explicit and testable by construction.
 
 use crate::{
-    run_concurrent_group_start_round, run_group_start_convergence, Ap2AudioFormat,
-    GroupPcmCoordinator, GroupPcmCoordinatorCycle, GroupPcmParticipant,
+    Ap2AudioFormat, GroupPcmCoordinator, GroupPcmCoordinatorCycle,
+    GroupPcmParticipant, WasapiLoopbackError, WindowsPcmCoordinatorOwner,
+    WindowsPcmCoordinatorSource,
+};
+use crate::group_start_orchestrator::{
+    run_concurrent_group_start_round, run_group_start_convergence,
     GroupStartConvergence, GroupStartIoError, GroupStartParticipant,
-    WasapiLoopbackError, WindowsPcmCoordinatorOwner, WindowsPcmCoordinatorSource,
 };
 use std::time::Duration;
 
