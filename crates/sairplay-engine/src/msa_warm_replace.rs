@@ -7,8 +7,9 @@
 //! existing MSA group START convergence loop re-anchors the session.
 
 use crate::{
-    msa_start_group, MsaGroupStartFailure, MsaGroupStartMember, MsaGroupStartResult,
-    MSA_GROUP_START_LEAD_MS, MSA_SPLICE_LEAD_MARGIN_MS,
+    MsaGroupStartFailure, MsaGroupStartMember, MsaGroupStartResult,
+    MSA_GROUP_START_LEAD_MS, MSA_SPLICE_LEAD_MARGIN_MS, MSA_START_MAX_ROUNDS,
+    MSA_START_TOLERANCE_MS,
 };
 use std::thread;
 
@@ -143,42 +144,99 @@ pub fn msa_start_warm_replacement(
 ) -> Result<MsaWarmReplaceResult, Vec<MsaGroupStartFailure>> {
     let anchor = msa_warm_anchor_unix_ms(now_unix_ms, &snapshots);
 
-    // Trait upcast through a temporary vector of thin forwarding refs is not
-    // yet stable for boxed trait objects, so use an adapter that forwards the
-    // START-facing portion only.
-    struct StartView<'a> {
-        inner: &'a mut dyn MsaWarmReplaceMember,
+    let mut target_ms = anchor;
+    let mut corrected_ms = anchor;
+    let mut last_acks = Vec::new();
+
+    for round in 1..=MSA_START_MAX_ROUNDS {
+        let round_result = thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(members.len());
+            for member in members.iter_mut() {
+                handles.push(scope.spawn(move || {
+                    let name = member.name().to_owned();
+                    let adjust = member.sync_adjust_ms();
+                    let commanded = if adjust >= 0 {
+                        target_ms.saturating_add(adjust as u64)
+                    } else {
+                        target_ms.saturating_sub(adjust.unsigned_abs())
+                    };
+                    match member.start_at(commanded, position_ms) {
+                        Ok(ack) => Ok((name, adjust, ack)),
+                        Err(error) => Err(MsaGroupStartFailure {
+                            member: name,
+                            error,
+                        }),
+                    }
+                }));
+            }
+
+            let mut ok = Vec::new();
+            let mut failures = Vec::new();
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(value)) => ok.push(value),
+                    Ok(Err(error)) => failures.push(error),
+                    Err(_) => failures.push(MsaGroupStartFailure {
+                        member: "AirPlay warm group".to_owned(),
+                        error: "warm START member panicked".to_owned(),
+                    }),
+                }
+            }
+
+            if failures.is_empty() { Ok(ok) } else { Err(failures) }
+        })?;
+
+        corrected_ms = target_ms;
+        last_acks.clear();
+        for (name, adjust, ack) in round_result {
+            let normalized = if adjust >= 0 {
+                ack.saturating_sub(adjust as u64)
+            } else {
+                ack.saturating_add(adjust.unsigned_abs())
+            };
+            corrected_ms = corrected_ms.max(normalized);
+            last_acks.push((name, normalized));
+        }
+
+        if corrected_ms <= target_ms.saturating_add(MSA_START_TOLERANCE_MS) {
+            return Ok(MsaWarmReplaceResult {
+                warm_anchor_unix_ms: anchor,
+                start: MsaGroupStartResult {
+                    anchor_unix_ms: target_ms,
+                    rounds: round,
+                    last_member_acks_unix_ms: last_acks,
+                    converged: true,
+                },
+                members: snapshots,
+            });
+        }
+
+        if members.len() == 1 {
+            return Ok(MsaWarmReplaceResult {
+                warm_anchor_unix_ms: anchor,
+                start: MsaGroupStartResult {
+                    anchor_unix_ms: corrected_ms,
+                    rounds: round,
+                    last_member_acks_unix_ms: last_acks,
+                    converged: true,
+                },
+                members: snapshots,
+            });
+        }
+
+        if round < MSA_START_MAX_ROUNDS {
+            target_ms = corrected_ms.saturating_add(MSA_SPLICE_LEAD_MARGIN_MS);
+        }
     }
 
-    impl MsaGroupStartMember for StartView<'_> {
-        fn name(&self) -> &str {
-            self.inner.name()
-        }
-        fn sync_adjust_ms(&self) -> i64 {
-            self.inner.sync_adjust_ms()
-        }
-        fn start_at(
-            &mut self,
-            commanded_unix_ms: u64,
-            position_ms: u64,
-        ) -> Result<u64, String> {
-            self.inner.start_at(commanded_unix_ms, position_ms)
-        }
-    }
-
-    let mut start_members: Vec<Box<dyn MsaGroupStartMember + '_>> = members
-        .iter_mut()
-        .map(|member| {
-            Box::new(StartView {
-                inner: member.as_mut(),
-            }) as Box<dyn MsaGroupStartMember>
-        })
-        .collect();
-
-    let start = msa_start_group(&mut start_members, position_ms, anchor)?;
     Ok(MsaWarmReplaceResult {
         warm_anchor_unix_ms: anchor,
-        start,
+        start: MsaGroupStartResult {
+            anchor_unix_ms: corrected_ms,
+            rounds: MSA_START_MAX_ROUNDS,
+            last_member_acks_unix_ms: last_acks,
+            converged: false,
+        },
         members: snapshots,
     })
 }
