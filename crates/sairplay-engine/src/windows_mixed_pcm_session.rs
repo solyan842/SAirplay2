@@ -7,8 +7,8 @@
 
 use crate::{
     Ap2AudioFormat, GroupPcmCoordinator, GroupPcmCoordinatorCycle,
-    GroupPcmParticipant, WasapiLoopbackError, WindowsPcmCoordinatorOwner,
-    WindowsPcmCoordinatorSource,
+    GroupPcmParticipant, OwnedNativePcmSink, WasapiLoopbackError,
+    WindowsPcmCoordinatorOwner, WindowsPcmCoordinatorSource,
 };
 use crate::group_start_orchestrator::{
     run_concurrent_group_start_round, run_group_start_convergence,
@@ -37,6 +37,23 @@ impl WindowsMixedPcmSession {
         member: Box<dyn GroupPcmParticipant>,
     ) -> Result<(), String> {
         self.coordinator.add_member(member)
+    }
+
+    /// Admit a native external-feed sink only after common START has armed it.
+    ///
+    /// This makes the Phase B ordering explicit:
+    /// connect transports -> common START convergence -> PCM coordinator attach.
+    pub fn add_armed_native_member(
+        &mut self,
+        member: OwnedNativePcmSink,
+    ) -> Result<(), String> {
+        if !member.is_armed() {
+            return Err(format!(
+                "{}: native mixed PCM sink must complete common START before attachment",
+                GroupPcmParticipant::name(&member),
+            ));
+        }
+        self.coordinator.add_member(Box::new(member))
     }
 
     /// Commit one common audible START across transport-neutral members using
