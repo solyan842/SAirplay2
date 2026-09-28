@@ -1,3 +1,4 @@
+pub mod msa_windows_source;
 pub mod msa_failure_isolation;
 pub mod msa_late_join_runtime;
 pub mod msa_late_join;
@@ -136,4 +137,8 @@ pub use msa_failure_isolation::{
     msa_rejoin_attempt_decision, msa_rejoin_succeeded, msa_unexpected_loss_action,
     MsaPlaybackState, MsaRejoinDecision, MsaRejoinMemberState,
     MsaUnexpectedLossAction, MSA_REJOIN_ATTEMPT_DELAYS_SECS,
+};
+
+pub use msa_windows_source::{
+    MsaWindowsSource, WINDOWS_PCM_PACKET_BYTES_16_441_STEREO,
 };
