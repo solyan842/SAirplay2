@@ -1,3 +1,4 @@
+pub mod msa_ap2_transport;
 pub mod msa_session_adapter;
 pub mod msa_session;
 pub mod ap2_info;
@@ -92,3 +93,5 @@ pub use msa_session::{MsaSessionCore, MsaSessionState};
 pub use msa_session_adapter::{
     MsaFlushAck, MsaSession, MsaSessionTransport, MsaStartAck,
 };
+
+pub use msa_ap2_transport::{MsaAp2Client, MsaAp2Transport};
