@@ -1,6 +1,6 @@
 # SAirplay2 — Project State
 
-Last updated: 2026-09-27  
+Last updated: 2026-09-28  
 Working branch: `dev/msa-cross-transport-foundation`
 
 ## 1. Protected stable
@@ -310,9 +310,10 @@ Current phase status:
   and capture independence from START/PTP/ALAC/network blocking are locked.
 - **Phase B — cross-transport foundation: IN PROGRESS.**
   Common START convergence, FLUSH/head contracts, shared PCM source/fan-out
-  contracts, RAOP PCM sink, producer/reader ownership split and both native +
-  legacy source-injection seams now exist. Mixed AP2 + RAOP runtime is still
-  deliberately disabled.
+  contracts, RAOP PCM sink, native PCM sink, producer/reader ownership split,
+  native + legacy source-injection seams, one-read shared PCM pump,
+  session-level shared PCM coordinator, failure pruning and explicit member
+  removal now exist. Mixed AP2 + RAOP runtime is still deliberately disabled.
 - **Phase C — heterogeneous handoff: NOT STARTED.**
   Per-member 44.1/48 kHz conversion and wider mixed-format handoff must not be
   pulled into Phase B.
@@ -365,30 +366,70 @@ instead of receiving the same source chunk.
 
 ### Current Phase B head
 
-Validated predecessor:
+Latest validated engine head:
 
-`fd268cf33803f9159b8901bcf57cdc61a9f2621e`
-— legacy shared PCM source injection seam — Windows Action #896 PASS.
+`1d68355b1197effa539f5f432d594c686c04647d`
+— explicit shared PCM member removal — Windows Action #905 PASS.
 
-Current head:
+Immediately preceding validated milestones:
 
-`df02ee9bea251ee49d77f74823ce27a7eff3b5d8`
-— native shared PCM source injection seam — Windows Action #897 PASS.
+- `3a10379951b9d3a1491f8efbf2ae3dd83bcdd680`
+  — coordinator cycle test alignment — Windows Action #904 PASS.
+- `e026b2cfaceb7dec5d9826ae9d4ae1f4296e3ef2`
+  — scoped fan-out compile fix; superseded by #904 PASS.
+- `9bbc1071eb10f7266e8c3536aa635a32b4b02a5d`
+  — prune failed PCM members between shared reads; initial Actions failed only
+  on compile/test wiring and were corrected without changing runtime semantics.
+- `3525473d402ccedda91dd2170f68940aabf094db`
+  — session-level shared PCM coordinator — Windows Action #901 PASS.
+- `cc463af5683830574887e948367ddc9a49a30325`
+  — one-read shared PCM pump contract — Windows Action #900 PASS.
+- `36682a24bbe082beffa84747cba63d5684ee71ae`
+  — native PCM sends routed through the common sink contract — Windows Action
+  #899 PASS.
+- `df02ee9bea251ee49d77f74823ce27a7eff3b5d8`
+  — native shared PCM source injection seam — Windows Action #897 PASS.
+- `fd268cf33803f9159b8901bcf57cdc61a9f2621e`
+  — legacy shared PCM source injection seam — Windows Action #896 PASS.
 
-At this point both transport families can accept an externally owned
-`WindowsPcmSourceHandle`, but this is only an ownership seam. It is **not**
-permission to run two independent readers from the same ring.
+Current shared-PCM invariants are now explicit and tested:
+
+1. one coordinator owns exactly one source reader;
+2. each pump cycle reads the source once;
+3. the exact same source chunk is delivered to every active sink;
+4. temporary starvation performs no fan-out and is not EOF;
+5. all member write results are gathered before failure isolation;
+6. failed sinks are removed before the next source read;
+7. explicit higher-level member removal is available before the next read;
+8. duplicate participant identities are rejected;
+9. native and RAOP both have sink/source seams, but they are **not yet wired**
+   into one live mixed session.
 
 ### Next architectural step
 
-Before building the common coordinator, separate the native transport's
-source-read responsibilities from its sink/send responsibilities, analogous to
-the existing `LegacyPcmSink`. Preserve native-only splice/pad, bit-depth
-adaptation, late-join history and RTP/PTP behavior behind that sink boundary.
+Do **not** remove the mixed-group GUI guard yet.
 
-Only after native and RAOP are both true sink surfaces should Phase B add the
-common one-read PCM coordinator and, after CI + hardware evidence, remove the
-mixed-group guard.
+The next safe Phase B task is to inspect the current native and legacy session
+lifecycles and introduce the smallest higher-level mixed-session ownership seam
+that can instantiate:
+
+```
+one WindowsPcmSession owner
+        -> one WindowsPcmSourceHandle consumed only by the coordinator
+        -> NativePcmSink + LegacyPcmSink participants
+        -> coordinator pump cycles
+```
+
+The key constraint remains that the existing native/legacy workers must not
+continue independently reading cloned source handles once the coordinator owns
+the live feed. START, PTP/NTP, splice/pad, late-join history, RAOP helper
+lifecycle and teardown must remain transport-specific until each lifecycle
+handoff is source-checked against MSA.
+
+Before wiring live mixed audio, require a code path where **the coordinator is
+provably the only PCM reader**. Only then may mixed runtime be enabled for a
+same-rate/same-compatible-format Phase B test. 44.1/48 per-member conversion
+remains Phase C and must not be hidden in this step.
 
 ### Explicitly forbidden shortcuts
 
@@ -425,13 +466,17 @@ Conversation memory is secondary to the repository state.
 
 Current priority is **complete Phase B without breaking the validated native/legacy paths**. Stability preservation remains mandatory; protocol expansion must follow the phase gates above.
 
-Before changing the engine again:
+For the cross-transport work now underway:
 
-1. obtain a reproducible physical failure;
-2. identify which layer failed from current diagnostics;
-3. compare that layer to pinned/current source;
-4. make one minimal change;
-5. require Windows CI PASS;
-6. retest only the affected hardware path.
+1. inspect the exact native + legacy lifecycle call sites before every patch;
+2. preserve one-reader ownership and same-chunk fan-out;
+3. make one minimal source-aligned change;
+4. require Windows CI PASS before the next change;
+5. do not enable mixed GUI/runtime until coordinator ownership is real;
+6. when live mixed runtime is finally introduced, hardware-test same-rate,
+   same-compatible-format first before any Phase C conversion work.
+
+For unrelated transport regressions, still require reproducible hardware
+evidence before modifying START/PTP/RTP/RTX/buffer behavior.
 
 Do not resurrect old experiment branches as shortcuts.
