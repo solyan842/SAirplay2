@@ -317,6 +317,12 @@ pub struct WindowsAudioTarget {
     pub(crate) metadata: NativeMetadataControl,
 }
 
+impl WindowsAudioTarget {
+    pub fn audio_format(&self) -> Ap2AudioFormat {
+        self.sender.audio_format()
+    }
+}
+
 impl GroupStartParticipant for WindowsAudioTarget {
     fn name(&self) -> &str {
         &self.name

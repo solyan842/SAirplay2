@@ -269,7 +269,7 @@ impl NativeGroupSession {
             }
             if targets
                 .iter()
-                .any(|target| target.sender.audio_format().sample_rate != source_format.sample_rate)
+                .any(|target| target.audio_format().sample_rate != source_format.sample_rate)
             {
                 return Err(NativeGroupError::Audio(WindowsMultiroomAudioError::Media(
                     "external native PCM source sample rate must match every target in Phase B".into(),
