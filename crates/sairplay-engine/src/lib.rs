@@ -1,3 +1,4 @@
+pub mod msa_late_join;
 pub mod msa_warm_replace;
 pub mod msa_group_start;
 pub mod msa_raop_transport;
@@ -115,4 +116,11 @@ pub use msa_warm_replace::{
     msa_flush_group_for_replace, msa_start_warm_replacement, msa_warm_anchor_unix_ms,
     MsaWarmFlushFailure, MsaWarmMemberSnapshot, MsaWarmReplaceMember,
     MsaWarmReplaceResult,
+};
+
+pub use msa_late_join::{
+    msa_late_join_requested_anchor_unix_ms, msa_late_join_ring_capacity_bytes,
+    msa_plan_late_join, MsaLateJoinPlan, MsaLateJoinSnapshot,
+    MSA_LATE_JOIN_MIN_HEADROOM_MS, MSA_LATE_JOIN_RING_MARGIN_SECONDS,
+    MSA_LATE_JOIN_RING_MAX_BYTES, MSA_LATE_JOIN_RING_MIN_SECONDS,
 };
