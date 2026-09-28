@@ -16,6 +16,9 @@ pub mod route;
 pub mod rtsp;
 pub mod session;
 pub mod timeline;
+pub mod cross_transport_timeline;
+pub mod group_start_orchestrator;
+pub mod group_flush;
 pub mod timing_policy;
 pub mod ntp_timing;
 pub mod ptp_engine;
@@ -77,6 +80,22 @@ pub use route::{ReceiverCapabilities, Route, RouteResolver};
 pub use rtsp::{RtspCodec, RtspError, RtspRequest, RtspResponse};
 pub use session::{EngineCommand, EngineEvent, EngineState, SessionCore};
 pub use timeline::{Boundary, SplicePlan, Timeline, TimelineError};
+pub use cross_transport_timeline::{
+    evaluate_group_start_round, ntp_epoch_to_unix_ms, raop_next_head_unix_ms,
+    resolve_raop_start_unix_ms, unix_ms_to_ntp_epoch, GroupStartRoundDecision,
+    RaopResolvedStart, AIRPLAY_COLD_GROUP_START_LEAD_MS as CROSS_TRANSPORT_COLD_GROUP_START_LEAD_MS,
+    AIRPLAY_GROUP_START_LEAD_MS, AIRPLAY_SPLICE_LEAD_MARGIN_MS,
+    AIRPLAY_START_CONVERGENCE_MAX_ROUNDS, AIRPLAY_START_CONVERGENCE_TOLERANCE_MS,
+    RAOP_SESSION_MIN_START_LEAD_MS,
+};
+pub use group_start_orchestrator::{
+    run_concurrent_group_start_round, run_group_start_convergence, GroupStartConvergence,
+    GroupStartCorrection, GroupStartIoError, GroupStartParticipant,
+};
+pub use group_flush::{
+    parse_group_flush_status, resolve_warm_group_anchor, GroupFlushAck,
+    WarmGroupMemberConstraint,
+};
 
 pub use timing_policy::{TimingDecision, TimingMode, TimingPreference, TimingReadiness, TimingStartResult};
 pub use ntp_timing::{build_timing_response, system_time_to_ntp, NtpTimingError, NtpTimingResponder};
