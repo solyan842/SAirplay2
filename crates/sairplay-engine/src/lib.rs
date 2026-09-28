@@ -48,6 +48,8 @@ pub mod wasapi_loopback;
 #[cfg(windows)]
 pub mod windows_pcm_session;
 #[cfg(windows)]
+pub mod windows_mixed_pcm_session;
+#[cfg(windows)]
 pub mod windows_audio_worker;
 #[cfg(windows)]
 pub mod windows_multiroom_worker;
@@ -145,6 +147,8 @@ pub use windows_pcm_session::{
     WindowsPcmSession, WindowsPcmSourceHandle, WINDOWS_PCM_SESSION_RING_MIN_BYTES,
     WINDOWS_PCM_SESSION_RING_SECONDS,
 };
+#[cfg(windows)]
+pub use windows_mixed_pcm_session::WindowsMixedPcmSession;
 #[cfg(windows)]
 pub use windows_audio_worker::{WindowsAudioWorker, WindowsAudioWorkerError};
 #[cfg(windows)]
