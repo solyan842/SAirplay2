@@ -39,6 +39,13 @@ enum RealtimeTiming {
     Ptp { clock: PtpClock },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MsaRealtimeFlushPoint {
+    pub sequence: u16,
+    pub rtptime: u32,
+    pub warm_head_unix_ms: Option<u64>,
+}
+
 pub struct RealtimeMediaSender {
     transport: MediaTransport,
     state: RtpState,
@@ -280,6 +287,20 @@ impl RealtimeMediaSender {
         self.head_ts
     }
 
+    /// Snapshot the sender at one instant for an MSA warm boundary.
+    ///
+    /// sequence/rtptime are the next wire RTP coordinates. warm_head_unix_ms
+    /// is derived from the scheduling head (head_ts), not from wire rtptime:
+    /// native AP2 applies a per-process RTP offset on the wire, while the warm
+    /// head lives in the wall-clock frame domain.
+    pub fn msa_flush_point(&self) -> MsaRealtimeFlushPoint {
+        MsaRealtimeFlushPoint {
+            sequence: self.state.sequence,
+            rtptime: self.state.timestamp,
+            warm_head_unix_ms: frame_clock_to_unix_ms(self.head_ts),
+        }
+    }
+
     pub fn pacing_window_frames(&self) -> u64 {
         self.pacing_window_frames
     }
@@ -416,6 +437,27 @@ impl RealtimeMediaSender {
     }
 }
 
+
+fn frame_clock_to_unix_ms(frames: u64) -> Option<u64> {
+    if frames == 0 {
+        return None;
+    }
+
+    const NTP_UNIX_EPOCH_DELTA: u64 = 2_208_988_800;
+    const SAMPLE_RATE: u64 = 44_100;
+
+    let ntp_seconds = frames / SAMPLE_RATE;
+    if ntp_seconds < NTP_UNIX_EPOCH_DELTA {
+        return None;
+    }
+    let remainder_frames = frames % SAMPLE_RATE;
+    Some(
+        ntp_seconds
+            .saturating_sub(NTP_UNIX_EPOCH_DELTA)
+            .saturating_mul(1000)
+            .saturating_add(remainder_frames.saturating_mul(1000) / SAMPLE_RATE),
+    )
+}
 
 fn system_unix_ns() -> u64 {
     SystemTime::now()
@@ -687,4 +729,43 @@ mod tests {
         assert_eq!(cn, 20);
         assert_eq!(&buf[4..8], &0u32.to_be_bytes());
     }
+
+    #[test]
+    fn msa_flush_point_keeps_wire_rtp_separate_from_audible_head() {
+        let data_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ctrl_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let transport = transport_to(&data_rx, &ctrl_rx);
+
+        let state = RtpState::new(77, 0x00AA_5500, 0);
+        let mut sender = RealtimeMediaSender::new(transport, state, [0x11u8; 32]);
+
+        let unix_ms = 12_345u64;
+        let ntp_seconds = 2_208_988_800u64 + unix_ms / 1000;
+        let remainder_ms = unix_ms % 1000;
+        let head_frames = ntp_seconds * 44_100 + remainder_ms * 44_100 / 1000;
+        sender.head_ts = head_frames;
+
+        let point = sender.msa_flush_point();
+
+        assert_eq!(point.sequence, 77);
+        assert_eq!(point.rtptime, 0x00AA_5500);
+        assert_eq!(point.warm_head_unix_ms, Some(12_345));
+    }
+
+    #[test]
+    fn msa_flush_point_reports_unknown_head_before_timeline_exists() {
+        let data_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ctrl_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let transport = transport_to(&data_rx, &ctrl_rx);
+
+        let mut sender = RealtimeMediaSender::new(
+            transport,
+            RtpState::new(1, 2, 3),
+            [0x22u8; 32],
+        );
+        sender.head_ts = 0;
+
+        assert_eq!(sender.msa_flush_point().warm_head_unix_ms, None);
+    }
+
 }

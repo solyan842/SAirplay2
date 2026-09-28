@@ -182,3 +182,5 @@ pub use msa_ap2_verify::{
 pub use native_flush::{
     send_native_realtime_flush, NativeFlushError,
 };
+
+pub use media_sender::MsaRealtimeFlushPoint;
