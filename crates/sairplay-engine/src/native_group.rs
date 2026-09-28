@@ -1,7 +1,7 @@
 use crate::{
-    NativeSession, NativeSessionConfig, NativeVolumeControl, PtpEngine, RetransmitStats,
-    WindowsGroupAudioKind, WindowsMultiroomAudioError, WindowsMultiroomAudioWorker,
-    WindowsMultiroomJoinHandle,
+    Ap2AudioFormat, NativeSession, NativeSessionConfig, NativeVolumeControl, PtpEngine,
+    RetransmitStats, WindowsGroupAudioKind, WindowsMultiroomAudioError,
+    WindowsMultiroomAudioWorker, WindowsMultiroomJoinHandle, WindowsPcmSourceHandle,
 };
 use std::fmt;
 use std::sync::Arc;
@@ -137,7 +137,35 @@ pub struct NativeGroupSession {
 }
 
 impl NativeGroupSession {
-    pub fn connect(kind: NativeGroupKind, mut configs: Vec<NativeGroupMemberConfig>) -> Result<Self, NativeGroupError> {
+    pub fn connect(
+        kind: NativeGroupKind,
+        configs: Vec<NativeGroupMemberConfig>,
+    ) -> Result<Self, NativeGroupError> {
+        Self::connect_with_optional_pcm_source(kind, configs, None)
+    }
+
+    /// Future mixed-session ownership seam: consume an externally owned
+    /// persistent Windows PCM source while preserving the existing native
+    /// connection/PTP/START/late-join lifecycle. The caller retains producer
+    /// lifetime ownership. This does not enable mixed playback by itself.
+    pub fn connect_with_pcm_source(
+        kind: NativeGroupKind,
+        configs: Vec<NativeGroupMemberConfig>,
+        pcm_source: WindowsPcmSourceHandle,
+        source_format: Ap2AudioFormat,
+    ) -> Result<Self, NativeGroupError> {
+        Self::connect_with_optional_pcm_source(
+            kind,
+            configs,
+            Some((pcm_source, source_format)),
+        )
+    }
+
+    fn connect_with_optional_pcm_source(
+        kind: NativeGroupKind,
+        mut configs: Vec<NativeGroupMemberConfig>,
+        injected_pcm_source: Option<(WindowsPcmSourceHandle, Ap2AudioFormat)>,
+    ) -> Result<Self, NativeGroupError> {
         if configs.is_empty() {
             return Err(NativeGroupError::EmptyGroup);
         }
@@ -210,8 +238,16 @@ impl NativeGroupSession {
             NativeGroupKind::StereoPair => WindowsGroupAudioKind::StereoPair,
             NativeGroupKind::MultiRoom => WindowsGroupAudioKind::MultiRoom,
         };
-        let audio_worker =
-            WindowsMultiroomAudioWorker::start(worker_kind, targets).map_err(NativeGroupError::Audio)?;
+        let audio_worker = match injected_pcm_source {
+            Some((pcm_source, source_format)) => WindowsMultiroomAudioWorker::start_with_pcm_source(
+                worker_kind,
+                targets,
+                pcm_source,
+                source_format,
+            ),
+            None => WindowsMultiroomAudioWorker::start(worker_kind, targets),
+        }
+        .map_err(NativeGroupError::Audio)?;
 
         Ok(Self {
             kind,
