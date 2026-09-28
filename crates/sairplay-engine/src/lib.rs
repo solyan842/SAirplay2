@@ -153,9 +153,9 @@ pub use windows_mixed_pcm_session::WindowsMixedPcmSession;
 pub use windows_audio_worker::{WindowsAudioWorker, WindowsAudioWorkerError};
 #[cfg(windows)]
 pub use windows_multiroom_worker::{
-    WindowsAudioTarget, WindowsGroupAudioKind, WindowsMultiroomAudioError,
-    WindowsMultiroomAudioWorker, WindowsMultiroomJoinHandle,
-    AIRPLAY_COLD_GROUP_START_LEAD_MS,
+    OwnedNativePcmSink, WindowsAudioTarget, WindowsGroupAudioKind,
+    WindowsMultiroomAudioError, WindowsMultiroomAudioWorker,
+    WindowsMultiroomJoinHandle, AIRPLAY_COLD_GROUP_START_LEAD_MS,
     AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS, AIRPLAY_START_LEAD_MS,
 };
 #[cfg(windows)]

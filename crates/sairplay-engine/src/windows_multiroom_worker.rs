@@ -445,6 +445,85 @@ impl WindowsMultiroomJoinHandle {
     }
 }
 
+/// Owned native PCM sink seam for the future mixed-session coordinator.
+///
+/// The current native worker continues using the borrowed NativePcmSink below.
+/// This owned form exists so a higher-level coordinator can hold a native sink
+/// without borrowing the worker's target vector. Packet timing remains explicit:
+/// the session controller must update NTP before each shared PCM write.
+pub struct OwnedNativePcmSink {
+    target: WindowsAudioTarget,
+    source_format: Ap2AudioFormat,
+    ntp: u64,
+}
+
+impl OwnedNativePcmSink {
+    pub fn new(
+        target: WindowsAudioTarget,
+        source_format: Ap2AudioFormat,
+        ntp: u64,
+    ) -> Self {
+        Self {
+            target,
+            source_format,
+            ntp,
+        }
+    }
+
+    pub fn set_ntp(&mut self, ntp: u64) {
+        self.ntp = ntp;
+    }
+
+    pub fn ntp(&self) -> u64 {
+        self.ntp
+    }
+
+    pub fn source_format(&self) -> Ap2AudioFormat {
+        self.source_format
+    }
+
+    pub fn target_format(&self) -> Ap2AudioFormat {
+        self.target.sender.audio_format()
+    }
+
+    pub fn can_accept_frames(&mut self, now_ntp: u64) -> Result<bool, String> {
+        self.target
+            .sender
+            .can_accept_frames(now_ntp)
+            .map_err(|error| format!("pacing/data channel failed: {error}"))
+    }
+
+    pub fn into_target(self) -> WindowsAudioTarget {
+        self.target
+    }
+}
+
+impl GroupPcmParticipant for OwnedNativePcmSink {
+    fn name(&self) -> &str {
+        &self.target.name
+    }
+
+    fn write_shared_pcm(&mut self, chunk: &[u8]) -> Result<(), String> {
+        let target_format = self.target.sender.audio_format();
+        let target_packet = adapt_group_pcm_packet(
+            chunk,
+            self.source_format,
+            target_format,
+        )
+        .map_err(|error| format!("media format failed: {error}"))?;
+
+        self.target
+            .sender
+            .send_pcm_352(
+                &target_packet,
+                self.ntp,
+                self.target.lead_frames,
+            )
+            .map(|_| ())
+            .map_err(|error| format!("media send failed: {error:?}"))
+    }
+}
+
 struct NativePcmSink<'a> {
     target: &'a mut WindowsAudioTarget,
     source_format: Ap2AudioFormat,
