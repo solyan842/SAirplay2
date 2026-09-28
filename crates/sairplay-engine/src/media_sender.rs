@@ -197,6 +197,69 @@ impl RealtimeMediaSender {
         Ok(())
     }
 
+    /// Physically commit a fresh native AP2 realtime START onto the sender.
+    ///
+    /// Mirrors pinned ap2cl_start(): scheduling head lives in the pure wall
+    /// frame domain; RTP offset exists only on the wire; cold START resets the
+    /// per-process sequence seed and first-packet state, then announces a PTP
+    /// line immediately when PTP timing is active.
+    pub fn msa_commit_cold_start_at(
+        &mut self,
+        at_unix_ms: u64,
+        latency_max: Option<u32>,
+        lead_frames: u32,
+        rtp_offset: u32,
+    ) -> Result<(), MediaSendError> {
+        let start_ntp = unix_ms_to_ntp_fixed(at_unix_ms);
+        let head_ts = ntp_to_frames(start_ntp, 44_100);
+        let sequence = std::process::id().wrapping_mul(40_503u32) as u16;
+
+        self.state.sequence = sequence;
+        self.state.timestamp = (head_ts as u32).wrapping_add(rtp_offset);
+        self.state.first_packet = true;
+        self.ptp_anchor_wall0 = None;
+        self.ptp_anchor_pos0 = self.state.timestamp;
+        self.splice_pad_frames = 0;
+        self.reanchor_shifted_frames = 0;
+        self.configure_source_timeline(start_ntp, head_ts, latency_max, lead_frames);
+
+        if matches!(&self.timing, RealtimeTiming::Ptp { .. }) {
+            let _ = self.prime_ptp_anchor(start_ntp, lead_frames)?;
+        }
+        Ok(())
+    }
+
+    /// Rebase a committed future START before any real audio has gone out.
+    ///
+    /// Mirrors pinned ap2_rebase_pending_anchor(): sequence/nonces stay
+    /// continuous; only the pending anchor line moves. The next packet is
+    /// marked first and PTP gets an immediate corrected-line announce.
+    pub fn msa_rebase_pending_anchor_at(
+        &mut self,
+        at_unix_ms: u64,
+        lead_frames: u32,
+        rtp_offset: u32,
+    ) -> Result<(), MediaSendError> {
+        let start_ntp = unix_ms_to_ntp_fixed(at_unix_ms);
+        let head_ts = ntp_to_frames(start_ntp, 44_100);
+        let sequence = self.state.sequence;
+
+        self.state.timestamp = (head_ts as u32).wrapping_add(rtp_offset);
+        self.state.first_packet = true;
+        self.ptp_anchor_wall0 = None;
+        self.ptp_anchor_pos0 = self.state.timestamp;
+        self.head_ts = head_ts;
+        self.pace_last_release = None;
+        self.splice_pad_frames = 0;
+
+        debug_assert_eq!(self.state.sequence, sequence);
+
+        if matches!(&self.timing, RealtimeTiming::Ptp { .. }) {
+            let _ = self.prime_ptp_anchor(start_ntp, lead_frames)?;
+        }
+        Ok(())
+    }
+
     fn splice_pad_to_lead(
         &mut self,
         now_ts: u64,
@@ -437,6 +500,13 @@ impl RealtimeMediaSender {
     }
 }
 
+
+fn unix_ms_to_ntp_fixed(unix_ms: u64) -> u64 {
+    const NTP_UNIX_EPOCH_DELTA: u64 = 2_208_988_800;
+    let seconds = unix_ms / 1000 + NTP_UNIX_EPOCH_DELTA;
+    let millis = unix_ms % 1000;
+    (seconds << 32) | (((millis as u128) << 32) / 1000u128) as u64
+}
 
 fn frame_clock_to_unix_ms(frames: u64) -> Option<u64> {
     if frames == 0 {
@@ -766,6 +836,59 @@ mod tests {
         sender.head_ts = 0;
 
         assert_eq!(sender.msa_flush_point().warm_head_unix_ms, None);
+    }
+
+
+    #[test]
+    fn msa_cold_start_resets_sequence_and_maps_head_to_wire_with_offset() {
+        let data_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ctrl_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let transport = transport_to(&data_rx, &ctrl_rx);
+        let state = RtpState::new(7, 11, 0);
+        let mut sender = RealtimeMediaSender::new(transport, state, [0x44u8; 32]);
+
+        let at = 12_000u64;
+        let offset = 0x000A_AA00u32;
+        sender
+            .msa_commit_cold_start_at(at, Some(66_150), 11_025, offset)
+            .unwrap();
+
+        let expected_head = ntp_to_frames(unix_ms_to_ntp_fixed(at), 44_100);
+        assert_eq!(sender.head_ts(), expected_head);
+        assert_eq!(
+            sender.state().sequence,
+            std::process::id().wrapping_mul(40_503u32) as u16
+        );
+        assert_eq!(
+            sender.state().timestamp,
+            (expected_head as u32).wrapping_add(offset)
+        );
+        assert!(sender.state().first_packet);
+        assert_eq!(sender.splice_pad_frames(), 0);
+        assert_eq!(sender.reanchor_shifted_frames(), 0);
+    }
+
+    #[test]
+    fn msa_pending_rebase_moves_line_without_resetting_sequence() {
+        let data_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let ctrl_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let transport = transport_to(&data_rx, &ctrl_rx);
+        let state = RtpState::new(0x3456, 99, 0);
+        let mut sender = RealtimeMediaSender::new(transport, state, [0x55u8; 32]);
+
+        let offset = 0x000B_BB00u32;
+        sender
+            .msa_rebase_pending_anchor_at(15_000, 11_025, offset)
+            .unwrap();
+
+        let expected_head = ntp_to_frames(unix_ms_to_ntp_fixed(15_000), 44_100);
+        assert_eq!(sender.state().sequence, 0x3456);
+        assert_eq!(sender.head_ts(), expected_head);
+        assert_eq!(
+            sender.state().timestamp,
+            (expected_head as u32).wrapping_add(offset)
+        );
+        assert!(sender.state().first_packet);
     }
 
 }
