@@ -1,3 +1,4 @@
+pub mod native_flush;
 pub mod msa_ap2_verify;
 pub mod msa_ap2_start;
 pub mod msa_ap2_clock;
@@ -176,4 +177,8 @@ pub use msa_ap2_verify::{
     msa_ap2_verify_arm, msa_ap2_verify_poll, MsaAp2VerifyArm, MsaAp2VerifyEvent,
     MsaAp2VerifyResult, MSA_AP2_CLOCK_VERIFY_EXTRA_WINDOW_MS,
     MSA_AP2_CLOCK_VERIFY_POLL_MS,
+};
+
+pub use native_flush::{
+    send_native_realtime_flush, NativeFlushError,
 };
