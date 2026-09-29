@@ -1,7 +1,8 @@
 //! Native AP2 SOLO command semantics ported from pinned MSA ap2_client.c.
 //! Late-join/group correction is intentionally excluded until SOLO parity is complete.
 
-use crate::timing::{resolve_ap2_warm_start, StartResolution, AP2_MIN_WARM_LEAD_MS};
+use crate::clock::resolve_at_floor;
+use crate::timing::{StartResolution, AP2_MIN_WARM_LEAD_MS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ap2State { Down, Connected, Streaming }
@@ -20,6 +21,8 @@ pub trait NativeAp2Transport {
     type Error;
     fn state(&self) -> Ap2State;
     fn now_unix_ms(&self) -> u64;
+    /// MSA native feasibility floor, already raised for live PTP clock readiness.
+    fn start_floor_ntp(&self) -> u64;
     fn splice_timeline(&self) -> bool;
     fn anchor_valid(&self) -> bool;
     fn audible_head_unix_ms(&self) -> u64;
@@ -38,7 +41,7 @@ pub trait NativeAp2Transport {
 
 pub fn start<T: NativeAp2Transport>(t:&mut T, requested:u64)->Result<StartResolution,T::Error>{
     assert!(t.state()!=Ap2State::Down,"MSA AP2 START requires a live session");
-    let s=resolve_ap2_warm_start(t.now_unix_ms(),requested);
+    let s=resolve_at_floor(requested,t.start_floor_ntp());
     t.anchor_start(s.at_unix_ms)?;
     t.set_streaming();
     t.announce_ptp_timeline()?;
@@ -93,7 +96,7 @@ pub fn resume<T:NativeAp2Transport>(t:&mut T,requested:u64)->Result<ResumePlan,T
         t.set_streaming();
         return Ok(plan);
     }
-    let s=resolve_ap2_warm_start(now,requested);
+    let s=resolve_at_floor(requested,t.start_floor_ntp());
     t.anchor_start(s.at_unix_ms)?;
     t.set_streaming();
     t.announce_ptp_timeline()?;
