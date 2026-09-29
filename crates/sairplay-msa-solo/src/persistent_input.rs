@@ -9,6 +9,9 @@ use crate::pcm_ring::PcmRing;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReaderState { Running, DrainRequested, Paused, Aborted }
 
+#[derive(Debug,PartialEq,Eq)]
+pub enum ReaderError<E>{InvalidState,Input(E)}
+
 pub trait PersistentInput {
     type Error;
     /// Nonblocking read. None means would-block; Some(empty) means EOF.
@@ -55,14 +58,14 @@ impl<I:PersistentInput> PersistentReader<I> {
         if self.state==ReaderState::DrainRequested{self.state=ReaderState::Paused;true}else{false}
     }
     /// Exclusive command-side drain: valid only after reader pause ack.
-    pub fn drain_preflush(&mut self)->Result<usize,I::Error>{
-        assert_eq!(self.state,ReaderState::Paused,"MSA drain requires paused reader");
+    pub fn drain_preflush(&mut self)->Result<usize,ReaderError<I::Error>>{
+        if self.state!=ReaderState::Paused{return Err(ReaderError::InvalidState);}
         self.ring.reset();
         self.audio_seen=false;
         let mut total=0usize;
         let mut scratch=[0u8;16384];
         for _ in 0..100_000 {
-            match self.input.read_nonblocking(&mut scratch)? {
+            match self.input.read_nonblocking(&mut scratch).map_err(ReaderError::Input)? {
                 None=>break,
                 Some(0)=>break,
                 Some(n)=>total=total.saturating_add(n),
@@ -70,9 +73,9 @@ impl<I:PersistentInput> PersistentReader<I> {
         }
         Ok(total)
     }
-    pub fn resume_after_drain(&mut self){
-        assert_eq!(self.state,ReaderState::Paused);
-        self.state=ReaderState::Running;
+    pub fn resume_after_drain(&mut self)->Result<(),ReaderError<I::Error>>{
+        if self.state!=ReaderState::Paused{return Err(ReaderError::InvalidState);}
+        self.state=ReaderState::Running;Ok(())
     }
     pub fn abort(&mut self){self.state=ReaderState::Aborted;}
     /// One persistent reader step. No read is allowed while drain is pending.
@@ -114,7 +117,7 @@ mod tests{
   assert_eq!(r.pump_once().unwrap(),4);assert!(r.audio_ready());
   r.request_drain();assert!(r.acknowledge_pause());
   assert_eq!(r.drain_preflush().unwrap(),6);assert_eq!(r.buffered_bytes(),0);assert!(!r.audio_ready());
-  r.resume_after_drain();assert_eq!(r.state(),ReaderState::Running);
+  r.resume_after_drain().unwrap();assert_eq!(r.state(),ReaderState::Running);
  }
  #[test] fn full_ring_applies_backpressure_without_consuming_input(){
   struct Count{reads:usize}
