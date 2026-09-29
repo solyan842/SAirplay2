@@ -10,6 +10,9 @@ pub enum Ap2State { Down, Connected, Streaming }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeLane { Realtime, Buffered }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ap2CommandError<E> { InvalidState, Transport(E) }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResumePlan {
     pub start: StartResolution,
@@ -39,35 +42,34 @@ pub trait NativeAp2Transport {
     fn announce_ptp_timeline(&mut self) -> Result<(), Self::Error>;
 }
 
-pub fn start<T: NativeAp2Transport>(t:&mut T, requested:u64)->Result<StartResolution,T::Error>{
-    assert!(t.state()!=Ap2State::Down,"MSA AP2 START requires a live session");
+pub fn start<T: NativeAp2Transport>(t:&mut T, requested:u64)->Result<StartResolution,Ap2CommandError<T::Error>>{
+    if t.state()==Ap2State::Down{return Err(Ap2CommandError::InvalidState);}
     let s=resolve_at_floor(requested,t.start_floor_ntp());
-    t.anchor_start(s.at_unix_ms)?;
+    t.anchor_start(s.at_unix_ms).map_err(Ap2CommandError::Transport)?;
     t.set_streaming();
-    t.announce_ptp_timeline()?;
+    t.announce_ptp_timeline().map_err(Ap2CommandError::Transport)?;
     Ok(s)
 }
 
-pub fn flush<T:NativeAp2Transport>(t:&mut T)->Result<(),T::Error>{
-    assert!(t.state()!=Ap2State::Down,"MSA AP2 FLUSH requires a live session");
-    assert!(t.rtsp_alive(),"MSA AP2 FLUSH requires live RTSP");
+pub fn flush<T:NativeAp2Transport>(t:&mut T)->Result<(),Ap2CommandError<T::Error>>{
+    if t.state()==Ap2State::Down || !t.rtsp_alive(){return Err(Ap2CommandError::InvalidState);}
     if t.splice_timeline() {
         t.keep_splice_queue();
         return Ok(());
     }
-    match t.lane(){NativeLane::Realtime=>t.flush_realtime()?,NativeLane::Buffered=>t.flush_buffered()?}
+    match t.lane(){NativeLane::Realtime=>t.flush_realtime().map_err(Ap2CommandError::Transport)?,NativeLane::Buffered=>t.flush_buffered().map_err(Ap2CommandError::Transport)?}
     t.clear_anchor();
     Ok(())
 }
 
-pub fn standby<T:NativeAp2Transport>(t:&mut T)->Result<(),T::Error>{
-    assert!(t.state()!=Ap2State::Down,"MSA AP2 STANDBY requires a live session");
+pub fn standby<T:NativeAp2Transport>(t:&mut T)->Result<(),Ap2CommandError<T::Error>>{
+    if t.state()==Ap2State::Down{return Ok(());}
     if t.splice_timeline() {
         t.keep_splice_queue();
         return Ok(());
     }
     if t.rtsp_alive() {
-        match t.lane(){NativeLane::Realtime=>t.flush_realtime()?,NativeLane::Buffered=>{t.park_buffered()?;t.flush_buffered()?;}}
+        match t.lane(){NativeLane::Realtime=>t.flush_realtime().map_err(Ap2CommandError::Transport)?,NativeLane::Buffered=>{t.park_buffered().map_err(Ap2CommandError::Transport)?;t.flush_buffered().map_err(Ap2CommandError::Transport)?;}}
     }
     t.clear_anchor();
     t.set_connected();
@@ -88,8 +90,8 @@ pub fn resolve_hot_splice(head_unix_ms:u64, requested:u64)->ResumePlan{
     ResumePlan{start:StartResolution{requested_unix_ms:requested,at_unix_ms:at,corrected_forward:true},silence_pad_ms:AP2_MIN_WARM_LEAD_MS,preserve_anchor_line:true}
 }
 
-pub fn resume<T:NativeAp2Transport>(t:&mut T,requested:u64)->Result<ResumePlan,T::Error>{
-    assert!(t.state()!=Ap2State::Down && t.rtsp_alive(),"MSA AP2 RESUME requires live session");
+pub fn resume<T:NativeAp2Transport>(t:&mut T,requested:u64)->Result<ResumePlan,Ap2CommandError<T::Error>>{
+    if t.state()==Ap2State::Down || !t.rtsp_alive(){return Err(Ap2CommandError::InvalidState);}
     let now=t.now_unix_ms();
     if t.splice_timeline() && t.anchor_valid() && t.audible_head_unix_ms()>now {
         let plan=resolve_hot_splice(t.audible_head_unix_ms(),requested);
@@ -97,9 +99,9 @@ pub fn resume<T:NativeAp2Transport>(t:&mut T,requested:u64)->Result<ResumePlan,T
         return Ok(plan);
     }
     let s=resolve_at_floor(requested,t.start_floor_ntp());
-    t.anchor_start(s.at_unix_ms)?;
+    t.anchor_start(s.at_unix_ms).map_err(Ap2CommandError::Transport)?;
     t.set_streaming();
-    t.announce_ptp_timeline()?;
+    t.announce_ptp_timeline().map_err(Ap2CommandError::Transport)?;
     Ok(ResumePlan{start:s,silence_pad_ms:0,preserve_anchor_line:false})
 }
 
