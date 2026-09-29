@@ -16,7 +16,7 @@ pub trait OwnedTransport {
 }
 
 #[derive(Debug,PartialEq,Eq)]
-pub enum OwnedError<TE,IE>{Transport(TE),Input(IE)}
+pub enum OwnedError<TE,IE>{Ended,Transport(TE),Input(IE)}
 
 pub struct OwnedSoloSession<T:OwnedTransport,I:PersistentInput>{
     transport:T,
@@ -34,7 +34,7 @@ impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
     pub fn audio_ready(&self)->bool{self.reader.audio_ready()}
     pub fn pump_input_once(&mut self)->Result<usize,I::Error>{self.reader.pump_once()}
 
-    pub fn start(&mut self,requested:u64)->Result<StartAck,T::Error>{
+    pub fn start(&mut self,requested:u64)->Result<StartAck,OwnedError<T::Error,I::Error>>{
         if self.state==SessionState::Ended{return Err(OwnedError::Ended);}
         self.transport.quiesce();
         let r=self.transport.commit_start(requested);
@@ -48,7 +48,7 @@ impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
     /// Exact MSA command order: quiesce -> transport FLUSH -> park reader ->
     /// reset ring/drain old input -> IDLE -> capture warm head -> resume.
     pub fn flush(&mut self)->Result<u64,OwnedError<T::Error,I::Error>>{
-        assert!(self.state!=SessionState::Ended);
+        if self.state==SessionState::Ended{return Err(OwnedError::Ended);}
         self.transport.quiesce();
         if let Err(e)=self.transport.flush(){self.transport.resume();return Err(OwnedError::Transport(e));}
         self.reader.request_drain();
@@ -61,11 +61,13 @@ impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
         Ok(head)
     }
 
-    pub fn standby(&mut self){
-        assert!(self.state!=SessionState::Ended);
-        self.transport.quiesce();self.transport.stop();self.state=SessionState::Standby;self.transport.resume();
+    pub fn standby(&mut self)->Result<(),OwnedError<T::Error,I::Error>>{
+        if self.state==SessionState::Ended{return Err(OwnedError::Ended);}
+        self.transport.quiesce();self.transport.stop();self.state=SessionState::Standby;self.transport.resume();Ok(())
     }
-    pub fn end(&mut self){self.reader.abort();self.transport.disconnect();self.state=SessionState::Ended;}
+    /// MSA END marks ENDED and wakes/stops the reader; teardown is outer lifecycle.
+    pub fn end(&mut self){self.reader.abort();self.state=SessionState::Ended;}
+    pub fn destroy(mut self){if self.state!=SessionState::Ended{self.end();}self.transport.disconnect();}
 }
 
 #[cfg(test)]
