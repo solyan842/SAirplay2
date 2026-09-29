@@ -49,11 +49,13 @@ pub trait NativeAp2Transport {
     fn sync_realtime_ptp_if_ready(&mut self) -> Result<(), Self::Error>;
     /// MSA cold-clock post-commit verification. SOLO is observation-only:
     /// enforce=false, so verification must never move the committed anchor.
+    fn disarm_clock_verify(&mut self);
     fn arm_clock_verify(&mut self, requested_unix_ms:u64, at_unix_ms:u64, enforce:bool);
 }
 
 pub fn start<T: NativeAp2Transport>(t:&mut T, requested:u64)->Result<StartResolution,Ap2CommandError<T::Error>>{
     if t.state()==Ap2State::Down{return Err(Ap2CommandError::InvalidState);}
+    t.disarm_clock_verify();
     let floor=t.start_floor();
     let s=resolve_at_floor(requested,floor.floor_ntp);
     t.reanchor_stock_timeline(s.at_unix_ms,matches!(t.lane(),NativeLane::Buffered));
@@ -70,7 +72,9 @@ pub fn start<T: NativeAp2Transport>(t:&mut T, requested:u64)->Result<StartResolu
 }
 
 pub fn flush<T:NativeAp2Transport>(t:&mut T)->Result<(),Ap2CommandError<T::Error>>{
-    if t.state()==Ap2State::Down || !t.rtsp_alive(){return Err(Ap2CommandError::InvalidState);}
+    if t.state()==Ap2State::Down{return Err(Ap2CommandError::InvalidState);}
+    t.disarm_clock_verify();
+    if !t.rtsp_alive(){return Err(Ap2CommandError::InvalidState);}
     if t.splice_timeline() {
         t.keep_splice_queue();
         return Ok(());
@@ -82,6 +86,7 @@ pub fn flush<T:NativeAp2Transport>(t:&mut T)->Result<(),Ap2CommandError<T::Error
 
 pub fn standby<T:NativeAp2Transport>(t:&mut T)->Result<(),Ap2CommandError<T::Error>>{
     if t.state()==Ap2State::Down{return Ok(());}
+    t.disarm_clock_verify();
     if t.splice_timeline() {
         t.keep_splice_queue();
         return Ok(());
@@ -109,7 +114,9 @@ pub fn resolve_hot_splice(head_unix_ms:u64, requested:u64)->ResumePlan{
 }
 
 pub fn resume<T:NativeAp2Transport>(t:&mut T,requested:u64)->Result<ResumePlan,Ap2CommandError<T::Error>>{
-    if t.state()==Ap2State::Down || !t.rtsp_alive(){return Err(Ap2CommandError::InvalidState);}
+    if t.state()==Ap2State::Down{return Err(Ap2CommandError::InvalidState);}
+    t.disarm_clock_verify();
+    if !t.rtsp_alive(){return Err(Ap2CommandError::InvalidState);}
     let now=t.now_unix_ms();
     if t.splice_timeline() && t.anchor_valid() && t.audible_head_unix_ms()>now {
         let plan=resolve_hot_splice(t.audible_head_unix_ms(),requested);
@@ -152,17 +159,19 @@ mod tests {
   fn splice_timeline(&self)->bool{false}fn anchor_valid(&self)->bool{self.anchor}fn audible_head_unix_ms(&self)->u64{0}fn lane(&self)->NativeLane{self.lane}fn rtsp_alive(&self)->bool{true}
   fn keep_splice_queue(&mut self){}fn flush_realtime(&mut self)->Result<(),Self::Error>{self.log.push("flush_rt");Ok(())}fn flush_buffered(&mut self)->Result<(),Self::Error>{self.log.push("flush_buf");Ok(())}
   fn park_buffered(&mut self)->Result<(),Self::Error>{Ok(())}fn set_connected(&mut self){self.state=Ap2State::Connected}fn set_streaming(&mut self){self.state=Ap2State::Streaming;self.log.push("streaming")}
-  fn clear_anchor(&mut self){self.anchor=false;self.log.push("clear")}fn reanchor_stock_timeline(&mut self,_:u64,buffered:bool){self.log.push(if buffered{"rebase_buf"}else{"rebase_rt"})}fn anchor_start(&mut self,_:u64)->Result<(),Self::Error>{self.anchor=true;self.log.push("anchor");Ok(())}fn anchor_buffered_start(&mut self,_:u64)->Result<(),Self::Error>{self.log.push("buf_anchor");Ok(())}fn sync_realtime_ptp_if_ready(&mut self)->Result<(),Self::Error>{self.log.push("sync");Ok(())}fn arm_clock_verify(&mut self,_:u64,_:u64,enforce:bool){assert!(!enforce);self.log.push("verify")}
+  fn clear_anchor(&mut self){self.anchor=false;self.log.push("clear")}fn reanchor_stock_timeline(&mut self,_:u64,buffered:bool){self.log.push(if buffered{"rebase_buf"}else{"rebase_rt"})}fn anchor_start(&mut self,_:u64)->Result<(),Self::Error>{self.anchor=true;self.log.push("anchor");Ok(())}fn anchor_buffered_start(&mut self,_:u64)->Result<(),Self::Error>{self.log.push("buf_anchor");Ok(())}fn sync_realtime_ptp_if_ready(&mut self)->Result<(),Self::Error>{self.log.push("sync");Ok(())}fn disarm_clock_verify(&mut self){self.log.push("disarm")}fn arm_clock_verify(&mut self,_:u64,_:u64,enforce:bool){assert!(!enforce);self.log.push("verify")}
  }
- #[test] fn cold_solo_start_arms_non_enforcing_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:true,log:vec![]};start(&mut t,0).unwrap();assert_eq!(t.log,vec!["rebase_rt","anchor","streaming","sync","verify"]);}
- #[test] fn warm_solo_start_does_not_arm_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:false,log:vec![]};start(&mut t,0).unwrap();assert_eq!(t.log,vec!["rebase_rt","anchor","streaming","sync"]);}
- #[test] fn cold_stock_resume_arms_non_enforcing_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:true,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["rebase_rt","anchor","streaming","sync","verify"]);}
- #[test] fn cold_buffered_start_anchors_and_skips_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Buffered,anchor:false,cold:true,log:vec![]};start(&mut t,0).unwrap();assert_eq!(t.log,vec!["rebase_buf","anchor","streaming","buf_anchor"]);}
- #[test] fn stock_resume_flushes_realtime_before_reanchor(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Realtime,anchor:true,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["flush_rt","clear","rebase_rt","anchor","streaming","sync"]);}
- #[test] fn stock_resume_flushes_anchored_buffered_before_reanchor(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Buffered,anchor:true,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["flush_buf","clear","rebase_buf","anchor","streaming","buf_anchor"]);}
- #[test] fn stock_resume_does_not_flush_unanchored_buffered(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Buffered,anchor:false,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["rebase_buf","anchor","streaming","buf_anchor"]);}
+ #[test] fn cold_solo_start_arms_non_enforcing_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:true,log:vec![]};start(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","rebase_rt","anchor","streaming","sync","verify"]);}
+ #[test] fn warm_solo_start_does_not_arm_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:false,log:vec![]};start(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","rebase_rt","anchor","streaming","sync"]);}
+ #[test] fn cold_stock_resume_arms_non_enforcing_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:true,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","rebase_rt","anchor","streaming","sync","verify"]);}
+ #[test] fn cold_buffered_start_anchors_and_skips_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Buffered,anchor:false,cold:true,log:vec![]};start(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","rebase_buf","anchor","streaming","buf_anchor"]);}
+ #[test] fn stock_resume_flushes_realtime_before_reanchor(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Realtime,anchor:true,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","flush_rt","clear","rebase_rt","anchor","streaming","sync"]);}
+ #[test] fn stock_resume_flushes_anchored_buffered_before_reanchor(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Buffered,anchor:true,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","flush_buf","clear","rebase_buf","anchor","streaming","buf_anchor"]);}
+ #[test] fn stock_resume_does_not_flush_unanchored_buffered(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Buffered,anchor:false,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","rebase_buf","anchor","streaming","buf_anchor"]);}
 
 
+ #[test] fn flush_disarms_verify_before_transport_boundary(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Realtime,anchor:true,cold:false,log:vec![]};flush(&mut t).unwrap();assert_eq!(t.log,vec!["disarm","flush_rt","clear"]);}
+ #[test] fn standby_disarms_verify_before_parking(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Buffered,anchor:true,cold:false,log:vec![]};standby(&mut t).unwrap();assert_eq!(t.log,vec!["disarm","flush_buf","clear"]);}
  #[test] fn hot_splice_exact_request_pads_to_command(){let p=resolve_hot_splice(2000,2300);assert_eq!(p.start.at_unix_ms,2300);assert_eq!(p.silence_pad_ms,300);assert!(p.preserve_anchor_line);}
  #[test] fn hot_splice_stale_request_corrects_beyond_head(){let p=resolve_hot_splice(2000,1900);assert_eq!(p.start.at_unix_ms,2250);assert!(p.start.corrected_forward);}
  #[test] fn hot_splice_zero_means_head(){let p=resolve_hot_splice(2000,0);assert_eq!(p.start.at_unix_ms,2000);assert_eq!(p.silence_pad_ms,0);}
