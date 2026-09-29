@@ -18,21 +18,39 @@ pub trait OwnedTransport {
 #[derive(Debug,PartialEq,Eq)]
 pub enum OwnedError<TE,IE>{Ended,Transport(TE),Input(IE)}
 
+#[derive(Debug,Clone,Copy,PartialEq,Eq)]
+pub enum SessionEvent{AudioReady{buffered_ms:u64},Flushed{head_unix_ms:u64},IdleTimeout}
+
 pub struct OwnedSoloSession<T:OwnedTransport,I:PersistentInput>{
     transport:T,
     reader:PersistentReader<I>,
     state:SessionState,
     epoch:u64,
+    byte_rate:usize,
+    idle_timeout_ms:u64,
+    idle_since_ms:u64,
+    last_audio_ready:bool,
 }
 
 impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
-    pub fn new(transport:T,input:I,byte_rate:usize,ready_bytes:usize)->Self{
-        Self{transport,reader:PersistentReader::new(input,byte_rate,ready_bytes),state:SessionState::Idle,epoch:0}
+    pub fn new(transport:T,input:I,byte_rate:usize,ready_bytes:usize)->Self{Self::new_at(transport,input,byte_rate,ready_bytes,0,0)}
+    pub fn new_at(transport:T,input:I,byte_rate:usize,ready_bytes:usize,idle_timeout_ms:u64,now_ms:u64)->Self{
+        Self{transport,reader:PersistentReader::new(input,byte_rate,ready_bytes),state:SessionState::Idle,epoch:0,byte_rate,idle_timeout_ms,idle_since_ms:now_ms,last_audio_ready:false}
     }
     pub fn state(&self)->SessionState{self.state}
     pub fn epoch(&self)->u64{self.epoch}
     pub fn audio_ready(&self)->bool{self.reader.audio_ready()}
     pub fn pump_input_once(&mut self)->Result<usize,I::Error>{self.reader.pump_once()}
+    pub fn read(&mut self,out:&mut[u8])->i32{self.reader.read_playing(out,self.state==SessionState::Playing)}
+    pub fn discard(&mut self,want:usize)->i32{self.reader.discard_playing(want,self.state==SessionState::Playing)}
+    pub fn take_audio_event(&mut self)->Option<SessionEvent>{
+        let ready=self.reader.audio_ready();if ready && !self.last_audio_ready{self.last_audio_ready=true;return Some(SessionEvent::AudioReady{buffered_ms:self.reader.buffered_bytes() as u64*1000/self.byte_rate as u64});}None
+    }
+    pub fn poll_at(&mut self,now_ms:u64)->Option<SessionEvent>{
+        if self.idle_timeout_ms==0 || self.state==SessionState::Ended{return None;}
+        let idle=self.state==SessionState::Idle || self.state==SessionState::Standby || (self.state==SessionState::Playing && self.reader.eof());
+        if idle && now_ms.saturating_sub(self.idle_since_ms)>=self.idle_timeout_ms{self.end();return Some(SessionEvent::IdleTimeout);}None
+    }
 
     pub fn start(&mut self,requested:u64)->Result<StartAck,OwnedError<T::Error,I::Error>>{
         if self.state==SessionState::Ended{return Err(OwnedError::Ended);}
@@ -55,15 +73,16 @@ impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
         assert!(self.reader.acknowledge_pause() || self.reader.state()==ReaderState::Paused);
         if let Err(e)=self.reader.drain_preflush(){self.reader.resume_after_drain();self.transport.resume();return Err(OwnedError::Input(e));}
         self.state=SessionState::Idle;
+        self.last_audio_ready=false;
         let head=self.transport.warm_head_unix_ms();
         self.reader.resume_after_drain();
         self.transport.resume();
         Ok(head)
     }
 
-    pub fn standby(&mut self)->Result<(),OwnedError<T::Error,I::Error>>{
+    pub fn standby_at(&mut self,now_ms:u64)->Result<(),OwnedError<T::Error,I::Error>>{
         if self.state==SessionState::Ended{return Err(OwnedError::Ended);}
-        self.transport.quiesce();self.transport.stop();self.state=SessionState::Standby;self.transport.resume();Ok(())
+        self.transport.quiesce();self.transport.stop();self.state=SessionState::Standby;self.idle_since_ms=now_ms;self.transport.resume();Ok(())
     }
     /// MSA END marks ENDED and wakes/stops the reader; teardown is outer lifecycle.
     pub fn end(&mut self){self.reader.abort();self.state=SessionState::Ended;}
