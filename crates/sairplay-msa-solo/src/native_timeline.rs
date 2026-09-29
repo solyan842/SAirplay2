@@ -29,11 +29,14 @@ pub fn ms_for_frames(frames:u64,sample_rate:u32)->u64{
 pub fn hot_splice(head_frame:u64,head_unix_ms:u64,requested_unix_ms:u64,sample_rate:u32)->SplicePlan{
  if requested_unix_ms==0{return SplicePlan{accepted_unix_ms:head_unix_ms,pad_frames:0,corrected:false}}
  if requested_unix_ms>=head_unix_ms{
-  let delta=requested_unix_ms-head_unix_ms;
-  return SplicePlan{accepted_unix_ms:requested_unix_ms,pad_frames:frames_for_ms(delta,sample_rate),corrected:false}
+  // MSA converts the requested instant into the sample/frame domain first,
+  // then subtracts head_ts. Do not derive padding from truncated ms delta.
+  let target=head_frame.saturating_add(frames_for_ms(requested_unix_ms-head_unix_ms,sample_rate));
+  return SplicePlan{accepted_unix_ms:requested_unix_ms,pad_frames:target.saturating_sub(head_frame),corrected:false}
  }
  let accepted=head_unix_ms.saturating_add(MIN_WARM_LEAD_MS);
- SplicePlan{accepted_unix_ms:accepted,pad_frames:frames_for_ms(MIN_WARM_LEAD_MS,sample_rate),corrected:true}
+ let target=head_frame.saturating_add(frames_for_ms(MIN_WARM_LEAD_MS,sample_rate));
+ SplicePlan{accepted_unix_ms:accepted,pad_frames:target.saturating_sub(head_frame),corrected:true}
 }
 
 /// Buffered RTP never moves backwards across FLUSHBUFFERED/re-anchor.
@@ -70,7 +73,8 @@ impl Timeline{
 #[cfg(test)]
 mod tests{
  use super::*;
- #[test]fn splice_padding_is_frame_exact(){let p=hot_splice(0,1000,1125,48000);assert_eq!(p.pad_frames,6000);assert_eq!(p.accepted_unix_ms,1125);}
+ #[test]fn splice_padding_is_frame_exact(){let p=hot_splice(123_456,1000,1125,48000);assert_eq!(p.pad_frames,6000);assert_eq!(p.accepted_unix_ms,1125);}
+ #[test]fn splice_padding_preserves_nonzero_head_domain(){let p=hot_splice(9_000_000,2000,2250,44100);assert_eq!(p.pad_frames,11025);assert_eq!(p.accepted_unix_ms,2250);}
  #[test]fn stale_splice_moves_one_lead_beyond_head(){let p=hot_splice(0,2000,1900,44100);assert_eq!(p.accepted_unix_ms,2250);assert_eq!(p.pad_frames,11025);assert!(p.corrected);}
  #[test]fn buffered_reanchor_stays_beyond_previous_wire_head(){
   let (off,rtp)=buffered_reanchor(500_000,100_000,7,48000,1);
