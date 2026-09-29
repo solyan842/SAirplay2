@@ -16,7 +16,7 @@ pub trait OwnedTransport {
 }
 
 #[derive(Debug,PartialEq,Eq)]
-pub enum OwnedError<TE,IE>{Ended,Transport(TE),Input(IE),ReaderState}
+pub enum OwnedError<TE,IE>{Ended,InvalidConfig,Transport(TE),Input(IE),ReaderState}
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
 pub enum SessionEvent{AudioReady{buffered_ms:u64},Flushed{head_unix_ms:Option<u64>},IdleTimeout}
@@ -34,14 +34,14 @@ pub struct OwnedSoloSession<T:OwnedTransport,I:PersistentInput>{
 }
 
 impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
-    pub fn new(transport:T,input:I,byte_rate:usize,ready_bytes:usize)->Self{Self::new_at(transport,input,byte_rate,ready_bytes,0,0)}
-    pub fn new_at(transport:T,input:I,byte_rate:usize,ready_bytes:usize,idle_timeout_ms:u64,now_ms:u64)->Self{
-        Self{transport,reader:PersistentReader::new(input,byte_rate,ready_bytes),state:SessionState::Idle,epoch:0,byte_rate,idle_timeout_ms,idle_since_ms:now_ms,last_audio_ready:false,pending_event:None}
+    pub fn new(transport:T,input:I,byte_rate:usize,ready_bytes:usize)->Result<Self,OwnedError<T::Error,I::Error>>{Self::new_at(transport,input,byte_rate,ready_bytes,0,0)}
+    pub fn new_at(transport:T,input:I,byte_rate:usize,ready_bytes:usize,idle_timeout_ms:u64,now_ms:u64)->Result<Self,OwnedError<T::Error,I::Error>>{
+        let reader=PersistentReader::new(input,byte_rate,ready_bytes).map_err(|e|match e{ReaderError::InvalidConfig=>OwnedError::InvalidConfig,ReaderError::InvalidState=>OwnedError::ReaderState,ReaderError::Input(e)=>OwnedError::Input(e)})?;
+        Ok(Self{transport,reader,state:SessionState::Idle,epoch:0,byte_rate,idle_timeout_ms,idle_since_ms:now_ms,last_audio_ready:false,pending_event:None})
     }
     pub fn state(&self)->SessionState{self.state}
     pub fn epoch(&self)->u64{self.epoch}
     pub fn audio_ready(&self)->bool{self.reader.audio_ready()}
-    pub fn pump_input_once(&mut self)->Result<usize,I::Error>{self.reader.pump_once()}
     /// Timed reader pump used by the owned runtime: MSA opens the orphan
     /// timeout window at the exact reader transition to EOF.
     pub fn pump_input_once_at(&mut self,now_ms:u64)->Result<usize,I::Error>{
@@ -92,7 +92,7 @@ impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
     pub fn complete_flush_at(&mut self,now_ms:u64)->Result<Option<u64>,OwnedError<T::Error,I::Error>>{
         if self.state==SessionState::Ended{return Err(OwnedError::Ended);}
         if self.reader.state()!=ReaderState::Paused{return Err(OwnedError::ReaderState);}
-        if let Err(e)=self.reader.drain_preflush(){let _=self.reader.resume_after_drain();self.transport.resume();return Err(match e{ReaderError::Input(e)=>OwnedError::Input(e),ReaderError::InvalidState=>OwnedError::ReaderState});}
+        if let Err(e)=self.reader.drain_preflush(){let _=self.reader.resume_after_drain();self.transport.resume();return Err(match e{ReaderError::Input(e)=>OwnedError::Input(e),ReaderError::InvalidState=>OwnedError::ReaderState,ReaderError::InvalidConfig=>OwnedError::InvalidConfig});}
         self.state=SessionState::Idle;
         self.idle_since_ms=now_ms;
         self.last_audio_ready=false;
@@ -128,26 +128,26 @@ mod tests{
   if self.i>=self.chunks.len(){return Ok(None)} let c=&self.chunks[self.i];self.i+=1;let n=c.len();d[..n].copy_from_slice(c);Ok(Some(n))
  }}
  #[test] fn flush_is_end_to_end_msa_order_and_rearms_reader(){
-  let i=I{chunks:vec![vec![1,2,3,4],vec![8,8]],i:0};let mut s=OwnedSoloSession::new(T::default(),i,100,4);
-  assert_eq!(s.pump_input_once().unwrap(),4);assert!(s.audio_ready());
+  let i=I{chunks:vec![vec![1,2,3,4],vec![8,8]],i:0};let mut s=OwnedSoloSession::new(T::default(),i,100,4).unwrap();
+  assert_eq!(s.pump_input_once_at(0).unwrap(),4);assert!(s.audio_ready());
   s.start_at(1000,10).unwrap();s.begin_flush().unwrap();assert_eq!(s.reader_state(),ReaderState::DrainRequested);assert!(s.reader_acknowledge_pause());let head=s.complete_flush_at(20).unwrap();assert_eq!(head,Some(777));assert_eq!(s.state(),SessionState::Idle);assert!(!s.audio_ready());
   assert_eq!(s.transport.log,vec!["quiesce","commit","resume","quiesce","flush","resume"]);
   assert_eq!(s.take_event(),Some(SessionEvent::Flushed{head_unix_ms:Some(777)}));
  }
  #[test] fn flush_completion_requires_reader_ack(){
-  let i=I{chunks:vec![],i:0};let mut s=OwnedSoloSession::new(T::default(),i,100,4);
+  let i=I{chunks:vec![],i:0};let mut s=OwnedSoloSession::new(T::default(),i,100,4).unwrap();
   s.begin_flush().unwrap();assert_eq!(s.complete_flush_at(20),Err(OwnedError::ReaderState));
   assert!(s.reader_acknowledge_pause());assert_eq!(s.complete_flush_at(20).unwrap(),Some(777));
  }
  #[test] fn flushed_status_can_omit_absent_warm_head(){
   #[derive(Default)] struct NoHead;
   impl OwnedTransport for NoHead{type Error=();fn quiesce(&mut self){}fn flush(&mut self)->Result<(),Self::Error>{Ok(())}fn commit_start(&mut self,r:u64)->Result<u64,Self::Error>{Ok(r)}fn stop(&mut self){}fn resume(&mut self){}fn disconnect(&mut self){}}
-  let i=I{chunks:vec![],i:0};let mut s=OwnedSoloSession::new(NoHead,i,100,4);
+  let i=I{chunks:vec![],i:0};let mut s=OwnedSoloSession::new(NoHead,i,100,4).unwrap();
   s.begin_flush().unwrap();assert!(s.reader_acknowledge_pause());assert_eq!(s.complete_flush_at(20).unwrap(),None);
   assert_eq!(s.take_event(),Some(SessionEvent::Flushed{head_unix_ms:None}));
  }
  #[test] fn idle_timeout_tracks_start_and_eof_window(){
-  let i=I{chunks:vec![vec![]],i:0};let mut s=OwnedSoloSession::new_at(T::default(),i,100,4,100,5);
+  let i=I{chunks:vec![vec![]],i:0};let mut s=OwnedSoloSession::new_at(T::default(),i,100,4,100,5).unwrap();
   s.start_at(1000,50).unwrap();s.pump_input_once_at(80).unwrap();assert_eq!(s.poll_at(179),None);
   assert_eq!(s.poll_at(180),Some(SessionEvent::IdleTimeout));assert_eq!(s.state(),SessionState::Ended);
  }
