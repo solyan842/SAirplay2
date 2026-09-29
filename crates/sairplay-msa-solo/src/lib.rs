@@ -1,3 +1,4 @@
+pub mod raop;
 //! Independent Music Assistant compatible SOLO engine.
 //! Source: music-assistant/airplay-cli @ 431c5c582eef9307c4e39c50a0ea65e970bc1128
 //! Legacy SAirplay Solo/MultiRoom remain frozen.
