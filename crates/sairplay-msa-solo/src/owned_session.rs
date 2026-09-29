@@ -2,7 +2,7 @@
 //! The platform input primitive is injected; lifecycle/order remains engine-owned.
 
 use crate::{SessionState, StartAck};
-use crate::persistent_input::{PersistentInput, PersistentReader, ReaderState};
+use crate::persistent_input::{PersistentInput, PersistentReader, ReaderError, ReaderState};
 
 pub trait OwnedTransport {
     type Error;
@@ -16,7 +16,7 @@ pub trait OwnedTransport {
 }
 
 #[derive(Debug,PartialEq,Eq)]
-pub enum OwnedError<TE,IE>{Ended,Transport(TE),Input(IE)}
+pub enum OwnedError<TE,IE>{Ended,Transport(TE),Input(IE),ReaderState}
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
 pub enum SessionEvent{AudioReady{buffered_ms:u64},Flushed{head_unix_ms:u64},IdleTimeout}
@@ -82,12 +82,12 @@ impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
         if let Err(e)=self.transport.flush(){self.transport.resume();return Err(OwnedError::Transport(e));}
         self.reader.request_drain();
         assert!(self.reader.acknowledge_pause() || self.reader.state()==ReaderState::Paused);
-        if let Err(e)=self.reader.drain_preflush(){self.reader.resume_after_drain();self.transport.resume();return Err(OwnedError::Input(e));}
+        if let Err(e)=self.reader.drain_preflush(){let _=self.reader.resume_after_drain();self.transport.resume();return Err(match e{ReaderError::Input(e)=>OwnedError::Input(e),ReaderError::InvalidState=>OwnedError::ReaderState});}
         self.state=SessionState::Idle;
         self.idle_since_ms=now_ms;
         self.last_audio_ready=false;
         let head=self.transport.warm_head_unix_ms();
-        self.reader.resume_after_drain();
+        self.reader.resume_after_drain().map_err(|e|match e{ReaderError::Input(e)=>OwnedError::Input(e),ReaderError::InvalidState=>OwnedError::ReaderState})?;
         self.transport.resume();
         self.pending_event=Some(SessionEvent::Flushed{head_unix_ms:head});
         Ok(head)
