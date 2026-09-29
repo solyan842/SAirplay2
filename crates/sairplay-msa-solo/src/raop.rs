@@ -23,12 +23,11 @@ pub trait RaopClient {
     fn flush(&mut self) -> Result<(), Self::Error>;
     fn pause(&mut self);
     /// Transport anchor instant, before receiver latency. The session ACK remains audible time.
-    fn start_at_transport_unix_ms(&mut self, transport_unix_ms: u64) -> Result<(), Self::Error>;
+    fn start_at_transport_ntp(&mut self, transport_ntp: u64) -> Result<(), Self::Error>;
 }
 
-fn transport_start_ms<C:RaopClient>(client:&C,audible_ms:u64)->u64{
-    let audible_ntp=unix_ms_to_ntp(audible_ms);
-    ntp_to_unix_ms(audible_ntp.saturating_sub(frames_to_ntp(client.latency_frames(),client.sample_rate())))
+fn transport_start_ntp<C:RaopClient>(client:&C,audible_ms:u64)->u64{
+    unix_ms_to_ntp(audible_ms).saturating_sub(frames_to_ntp(client.latency_frames(),client.sample_rate()))
 }
 
 pub fn commit<C:RaopClient>(client:&mut C,requested_unix_ms:u64)->Result<StartResolution,RaopContractError<C::Error>>{
@@ -37,14 +36,14 @@ pub fn commit<C:RaopClient>(client:&mut C,requested_unix_ms:u64)->Result<StartRe
     let start=resolve_raop_start(client.now_unix_ms(),requested_unix_ms);
     client.stop();
     if state==RaopState::Streaming{client.flush().map_err(RaopContractError::Transport)?;}
-    client.start_at_transport_unix_ms(transport_start_ms(client,start.at_unix_ms)).map_err(RaopContractError::Transport)?;
+    client.start_at_transport_ntp(transport_start_ntp(client,start.at_unix_ms)).map_err(RaopContractError::Transport)?;
     Ok(start)
 }
 
 pub fn start_after_flush<C:RaopClient>(client:&mut C,requested_unix_ms:u64)->Result<StartResolution,RaopContractError<C::Error>>{
     if client.state()!=RaopState::Flushed{return Err(RaopContractError::InvalidState)}
     let start=resolve_raop_start(client.now_unix_ms(),requested_unix_ms);
-    client.start_at_transport_unix_ms(transport_start_ms(client,start.at_unix_ms)).map_err(RaopContractError::Transport)?;
+    client.start_at_transport_ntp(transport_start_ntp(client,start.at_unix_ms)).map_err(RaopContractError::Transport)?;
     Ok(start)
 }
 
@@ -66,7 +65,7 @@ pub fn pause<C:RaopClient>(client:&mut C)->Result<(),RaopContractError<C::Error>
 pub fn resume<C:RaopClient>(client:&mut C)->Result<StartResolution,RaopContractError<C::Error>>{
     if !matches!(client.state(),RaopState::Flushed|RaopState::Streaming){return Err(RaopContractError::InvalidState)}
     let start=resolve_raop_start(client.now_unix_ms(),0);
-    client.start_at_transport_unix_ms(transport_start_ms(client,start.at_unix_ms)).map_err(RaopContractError::Transport)?;
+    client.start_at_transport_ntp(transport_start_ntp(client,start.at_unix_ms)).map_err(RaopContractError::Transport)?;
     Ok(start)
 }
 
@@ -86,11 +85,11 @@ mod tests {
   fn state(&self)->RaopState{match self.state{1=>RaopState::Streaming,2=>RaopState::Flushed,_=>RaopState::Other}}
   fn now_unix_ms(&self)->u64{self.now} fn latency_frames(&self)->u32{4410} fn sample_rate(&self)->u32{44100}
   fn stop(&mut self){self.stops+=1} fn flush(&mut self)->Result<(),Self::Error>{self.flushes+=1;self.state=2;Ok(())}
-  fn pause(&mut self){} fn start_at_transport_unix_ms(&mut self,t:u64)->Result<(),Self::Error>{self.starts.push(t);self.state=1;Ok(())}
+  fn pause(&mut self){} fn start_at_transport_ntp(&mut self,t:u64)->Result<(),Self::Error>{self.starts.push(t);self.state=1;Ok(())}
  }
- #[test] fn live_commit_discards_backlog_and_schedules_true_start(){let mut f=Fake{state:1,now:1000,..Default::default()};let a=commit(&mut f,1100).unwrap();assert_eq!(a.at_unix_ms,1400);assert_eq!((f.stops,f.flushes),(1,1));assert_eq!(f.starts,vec![1300]);}
- #[test] fn warm_start_requires_flushed_and_does_not_flush_again(){let mut f=Fake{state:2,now:1000,..Default::default()};let a=start_after_flush(&mut f,1500).unwrap();assert_eq!(a.at_unix_ms,1500);assert_eq!(f.flushes,0);assert_eq!(f.starts,vec![1400]);}
- #[test] fn ack_is_audible_but_transport_anchor_subtracts_receiver_latency(){let mut f=Fake{state:2,now:1000,..Default::default()};let a=start_after_flush(&mut f,1600).unwrap();assert_eq!(a.at_unix_ms,1600);assert_eq!(f.starts,vec![1500]);}
+ #[test] fn live_commit_discards_backlog_and_schedules_true_start(){let mut f=Fake{state:1,now:1000,..Default::default()};let a=commit(&mut f,1100).unwrap();assert_eq!(a.at_unix_ms,1400);assert_eq!((f.stops,f.flushes),(1,1));assert_eq!(f.starts,vec![transport_start_ntp(&f,1400)]);}
+ #[test] fn warm_start_requires_flushed_and_does_not_flush_again(){let mut f=Fake{state:2,now:1000,..Default::default()};let a=start_after_flush(&mut f,1500).unwrap();assert_eq!(a.at_unix_ms,1500);assert_eq!(f.flushes,0);assert_eq!(f.starts,vec![transport_start_ntp(&f,1500)]);}
+ #[test] fn ack_is_audible_but_transport_anchor_subtracts_receiver_latency(){let mut f=Fake{state:2,now:1000,..Default::default()};let a=start_after_flush(&mut f,1600).unwrap();assert_eq!(a.at_unix_ms,1600);assert_eq!(f.starts,vec![transport_start_ntp(&f,1600)]);}
  #[test] fn head_projection_is_contiguous(){assert_eq!(next_head_unix_ms(unix_ms_to_ntp(1000),441,44100),1010);}
  #[test] fn ntp_frame_latency_keeps_fraction_until_projection(){let audible=unix_ms_to_ntp(1600);let wire=audible-frames_to_ntp(1,44100);assert_eq!(ntp_to_unix_ms(wire),1599);}
  #[test] fn invalid_state_is_failure_not_panic(){let mut f=Fake::default();assert_eq!(commit(&mut f,1000),Err(RaopContractError::InvalidState));}
