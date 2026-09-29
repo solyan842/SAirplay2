@@ -10,7 +10,7 @@ pub trait OwnedTransport {
     fn flush(&mut self)->Result<(),Self::Error>;
     fn commit_start(&mut self,requested_unix_ms:u64)->Result<u64,Self::Error>;
     fn stop(&mut self);
-    fn warm_head_unix_ms(&self)->u64 { 0 }
+    fn warm_head_unix_ms(&self)->Option<u64> { None }
     fn resume(&mut self);
     fn disconnect(&mut self);
 }
@@ -19,7 +19,7 @@ pub trait OwnedTransport {
 pub enum OwnedError<TE,IE>{Ended,Transport(TE),Input(IE),ReaderState}
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
-pub enum SessionEvent{AudioReady{buffered_ms:u64},Flushed{head_unix_ms:u64},IdleTimeout}
+pub enum SessionEvent{AudioReady{buffered_ms:u64},Flushed{head_unix_ms:Option<u64>},IdleTimeout}
 
 pub struct OwnedSoloSession<T:OwnedTransport,I:PersistentInput>{
     transport:T,
@@ -89,7 +89,7 @@ impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
     }
 
     /// Command-side phase 2, called only after reader-side pause acknowledgement.
-    pub fn complete_flush_at(&mut self,now_ms:u64)->Result<u64,OwnedError<T::Error,I::Error>>{
+    pub fn complete_flush_at(&mut self,now_ms:u64)->Result<Option<u64>,OwnedError<T::Error,I::Error>>{
         if self.state==SessionState::Ended{return Err(OwnedError::Ended);}
         if self.reader.state()!=ReaderState::Paused{return Err(OwnedError::ReaderState);}
         if let Err(e)=self.reader.drain_preflush(){let _=self.reader.resume_after_drain();self.transport.resume();return Err(match e{ReaderError::Input(e)=>OwnedError::Input(e),ReaderError::InvalidState=>OwnedError::ReaderState});}
@@ -120,7 +120,7 @@ mod tests{
   type Error=();
   fn quiesce(&mut self){self.log.push("quiesce")} fn flush(&mut self)->Result<(),Self::Error>{self.log.push("flush");Ok(())}
   fn commit_start(&mut self,r:u64)->Result<u64,Self::Error>{self.log.push("commit");Ok(r)}
-  fn stop(&mut self){self.log.push("stop")} fn warm_head_unix_ms(&self)->u64{777}
+  fn stop(&mut self){self.log.push("stop")} fn warm_head_unix_ms(&self)->Option<u64>{Some(777)}
   fn resume(&mut self){self.log.push("resume")} fn disconnect(&mut self){self.log.push("disconnect")}
  }
  struct I{chunks:Vec<Vec<u8>>,i:usize}
@@ -130,14 +130,21 @@ mod tests{
  #[test] fn flush_is_end_to_end_msa_order_and_rearms_reader(){
   let i=I{chunks:vec![vec![1,2,3,4],vec![8,8]],i:0};let mut s=OwnedSoloSession::new(T::default(),i,100,4);
   assert_eq!(s.pump_input_once().unwrap(),4);assert!(s.audio_ready());
-  s.start_at(1000,10).unwrap();s.begin_flush().unwrap();assert_eq!(s.reader_state(),ReaderState::DrainRequested);assert!(s.reader_acknowledge_pause());let head=s.complete_flush_at(20).unwrap();assert_eq!(head,777);assert_eq!(s.state(),SessionState::Idle);assert!(!s.audio_ready());
+  s.start_at(1000,10).unwrap();s.begin_flush().unwrap();assert_eq!(s.reader_state(),ReaderState::DrainRequested);assert!(s.reader_acknowledge_pause());let head=s.complete_flush_at(20).unwrap();assert_eq!(head,Some(777));assert_eq!(s.state(),SessionState::Idle);assert!(!s.audio_ready());
   assert_eq!(s.transport.log,vec!["quiesce","commit","resume","quiesce","flush","resume"]);
-  assert_eq!(s.take_event(),Some(SessionEvent::Flushed{head_unix_ms:777}));
+  assert_eq!(s.take_event(),Some(SessionEvent::Flushed{head_unix_ms:Some(777)}));
  }
  #[test] fn flush_completion_requires_reader_ack(){
   let i=I{chunks:vec![],i:0};let mut s=OwnedSoloSession::new(T::default(),i,100,4);
   s.begin_flush().unwrap();assert_eq!(s.complete_flush_at(20),Err(OwnedError::ReaderState));
-  assert!(s.reader_acknowledge_pause());assert_eq!(s.complete_flush_at(20).unwrap(),777);
+  assert!(s.reader_acknowledge_pause());assert_eq!(s.complete_flush_at(20).unwrap(),Some(777));
+ }
+ #[test] fn flushed_status_can_omit_absent_warm_head(){
+  #[derive(Default)] struct NoHead;
+  impl OwnedTransport for NoHead{type Error=();fn quiesce(&mut self){}fn flush(&mut self)->Result<(),Self::Error>{Ok(())}fn commit_start(&mut self,r:u64)->Result<u64,Self::Error>{Ok(r)}fn stop(&mut self){}fn resume(&mut self){}fn disconnect(&mut self){}}
+  let i=I{chunks:vec![],i:0};let mut s=OwnedSoloSession::new(NoHead,i,100,4);
+  s.begin_flush().unwrap();assert!(s.reader_acknowledge_pause());assert_eq!(s.complete_flush_at(20).unwrap(),None);
+  assert_eq!(s.take_event(),Some(SessionEvent::Flushed{head_unix_ms:None}));
  }
  #[test] fn idle_timeout_tracks_start_and_eof_window(){
   let i=I{chunks:vec![vec![]],i:0};let mut s=OwnedSoloSession::new_at(T::default(),i,100,4,100,5);
