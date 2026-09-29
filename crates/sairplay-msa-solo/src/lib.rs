@@ -1,3 +1,6 @@
+pub mod route;
+pub mod timing;
+pub mod audio_format;
 pub mod pcm_ring;
 use pcm_ring::PcmRing;
 //! Independent Music Assistant compatible SOLO engine.
