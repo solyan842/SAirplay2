@@ -30,7 +30,8 @@ impl<I:PersistentInput> PersistentReader<I> {
         Self{input,ring,ready_bytes,audio_seen:false,state:ReaderState::Running}
     }
     pub fn state(&self)->ReaderState{self.state}
-    pub fn buffered_bytes(&self)->usize{self.ring.fill()}\n    pub fn writable_bytes(&self)->usize{self.ring.capacity()-self.ring.fill()}
+    pub fn buffered_bytes(&self)->usize{self.ring.fill()}
+    pub fn writable_bytes(&self)->usize{self.ring.capacity()-self.ring.fill()}
     pub fn audio_ready(&self)->bool{self.audio_seen}
     pub fn request_drain(&mut self){if self.state!=ReaderState::Aborted{self.state=ReaderState::DrainRequested;}}
     /// Reader-side acknowledgement. MSA parks before the command thread may
@@ -62,8 +63,11 @@ impl<I:PersistentInput> PersistentReader<I> {
     /// One persistent reader step. No read is allowed while drain is pending.
     pub fn pump_once(&mut self)->Result<usize,I::Error>{
         if self.state!=ReaderState::Running || self.ring.eof(){return Ok(0);}
+        let free=self.writable_bytes();
+        if free==0{return Ok(0);}
         let mut buf=[0u8;16384];
-        match self.input.read_nonblocking(&mut buf)? {
+        let want=free.min(buf.len());
+        match self.input.read_nonblocking(&mut buf[..want])? {
             None=>Ok(0),
             Some(0)=>{self.ring.mark_eof();if !self.audio_seen && self.ring.fill()>0{self.audio_seen=true;}Ok(0)}
             Some(n)=>{
@@ -97,7 +101,14 @@ mod tests{
   assert_eq!(r.drain_preflush().unwrap(),6);assert_eq!(r.buffered_bytes(),0);assert!(!r.audio_ready());
   r.resume_after_drain();assert_eq!(r.state(),ReaderState::Running);
  }
- #[test] fn full_ring_applies_backpressure_without_consuming_input(){\n  struct Count{reads:usize}\n  impl PersistentInput for Count{type Error=();fn read_nonblocking(&mut self,d:&mut[u8])->Result<Option<usize>,Self::Error>{self.reads+=1;d.fill(1);Ok(Some(d.len()))}}\n  let i=Count{reads:0};let mut r=PersistentReader::new(i,1,1);\n  while r.writable_bytes()>0{r.pump_once().unwrap();}\n  let before=r.input.reads;assert_eq!(r.pump_once().unwrap(),0);assert_eq!(r.input.reads,before);\n }\n #[test] fn reader_never_touches_input_during_drain_handshake(){
+ #[test] fn full_ring_applies_backpressure_without_consuming_input(){
+  struct Count{reads:usize}
+  impl PersistentInput for Count{type Error=();fn read_nonblocking(&mut self,d:&mut[u8])->Result<Option<usize>,Self::Error>{self.reads+=1;d.fill(1);Ok(Some(d.len()))}}
+  let i=Count{reads:0};let mut r=PersistentReader::new(i,1,1);
+  while r.writable_bytes()>0{r.pump_once().unwrap();}
+  let before=r.input.reads;assert_eq!(r.pump_once().unwrap(),0);assert_eq!(r.input.reads,before);
+ }
+ #[test] fn reader_never_touches_input_during_drain_handshake(){
   let i=Input{chunks:vec![vec![1]],i:0};let mut r=PersistentReader::new(i,100,1);
   r.request_drain();assert_eq!(r.pump_once().unwrap(),0);assert!(r.acknowledge_pause());
  }
