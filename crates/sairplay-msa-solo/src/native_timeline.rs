@@ -17,6 +17,21 @@ pub struct Timeline{
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
 pub struct SplicePlan{pub accepted_unix_ms:u64,pub pad_frames:u64,pub corrected:bool}
 
+#[derive(Debug,Clone,Copy,PartialEq,Eq)]
+pub struct RecoveryPlan{pub head_frame:u64,pub rtp_offset:u32,pub shifted_frames:u64}
+
+/// MSA stock realtime starvation recovery. Re-anchor only when the head is
+/// inside the floor and the RTP/head invariant is still intact. The wire RTP
+/// remains continuous; the head moves forward and the offset folds backward.
+pub fn plan_stock_recovery(head_frame:u64,wire_rtp:u32,rtp_offset:u32,now_frame:u64,floor_frames:u64,recovery_lead_frames:u64)->Option<RecoveryPlan>{
+ if head_frame>now_frame.saturating_add(floor_frames){return None;}
+ if (head_frame as u32).wrapping_add(rtp_offset)!=wire_rtp{return None;}
+ let target=now_frame.saturating_add(recovery_lead_frames);
+ if target<=head_frame{return None;}
+ let shifted=target-head_frame;
+ Some(RecoveryPlan{head_frame:target,rtp_offset:rtp_offset.wrapping_sub(shifted as u32),shifted_frames:shifted})
+}
+
 pub fn frames_for_ms(ms:u64,sample_rate:u32)->u64{
  if sample_rate==0{0}else{ms.saturating_mul(u64::from(sample_rate))/1000}
 }
@@ -62,6 +77,10 @@ impl Timeline{
   }else{self.wire_rtp=(new_head_frame as u32).wrapping_add(self.rtp_offset);}
   self.first_packet=true;
  }
+ pub fn recover_stock(&mut self,now_frame:u64,floor_frames:u64,recovery_lead_frames:u64)->Option<u64>{
+  let p=plan_stock_recovery(self.head_frame,self.wire_rtp,self.rtp_offset,now_frame,floor_frames,recovery_lead_frames)?;
+  self.head_frame=p.head_frame;self.rtp_offset=p.rtp_offset;Some(p.shifted_frames)
+ }
  pub fn advance(&mut self,frames:u32){
   self.head_frame=self.head_frame.saturating_add(u64::from(frames));
   self.wire_rtp=self.wire_rtp.wrapping_add(frames);
@@ -73,6 +92,18 @@ impl Timeline{
 #[cfg(test)]
 mod tests{
  use super::*;
+ #[test]fn stock_recovery_preserves_wire_rtp_and_moves_head(){
+  let mut t=Timeline{sample_rate:44100,head_frame:100000,wire_rtp:105000,rtp_offset:5000,seq:7,first_packet:false};
+  let shifted=t.recover_stock(120000,11025,77175).unwrap();
+  assert_eq!(shifted,97175);assert_eq!(t.head_frame,197175);assert_eq!(t.wire_rtp,105000);
+  assert_eq!((t.head_frame as u32).wrapping_add(t.rtp_offset),t.wire_rtp);
+ }
+ #[test]fn stock_recovery_refuses_broken_rtp_head_invariant(){
+  assert_eq!(plan_stock_recovery(100000,105001,5000,120000,11025,77175),None);
+ }
+ #[test]fn stock_recovery_is_idle_when_head_is_outside_floor(){
+  assert_eq!(plan_stock_recovery(200000,205000,5000,100000,11025,77175),None);
+ }
  #[test]fn splice_padding_is_frame_exact(){let p=hot_splice(123_456,1000,1125,48000);assert_eq!(p.pad_frames,6000);assert_eq!(p.accepted_unix_ms,1125);}
  #[test]fn splice_padding_preserves_nonzero_head_domain(){let p=hot_splice(9_000_000,2000,2250,44100);assert_eq!(p.pad_frames,11025);assert_eq!(p.accepted_unix_ms,2250);}
  #[test]fn stale_splice_moves_one_lead_beyond_head(){let p=hot_splice(0,2000,1900,44100);assert_eq!(p.accepted_unix_ms,2250);assert_eq!(p.pad_frames,11025);assert!(p.corrected);}
