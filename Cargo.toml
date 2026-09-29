@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/sairplay-engine",
+  "crates/sairplay-msa-solo",
   "crates/sairplay-gui",
 ]
 resolver = "2"
