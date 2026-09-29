@@ -125,20 +125,20 @@ pub fn resume<T:NativeAp2Transport>(t:&mut T,requested:u64)->Result<ResumePlan,A
 #[cfg(test)]
 mod tests {
  use super::*;
- #[derive(Default)] struct Mock{state:Ap2State,lane:NativeLane,anchor:bool,log:Vec<&'static str>}
+ #[derive(Default)] struct Mock{state:Ap2State,lane:NativeLane,anchor:bool,cold:bool,log:Vec<&'static str>}
  impl Default for Ap2State{fn default()->Self{Self::Connected}}
  impl Default for NativeLane{fn default()->Self{Self::Realtime}}
  impl NativeAp2Transport for Mock{
-  type Error=();fn state(&self)->Ap2State{self.state}fn now_unix_ms(&self)->u64{1000}fn start_floor(&self)->ClockFloor{ClockFloor{floor_ntp:(2u64)<<32,cold:false}}
+  type Error=();fn state(&self)->Ap2State{self.state}fn now_unix_ms(&self)->u64{1000}fn start_floor(&self)->ClockFloor{ClockFloor{floor_ntp:(2u64)<<32,cold:self.cold}}
   fn splice_timeline(&self)->bool{false}fn anchor_valid(&self)->bool{self.anchor}fn audible_head_unix_ms(&self)->u64{0}fn lane(&self)->NativeLane{self.lane}fn rtsp_alive(&self)->bool{true}
   fn keep_splice_queue(&mut self){}fn flush_realtime(&mut self)->Result<(),Self::Error>{self.log.push("flush_rt");Ok(())}fn flush_buffered(&mut self)->Result<(),Self::Error>{self.log.push("flush_buf");Ok(())}
   fn park_buffered(&mut self)->Result<(),Self::Error>{Ok(())}fn set_connected(&mut self){self.state=Ap2State::Connected}fn set_streaming(&mut self){self.state=Ap2State::Streaming;self.log.push("streaming")}
   fn clear_anchor(&mut self){self.anchor=false;self.log.push("clear")}fn anchor_start(&mut self,_:u64)->Result<(),Self::Error>{self.anchor=true;self.log.push("anchor");Ok(())}fn announce_ptp_timeline(&mut self)->Result<(),Self::Error>{self.log.push("sync");Ok(())}fn arm_clock_verify(&mut self,_:u64,_:u64,enforce:bool){assert!(!enforce);self.log.push("verify")}
  }
- #[test] fn cold_solo_start_arms_non_enforcing_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,log:vec![]};fn cold(t:&mut Mock){let _=t;} t.log.clear(); /* transport floor is warm by default */ assert_eq!(start(&mut t,0).unwrap().requested_unix_ms,0);assert!(!t.log.contains(&"verify"));}
- #[test] fn stock_resume_flushes_realtime_before_reanchor(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Realtime,anchor:true,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["flush_rt","clear","anchor","streaming","sync"]);}
- #[test] fn stock_resume_flushes_anchored_buffered_before_reanchor(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Buffered,anchor:true,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["flush_buf","clear","anchor","streaming","sync"]);}
- #[test] fn stock_resume_does_not_flush_unanchored_buffered(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Buffered,anchor:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["anchor","streaming","sync"]);}
+ #[test] fn cold_solo_start_arms_non_enforcing_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:true,log:vec![]};start(&mut t,0).unwrap();assert_eq!(t.log,vec!["anchor","streaming","sync","verify"]);}\n #[test] fn warm_solo_start_does_not_arm_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:false,log:vec![]};start(&mut t,0).unwrap();assert_eq!(t.log,vec!["anchor","streaming","sync"]);}\n #[test] fn cold_stock_resume_arms_non_enforcing_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:true,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["anchor","streaming","sync","verify"]);}
+ #[test] fn stock_resume_flushes_realtime_before_reanchor(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Realtime,anchor:true,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["flush_rt","clear","anchor","streaming","sync"]);}
+ #[test] fn stock_resume_flushes_anchored_buffered_before_reanchor(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Buffered,anchor:true,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["flush_buf","clear","anchor","streaming","sync"]);}
+ #[test] fn stock_resume_does_not_flush_unanchored_buffered(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Buffered,anchor:false,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["anchor","streaming","sync"]);}
 
 
  #[test] fn hot_splice_exact_request_pads_to_command(){let p=resolve_hot_splice(2000,2300);assert_eq!(p.start.at_unix_ms,2300);assert_eq!(p.silence_pad_ms,300);assert!(p.preserve_anchor_line);}
