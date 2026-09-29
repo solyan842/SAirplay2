@@ -191,6 +191,10 @@ impl LegacyPcmSink {
     pub fn is_feed_armed(&self) -> bool {
         self.feed_armed
     }
+
+    pub fn feed_not_before_ntp(&self) -> Option<u64> {
+        self.feed_not_before_ntp
+    }
 }
 
 impl GroupPcmParticipant for LegacyPcmSink {

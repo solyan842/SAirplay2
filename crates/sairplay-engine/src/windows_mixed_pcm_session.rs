@@ -303,6 +303,20 @@ impl WindowsMixedPcmSession {
             convergence.rounds,
             convergence.converged,
         ));
+        for sink in &native_sinks {
+            self.diagnostic_events.push(format!(
+                "Mixed native START armed · member={} · committed_start_ntp={}.",
+                GroupPcmParticipant::name(sink),
+                sink.committed_start_ntp().unwrap_or_default(),
+            ));
+        }
+        for sink in &legacy_sinks {
+            self.diagnostic_events.push(format!(
+                "Mixed RAOP feed armed · member={} · feed_not_before_ntp={}.",
+                GroupPcmParticipant::name(sink),
+                sink.feed_not_before_ntp().unwrap_or_default(),
+            ));
+        }
 
         let mut attached = Vec::<String>::new();
         for sink in native_sinks {
@@ -373,7 +387,7 @@ impl WindowsMixedPcmSession {
             crate::GroupPcmPumpOutcome::Delivered { bytes, failures } => {
                 if self.pump_cycles <= 8 || !failures.is_empty() || !cycle.removed_members.is_empty() {
                     self.diagnostic_events.push(format!(
-                        "Mixed PCM cycle #{} · source_read=1 · bytes={} · fanout_members={} · failures={} · removed={}.",
+                        "Mixed PCM cycle #{} · source_read=1 · bytes={} · fanout_members={} · failures={} · removed={}{}.",
                         self.pump_cycles,
                         bytes,
                         self.member_count().saturating_add(cycle.removed_members.len()),
@@ -382,6 +396,11 @@ impl WindowsMixedPcmSession {
                             "-".to_owned()
                         } else {
                             cycle.removed_members.join(", ")
+                        },
+                        if self.pump_cycles == 1 && failures.is_empty() {
+                            " · first_transport_writes_completed=true"
+                        } else {
+                            ""
                         },
                     ));
                 }
