@@ -33,6 +33,21 @@ impl<I:PersistentInput> PersistentReader<I> {
     pub fn buffered_bytes(&self)->usize{self.ring.fill()}
     pub fn writable_bytes(&self)->usize{self.ring.capacity()-self.ring.fill()}
     pub fn audio_ready(&self)->bool{self.audio_seen}
+    pub fn eof(&self)->bool{self.ring.eof()}
+    pub fn read_playing(&mut self,out:&mut[u8],playing:bool)->i32{
+        if self.state==ReaderState::Aborted{return -2;}
+        if !playing || out.is_empty(){return 0;}
+        if self.ring.fill()>=out.len() || (self.ring.eof() && self.ring.fill()>0){return self.ring.pop(out) as i32;}
+        if self.ring.eof(){return -1;}
+        0
+    }
+    pub fn discard_playing(&mut self,want:usize,playing:bool)->i32{
+        if self.state==ReaderState::Aborted{return -2;}
+        if !playing || want==0{return 0;}
+        if self.ring.fill()>0{return self.ring.discard(want) as i32;}
+        if self.ring.eof(){return -1;}
+        0
+    }
     pub fn request_drain(&mut self){if self.state!=ReaderState::Aborted{self.state=ReaderState::DrainRequested;}}
     /// Reader-side acknowledgement. MSA parks before the command thread may
     /// touch the same input descriptor.
@@ -107,6 +122,12 @@ mod tests{
   let i=Count{reads:0};let mut r=PersistentReader::new(i,1,1);
   while r.writable_bytes()>0{r.pump_once().unwrap();}
   let before=r.input.reads;assert_eq!(r.pump_once().unwrap(),0);assert_eq!(r.input.reads,before);
+ }
+ #[test] fn read_and_discard_match_msa_playing_and_eof_semantics(){
+  let i=Input{chunks:vec![vec![1,2,3],vec![]],i:0};let mut r=PersistentReader::new(i,100,1);
+  r.pump_once().unwrap();let mut out=[0u8;4];assert_eq!(r.read_playing(&mut out,true),0);
+  r.pump_once().unwrap();assert_eq!(r.read_playing(&mut out,true),3);assert_eq!(&out[..3],&[1,2,3]);
+  assert_eq!(r.discard_playing(1,true),-1);assert_eq!(r.read_playing(&mut out,false),0);
  }
  #[test] fn reader_never_touches_input_during_drain_handshake(){
   let i=Input{chunks:vec![vec![1]],i:0};let mut r=PersistentReader::new(i,100,1);
