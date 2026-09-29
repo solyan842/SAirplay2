@@ -1,11 +1,12 @@
+//! Independent Music Assistant compatible SOLO engine.
+//! Source: music-assistant/airplay-cli @ 431c5c582eef9307c4e39c50a0ea65e970bc1128
+//! Legacy SAirplay Solo/MultiRoom remain frozen.
+
 pub mod route;
 pub mod timing;
 pub mod audio_format;
 pub mod pcm_ring;
 use pcm_ring::PcmRing;
-//! Independent Music Assistant compatible SOLO engine.
-//! Source: music-assistant/airplay-cli @ 431c5c582eef9307c4e39c50a0ea65e970bc1128
-//! Legacy SAirplay Solo/MultiRoom remain frozen.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState { Idle, Playing, Standby, Ended }
