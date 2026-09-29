@@ -18,6 +18,20 @@ pub struct ResumePlan {
     pub start: StartResolution,
     pub silence_pad_ms: u64,
     pub preserve_anchor_line: bool,
+ #[derive(Default)] struct Mock{state:Ap2State,lane:NativeLane,anchor:bool,log:Vec<&'static str>}
+ impl Default for Ap2State{fn default()->Self{Self::Connected}}
+ impl Default for NativeLane{fn default()->Self{Self::Realtime}}
+ impl NativeAp2Transport for Mock{
+  type Error=();fn state(&self)->Ap2State{self.state}fn now_unix_ms(&self)->u64{1000}fn start_floor_ntp(&self)->u64{(2u64)<<32}
+  fn splice_timeline(&self)->bool{false}fn anchor_valid(&self)->bool{self.anchor}fn audible_head_unix_ms(&self)->u64{0}fn lane(&self)->NativeLane{self.lane}fn rtsp_alive(&self)->bool{true}
+  fn keep_splice_queue(&mut self){}fn flush_realtime(&mut self)->Result<(),Self::Error>{self.log.push("flush_rt");Ok(())}fn flush_buffered(&mut self)->Result<(),Self::Error>{self.log.push("flush_buf");Ok(())}
+  fn park_buffered(&mut self)->Result<(),Self::Error>{Ok(())}fn set_connected(&mut self){self.state=Ap2State::Connected}fn set_streaming(&mut self){self.state=Ap2State::Streaming;self.log.push("streaming")}
+  fn clear_anchor(&mut self){self.anchor=false;self.log.push("clear")}fn anchor_start(&mut self,_:u64)->Result<(),Self::Error>{self.anchor=true;self.log.push("anchor");Ok(())}fn announce_ptp_timeline(&mut self)->Result<(),Self::Error>{self.log.push("sync");Ok(())}
+ }
+ #[test] fn stock_resume_flushes_realtime_before_reanchor(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Realtime,anchor:true,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["flush_rt","clear","anchor","streaming","sync"]);}
+ #[test] fn stock_resume_flushes_anchored_buffered_before_reanchor(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Buffered,anchor:true,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["flush_buf","clear","anchor","streaming","sync"]);}
+ #[test] fn stock_resume_does_not_flush_unanchored_buffered(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Buffered,anchor:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["anchor","streaming","sync"]);}
+
 }
 
 pub trait NativeAp2Transport {
@@ -97,6 +111,16 @@ pub fn resume<T:NativeAp2Transport>(t:&mut T,requested:u64)->Result<ResumePlan,A
         let plan=resolve_hot_splice(t.audible_head_unix_ms(),requested);
         t.set_streaming();
         return Ok(plan);
+    }
+    // MSA stock resume discards the receiver's old queue before creating a
+    // fresh anchor when resuming an already-streaming non-splice timeline.
+    // Buffered only flushes here once an anchor exists; realtime always does.
+    if t.state()==Ap2State::Streaming && (!matches!(t.lane(),NativeLane::Buffered) || t.anchor_valid()) {
+        match t.lane(){
+            NativeLane::Realtime=>t.flush_realtime().map_err(Ap2CommandError::Transport)?,
+            NativeLane::Buffered=>t.flush_buffered().map_err(Ap2CommandError::Transport)?,
+        }
+        t.clear_anchor();
     }
     let s=resolve_at_floor(requested,t.start_floor_ntp());
     t.anchor_start(s.at_unix_ms).map_err(Ap2CommandError::Transport)?;
