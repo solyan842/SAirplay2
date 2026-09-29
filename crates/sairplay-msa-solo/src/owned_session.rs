@@ -42,6 +42,14 @@ impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
     pub fn epoch(&self)->u64{self.epoch}
     pub fn audio_ready(&self)->bool{self.reader.audio_ready()}
     pub fn pump_input_once(&mut self)->Result<usize,I::Error>{self.reader.pump_once()}
+    /// Timed reader pump used by the owned runtime: MSA opens the orphan
+    /// timeout window at the exact reader transition to EOF.
+    pub fn pump_input_once_at(&mut self,now_ms:u64)->Result<usize,I::Error>{
+        let was_eof=self.reader.eof();
+        let n=self.reader.pump_once()?;
+        if !was_eof && self.reader.eof(){self.idle_since_ms=now_ms;}
+        Ok(n)
+    }
     pub fn read(&mut self,out:&mut[u8])->i32{self.reader.read_playing(out,self.state==SessionState::Playing)}
     pub fn discard(&mut self,want:usize)->i32{self.reader.discard_playing(want,self.state==SessionState::Playing)}
     pub fn take_event(&mut self)->Option<SessionEvent>{
@@ -118,7 +126,7 @@ mod tests{
  }
  #[test] fn idle_timeout_tracks_start_and_eof_window(){
   let i=I{chunks:vec![vec![]],i:0};let mut s=OwnedSoloSession::new_at(T::default(),i,100,4,100,5);
-  s.start_at(1000,50).unwrap();s.pump_input_once().unwrap();assert_eq!(s.poll_at(149),None);
-  assert_eq!(s.poll_at(150),Some(SessionEvent::IdleTimeout));assert_eq!(s.state(),SessionState::Ended);
+  s.start_at(1000,50).unwrap();s.pump_input_once_at(80).unwrap();assert_eq!(s.poll_at(179),None);
+  assert_eq!(s.poll_at(180),Some(SessionEvent::IdleTimeout));assert_eq!(s.state(),SessionState::Ended);
  }
 }
