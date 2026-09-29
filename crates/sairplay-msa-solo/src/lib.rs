@@ -2,6 +2,7 @@
 //! Source: music-assistant/airplay-cli @ 431c5c582eef9307c4e39c50a0ea65e970bc1128
 //! Legacy SAirplay Solo/MultiRoom remain frozen.
 
+pub mod owned_session;
 pub mod persistent_input;
 pub mod ap2;
 pub mod raop;
