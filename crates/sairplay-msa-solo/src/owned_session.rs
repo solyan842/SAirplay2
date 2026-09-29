@@ -35,11 +35,11 @@ impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
     pub fn pump_input_once(&mut self)->Result<usize,I::Error>{self.reader.pump_once()}
 
     pub fn start(&mut self,requested:u64)->Result<StartAck,T::Error>{
-        assert!(self.state!=SessionState::Ended);
+        if self.state==SessionState::Ended{return Err(OwnedError::Ended);}
         self.transport.quiesce();
         let r=self.transport.commit_start(requested);
         self.transport.resume();
-        let at=r?;
+        let at=r.map_err(OwnedError::Transport)?;
         self.epoch=self.epoch.wrapping_add(1);
         self.state=SessionState::Playing;
         Ok(StartAck{requested_unix_ms:requested,at_unix_ms:at})
