@@ -10,7 +10,7 @@ use crate::pcm_ring::PcmRing;
 pub enum ReaderState { Running, DrainRequested, Paused, Aborted }
 
 #[derive(Debug,PartialEq,Eq)]
-pub enum ReaderError<E>{InvalidState,Input(E)}
+pub enum ReaderError<E>{InvalidConfig,InvalidState,Input(E)}
 
 pub trait PersistentInput {
     type Error;
@@ -27,10 +27,11 @@ pub struct PersistentReader<I:PersistentInput> {
 }
 
 impl<I:PersistentInput> PersistentReader<I> {
-    pub fn new(input:I,byte_rate:usize,ready_bytes:usize)->Self{
+    pub fn new(input:I,byte_rate:usize,ready_bytes:usize)->Result<Self,ReaderError<I::Error>>{
+        if byte_rate==0 || ready_bytes==0{return Err(ReaderError::InvalidConfig);}
         let ring=PcmRing::for_byte_rate(byte_rate);
-        assert!(ready_bytes>0 && ready_bytes<=ring.capacity());
-        Self{input,ring,ready_bytes,audio_seen:false,state:ReaderState::Running}
+        if ready_bytes>ring.capacity(){return Err(ReaderError::InvalidConfig);}
+        Ok(Self{input,ring,ready_bytes,audio_seen:false,state:ReaderState::Running})
     }
     pub fn state(&self)->ReaderState{self.state}
     pub fn buffered_bytes(&self)->usize{self.ring.fill()}
@@ -111,9 +112,13 @@ mod tests{
    let n=c.len().min(d.len());d[..n].copy_from_slice(&c[..n]);Ok(Some(n))
   }
  }
+ #[test] fn invalid_config_is_rejected_without_panic(){
+  let i=Input{chunks:vec![],i:0};assert!(matches!(PersistentReader::new(i,0,1),Err(ReaderError::InvalidConfig)));
+  let i=Input{chunks:vec![],i:0};assert!(matches!(PersistentReader::new(i,100,0),Err(ReaderError::InvalidConfig)));
+ }
  #[test] fn ready_is_one_shot_until_flush_drain(){
   let i=Input{chunks:vec![vec![1,2,3,4],vec![9,9],vec![7,7,7,7]],i:0};
-  let mut r=PersistentReader::new(i,100,4);
+  let mut r=PersistentReader::new(i,100,4).unwrap();
   assert_eq!(r.pump_once().unwrap(),4);assert!(r.audio_ready());
   r.request_drain();assert!(r.acknowledge_pause());
   assert_eq!(r.drain_preflush().unwrap(),6);assert_eq!(r.buffered_bytes(),0);assert!(!r.audio_ready());
@@ -122,18 +127,18 @@ mod tests{
  #[test] fn full_ring_applies_backpressure_without_consuming_input(){
   struct Count{reads:usize}
   impl PersistentInput for Count{type Error=();fn read_nonblocking(&mut self,d:&mut[u8])->Result<Option<usize>,Self::Error>{self.reads+=1;d.fill(1);Ok(Some(d.len()))}}
-  let i=Count{reads:0};let mut r=PersistentReader::new(i,1,1);
+  let i=Count{reads:0};let mut r=PersistentReader::new(i,1,1).unwrap();
   while r.writable_bytes()>0{r.pump_once().unwrap();}
   let before=r.input.reads;assert_eq!(r.pump_once().unwrap(),0);assert_eq!(r.input.reads,before);
  }
  #[test] fn read_and_discard_match_msa_playing_and_eof_semantics(){
-  let i=Input{chunks:vec![vec![1,2,3],vec![]],i:0};let mut r=PersistentReader::new(i,100,1);
+  let i=Input{chunks:vec![vec![1,2,3],vec![]],i:0};let mut r=PersistentReader::new(i,100,1).unwrap();
   r.pump_once().unwrap();let mut out=[0u8;4];assert_eq!(r.read_playing(&mut out,true),0);
   r.pump_once().unwrap();assert_eq!(r.read_playing(&mut out,true),3);assert_eq!(&out[..3],&[1,2,3]);
   assert_eq!(r.discard_playing(1,true),-1);assert_eq!(r.read_playing(&mut out,false),0);
  }
  #[test] fn reader_never_touches_input_during_drain_handshake(){
-  let i=Input{chunks:vec![vec![1]],i:0};let mut r=PersistentReader::new(i,100,1);
+  let i=Input{chunks:vec![vec![1]],i:0};let mut r=PersistentReader::new(i,100,1).unwrap();
   r.request_drain();assert_eq!(r.pump_once().unwrap(),0);assert!(r.acknowledge_pause());
  }
 }
