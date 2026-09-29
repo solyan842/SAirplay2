@@ -6,17 +6,19 @@ use crate::timing::{AP2_CLOCK_LOCK_MS,AP2_CLOCK_SETTLE_MS,AP2_CLOCK_SEAT_EXCHANG
 pub const AP2_CLOCK_STALL_MS:u64=5000;
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
-pub struct ProbeStreak{pub first_unix_ms:u64,pub third_unix_ms:u64,pub exchanges:u32}
+pub struct ProbeStreak{pub first_age_ms:u64,pub third_age_ms:u64,pub exchanges:u32}
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
 pub struct ClockFloor{pub floor_unix_ms:u64,pub cold:bool}
 
 pub fn ready_from(now:u64,apple_model:bool,ex:ProbeStreak)->u64{
-    let first=ex.first_unix_ms.min(now);
-    let mut ready=now.saturating_sub(first).saturating_add(AP2_CLOCK_LOCK_MS);
+    // MSA ap2_ptp_exchange reports AGES before now, not absolute timestamps.
+    // Source formula: now - min(age, now) + lock/settle.
+    let first_age=ex.first_age_ms.min(now);
+    let mut ready=now.saturating_sub(first_age).saturating_add(AP2_CLOCK_LOCK_MS);
     if apple_model && ex.exchanges>=AP2_CLOCK_SEAT_EXCHANGES{
-        let third=ex.third_unix_ms.min(now);
-        let fast=now.saturating_sub(third).saturating_add(AP2_CLOCK_SETTLE_MS);
+        let third_age=ex.third_age_ms.min(now);
+        let fast=now.saturating_sub(third_age).saturating_add(AP2_CLOCK_SETTLE_MS);
         ready=ready.min(fast);
     }
     ready
@@ -42,11 +44,11 @@ pub fn resolve_at_floor(requested:u64,floor:u64)->StartResolution{
 mod tests{
  use super::*;
  #[test] fn third_party_waits_full_lock_from_streak_start(){
-  let ex=ProbeStreak{first_unix_ms:1000,third_unix_ms:1300,exchanges:4};
+  let ex=ProbeStreak{first_age_ms:1000,third_age_ms:1300,exchanges:4};
   assert_eq!(ready_from(1500,false,ex),2800);
  }
  #[test] fn apple_after_three_exchanges_uses_fast_settle(){
-  let ex=ProbeStreak{first_unix_ms:1000,third_unix_ms:1400,exchanges:3};
+  let ex=ProbeStreak{first_age_ms:1000,third_age_ms:1400,exchanges:3};
   assert_eq!(ready_from(1500,true,ex),350);
  }
  #[test] fn cold_ptp_keeps_warm_floor_and_marks_cold(){
