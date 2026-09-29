@@ -35,6 +35,8 @@ pub struct SoloSession<T: SoloTransport> {
     state: SessionState,
     epoch: u64,
     pcm: PcmRing,
+    ready_bytes: usize,
+    audio_seen: bool,
 }
 
 impl<T: SoloTransport> SoloSession<T> {
@@ -43,7 +45,12 @@ impl<T: SoloTransport> SoloSession<T> {
     }
 
     pub fn with_byte_rate(transport: T, byte_rate: usize) -> Self {
-        Self { transport, state: SessionState::Idle, epoch: 0, pcm: PcmRing::for_byte_rate(byte_rate) }
+        Self::with_ready_bytes(transport, byte_rate, 1)
+    }
+    pub fn with_ready_bytes(transport: T, byte_rate: usize, ready_bytes: usize) -> Self {
+        let pcm = PcmRing::for_byte_rate(byte_rate);
+        assert!(ready_bytes > 0 && ready_bytes <= pcm.capacity());
+        Self { transport, state: SessionState::Idle, epoch: 0, pcm, ready_bytes, audio_seen: false }
     }
     pub fn state(&self) -> SessionState { self.state }
     pub fn epoch(&self) -> u64 { self.epoch }
@@ -51,7 +58,23 @@ impl<T: SoloTransport> SoloSession<T> {
 
     pub fn buffer_pcm(&mut self, input: &[u8]) -> usize {
         if self.state == SessionState::Ended { return 0; }
-        self.pcm.push(input)
+        let n = self.pcm.push(input);
+        if !self.audio_seen && self.pcm.fill() >= self.ready_bytes { self.audio_seen = true; }
+        n
+    }
+
+    pub fn audio_ready(&self) -> bool { self.audio_seen }
+
+    pub fn poll_idle_timeout(&mut self, elapsed_idle_ms: u64, idle_timeout_ms: u64) -> bool {
+        if idle_timeout_ms == 0 { return false; }
+        let idle = self.state == SessionState::Idle
+            || self.state == SessionState::Standby
+            || (self.state == SessionState::Playing && self.pcm.eof());
+        if idle && elapsed_idle_ms >= idle_timeout_ms {
+            self.state = SessionState::Ended;
+            return true;
+        }
+        false
     }
 
     pub fn mark_input_eof(&mut self) { self.pcm.mark_eof(); }
@@ -87,10 +110,17 @@ impl<T: SoloTransport> SoloSession<T> {
     pub fn flush(&mut self) -> Result<(), T::Error> {
         self.transport.quiesce();
         let result = self.transport.flush();
-        self.transport.resume();
+        if result.is_err() {
+            self.transport.resume();
+        }
         result?;
+        // MSA keeps sends quiesced while the reader is parked, then resets the
+        // ring and drains pre-FLUSH input. This pure owner has no fd yet; the
+        // Windows source adapter supplies that drain handshake before resume.
         self.pcm.reset();
+        self.audio_seen = false;
         self.state = SessionState::Idle;
+        self.transport.resume();
         Ok(())
     }
 
