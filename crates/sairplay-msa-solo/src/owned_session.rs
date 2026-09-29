@@ -97,7 +97,7 @@ impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
         self.idle_since_ms=now_ms;
         self.last_audio_ready=false;
         let head=self.transport.warm_head_unix_ms();
-        self.reader.resume_after_drain().map_err(|e|match e{ReaderError::Input(e)=>OwnedError::Input(e),ReaderError::InvalidState=>OwnedError::ReaderState})?;
+        self.reader.resume_after_drain().map_err(|e|match e{ReaderError::Input(e)=>OwnedError::Input(e),ReaderError::InvalidState=>OwnedError::ReaderState,ReaderError::InvalidConfig=>OwnedError::InvalidConfig})?;
         self.transport.resume();
         self.pending_event=Some(SessionEvent::Flushed{head_unix_ms:head});
         Ok(head)
