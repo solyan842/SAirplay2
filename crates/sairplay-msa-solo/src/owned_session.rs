@@ -50,6 +50,10 @@ impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
         if !was_eof && self.reader.eof(){self.idle_since_ms=now_ms;}
         Ok(n)
     }
+    pub fn reader_state(&self)->ReaderState{self.reader.state()}
+    /// Reader-side park acknowledgement; the runtime reader loop calls this,
+    /// never the command-side FLUSH path.
+    pub fn reader_acknowledge_pause(&mut self)->bool{self.reader.acknowledge_pause()}
     pub fn read(&mut self,out:&mut[u8])->i32{self.reader.read_playing(out,self.state==SessionState::Playing)}
     pub fn discard(&mut self,want:usize)->i32{self.reader.discard_playing(want,self.state==SessionState::Playing)}
     pub fn take_event(&mut self)->Option<SessionEvent>{
@@ -74,14 +78,20 @@ impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
         Ok(StartAck{requested_unix_ms:requested,at_unix_ms:at})
     }
 
-    /// Exact MSA command order: quiesce -> transport FLUSH -> park reader ->
-    /// reset ring/drain old input -> IDLE -> capture warm head -> resume.
-    pub fn flush_at(&mut self,now_ms:u64)->Result<u64,OwnedError<T::Error,I::Error>>{
+    /// Command-side phase 1: quiesce/FLUSH then request the persistent reader
+    /// to park. Completion is illegal until the reader loop acknowledges.
+    pub fn begin_flush(&mut self)->Result<(),OwnedError<T::Error,I::Error>>{
         if self.state==SessionState::Ended{return Err(OwnedError::Ended);}
         self.transport.quiesce();
         if let Err(e)=self.transport.flush(){self.transport.resume();return Err(OwnedError::Transport(e));}
         self.reader.request_drain();
-        assert!(self.reader.acknowledge_pause() || self.reader.state()==ReaderState::Paused);
+        Ok(())
+    }
+
+    /// Command-side phase 2, called only after reader-side pause acknowledgement.
+    pub fn complete_flush_at(&mut self,now_ms:u64)->Result<u64,OwnedError<T::Error,I::Error>>{
+        if self.state==SessionState::Ended{return Err(OwnedError::Ended);}
+        if self.reader.state()!=ReaderState::Paused{return Err(OwnedError::ReaderState);}
         if let Err(e)=self.reader.drain_preflush(){let _=self.reader.resume_after_drain();self.transport.resume();return Err(match e{ReaderError::Input(e)=>OwnedError::Input(e),ReaderError::InvalidState=>OwnedError::ReaderState});}
         self.state=SessionState::Idle;
         self.idle_since_ms=now_ms;
@@ -120,9 +130,14 @@ mod tests{
  #[test] fn flush_is_end_to_end_msa_order_and_rearms_reader(){
   let i=I{chunks:vec![vec![1,2,3,4],vec![8,8]],i:0};let mut s=OwnedSoloSession::new(T::default(),i,100,4);
   assert_eq!(s.pump_input_once().unwrap(),4);assert!(s.audio_ready());
-  s.start_at(1000,10).unwrap();let head=s.flush_at(20).unwrap();assert_eq!(head,777);assert_eq!(s.state(),SessionState::Idle);assert!(!s.audio_ready());
+  s.start_at(1000,10).unwrap();s.begin_flush().unwrap();assert_eq!(s.reader_state(),ReaderState::DrainRequested);assert!(s.reader_acknowledge_pause());let head=s.complete_flush_at(20).unwrap();assert_eq!(head,777);assert_eq!(s.state(),SessionState::Idle);assert!(!s.audio_ready());
   assert_eq!(s.transport.log,vec!["quiesce","commit","resume","quiesce","flush","resume"]);
   assert_eq!(s.take_event(),Some(SessionEvent::Flushed{head_unix_ms:777}));
+ }
+ #[test] fn flush_completion_requires_reader_ack(){
+  let i=I{chunks:vec![],i:0};let mut s=OwnedSoloSession::new(T::default(),i,100,4);
+  s.begin_flush().unwrap();assert_eq!(s.complete_flush_at(20),Err(OwnedError::ReaderState));
+  assert!(s.reader_acknowledge_pause());assert_eq!(s.complete_flush_at(20).unwrap(),777);
  }
  #[test] fn idle_timeout_tracks_start_and_eof_window(){
   let i=I{chunks:vec![vec![]],i:0};let mut s=OwnedSoloSession::new_at(T::default(),i,100,4,100,5);
