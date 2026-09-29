@@ -6,6 +6,7 @@ use sairplay_engine::{
     LegacyGroupSession, LegacyMemberConfig, MdnsBrowser, NativeGroupJoinHandle, NativeGroupKind,
     NativeGroupMemberConfig, NativeGroupSession, NativeHapPairingClient,
     NativeSession, NativeSessionConfig, ReceiverCapabilities, RetransmitStats, Route, ServiceKind, VolumeSetResult,
+    WindowsMixedPcmSession, WindowsMixedPcmWorker, AIRPLAY_COLD_GROUP_START_LEAD_MS,
     ALAC_44100_16_2, ALAC_44100_24_2, ALAC_48000_16_2,
     ALAC_48000_24_2,
 };
@@ -19,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PlaybackUiState {
@@ -41,12 +42,19 @@ enum ActiveSession {
     StereoPair(NativeGroupSession),
     MultiRoom(NativeGroupSession),
     Legacy(LegacyGroupSession),
+    Mixed(MixedActiveSession),
 }
 
 #[derive(Clone)]
 enum ActiveVolumeControl {
     Native(sairplay_engine::NativeVolumeControl),
     Legacy(sairplay_engine::LegacyVolumeControl),
+}
+
+struct MixedActiveSession {
+    worker: WindowsMixedPcmWorker,
+    volume_controls: Vec<ActiveVolumeControl>,
+    initial_volume_results: Vec<(String, VolumeSetResult)>,
 }
 
 impl ActiveVolumeControl {
@@ -65,6 +73,7 @@ impl ActiveSession {
             Self::StereoPair(session) => session.audio_running(),
             Self::MultiRoom(session) => session.audio_running(),
             Self::Legacy(session) => session.is_running(),
+            Self::Mixed(session) => session.worker.is_running(),
         }
     }
 
@@ -74,6 +83,7 @@ impl ActiveSession {
             Self::StereoPair(session) => session.audio_error(),
             Self::MultiRoom(session) => session.audio_error(),
             Self::Legacy(session) => session.last_error(),
+            Self::Mixed(session) => session.worker.last_error(),
         }
     }
 
@@ -83,6 +93,7 @@ impl ActiveSession {
             Self::StereoPair(session) => session.audio_format(),
             Self::MultiRoom(session) => session.audio_format(),
             Self::Legacy(_) => None,
+            Self::Mixed(_) => Some(sairplay_engine::Ap2AudioFormat::ALAC_44100_16_STEREO),
         }
     }
 
@@ -92,6 +103,7 @@ impl ActiveSession {
             Self::StereoPair(session) => session.drain_startup_events(),
             Self::MultiRoom(session) => session.drain_startup_events(),
             Self::Legacy(session) => session.drain_startup_events(),
+            Self::Mixed(session) => session.worker.drain_diagnostic_events(),
         }
     }
 
@@ -100,7 +112,7 @@ impl ActiveSession {
             Self::Single(session) => session.retransmit_stats(),
             Self::StereoPair(session) => session.retransmit_stats(),
             Self::MultiRoom(session) => session.retransmit_stats(),
-            Self::Legacy(_) => RetransmitStats::default(),
+            Self::Legacy(_) | Self::Mixed(_) => RetransmitStats::default(),
         }
     }
 
@@ -109,7 +121,7 @@ impl ActiveSession {
             Self::StereoPair(session) | Self::MultiRoom(session) => {
                 session.member_retransmit_stats()
             }
-            Self::Single(_) | Self::Legacy(_) => Vec::new(),
+            Self::Single(_) | Self::Legacy(_) | Self::Mixed(_) => Vec::new(),
         }
     }
 
@@ -119,6 +131,7 @@ impl ActiveSession {
             Self::StereoPair(session) => session.feedback_running(),
             Self::MultiRoom(session) => session.feedback_running(),
             Self::Legacy(session) => session.is_running(),
+            Self::Mixed(session) => session.worker.is_running(),
         }
     }
 
@@ -128,6 +141,7 @@ impl ActiveSession {
             Self::StereoPair(session) => session.feedback_error(),
             Self::MultiRoom(session) => session.feedback_error(),
             Self::Legacy(_) => None,
+            Self::Mixed(session) => session.worker.last_error(),
         }
     }
 
@@ -149,6 +163,7 @@ impl ActiveSession {
                 .into_iter()
                 .map(ActiveVolumeControl::Legacy)
                 .collect(),
+            Self::Mixed(session) => session.volume_controls.clone(),
         }
     }
 
@@ -161,6 +176,7 @@ impl ActiveSession {
             Self::StereoPair(session) => session.initial_volume_results(),
             Self::MultiRoom(session) => session.initial_volume_results(),
             Self::Legacy(_) => Vec::new(),
+            Self::Mixed(session) => session.initial_volume_results.clone(),
         }
     }
 
@@ -169,7 +185,7 @@ impl ActiveSession {
             Self::StereoPair(session) | Self::MultiRoom(session) => {
                 session.failed_group_members()
             }
-            Self::Single(_) | Self::Legacy(_) => Vec::new(),
+            Self::Single(_) | Self::Legacy(_) | Self::Mixed(_) => Vec::new(),
         }
     }
 
@@ -178,7 +194,7 @@ impl ActiveSession {
             Self::StereoPair(session) | Self::MultiRoom(session) => {
                 session.recovery_join_handle()
             }
-            Self::Single(_) | Self::Legacy(_) => None,
+            Self::Single(_) | Self::Legacy(_) | Self::Mixed(_) => None,
         }
     }
 
@@ -187,7 +203,7 @@ impl ActiveSession {
             Self::StereoPair(session) | Self::MultiRoom(session) => {
                 session.detach_failed_member(name).map_err(|error| error.to_string())
             }
-            Self::Single(_) | Self::Legacy(_) => Ok(false),
+            Self::Single(_) | Self::Legacy(_) | Self::Mixed(_) => Ok(false),
         }
     }
 
@@ -197,7 +213,7 @@ impl ActiveSession {
                 group.adopt_member(name, session);
                 true
             }
-            Self::Single(_) | Self::Legacy(_) => false,
+            Self::Single(_) | Self::Legacy(_) | Self::Mixed(_) => false,
         }
     }
 }
@@ -775,7 +791,7 @@ impl SairplayApp {
                     self.session = Some(success.session);
                 } else {
                     let message =
-                        "native transport returned without a running Windows audio path".to_owned();
+                        "transport returned without a running Windows audio path".to_owned();
                     self.log.push(message.clone());
                     self.active_fullnames.clear();
                     self.active_native_configs.clear();
@@ -2008,14 +2024,28 @@ impl SairplayApp {
             .iter()
             .all(|route| matches!(route, Route::Raop | Route::AirPlay2Compat));
 
-        if !all_native && !all_legacy {
-            let message = "Mixed native AirPlay 2 + RAOP groups need one shared cross-transport timeline; select receivers from the same transport family for this build.".to_owned();
-            self.log.push(message.clone());
-            self.playback = PlaybackUiState::Error(message);
-            return;
+        let mixed_transport = !all_native && !all_legacy;
+        if mixed_transport {
+            let native_count = routes
+                .iter()
+                .filter(|route| **route == Route::AirPlay2Native)
+                .count();
+            let legacy_count = routes
+                .iter()
+                .filter(|route| matches!(route, Route::Raop | Route::AirPlay2Compat))
+                .count();
+            if native_count != 1 || legacy_count != 1 {
+                let message = "Phase B mixed playback is currently limited to exactly one native AirPlay 2 receiver + one RAOP receiver at 16-bit/44.1 kHz.".to_owned();
+                self.log.push(message.clone());
+                self.playback = PlaybackUiState::Error(message);
+                return;
+            }
         }
 
-        if all_legacy {
+        if routes
+            .iter()
+            .any(|route| matches!(route, Route::Raop | Route::AirPlay2Compat))
+        {
             if let Some((_, device)) = selected_devices
                 .iter()
                 .find(|(_, device)| self.legacy_pairing_required(device))
@@ -2083,7 +2113,123 @@ impl SairplayApp {
         self.active_fullnames.clear();
         self.last_feedback_error = None;
 
-        if all_native {
+        if mixed_transport {
+            let native_index = routes
+                .iter()
+                .position(|route| *route == Route::AirPlay2Native)
+                .expect("mixed path requires one native route");
+            let legacy_index = routes
+                .iter()
+                .position(|route| matches!(route, Route::Raop | Route::AirPlay2Compat))
+                .expect("mixed path requires one legacy route");
+
+            let (native_fullname, native_device) = &selected_devices[native_index];
+            let mut native_config = match native_config_for_device(
+                native_device,
+                initial_volume,
+                Some(false),
+            ) {
+                Ok(config) => config,
+                Err(message) => {
+                    self.log.push(message.clone());
+                    self.playback = PlaybackUiState::Error(message);
+                    self.connect_rx = None;
+                    return;
+                }
+            };
+            native_config.auth_credentials =
+                self.native_credentials.get(native_fullname).cloned();
+            native_config.hires_enabled = false;
+            native_config.session_sample_rate = 44_100;
+            native_config.buffered_auto_enabled = true;
+
+            let (_, legacy_device) = &selected_devices[legacy_index];
+            let pairing_key = Self::legacy_pairing_key(legacy_device);
+            let legacy_secret = pairing_key
+                .as_ref()
+                .and_then(|key| self.legacy_secrets.get(key))
+                .map(String::as_str);
+            let legacy_config =
+                match legacy_config_for_device(legacy_device, initial_volume, legacy_secret) {
+                    Ok(config) => config,
+                    Err(message) => {
+                        self.log.push(message.clone());
+                        self.playback = PlaybackUiState::Error(message);
+                        self.connect_rx = None;
+                        return;
+                    }
+                };
+
+            let native_configs =
+                BTreeMap::from([(native_fullname.clone(), native_config.clone())]);
+            let native_member =
+                NativeGroupMemberConfig::new(native_fullname.clone(), native_config);
+
+            thread::Builder::new()
+                .name("sairplay-mixed-connect".into())
+                .spawn(move || {
+                    let result = (|| -> Result<ActiveSession, String> {
+                        let native_group = NativeGroupSession::connect_external_pcm(
+                            NativeGroupKind::MultiRoom,
+                            vec![native_member],
+                            sairplay_engine::Ap2AudioFormat::ALAC_44100_16_STEREO,
+                        )
+                        .map_err(|error| error.to_string())?;
+
+                        let initial_volume_results = native_group.initial_volume_results();
+                        let mut volume_controls = native_group
+                            .volume_controls()
+                            .into_iter()
+                            .map(ActiveVolumeControl::Native)
+                            .collect::<Vec<_>>();
+
+                        let legacy_group =
+                            LegacyGroupSession::connect_external_pcm(vec![legacy_config])
+                                .map_err(|error| error.to_string())?;
+                        volume_controls.extend(
+                            legacy_group
+                                .volume_controls()
+                                .into_iter()
+                                .map(ActiveVolumeControl::Legacy),
+                        );
+
+                        let mut mixed = WindowsMixedPcmSession::start(
+                            sairplay_engine::Ap2AudioFormat::ALAC_44100_16_STEREO,
+                        )
+                        .map_err(|error| error.to_string())?;
+
+                        let now_unix_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_err(|error| format!("system clock before Unix epoch: {error}"))?
+                            .as_millis() as u64;
+                        let initial_target_unix_ms =
+                            now_unix_ms.saturating_add(AIRPLAY_COLD_GROUP_START_LEAD_MS);
+
+                        mixed.attach_external_44100_16_groups(
+                            native_group,
+                            legacy_group,
+                            initial_target_unix_ms,
+                        )?;
+
+                        let worker = WindowsMixedPcmWorker::start(mixed)?;
+                        Ok(ActiveSession::Mixed(MixedActiveSession {
+                            worker,
+                            volume_controls,
+                            initial_volume_results,
+                        }))
+                    })()
+                    .map(|session| ConnectSuccess {
+                        session,
+                        active_fullnames,
+                        native_configs,
+                        label,
+                        mode: requested_mode,
+                    });
+
+                    let _ = tx.send(result);
+                })
+                .expect("failed to spawn mixed connect worker");
+        } else if all_native {
             if requested_mode == PlaybackMode::Single && member_count == 1 {
                 let (fullname, device) = &selected_devices[0];
                 let hires_override = self.hires_overrides.get(fullname).copied();
@@ -2240,6 +2386,16 @@ impl SairplayApp {
                             .into(),
                     );
                 }
+                ActiveSession::Mixed(session) => {
+                    thread::Builder::new()
+                        .name("sairplay-mixed-stop".into())
+                        .spawn(move || drop(session))
+                        .expect("failed to spawn mixed stop worker");
+                    self.log.push(
+                        "Playback stopped; mixed AirPlay 2 + RAOP resources are releasing asynchronously."
+                            .into(),
+                    );
+                }
                 // Native workers currently have bounded local shutdown and stay
                 // on the existing path; do not change their proven stop behavior.
                 session => {
@@ -2272,16 +2428,20 @@ impl SairplayApp {
                 UiTheme::amber(),
             ),
             PlaybackUiState::Playing(_) => {
-                let detail = match self.session.as_ref().and_then(ActiveSession::audio_format) {
-                    Some(format) => format!(
-                        "AirPlay 2 · ALAC · {}-bit / {} kHz",
-                        format.bit_depth,
-                        if format.sample_rate == 44_100 { "44.1".to_owned() } else { (format.sample_rate / 1000).to_string() }
-                    ),
-                    None => self.t(
-                        "Đang truyền âm thanh qua AirPlay",
-                        "Streaming via AirPlay",
-                    ).to_owned(),
+                let detail = if matches!(self.session, Some(ActiveSession::Mixed(_))) {
+                    "AirPlay 2 + RAOP · ALAC · 16-bit / 44.1 kHz".to_owned()
+                } else {
+                    match self.session.as_ref().and_then(ActiveSession::audio_format) {
+                        Some(format) => format!(
+                            "AirPlay 2 · ALAC · {}-bit / {} kHz",
+                            format.bit_depth,
+                            if format.sample_rate == 44_100 { "44.1".to_owned() } else { (format.sample_rate / 1000).to_string() }
+                        ),
+                        None => self.t(
+                            "Đang truyền âm thanh qua AirPlay",
+                            "Streaming via AirPlay",
+                        ).to_owned(),
+                    }
                 };
                 (
                     self.t("Đang chạy", "Running"),

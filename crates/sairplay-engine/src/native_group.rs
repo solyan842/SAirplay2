@@ -193,7 +193,14 @@ impl NativeGroupSession {
         }
         match kind {
             NativeGroupKind::StereoPair if configs.len() != 2 => return Err(NativeGroupError::InvalidMembership { kind, members: configs.len() }),
-            NativeGroupKind::MultiRoom if configs.len() < 2 => return Err(NativeGroupError::InvalidMembership { kind, members: configs.len() }),
+            NativeGroupKind::MultiRoom
+                if configs.len() < 2 && external_pcm_format.is_none() =>
+            {
+                return Err(NativeGroupError::InvalidMembership {
+                    kind,
+                    members: configs.len(),
+                });
+            }
             _ => {}
         }
 
