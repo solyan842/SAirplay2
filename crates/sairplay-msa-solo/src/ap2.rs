@@ -39,7 +39,11 @@ pub trait NativeAp2Transport {
     fn set_streaming(&mut self);
     fn clear_anchor(&mut self);
     fn anchor_start(&mut self, at_unix_ms: u64) -> Result<(), Self::Error>;
-    fn announce_ptp_timeline(&mut self) -> Result<(), Self::Error>;
+    /// Buffered native AP2 commits with rate-1 SETRATEANCHORTIME and returns.
+    fn anchor_buffered_start(&mut self, at_unix_ms:u64) -> Result<(), Self::Error>;
+    /// Realtime native AP2 sends an immediate sync only when PTP/control is live.
+    /// The transport owns that exact gate; NTP realtime waits for first-packet sync.
+    fn sync_realtime_ptp_if_ready(&mut self) -> Result<(), Self::Error>;
     /// MSA cold-clock post-commit verification. SOLO is observation-only:
     /// enforce=false, so verification must never move the committed anchor.
     fn arm_clock_verify(&mut self, requested_unix_ms:u64, at_unix_ms:u64, enforce:bool);
@@ -51,8 +55,13 @@ pub fn start<T: NativeAp2Transport>(t:&mut T, requested:u64)->Result<StartResolu
     let s=resolve_at_floor(requested,floor.floor_ntp);
     t.anchor_start(s.at_unix_ms).map_err(Ap2CommandError::Transport)?;
     t.set_streaming();
-    t.announce_ptp_timeline().map_err(Ap2CommandError::Transport)?;
-    if floor.cold{t.arm_clock_verify(requested,s.at_unix_ms,false);}
+    match t.lane(){
+        NativeLane::Buffered=>t.anchor_buffered_start(s.at_unix_ms).map_err(Ap2CommandError::Transport)?,
+        NativeLane::Realtime=>{
+            t.sync_realtime_ptp_if_ready().map_err(Ap2CommandError::Transport)?;
+            if floor.cold{t.arm_clock_verify(requested,s.at_unix_ms,false);}
+        }
+    }
     Ok(s)
 }
 
@@ -117,8 +126,13 @@ pub fn resume<T:NativeAp2Transport>(t:&mut T,requested:u64)->Result<ResumePlan,A
     let s=resolve_at_floor(requested,floor.floor_ntp);
     t.anchor_start(s.at_unix_ms).map_err(Ap2CommandError::Transport)?;
     t.set_streaming();
-    t.announce_ptp_timeline().map_err(Ap2CommandError::Transport)?;
-    if floor.cold{t.arm_clock_verify(requested,s.at_unix_ms,false);}
+    match t.lane(){
+        NativeLane::Buffered=>t.anchor_buffered_start(s.at_unix_ms).map_err(Ap2CommandError::Transport)?,
+        NativeLane::Realtime=>{
+            t.sync_realtime_ptp_if_ready().map_err(Ap2CommandError::Transport)?;
+            if floor.cold{t.arm_clock_verify(requested,s.at_unix_ms,false);}
+        }
+    }
     Ok(ResumePlan{start:s,silence_pad_ms:0,preserve_anchor_line:false})
 }
 
@@ -133,13 +147,13 @@ mod tests {
   fn splice_timeline(&self)->bool{false}fn anchor_valid(&self)->bool{self.anchor}fn audible_head_unix_ms(&self)->u64{0}fn lane(&self)->NativeLane{self.lane}fn rtsp_alive(&self)->bool{true}
   fn keep_splice_queue(&mut self){}fn flush_realtime(&mut self)->Result<(),Self::Error>{self.log.push("flush_rt");Ok(())}fn flush_buffered(&mut self)->Result<(),Self::Error>{self.log.push("flush_buf");Ok(())}
   fn park_buffered(&mut self)->Result<(),Self::Error>{Ok(())}fn set_connected(&mut self){self.state=Ap2State::Connected}fn set_streaming(&mut self){self.state=Ap2State::Streaming;self.log.push("streaming")}
-  fn clear_anchor(&mut self){self.anchor=false;self.log.push("clear")}fn anchor_start(&mut self,_:u64)->Result<(),Self::Error>{self.anchor=true;self.log.push("anchor");Ok(())}fn announce_ptp_timeline(&mut self)->Result<(),Self::Error>{self.log.push("sync");Ok(())}fn arm_clock_verify(&mut self,_:u64,_:u64,enforce:bool){assert!(!enforce);self.log.push("verify")}
+  fn clear_anchor(&mut self){self.anchor=false;self.log.push("clear")}fn anchor_start(&mut self,_:u64)->Result<(),Self::Error>{self.anchor=true;self.log.push("anchor");Ok(())}fn anchor_buffered_start(&mut self,_:u64)->Result<(),Self::Error>{self.log.push("buf_anchor");Ok(())}fn sync_realtime_ptp_if_ready(&mut self)->Result<(),Self::Error>{self.log.push("sync");Ok(())}fn arm_clock_verify(&mut self,_:u64,_:u64,enforce:bool){assert!(!enforce);self.log.push("verify")}
  }
  #[test] fn cold_solo_start_arms_non_enforcing_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:true,log:vec![]};start(&mut t,0).unwrap();assert_eq!(t.log,vec!["anchor","streaming","sync","verify"]);}
  #[test] fn warm_solo_start_does_not_arm_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:false,log:vec![]};start(&mut t,0).unwrap();assert_eq!(t.log,vec!["anchor","streaming","sync"]);}
  #[test] fn cold_stock_resume_arms_non_enforcing_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:true,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["anchor","streaming","sync","verify"]);}
- #[test] fn stock_resume_flushes_realtime_before_reanchor(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Realtime,anchor:true,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["flush_rt","clear","anchor","streaming","sync"]);}
- #[test] fn stock_resume_flushes_anchored_buffered_before_reanchor(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Buffered,anchor:true,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["flush_buf","clear","anchor","streaming","sync"]);}
+ #[test] fn cold_buffered_start_anchors_and_skips_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Buffered,anchor:false,cold:true,log:vec![]};start(&mut t,0).unwrap();assert_eq!(t.log,vec!["anchor","streaming","buf_anchor"]);}\n #[test] fn stock_resume_flushes_realtime_before_reanchor(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Realtime,anchor:true,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["flush_rt","clear","anchor","streaming","sync"]);}
+ #[test] fn stock_resume_flushes_anchored_buffered_before_reanchor(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Buffered,anchor:true,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["flush_buf","clear","anchor","streaming","buf_anchor"]);}
  #[test] fn stock_resume_does_not_flush_unanchored_buffered(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Buffered,anchor:false,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["anchor","streaming","sync"]);}
 
 
