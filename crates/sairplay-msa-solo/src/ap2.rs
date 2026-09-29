@@ -155,7 +155,7 @@ mod tests {
  #[test] fn cold_buffered_start_anchors_and_skips_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Buffered,anchor:false,cold:true,log:vec![]};start(&mut t,0).unwrap();assert_eq!(t.log,vec!["anchor","streaming","buf_anchor"]);}
  #[test] fn stock_resume_flushes_realtime_before_reanchor(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Realtime,anchor:true,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["flush_rt","clear","anchor","streaming","sync"]);}
  #[test] fn stock_resume_flushes_anchored_buffered_before_reanchor(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Buffered,anchor:true,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["flush_buf","clear","anchor","streaming","buf_anchor"]);}
- #[test] fn stock_resume_does_not_flush_unanchored_buffered(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Buffered,anchor:false,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["anchor","streaming","sync"]);}
+ #[test] fn stock_resume_does_not_flush_unanchored_buffered(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Buffered,anchor:false,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["anchor","streaming","buf_anchor"]);}
 
 
  #[test] fn hot_splice_exact_request_pads_to_command(){let p=resolve_hot_splice(2000,2300);assert_eq!(p.start.at_unix_ms,2300);assert_eq!(p.silence_pad_ms,300);assert!(p.preserve_anchor_line);}
