@@ -30,12 +30,13 @@ pub struct OwnedSoloSession<T:OwnedTransport,I:PersistentInput>{
     idle_timeout_ms:u64,
     idle_since_ms:u64,
     last_audio_ready:bool,
+    pending_event:Option<SessionEvent>,
 }
 
 impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
     pub fn new(transport:T,input:I,byte_rate:usize,ready_bytes:usize)->Self{Self::new_at(transport,input,byte_rate,ready_bytes,0,0)}
     pub fn new_at(transport:T,input:I,byte_rate:usize,ready_bytes:usize,idle_timeout_ms:u64,now_ms:u64)->Self{
-        Self{transport,reader:PersistentReader::new(input,byte_rate,ready_bytes),state:SessionState::Idle,epoch:0,byte_rate,idle_timeout_ms,idle_since_ms:now_ms,last_audio_ready:false}
+        Self{transport,reader:PersistentReader::new(input,byte_rate,ready_bytes),state:SessionState::Idle,epoch:0,byte_rate,idle_timeout_ms,idle_since_ms:now_ms,last_audio_ready:false,pending_event:None}
     }
     pub fn state(&self)->SessionState{self.state}
     pub fn epoch(&self)->u64{self.epoch}
@@ -43,7 +44,8 @@ impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
     pub fn pump_input_once(&mut self)->Result<usize,I::Error>{self.reader.pump_once()}
     pub fn read(&mut self,out:&mut[u8])->i32{self.reader.read_playing(out,self.state==SessionState::Playing)}
     pub fn discard(&mut self,want:usize)->i32{self.reader.discard_playing(want,self.state==SessionState::Playing)}
-    pub fn take_audio_event(&mut self)->Option<SessionEvent>{
+    pub fn take_event(&mut self)->Option<SessionEvent>{
+        if let Some(e)=self.pending_event.take(){return Some(e);}
         let ready=self.reader.audio_ready();if ready && !self.last_audio_ready{self.last_audio_ready=true;return Some(SessionEvent::AudioReady{buffered_ms:self.reader.buffered_bytes() as u64*1000/self.byte_rate as u64});}None
     }
     pub fn poll_at(&mut self,now_ms:u64)->Option<SessionEvent>{
@@ -52,7 +54,7 @@ impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
         if idle && now_ms.saturating_sub(self.idle_since_ms)>=self.idle_timeout_ms{self.end();return Some(SessionEvent::IdleTimeout);}None
     }
 
-    pub fn start(&mut self,requested:u64)->Result<StartAck,OwnedError<T::Error,I::Error>>{
+    pub fn start_at(&mut self,requested:u64,now_ms:u64)->Result<StartAck,OwnedError<T::Error,I::Error>>{
         if self.state==SessionState::Ended{return Err(OwnedError::Ended);}
         self.transport.quiesce();
         let r=self.transport.commit_start(requested);
@@ -60,12 +62,13 @@ impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
         let at=r.map_err(OwnedError::Transport)?;
         self.epoch=self.epoch.wrapping_add(1);
         self.state=SessionState::Playing;
+        self.idle_since_ms=now_ms;
         Ok(StartAck{requested_unix_ms:requested,at_unix_ms:at})
     }
 
     /// Exact MSA command order: quiesce -> transport FLUSH -> park reader ->
     /// reset ring/drain old input -> IDLE -> capture warm head -> resume.
-    pub fn flush(&mut self)->Result<u64,OwnedError<T::Error,I::Error>>{
+    pub fn flush_at(&mut self,now_ms:u64)->Result<u64,OwnedError<T::Error,I::Error>>{
         if self.state==SessionState::Ended{return Err(OwnedError::Ended);}
         self.transport.quiesce();
         if let Err(e)=self.transport.flush(){self.transport.resume();return Err(OwnedError::Transport(e));}
@@ -73,10 +76,12 @@ impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
         assert!(self.reader.acknowledge_pause() || self.reader.state()==ReaderState::Paused);
         if let Err(e)=self.reader.drain_preflush(){self.reader.resume_after_drain();self.transport.resume();return Err(OwnedError::Input(e));}
         self.state=SessionState::Idle;
+        self.idle_since_ms=now_ms;
         self.last_audio_ready=false;
         let head=self.transport.warm_head_unix_ms();
         self.reader.resume_after_drain();
         self.transport.resume();
+        self.pending_event=Some(SessionEvent::Flushed{head_unix_ms:head});
         Ok(head)
     }
 
@@ -107,7 +112,13 @@ mod tests{
  #[test] fn flush_is_end_to_end_msa_order_and_rearms_reader(){
   let i=I{chunks:vec![vec![1,2,3,4],vec![8,8]],i:0};let mut s=OwnedSoloSession::new(T::default(),i,100,4);
   assert_eq!(s.pump_input_once().unwrap(),4);assert!(s.audio_ready());
-  s.start(1000).unwrap();let head=s.flush().unwrap();assert_eq!(head,777);assert_eq!(s.state(),SessionState::Idle);assert!(!s.audio_ready());
+  s.start_at(1000,10).unwrap();let head=s.flush_at(20).unwrap();assert_eq!(head,777);assert_eq!(s.state(),SessionState::Idle);assert!(!s.audio_ready());
   assert_eq!(s.transport.log,vec!["quiesce","commit","resume","quiesce","flush","resume"]);
+  assert_eq!(s.take_event(),Some(SessionEvent::Flushed{head_unix_ms:777}));
+ }
+ #[test] fn idle_timeout_tracks_start_and_eof_window(){
+  let i=I{chunks:vec![vec![]],i:0};let mut s=OwnedSoloSession::new_at(T::default(),i,100,4,100,5);
+  s.start_at(1000,50).unwrap();s.pump_input_once().unwrap();assert_eq!(s.poll_at(149),None);
+  assert_eq!(s.poll_at(150),Some(SessionEvent::IdleTimeout));assert_eq!(s.state(),SessionState::Ended);
  }
 }
