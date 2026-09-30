@@ -113,6 +113,30 @@ impl WindowsSoloAudioWorker {
                 let mut last_starvation_recovery: Option<Instant> = None;
 
                 while running_thread.load(Ordering::SeqCst) {
+                    // Exact cliairplay outer-loop health gate: MediaRemote
+                    // reverse-event health is part of the control verdict,
+                    // even when RTSP/media sockets themselves are still alive.
+                    let control_ok = {
+                        let mut guard = match engine_thread.lock() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                if let Ok(mut slot) = error_thread.lock() {
+                                    *slot = Some("native SOLO engine mutex poisoned".into());
+                                }
+                                running_thread.store(false, Ordering::SeqCst);
+                                return;
+                            }
+                        };
+                        guard.state() != Ap2State::Down && guard.control_healthy()
+                    };
+                    if !control_ok {
+                        if let Ok(mut slot) = error_thread.lock() {
+                            *slot = Some("AirPlay 2 control channel failed".into());
+                        }
+                        running_thread.store(false, Ordering::SeqCst);
+                        return;
+                    }
+
                     let generation = flush_thread.load(Ordering::SeqCst);
                     if generation != local_flush_generation {
                         chunker.clear();
