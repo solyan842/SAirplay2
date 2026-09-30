@@ -21,6 +21,14 @@ pub fn pacing_window_frames(sample_rate:u32,dev_latency_max:u64,buffered:bool,sp
  if buffered{return window.max(depth)}
  if splice{if !reported&&depth_explicit{return depth}window=window.min(depth);}
  window
+ #[derive(Default)]struct FakeIo{rt:SendResult,writes:Vec<StreamWrite>,rtx:usize}
+ impl MediaIo for FakeIo{fn send_realtime(&mut self,_:&[u8])->SendResult{self.rt}fn send_buffered(&mut self,_:&[u8])->StreamWrite{if self.writes.is_empty(){StreamWrite::Complete}else{self.writes.remove(0)}}fn store_retransmit(&mut self,_:u16,_:&[u8]){self.rtx+=1}}
+ #[test]fn realtime_executor_stores_rtx_only_on_sent(){let mut s=state(true);let mut h=MediaHealth::default();let mut io=FakeIo{rt:SendResult::Sent,..Default::default()};let p=BuiltPacket{bytes:vec![1],seq:s.timeline.seq,rtp:s.timeline.wire_rtp,frames:352};assert_eq!(execute_realtime(&mut s,&mut h,&mut io,&p,SendResult::Sent),SendResult::Sent);assert_eq!(io.rtx,1);assert!(h.healthy);let p2=BuiltPacket{bytes:vec![2],seq:s.timeline.seq,rtp:s.timeline.wire_rtp,frames:352};io.rt=SendResult::Dropped;execute_realtime(&mut s,&mut h,&mut io,&p2,SendResult::Sent);assert_eq!(io.rtx,1);assert_eq!(s.counters.dropped,1);}
+ #[test]fn fatal_sync_never_sends_audio_and_marks_unhealthy(){let mut s=state(true);let mut h=MediaHealth::default();let mut io=FakeIo{rt:SendResult::Sent,..Default::default()};let p=BuiltPacket{bytes:vec![1],seq:s.timeline.seq,rtp:s.timeline.wire_rtp,frames:352};assert_eq!(execute_realtime(&mut s,&mut h,&mut io,&p,SendResult::Fatal),SendResult::Fatal);assert!(!h.healthy);assert_eq!(s.timeline.seq,0x1234);}
+ #[test]fn buffered_partial_write_commits_frame_and_parks_tail(){let mut s=state(true);let mut h=MediaHealth::default();let mut p=BufferedPending::default();let mut io=FakeIo{writes:vec![StreamWrite::Partial(2)],rt:SendResult::Sent,rtx:0};let b=BuiltPacket{bytes:vec![1,2,3,4,5],seq:s.timeline.seq,rtp:s.timeline.wire_rtp,frames:352};assert_eq!(execute_buffered(&mut s,&mut h,&mut p,&mut io,b),SendResult::Sent);assert_eq!(p.remaining(),&[3,4,5]);assert_eq!(s.timeline.seq,0x1235);}
+ #[test]fn buffered_wouldblock_parks_whole_committed_frame(){let mut s=state(true);let mut h=MediaHealth::default();let mut p=BufferedPending::default();let mut io=FakeIo{writes:vec![StreamWrite::WouldBlock],rt:SendResult::Sent,rtx:0};let b=BuiltPacket{bytes:vec![1,2,3],seq:s.timeline.seq,rtp:s.timeline.wire_rtp,frames:352};execute_buffered(&mut s,&mut h,&mut p,&mut io,b);assert_eq!(p.remaining(),&[1,2,3]);assert_eq!(s.counters.nonce_counter,1);}
+ #[test]fn buffered_pending_drains_in_order_and_fatal_marks_unhealthy(){let mut h=MediaHealth::default();let mut p=BufferedPending::default();p.park(vec![1,2,3,4]).unwrap();let mut io=FakeIo{writes:vec![StreamWrite::Partial(2),StreamWrite::WouldBlock],rt:SendResult::Sent,rtx:0};assert!(!drain_buffered_pending(&mut h,&mut p,&mut io));assert_eq!(p.remaining(),&[3,4]);io.writes=vec![StreamWrite::Fatal];assert!(!drain_buffered_pending(&mut h,&mut p,&mut io));assert!(!h.healthy);assert!(p.is_empty());}
+
 }
 
 pub fn pacing_accept(now_frame:u64,head_frame:u64,window_frames:u64,last_release_us:u64,now_us:u64)->bool{
@@ -99,6 +107,51 @@ pub fn build_buffered_frame<E:AlacEncoder,C:AudioCipher>(state:&NativeMediaState
  let total=buffered_total_len(ct.len()).ok_or(BuildError::FrameTooLarge)?;
  let mut bytes=Vec::with_capacity(total as usize);bytes.extend_from_slice(&total.to_be_bytes());bytes.extend_from_slice(&hdr.bytes);bytes.extend_from_slice(&ct);bytes.extend_from_slice(&tag);bytes.extend_from_slice(&trailing_nonce(&nonce));
  Ok(BuiltPacket{bytes,seq:state.timeline.seq,rtp:state.timeline.wire_rtp,frames})
+}
+
+
+#[derive(Debug,Clone,Copy,PartialEq,Eq)] pub enum StreamWrite{Complete,Partial(usize),WouldBlock,Fatal}
+pub trait MediaIo{
+ fn send_realtime(&mut self,packet:&[u8])->SendResult;
+ fn send_buffered(&mut self,bytes:&[u8])->StreamWrite;
+ fn store_retransmit(&mut self,_seq:u16,_packet:&[u8]){}
+}
+#[derive(Debug,Clone,Copy,PartialEq,Eq)] pub struct MediaHealth{pub healthy:bool}
+impl Default for MediaHealth{fn default()->Self{Self{healthy:true}}}
+
+pub fn execute_realtime<I:MediaIo>(state:&mut NativeMediaState,health:&mut MediaHealth,io:&mut I,packet:&BuiltPacket,sync:SendResult)->SendResult{
+ if sync==SendResult::Fatal{health.healthy=false;return SendResult::Fatal}
+ let result=io.send_realtime(&packet.bytes);
+ if result==SendResult::Sent{io.store_retransmit(packet.seq,&packet.bytes);}
+ if result==SendResult::Fatal{health.healthy=false;return SendResult::Fatal}
+ state.commit_realtime(packet.frames,result,sync)
+}
+
+pub fn execute_buffered<I:MediaIo>(state:&mut NativeMediaState,health:&mut MediaHealth,pending:&mut BufferedPending,io:&mut I,packet:BuiltPacket)->SendResult{
+ if !pending.is_empty(){return SendResult::Dropped}
+ let frame_len=packet.bytes.len();
+ match io.send_buffered(&packet.bytes){
+  StreamWrite::Fatal=>{health.healthy=false;SendResult::Fatal}
+  StreamWrite::Complete=>{state.commit_buffered_frame(packet.frames);SendResult::Sent}
+  StreamWrite::Partial(n)=>{
+   let n=n.min(frame_len);if n<frame_len{let mut tail=packet.bytes;tail.drain(..n);let _=pending.park(tail);}
+   state.commit_buffered_frame(packet.frames);SendResult::Sent
+  }
+  StreamWrite::WouldBlock=>{let _=pending.park(packet.bytes);state.commit_buffered_frame(packet.frames);SendResult::Sent}
+ }
+}
+
+pub fn drain_buffered_pending<I:MediaIo>(health:&mut MediaHealth,pending:&mut BufferedPending,io:&mut I)->bool{
+ while !pending.is_empty(){
+  let rem=pending.remaining();
+  match io.send_buffered(rem){
+   StreamWrite::Complete=>{let n=rem.len();pending.consume(n);}
+   StreamWrite::Partial(n)=>{if n==0{return false}pending.consume(n);}
+   StreamWrite::WouldBlock=>return false,
+   StreamWrite::Fatal=>{health.healthy=false;pending.clear();return false}
+  }
+ }
+ true
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Default)] pub struct BufferedPending{bytes:Vec<u8>,off:usize}
