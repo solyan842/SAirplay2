@@ -347,7 +347,7 @@ pub use windows_raop_worker::{
 #[cfg(windows)]
 pub use windows_solo_client::{
     SoloConnectError, SoloConnectErrorClass, SoloFlushAck, WindowsMsaSoloClient,
-    WindowsMsaSoloConfig, WindowsMsaSoloError,
+    WindowsMsaSoloConfig, WindowsMsaSoloError, WindowsMsaSoloState,
 };
 
 pub use owned_session::{OwnedError, OwnedSoloSession, OwnedTransport, SessionEvent, SESSION_IDLE_TIMEOUT_MS};
