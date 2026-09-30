@@ -21,6 +21,11 @@ pub fn pacing_window_frames(sample_rate:u32,dev_latency_max:u64,buffered:bool,sp
  if buffered{return window.max(depth)}
  if splice{if !reported&&depth_explicit{return depth}window=window.min(depth);}
  window
+ #[derive(Default)]struct FakeAlac;impl AlacEncoder for FakeAlac{type Error=();fn encode(&mut self,pcm:&[u8],_:u32)->Result<Vec<u8>,Self::Error>{Ok(pcm.to_vec())}}
+ #[derive(Default)]struct FakeCipher;impl AudioCipher for FakeCipher{type Error=();fn seal(&mut self,_:&[u8;12],_:&[u8],plain:&[u8])->Result<(Vec<u8>,[u8;16]),Self::Error>{Ok((plain.to_vec(),[0xaa;16]))}}
+ #[test]fn realtime_builder_matches_msa_wire_shape(){let s=state(true);let p=build_realtime_packet(&s,0x05060708,&[9,8,7],352,&mut FakeAlac,&mut FakeCipher).unwrap();assert_eq!(&p.bytes[..12],&[0x80,0xe0,0x12,0x34,0,0,0x13,0x88,5,6,7,8]);assert_eq!(&p.bytes[12..15],&[9,8,7]);assert_eq!(&p.bytes[p.bytes.len()-8..],&[0x34,0x12,0,0,0,0,0,0]);}
+ #[test]fn buffered_builder_prefix_and_nonce_match_msa(){let mut s=state(true);s.counters.nonce_counter=0x0807060504030201;let p=build_buffered_frame(&s,0x05060708,&[9,8,7],352,&mut FakeAlac,&mut FakeCipher).unwrap();assert_eq!(u16::from_be_bytes([p.bytes[0],p.bytes[1]]) as usize,p.bytes.len());assert_eq!(p.bytes[3],0xe7);assert_eq!(&p.bytes[p.bytes.len()-8..],&[1,2,3,4,5,6,7,8]);}
+
 }
 
 pub fn pacing_accept(now_frame:u64,head_frame:u64,window_frames:u64,last_release_us:u64,now_us:u64)->bool{
@@ -75,6 +80,32 @@ impl NativeMediaState{
   self.timeline.wire_rtp=self.timeline.wire_rtp.wrapping_add(frames);self.timeline.seq=self.timeline.seq.wrapping_add(1);
  }
 }
+
+pub trait AlacEncoder{type Error;fn encode(&mut self,pcm:&[u8],frames:u32)->Result<Vec<u8>,Self::Error>;}
+pub trait AudioCipher{type Error;fn seal(&mut self,nonce:&[u8;12],aad:&[u8],plain:&[u8])->Result<(Vec<u8>,[u8;CHACHA_TAG_SIZE]),Self::Error>;}
+#[derive(Debug,PartialEq,Eq)] pub enum BuildError<EE,CE>{Encode(EE),Encrypt(CE),FrameTooLarge}
+#[derive(Debug,Clone,PartialEq,Eq)] pub struct BuiltPacket{pub bytes:Vec<u8>,pub seq:u16,pub rtp:u32,pub frames:u32}
+
+pub fn build_realtime_packet<E:AlacEncoder,C:AudioCipher>(state:&NativeMediaState,ssrc:u32,pcm:&[u8],frames:u32,enc:&mut E,cipher:&mut C)->Result<BuiltPacket,BuildError<E::Error,C::Error>>{
+ let encoded=enc.encode(pcm,frames).map_err(BuildError::Encode)?;
+ let hdr=RtpHeader::new(false,state.timeline.first_packet,state.timeline.seq,state.timeline.wire_rtp,ssrc);
+ let nonce=realtime_nonce(state.timeline.seq);
+ let (ct,tag)=cipher.seal(&nonce,hdr.aad(),&encoded).map_err(BuildError::Encrypt)?;
+ let mut bytes=Vec::with_capacity(12+ct.len()+CHACHA_TAG_SIZE+TRAILING_NONCE_SIZE);
+ bytes.extend_from_slice(&hdr.bytes);bytes.extend_from_slice(&ct);bytes.extend_from_slice(&tag);bytes.extend_from_slice(&trailing_nonce(&nonce));
+ Ok(BuiltPacket{bytes,seq:state.timeline.seq,rtp:state.timeline.wire_rtp,frames})
+}
+
+pub fn build_buffered_frame<E:AlacEncoder,C:AudioCipher>(state:&NativeMediaState,ssrc:u32,pcm:&[u8],frames:u32,enc:&mut E,cipher:&mut C)->Result<BuiltPacket,BuildError<E::Error,C::Error>>{
+ let encoded=enc.encode(pcm,frames).map_err(BuildError::Encode)?;
+ let hdr=RtpHeader::new(true,state.timeline.first_packet,state.timeline.seq,state.timeline.wire_rtp,ssrc);
+ let nonce=buffered_nonce(state.counters.nonce_counter);
+ let (ct,tag)=cipher.seal(&nonce,hdr.aad(),&encoded).map_err(BuildError::Encrypt)?;
+ let total=buffered_total_len(ct.len()).ok_or(BuildError::FrameTooLarge)?;
+ let mut bytes=Vec::with_capacity(total as usize);bytes.extend_from_slice(&total.to_be_bytes());bytes.extend_from_slice(&hdr.bytes);bytes.extend_from_slice(&ct);bytes.extend_from_slice(&tag);bytes.extend_from_slice(&trailing_nonce(&nonce));
+ Ok(BuiltPacket{bytes,seq:state.timeline.seq,rtp:state.timeline.wire_rtp,frames})
+}
+
 #[derive(Debug,Clone,PartialEq,Eq,Default)] pub struct BufferedPending{bytes:Vec<u8>,off:usize}
 impl BufferedPending{
  pub fn is_empty(&self)->bool{self.off>=self.bytes.len()}
