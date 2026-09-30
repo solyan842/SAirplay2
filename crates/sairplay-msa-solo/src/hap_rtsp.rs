@@ -75,7 +75,16 @@ impl EncryptedRtspChannel {
         self.stream
             .set_write_timeout(Some(write_budget))
             .map_err(EncryptedRtspError::Write)?;
-        let write_result = self.stream.write_all(&wire).map_err(EncryptedRtspError::Write);
+        let write_result = match self.stream.write_all(&wire) {
+            Ok(()) => Ok(()),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::TimedOut
+                    || err.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                Err(EncryptedRtspError::Timeout)
+            }
+            Err(err) => Err(EncryptedRtspError::Write(err)),
+        };
         let _ = self.stream.set_write_timeout(Some(self.exchange_timeout));
         write_result?;
 
