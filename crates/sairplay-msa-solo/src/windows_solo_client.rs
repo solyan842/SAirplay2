@@ -22,6 +22,7 @@ pub struct WindowsMsaSoloConfig {
     pub protocol: ProtocolPreference,
     pub txt: Option<String>,
     pub am: Option<String>,
+    pub raop_cn: Option<String>,
     pub pw_txt: Option<String>,
     pub force_native: bool,
     pub ptp_override: Option<bool>,
@@ -37,6 +38,7 @@ impl WindowsMsaSoloConfig {
             protocol: ProtocolPreference::Auto,
             txt: None,
             am: None,
+            raop_cn: None,
             pw_txt: None,
             force_native: false,
             ptp_override: None,
@@ -134,6 +136,11 @@ impl WindowsMsaSoloClient {
         config.raop.bit_depth = config.native.control.audio_format.bit_depth;
         config.raop.channels = config.native.control.audio_format.channels;
         config.raop.lead_ms = 2_000;
+        config.raop.dacp_id = config.native.control.dacp_id.clone();
+        config.raop.active_remote = config.native.control.active_remote.clone();
+        config.raop.bind_ip = config.native.control.bind_ip;
+        config.raop.mfi_auth = config.raop.mfi_auth
+            || config.am.as_deref().is_some_and(|v| v.to_ascii_lowercase().contains("airport"));
 
         let route = resolve_route_from_txt(
             config.protocol,
@@ -170,6 +177,17 @@ impl WindowsMsaSoloClient {
                 })
             }
             Flow::Raop | Flow::AirPlay2Compat => {
+                if route.flow == Flow::AirPlay2Compat {
+                    // ap2_client.c RAOP-compatible flow always uses compressed
+                    // ALAC and clear transport; cn/raw policy belongs to the
+                    // explicit legacy RAOP CLI route.
+                    config.raop.compressed_alac = true;
+                    config.raop.encrypt = false;
+                } else if let Some(cn) = config.raop_cn.as_deref() {
+                    if !cn.split(',').any(|v| v.trim() == "1") {
+                        config.raop.compressed_alac = false;
+                    }
+                }
                 let worker = WindowsRaopAudioWorker::connect(config.raop)
                     .map_err(|e| SoloConnectError::raop(route, e))?;
                 Ok(Self {
