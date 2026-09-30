@@ -106,7 +106,7 @@ impl NativeMediaIo {
 fn transient_udp(error: &io::Error) -> bool {
     if matches!(
         error.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
     ) {
         return true;
     }
