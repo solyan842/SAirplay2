@@ -402,8 +402,13 @@ impl NativeSoloEngine {
         (self.config.control.audio_format, self.ready.info.realtime, self.ready.info.buffered)
     }
 
-    pub fn latency_info(&self) -> (u64, Option<u32>, Option<u32>) {
-        (self.runtime.lead_ms, self.ready.latency_min, self.ready.latency_max)
+    pub fn latency_info(&self) -> NativeLatencyInfo {
+        NativeLatencyInfo {
+            lead_ms: self.runtime.lead_ms,
+            device_min_frames: self.ready.latency_min.unwrap_or(0),
+            device_max_frames: self.ready.latency_max.unwrap_or(0),
+            render_latency_ms: self.ready.arrival_to_render_latency_ms.unwrap_or(0),
+        }
     }
 
     pub fn render_latency_ms(&self) -> Option<u32> {
