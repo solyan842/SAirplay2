@@ -1,4 +1,6 @@
 use crate::{write_farewell_teardown_locked, EncryptedRtspChannel, EncryptedRtspError, RtspRequest};
+use plist::Value;
+use std::io::Cursor;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Mutex, TryLockError,
@@ -23,6 +25,7 @@ pub struct FeedbackWorker {
     running: Arc<AtomicBool>,
     misses: Arc<AtomicU32>,
     last_error: Arc<Mutex<Option<String>>>,
+    last_stream_count: Arc<Mutex<Option<usize>>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -38,11 +41,13 @@ impl FeedbackWorker {
         let running = Arc::new(AtomicBool::new(true));
         let misses = Arc::new(AtomicU32::new(0));
         let last_error = Arc::new(Mutex::new(None));
+        let last_stream_count = Arc::new(Mutex::new(None));
 
         let stop_thread = Arc::clone(&stop);
         let running_thread = Arc::clone(&running);
         let misses_thread = Arc::clone(&misses);
         let error_thread = Arc::clone(&last_error);
+        let streams_thread = Arc::clone(&last_stream_count);
 
         let worker = thread::Builder::new()
             .name("sairplay-msa-feedback".into())
@@ -124,6 +129,9 @@ impl FeedbackWorker {
                             if let Ok(mut slot) = error_thread.lock() {
                                 *slot = None;
                             }
+                            if let Ok(mut slot) = streams_thread.lock() {
+                                *slot = feedback_stream_count(&response.body);
+                            }
                         }
                         Ok(response) => {
                             let now_misses = misses_thread.fetch_add(1, Ordering::SeqCst) + 1;
@@ -184,6 +192,7 @@ impl FeedbackWorker {
             running,
             misses,
             last_error,
+            last_stream_count,
             worker: Some(worker),
         })
     }
@@ -198,6 +207,10 @@ impl FeedbackWorker {
 
     pub fn healthy(&self) -> bool {
         self.is_running() && self.consecutive_misses() < MAX_CONSECUTIVE_MISSES
+    }
+
+    pub fn last_stream_count(&self) -> Option<usize> {
+        self.last_stream_count.lock().ok().and_then(|v| *v)
     }
 
     pub fn last_error(&self) -> Option<String> {
@@ -219,6 +232,19 @@ impl Drop for FeedbackWorker {
     }
 }
 
+
+fn feedback_stream_count(body: &[u8]) -> Option<usize> {
+    if body.is_empty() {
+        return None;
+    }
+    let root = Value::from_reader(Cursor::new(body)).ok()?;
+    let dict = root.as_dictionary()?;
+    match dict.get("streams")? {
+        Value::Array(v) => Some(v.len()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +254,25 @@ mod tests {
         assert_eq!(FEEDBACK_INTERVAL, Duration::from_millis(2000));
         assert_eq!(FEEDBACK_TIMEOUT, Duration::from_millis(2000));
         assert_eq!(MAX_CONSECUTIVE_MISSES, 3);
+    }
+
+    #[test]
+    fn feedback_stream_count_distinguishes_empty_active_and_missing() {
+        fn plist_with_streams(count: usize) -> Vec<u8> {
+            let mut d = plist::Dictionary::new();
+            d.insert("streams".into(), Value::Array((0..count).map(|_| Value::Dictionary(plist::Dictionary::new())).collect()));
+            let mut out = Vec::new();
+            Value::Dictionary(d).to_writer_binary(&mut out).unwrap();
+            out
+        }
+        assert_eq!(feedback_stream_count(&plist_with_streams(0)), Some(0));
+        assert_eq!(feedback_stream_count(&plist_with_streams(1)), Some(1));
+        let mut d = plist::Dictionary::new();
+        d.insert("stream".into(), Value::Array(Vec::new()));
+        let mut out = Vec::new();
+        Value::Dictionary(d).to_writer_binary(&mut out).unwrap();
+        assert_eq!(feedback_stream_count(&out), None);
+        assert_eq!(feedback_stream_count(&out[..8]), None);
     }
 
     #[test]
