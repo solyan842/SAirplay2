@@ -60,10 +60,25 @@ impl EncryptedRtspChannel {
         expected_cseq: u32,
         timeout: Duration,
     ) -> Result<RtspResponse, EncryptedRtspError> {
-        let wire = self.cipher.encrypt(request)?;
-        self.stream.write_all(&wire).map_err(EncryptedRtspError::Write)?;
-
+        if timeout.is_zero() {
+            return Err(EncryptedRtspError::Timeout);
+        }
         let deadline = Instant::now() + timeout;
+        let wire = self.cipher.encrypt(request)?;
+
+        // Pinned ap2_io uses one control deadline for lock + write + read.
+        // Do not inherit the 8s pairing timeout for a 2s feedback budget.
+        let write_budget = deadline.saturating_duration_since(Instant::now());
+        if write_budget.is_zero() {
+            return Err(EncryptedRtspError::Timeout);
+        }
+        self.stream
+            .set_write_timeout(Some(write_budget))
+            .map_err(EncryptedRtspError::Write)?;
+        let write_result = self.stream.write_all(&wire).map_err(EncryptedRtspError::Write);
+        let _ = self.stream.set_write_timeout(Some(self.exchange_timeout));
+        write_result?;
+
         let mut buf = [0u8; 4096];
 
         loop {
@@ -229,6 +244,32 @@ mod tests {
         assert_eq!(channel.write_counter(), 1);
         assert_eq!(channel.read_counter(), 2);
 
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn exchange_deadline_overrides_long_pairing_socket_timeout() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let key = [0x67u8; 32];
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).unwrap();
+            std::thread::sleep(Duration::from_secs(1));
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+        stream.set_write_timeout(Some(Duration::from_secs(8))).unwrap();
+        let mut channel =
+            EncryptedRtspChannel::new(stream, key, key, Duration::from_secs(8));
+        let started = Instant::now();
+        let req = b"POST /feedback RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n";
+        assert!(matches!(
+            channel.exchange_with_timeout(req, 1, Duration::from_millis(120)),
+            Err(EncryptedRtspError::Timeout)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(700));
         server.join().unwrap();
     }
 
