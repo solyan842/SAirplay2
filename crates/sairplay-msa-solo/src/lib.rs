@@ -3,6 +3,7 @@
 //! Legacy SAirplay Solo/MultiRoom remain frozen.
 
 pub mod native_timeline;
+pub mod native_media;
 pub mod native_connect;
 pub mod clock;
 pub mod owned_session;
