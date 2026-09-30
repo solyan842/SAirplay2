@@ -12,6 +12,11 @@ pub mod native_io;
 pub mod native_media_owner;
 pub mod native_control;
 pub mod native_solo;
+pub mod pcm_chunker;
+#[cfg(windows)]
+pub mod wasapi_loopback;
+#[cfg(windows)]
+pub mod windows_audio_worker;
 pub mod native_rtx_worker;
 pub mod feedback;
 pub mod native_commands;
@@ -288,3 +293,12 @@ pub use feedback::{
     FEEDBACK_INTERVAL, FEEDBACK_TIMEOUT, MAX_CONSECUTIVE_MISSES,
 };
 pub use native_rtx_worker::RtxWorker;
+
+pub use pcm_chunker::{Pcm352Chunker, PCM352_PACKET_BYTES};
+#[cfg(windows)]
+pub use wasapi_loopback::{WasapiDrainReport, WasapiLoopbackCapture, WasapiLoopbackError};
+#[cfg(windows)]
+pub use windows_audio_worker::{
+    SharedNativeSoloEngine, WindowsSoloAudioWorker, WindowsSoloAudioWorkerError,
+    AIRPLAY_CLOCK_READY_TIMEOUT, STARVATION_RECOVERY_INTERVAL,
+};
