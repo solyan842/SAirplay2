@@ -947,14 +947,18 @@ impl NativeSoloEngine {
         Ok(self.runtime.accept_frames(now_frame, now_us, &mut self.ready.media.io))
     }
 
-    pub fn send_pcm_352(&mut self, pcm: &[u8]) -> Result<SendResult, NativeSoloError> {
+    pub fn send_pcm_frames(
+        &mut self,
+        pcm: &[u8],
+        frames: u32,
+    ) -> Result<SendResult, NativeSoloError> {
         self.refresh_control_health();
         if self.rtsp_dead { return Err(NativeSoloError::MediaFatal); }
         let timing = self.ready.timing_owner.sync_timing().map_err(NativeSoloError::Timing)?;
         let media = &mut self.ready.media;
         let result = self.runtime.send_chunk(
             pcm,
-            352,
+            frames,
             &mut media.encoder,
             &mut media.cipher,
             &mut media.io,
@@ -964,6 +968,10 @@ impl NativeSoloEngine {
             return Err(NativeSoloError::MediaFatal);
         }
         Ok(result)
+    }
+
+    pub fn send_pcm_352(&mut self, pcm: &[u8]) -> Result<SendResult, NativeSoloError> {
+        self.send_pcm_frames(pcm, 352)
     }
 
     pub fn poll_rtx_once(&mut self) -> Result<bool, NativeSoloError> {
