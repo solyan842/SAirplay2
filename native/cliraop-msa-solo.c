@@ -246,8 +246,9 @@ static bool process_command(const char *path, const char *ack_path,
 
 int main(int argc, char **argv) {
     int port = 5000, volume = 50, lead_ms = 2000, sample_rate = 44100, bit_depth = 16, channels = 2;
-    bool alac = true, auth = false;
+    bool alac = true, auth = false, encrypt = false;
     char *secret = NULL, *password = NULL, *et = NULL, *md = NULL;
+    char *dacp_id = NULL, *active_remote = NULL, *bind_ip = NULL;
     char *control = NULL, *ack = NULL, *metadata_path = NULL, *artwork_path = NULL, *host_name = NULL;
 
     for (int i = 1; i < argc; ++i) {
@@ -265,6 +266,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-P") && i + 1 < argc) password = argv[++i];
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) et = argv[++i];
         else if (!strcmp(argv[i], "-m") && i + 1 < argc) md = argv[++i];
+        else if (!strcmp(argv[i], "-D") && i + 1 < argc) dacp_id = argv[++i];
+        else if (!strcmp(argv[i], "-R") && i + 1 < argc) active_remote = argv[++i];
+        else if (!strcmp(argv[i], "--bind") && i + 1 < argc) bind_ip = argv[++i];
+        else if (!strcmp(argv[i], "-e")) encrypt = true;
         else if (!strcmp(argv[i], "-u")) auth = true;
         else if (!strcmp(argv[i], "--pcm")) alac = false;
         else if (argv[i][0] != '-') host_name = argv[i];
@@ -291,6 +296,10 @@ int main(int argc, char **argv) {
     }
     struct in_addr player = {0}, local = {0};
     memcpy(&player.s_addr, he->h_addr_list[0], he->h_length);
+    if (bind_ip && *bind_ip && inet_pton(AF_INET, bind_ip, &local) != 1) {
+        fprintf(stderr, "MSA-RAOP ERROR bind_ip\n");
+        return 3;
+    }
 
     if (channels <= 0 || (bit_depth != 16 && bit_depth != 24) ||
         (sample_rate != 44100 && sample_rate != 48000)) {
@@ -298,16 +307,20 @@ int main(int argc, char **argv) {
         return 2;
     }
     int latency = MS2TS(lead_ms, sample_rate);
+    raop_crypto_t crypto = (encrypt && et && strchr(et, '1')) ? RAOP_RSA : RAOP_CLEAR;
     struct raopcl_s *p = raopcl_create(
-        local, 0, 0, NULL, NULL, alac ? RAOP_ALAC : RAOP_ALAC_RAW,
-        FRAMES_PER_CHUNK, latency, RAOP_CLEAR, auth, secret, password,
+        local, 0, 0,
+        dacp_id ? dacp_id : "1A2B3D4EA1B2C3D4",
+        active_remote ? active_remote : "0",
+        alac ? RAOP_ALAC : RAOP_ALAC_RAW,
+        FRAMES_PER_CHUNK, latency, crypto, auth, secret, password,
         et, md, sample_rate, bit_depth, channels, raopcl_float_volume(volume)
     );
     if (!p) {
         fprintf(stderr, "MSA-RAOP ERROR create\n");
         return 4;
     }
-    if (!raopcl_connect(p, player, (uint16_t)port, true)) {
+    if (!raopcl_connect(p, player, (uint16_t)port, volume > 0)) {
         fprintf(stderr, "MSA-RAOP ERROR connect\n");
         raopcl_destroy(p);
         return 5;
