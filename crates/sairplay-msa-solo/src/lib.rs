@@ -4,6 +4,8 @@
 
 pub mod native_timeline;
 pub mod native_media;
+pub mod native_sync;
+pub mod native_rtx;
 pub mod native_connect;
 pub mod clock;
 pub mod owned_session;
