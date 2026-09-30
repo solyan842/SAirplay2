@@ -25,6 +25,7 @@ pub mod teardown;
 pub mod native_metadata;
 pub mod volume;
 pub mod mrp;
+pub mod mrp_event;
 pub mod native_timing_owner;
 pub mod ptp_engine;
 pub mod ntp_timing;
@@ -321,3 +322,5 @@ pub use mrp::{
     MrpArtworkInfo, MrpArtworkResult, MrpError, MrpPlaybackState, MrpPostResult,
     MrpState, ARTWORK_STAGING_MAX_BYTES,
 };
+
+pub use mrp_event::{MrpEventWorker, MrpRemoteCommand};
