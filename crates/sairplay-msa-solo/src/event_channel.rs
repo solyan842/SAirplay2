@@ -8,6 +8,7 @@ use std::time::Duration;
 const EVENTS_SALT: &[u8] = b"Events-Salt";
 const EVENTS_WRITE_INFO: &[u8] = b"Events-Write-Encryption-Key";
 const EVENTS_READ_INFO: &[u8] = b"Events-Read-Encryption-Key";
+pub const AP2_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 pub enum EventChannelError {
@@ -62,7 +63,7 @@ impl EventChannel {
             .map_err(EventChannelError::Connect)?;
         stream.set_nodelay(true).map_err(EventChannelError::Configure)?;
         stream
-            .set_read_timeout(Some(Duration::from_millis(250)))
+            .set_read_timeout(Some(AP2_EVENT_POLL_INTERVAL))
             .map_err(EventChannelError::Configure)?;
         stream
             .set_write_timeout(Some(timeout))
