@@ -307,9 +307,9 @@ pub use windows_audio_worker::{
     AIRPLAY_CLOCK_READY_TIMEOUT, STARVATION_RECOVERY_INTERVAL,
 };
 
-pub use volume::{set_native_volume, volume_percent_to_db, VolumeError, VolumeResult};
-pub use native_metadata::{send_native_metadata, MetadataError, MetadataResult};
+pub use volume::{set_native_volume, volume_percent_to_db, NativeVolumeControl, VolumeError, VolumeSetResult};
+pub use native_metadata::{build_dmap_metadata, send_native_metadata, MetadataError, MetadataSetResult, NativeMetadataControl};
 pub use native_parameters::{
     send_native_artwork, send_native_progress, ParameterError, ParameterResult,
 };
-pub use teardown::{send_teardown, TeardownError, TeardownResult};
+pub use teardown::{send_teardown, TeardownError};
