@@ -729,27 +729,22 @@ impl NativeSoloEngine {
         duration_s: u32,
     ) -> Result<ParameterResult, NativeSoloError> {
         if let Some(mrp) = self.mrp.clone() {
+            // Exact ap2cl_set_progress: with MediaRemote active, stage the
+            // progress/playback-rate state only. The caller performs the
+            // separate ap2cl_mrp_push_progress step after releasing any outer
+            // audio-send serialization.
             let playing = self.runtime.state == Ap2State::Streaming
                 && !self.content_paused
                 && !self.content_stopped;
-            return match mrp.set_progress_and_push(
+            if let Err(e) = mrp.stage_progress(
                 i64::from(elapsed_s) * 1000,
                 i64::from(duration_s) * 1000,
                 playing,
             ) {
-                Ok(push) => Ok(ParameterResult {
-                    status: if push.overall_status >= 0 {
-                        push.overall_status.min(u16::MAX as i32) as u16
-                    } else {
-                        0
-                    },
-                    bytes: 0,
-                }),
-                Err(e) => {
-                    self.note_mrp_error(&e);
-                    Err(NativeSoloError::Command(format!("MRP progress: {e:?}")))
-                }
-            };
+                self.note_mrp_error(&e);
+                return Err(NativeSoloError::Command(format!("MRP progress stage: {e:?}")));
+            }
+            return Ok(ParameterResult { status: 200, bytes: 0 });
         }
 
         let now_ntp = system_time_to_ntp(SystemTime::now())
@@ -782,9 +777,22 @@ impl NativeSoloEngine {
         elapsed_s: u32,
         duration_s: u32,
     ) -> Result<ParameterResult, NativeSoloError> {
-        // set_progress already mirrors pinned ap2cl_set_progress: MRP when
-        // active, otherwise native RTSP SET_PARAMETER progress.
-        self.set_progress(elapsed_s, duration_s)
+        let staged = self.set_progress(elapsed_s, duration_s)?;
+        let Some(mrp) = self.mrp.clone() else { return Ok(staged) };
+        match mrp.push_progress() {
+            Ok(push) => Ok(ParameterResult {
+                status: if push.overall_status >= 0 {
+                    push.overall_status.min(u16::MAX as i32) as u16
+                } else {
+                    0
+                },
+                bytes: 0,
+            }),
+            Err(e) => {
+                self.note_mrp_error(&e);
+                Err(NativeSoloError::Command(format!("MRP progress push: {e:?}")))
+            }
+        }
     }
 
     pub fn pause_content(&mut self) -> Result<(), NativeSoloError> {
