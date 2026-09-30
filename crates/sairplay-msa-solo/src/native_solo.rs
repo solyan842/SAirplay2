@@ -506,9 +506,9 @@ impl NativeSoloEngine {
                 return Err(NativeSoloError::Command(format!("volume: {e:?}")));
             }
         };
-        if !(200..300).contains(&result.status) {
-            return Err(NativeSoloError::Command(format!("volume status {}", result.status)));
-        }
+        // Pinned ap2cl_set_volume treats any received RTSP status as a
+        // completed control request; only transport failure makes the call
+        // fail. Preserve the status for diagnostics/caller policy.
         Ok(result)
     }
 
