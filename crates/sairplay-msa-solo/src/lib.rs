@@ -11,6 +11,8 @@ pub mod native_codec;
 pub mod native_io;
 pub mod native_media_owner;
 pub mod native_control;
+pub mod native_solo;
+pub mod native_commands;
 pub mod native_timing_owner;
 pub mod ptp_engine;
 pub mod ntp_timing;
@@ -272,3 +274,9 @@ pub use native_control::{
 pub use ntp_timing::{build_timing_response, system_time_to_ntp, NtpTimingError, NtpTimingResponder};
 pub use ptp_engine::{PtpClock, PtpEngine, PtpEngineError, PtpExchange};
 pub use native_timing_owner::NativeTimingOwner;
+
+pub use native_commands::NativeCommandError;
+pub use native_solo::{
+    NativeSoloConfig, NativeSoloEngine, NativeSoloError,
+    MSA_NATIVE_LEAD_MS, MSA_SPLICE_DEPTH_MS,
+};
