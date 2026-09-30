@@ -32,6 +32,16 @@ pub fn plan_stock_recovery(head_frame:u64,wire_rtp:u32,rtp_offset:u32,now_frame:
  Some(RecoveryPlan{head_frame:target,rtp_offset:rtp_offset.wrapping_sub(shifted as u32),shifted_frames:shifted})
 }
 
+const NTP_FRAC_SCALE:u128=1u128<<32;
+pub fn unix_ms_to_ntp(ms:u64)->u64{(((u128::from(ms/1000))<<32)+((u128::from(ms%1000)<<32)/1000)) as u64}
+pub fn ntp_to_unix_ms(ntp:u64)->u64{((u128::from(ntp>>32)*1000)+((u128::from(ntp&0xffff_ffff)*1000)>>32)) as u64}
+pub fn frames_to_ntp(frames:u64,sample_rate:u32)->u64{
+ if sample_rate==0{0}else{((u128::from(frames)*NTP_FRAC_SCALE)/u128::from(sample_rate)) as u64}
+}
+pub fn ntp_to_frames(ntp:u64,sample_rate:u32)->u64{
+ if sample_rate==0{0}else{((u128::from(ntp)*u128::from(sample_rate))>>32) as u64}
+}
+
 pub fn frames_for_ms(ms:u64,sample_rate:u32)->u64{
  if sample_rate==0{0}else{ms.saturating_mul(u64::from(sample_rate))/1000}
 }
@@ -41,17 +51,17 @@ pub fn ms_for_frames(frames:u64,sample_rate:u32)->u64{
 
 /// Hot splice keeps the immutable anchor line and advances it with encoded
 /// silence. A stale request is corrected to head + 250 ms.
-pub fn hot_splice(head_frame:u64,head_unix_ms:u64,requested_unix_ms:u64,sample_rate:u32)->SplicePlan{
- if requested_unix_ms==0{return SplicePlan{accepted_unix_ms:head_unix_ms,pad_frames:0,corrected:false}}
- if requested_unix_ms>=head_unix_ms{
-  // MSA converts the requested instant into the sample/frame domain first,
-  // then subtracts head_ts. Do not derive padding from truncated ms delta.
-  let target=head_frame.saturating_add(frames_for_ms(requested_unix_ms-head_unix_ms,sample_rate));
+pub fn hot_splice(head_frame:u64,requested_unix_ms:u64,sample_rate:u32)->SplicePlan{
+ let head_ntp=frames_to_ntp(head_frame,sample_rate);
+ if requested_unix_ms==0{return SplicePlan{accepted_unix_ms:ntp_to_unix_ms(head_ntp),pad_frames:0,corrected:false}}
+ let requested=unix_ms_to_ntp(requested_unix_ms);
+ if requested>=head_ntp{
+  let target=ntp_to_frames(requested,sample_rate);
   return SplicePlan{accepted_unix_ms:requested_unix_ms,pad_frames:target.saturating_sub(head_frame),corrected:false}
  }
- let accepted=head_unix_ms.saturating_add(MIN_WARM_LEAD_MS);
- let target=head_frame.saturating_add(frames_for_ms(MIN_WARM_LEAD_MS,sample_rate));
- SplicePlan{accepted_unix_ms:accepted,pad_frames:target.saturating_sub(head_frame),corrected:true}
+ let corrected_ntp=head_ntp.saturating_add(unix_ms_to_ntp(MIN_WARM_LEAD_MS));
+ let target=ntp_to_frames(corrected_ntp,sample_rate);
+ SplicePlan{accepted_unix_ms:ntp_to_unix_ms(corrected_ntp),pad_frames:target.saturating_sub(head_frame),corrected:true}
 }
 
 /// Buffered RTP never moves backwards across FLUSHBUFFERED/re-anchor.
@@ -104,9 +114,12 @@ mod tests{
  #[test]fn stock_recovery_is_idle_when_head_is_outside_floor(){
   assert_eq!(plan_stock_recovery(200000,205000,5000,100000,11025,77175),None);
  }
- #[test]fn splice_padding_is_frame_exact(){let p=hot_splice(123_456,1000,1125,48000);assert_eq!(p.pad_frames,6000);assert_eq!(p.accepted_unix_ms,1125);}
- #[test]fn splice_padding_preserves_nonzero_head_domain(){let p=hot_splice(9_000_000,2000,2250,44100);assert_eq!(p.pad_frames,11025);assert_eq!(p.accepted_unix_ms,2250);}
- #[test]fn stale_splice_moves_one_lead_beyond_head(){let p=hot_splice(0,2000,1900,44100);assert_eq!(p.accepted_unix_ms,2250);assert_eq!(p.pad_frames,11025);assert!(p.corrected);}
+ #[test]fn splice_padding_is_frame_exact(){let p=hot_splice(48_000,1125,48000);assert_eq!(p.pad_frames,6000);assert_eq!(p.accepted_unix_ms,1125);}
+ #[test]fn splice_padding_preserves_nonzero_head_domain(){let p=hot_splice(88_200,2250,44100);assert_eq!(p.pad_frames,11025);assert_eq!(p.accepted_unix_ms,2250);}
+ #[test]fn stale_splice_moves_one_lead_beyond_head(){let p=hot_splice(88_200,1900,44100);assert_eq!(p.accepted_unix_ms,2249);assert_eq!(p.pad_frames,11024);assert!(p.corrected);}
+ #[test]fn ntp_frame_conversion_keeps_fractional_sample_contract(){
+  let ntp=unix_ms_to_ntp(1125);assert_eq!(ntp_to_frames(ntp,44100),49612);
+ }
  #[test]fn buffered_reanchor_stays_beyond_previous_wire_head(){
   let (off,rtp)=buffered_reanchor(500_000,100_000,7,48000,1);
   assert_eq!(rtp,504_800);assert_eq!(off,404_800);
