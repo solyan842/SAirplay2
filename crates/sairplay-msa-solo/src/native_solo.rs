@@ -777,6 +777,16 @@ impl NativeSoloEngine {
         }
     }
 
+    pub fn set_progress_and_publish(
+        &mut self,
+        elapsed_s: u32,
+        duration_s: u32,
+    ) -> Result<ParameterResult, NativeSoloError> {
+        // set_progress already mirrors pinned ap2cl_set_progress: MRP when
+        // active, otherwise native RTSP SET_PARAMETER progress.
+        self.set_progress(elapsed_s, duration_s)
+    }
+
     pub fn pause_content(&mut self) -> Result<(), NativeSoloError> {
         self.content_stopped = false;
         if self.runtime.splice_timeline {
