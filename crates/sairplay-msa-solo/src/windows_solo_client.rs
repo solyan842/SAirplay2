@@ -375,7 +375,7 @@ impl WindowsMsaSoloClient {
             Transport::Native { engine, .. } => {
                 engine.lock()
                     .map_err(|_| WindowsMsaSoloError::Native("native engine mutex poisoned".into()))?
-                    .set_progress(elapsed_s, duration_s)
+                    .set_progress_and_publish(elapsed_s, duration_s)
                     .map(|_| ())
                     .map_err(|e| WindowsMsaSoloError::Native(format!("{e:?}")))
             }
