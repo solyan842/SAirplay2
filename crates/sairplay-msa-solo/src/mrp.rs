@@ -690,6 +690,23 @@ impl MrpController {
         self.push_full_locked()
     }
 
+    pub fn stage_progress(
+        &self,
+        elapsed_ms: i64,
+        duration_ms: i64,
+        playing: bool,
+    ) -> Result<(), MrpError> {
+        let _publish = self.publish_lock.lock().map_err(|_| MrpError::Lock)?;
+        let mut state = self.state.lock().map_err(|_| MrpError::Lock)?;
+        state.set_progress(elapsed_ms, duration_ms, playing);
+        Ok(())
+    }
+
+    pub fn push_progress(&self) -> Result<MrpPushResult, MrpError> {
+        let _publish = self.publish_lock.lock().map_err(|_| MrpError::Lock)?;
+        self.push_progress_locked()
+    }
+
     pub fn set_progress_and_push(
         &self,
         elapsed_ms: i64,
