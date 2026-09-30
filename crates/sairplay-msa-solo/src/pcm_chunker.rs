@@ -35,6 +35,18 @@ impl Pcm352Chunker {
 
     pub fn clear(&mut self) { self.pending.clear(); }
 
+    /// Platform-adapter backpressure equivalent: keep the oldest bytes that
+    /// would still be resident in MSA's bounded persistent ring and discard
+    /// only newly captured excess that Windows cannot physically backpressure.
+    pub fn truncate_pending(&mut self, max_bytes: usize) -> usize {
+        let mut dropped = 0usize;
+        while self.pending.len() > max_bytes {
+            self.pending.pop_back();
+            dropped += 1;
+        }
+        dropped
+    }
+
     pub fn push(&mut self, pcm_le_stereo_16: &[u8]) {
         self.pending.extend(pcm_le_stereo_16.iter().copied());
     }
@@ -147,6 +159,16 @@ mod tests {
         let out = c.pop_packet().unwrap();
         assert_eq!(out.len(), 352 * 8);
         assert!(out.iter().all(|b| *b == 0x44));
+    }
+
+    #[test]
+    fn capacity_trim_preserves_oldest_bytes_like_source_backpressure() {
+        let mut c = Pcm352Chunker::new();
+        c.push(&[1,2,3,4,5,6]);
+        assert_eq!(c.truncate_pending(4), 2);
+        assert_eq!(c.pending_bytes(), 4);
+        let mut out = c.pop_packet_padded_silence();
+        assert_eq!(&out[..4], &[1,2,3,4]);
     }
 
     #[test]
