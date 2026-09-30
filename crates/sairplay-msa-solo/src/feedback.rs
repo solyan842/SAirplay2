@@ -145,7 +145,7 @@ impl FeedbackWorker {
                                 // Pinned MSA appends one final encrypted TEARDOWN
                                 // on a timeout-dead but still intact control stream.
                                 let _ = write_farewell_teardown_locked(
-                                    &mut channel,
+                                    channel,
                                     &next_cseq,
                                     &session_uri,
                                     &dacp_id,
