@@ -278,12 +278,15 @@ impl NativeSoloEngine {
             None
         };
 
+        let mrp_feedback_pulses =
+            mrp_data.as_ref().map(|worker| worker.feedback_pulse_handle());
         let feedback = FeedbackWorker::start(
             Arc::clone(&ready.control),
             Arc::clone(&ready.next_cseq),
             config.control.dacp_id.clone(),
             config.control.active_remote.clone(),
             ready.session_uri.clone(),
+            mrp_feedback_pulses,
         ).map_err(|e| NativeSoloError::Lifecycle(format!("feedback worker: {e}")))?;
 
         // Pinned MSA: retransmit responder is realtime-only and non-fatal if
