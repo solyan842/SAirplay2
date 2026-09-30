@@ -209,12 +209,12 @@ impl WindowsRaopAudioWorker {
             }
             Err(mpsc::RecvTimeoutError::Disconnected)=>{
                 running.store(false,Ordering::SeqCst);
-                let _=capture_worker.join();let _=writer_worker.join();let _=keepalive_worker.join();
+                let _=capture_worker.join();let _=writer_worker.join();let _=health_worker.join();
                 Err(WindowsRaopWorkerError::Worker("RAOP WASAPI worker disconnected before ready".into()))
             }
             Err(mpsc::RecvTimeoutError::Timeout)=>{
                 running.store(false,Ordering::SeqCst);
-                let _=capture_worker.join();let _=writer_worker.join();let _=keepalive_worker.join();
+                let _=capture_worker.join();let _=writer_worker.join();let _=health_worker.join();
                 Err(WindowsRaopWorkerError::Worker("RAOP WASAPI worker did not become ready".into()))
             }
         }
