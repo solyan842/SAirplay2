@@ -1132,6 +1132,61 @@ impl NativeSoloEngine {
         }
     }
 
+    pub fn mrp_register(&self) -> Result<i32, NativeSoloError> {
+        let Some(mrp) = self.mrp.as_ref() else { return Ok(-1) };
+        mrp.register()
+            .map_err(|e| NativeSoloError::Command(format!("MRP register: {e:?}")))
+    }
+
+    pub fn mrp_push(&mut self) -> Result<MrpPushResult, NativeSoloError> {
+        let Some(mrp) = self.mrp.clone() else { return Ok(MrpPushResult::empty()) };
+        match mrp.push_full() {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                self.note_mrp_error(&e);
+                Err(NativeSoloError::Command(format!("MRP push: {e:?}")))
+            }
+        }
+    }
+
+    pub fn mrp_push_progress(&mut self) -> Result<MrpPushResult, NativeSoloError> {
+        let Some(mrp) = self.mrp.clone() else { return Ok(MrpPushResult::empty()) };
+        match mrp.push_progress() {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                self.note_mrp_error(&e);
+                Err(NativeSoloError::Command(format!("MRP progress push: {e:?}")))
+            }
+        }
+    }
+
+    pub fn clear_mrp_artwork(&mut self) -> Result<Option<MrpPushResult>, NativeSoloError> {
+        let Some(mrp) = self.mrp.clone() else { return Ok(None) };
+        match mrp.clear_artwork_and_push() {
+            Ok(v) => Ok(Some(v)),
+            Err(e) => {
+                self.note_mrp_error(&e);
+                Err(NativeSoloError::Command(format!("MRP clear artwork: {e:?}")))
+            }
+        }
+    }
+
+    pub fn mrp_channel_status(&self) -> i32 {
+        // Exact ap2cl_mrp_channel_status semantics:
+        // -1 = not attempted/not applicable, 0 = attempted but down,
+        // 1 = type-130 channel established.
+        if !self.ready.pair_verified || !env_enabled("CLIAIRPLAY_MRP_TYPE130", false) {
+            return -1;
+        }
+        if self.mrp.is_none() {
+            return -1;
+        }
+        match self.mrp_data.as_ref() {
+            Some(worker) if worker.healthy() => 1,
+            _ => 0,
+        }
+    }
+
     pub fn uses_ptp(&self) -> bool { self.runtime.use_ptp }
 
     pub fn splice_pad_frames(&self) -> u64 { self.runtime.splice_pad_frames }
