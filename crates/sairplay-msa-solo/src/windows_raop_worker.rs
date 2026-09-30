@@ -6,9 +6,8 @@
 //! discards only pre-FLUSH content.
 
 use crate::{
-    MsaRaopConfig, MsaRaopError, MsaRaopPcmWriter, MsaRaopSession,
+    Ap2AudioFormat, MsaRaopConfig, MsaRaopError, MsaRaopPcmWriter, MsaRaopSession,
     Pcm352Chunker, WasapiLoopbackCapture, WasapiLoopbackError,
-    RAOP_PCM_PACKET_BYTES,
 };
 use std::fmt;
 use std::sync::{
@@ -19,7 +18,6 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-const RAOP_RING_CAPACITY_BYTES: usize = 1 << 20; // max(4s*176400,1MiB) = 1MiB
 const WRITER_QUEUE_PACKETS: usize = 256;
 const FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -63,9 +61,19 @@ impl WindowsRaopAudioWorker {
     }
 
     pub fn start(session:SharedMsaRaopSession)->Result<Self,WindowsRaopWorkerError>{
-        let pcm_writer=session.lock()
-            .map_err(|_|WindowsRaopWorkerError::Worker("RAOP session mutex poisoned".into()))?
-            .pcm_writer();
+        let (pcm_writer, ready)={
+            let guard=session.lock()
+                .map_err(|_|WindowsRaopWorkerError::Worker("RAOP session mutex poisoned".into()))?;
+            (guard.pcm_writer(), guard.ready())
+        };
+        let audio_format=Ap2AudioFormat {
+            sample_rate: ready.sample_rate,
+            bit_depth: ready.bit_depth,
+            channels: ready.channels,
+        };
+        let input_bpf=audio_format.input_bytes_per_frame();
+        let byte_rate=audio_format.sample_rate as usize * input_bpf;
+        let ring_capacity_bytes=(byte_rate.saturating_mul(4)).max(1 << 20);
 
         let running=Arc::new(AtomicBool::new(true));
         let delivery_enabled=Arc::new(AtomicBool::new(false));
@@ -74,7 +82,7 @@ impl WindowsRaopAudioWorker {
         let first_start_done=Arc::new(AtomicBool::new(false));
         let last_error=Arc::new(Mutex::new(None));
 
-        let (tx,rx)=mpsc::sync_channel::<(u64,[u8;RAOP_PCM_PACKET_BYTES])>(WRITER_QUEUE_PACKETS);
+        let (tx,rx)=mpsc::sync_channel::<(u64,Vec<u8>)>(WRITER_QUEUE_PACKETS);
         let running_w=Arc::clone(&running);
         let flush_w=Arc::clone(&flush_generation);
         let error_w=Arc::clone(&last_error);
@@ -104,7 +112,7 @@ impl WindowsRaopAudioWorker {
         let error_c=Arc::clone(&last_error);
         let (ready_tx,ready_rx)=mpsc::sync_channel::<Result<(),String>>(1);
         let capture_worker=thread::Builder::new().name("msa-raop-wasapi".into()).spawn(move||{
-            let capture=match WasapiLoopbackCapture::open_default(){
+            let capture=match WasapiLoopbackCapture::open_default_for_format(audio_format){
                 Ok(v)=>{let _=ready_tx.send(Ok(()));v}
                 Err(e)=>{
                     let msg=e.to_string();let _=ready_tx.send(Err(msg.clone()));
@@ -112,9 +120,9 @@ impl WindowsRaopAudioWorker {
                     running_c.store(false,Ordering::SeqCst);return;
                 }
             };
-            let mut chunker=Pcm352Chunker::new();
+            let mut chunker=Pcm352Chunker::new_with_bytes_per_frame(input_bpf);
             let mut local_flush=flush_c.load(Ordering::SeqCst);
-            let mut pending_packet:Option<[u8;RAOP_PCM_PACKET_BYTES]>=None;
+            let mut pending_packet:Option<Vec<u8>>=None;
 
             while running_c.load(Ordering::SeqCst) {
                 let generation=flush_c.load(Ordering::SeqCst);
@@ -136,7 +144,7 @@ impl WindowsRaopAudioWorker {
                         running_c.store(false,Ordering::SeqCst);break;
                     }
                 };
-                let _=chunker.truncate_pending(RAOP_RING_CAPACITY_BYTES);
+                let _=chunker.truncate_pending(ring_capacity_bytes);
 
                 if !enabled_c.load(Ordering::SeqCst) {
                     if report.frames==0 { thread::sleep(Duration::from_millis(1)); }
@@ -146,7 +154,7 @@ impl WindowsRaopAudioWorker {
                 loop {
                     if pending_packet.is_none() {
                         let Some(packet)=chunker.pop_packet() else { break };
-                        pending_packet=Some(packet.try_into().expect("RAOP chunker is fixed PCM16 stereo"));
+                        pending_packet=Some(packet);
                     }
                     let packet=pending_packet.take().unwrap();
                     match tx.try_send((local_flush,packet)) {
