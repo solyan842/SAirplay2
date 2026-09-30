@@ -22,7 +22,6 @@ pub enum NtpSessionSetupError {
     Status(u16),
     Plist(plist::Error),
     InvalidRoot,
-    MissingEventPort,
     InvalidEventPort,
 }
 
@@ -38,7 +37,7 @@ impl From<plist::Error> for NtpSessionSetupError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NtpSessionSetupResult {
-    pub event_port: u16,
+    pub event_port: Option<u16>,
 }
 
 pub fn build_ntp_session_plist(
@@ -62,22 +61,16 @@ pub fn build_ntp_session_plist(
     Ok(out)
 }
 
-pub fn parse_event_port(body: &[u8]) -> Result<u16, NtpSessionSetupError> {
+pub fn parse_event_port(body: &[u8]) -> Result<Option<u16>, NtpSessionSetupError> {
     let value = Value::from_reader(Cursor::new(body))?;
-    let root = value
-        .as_dictionary()
-        .ok_or(NtpSessionSetupError::InvalidRoot)?;
-
-    let event = root
-        .get("eventPort")
-        .and_then(Value::as_unsigned_integer)
-        .ok_or(NtpSessionSetupError::MissingEventPort)?;
-
+    let root = value.as_dictionary().ok_or(NtpSessionSetupError::InvalidRoot)?;
+    let Some(event) = root.get("eventPort").and_then(Value::as_unsigned_integer) else {
+        return Ok(None);
+    };
     if !(1024..=65535).contains(&event) {
-        return Err(NtpSessionSetupError::InvalidEventPort);
+        return Ok(None);
     }
-
-    Ok(event as u16)
+    Ok(Some(event as u16))
 }
 
 pub fn setup_ntp_session(
@@ -116,7 +109,7 @@ pub fn setup_ntp_session(
 
     let event_port = parse_event_port(&response.body)?;
 
-    // Advance only after successful encrypted exchange and valid eventPort.
+    // MSA advances after a successful session SETUP even when eventPort is absent/invalid.
     flow.session_setup()?;
 
     Ok(NtpSessionSetupResult { event_port })
@@ -263,14 +256,14 @@ mod tests {
         };
 
         let result = setup_ntp_session(&mut flow, &mut channel, &config).unwrap();
-        assert_eq!(result.event_port, 7000);
+        assert_eq!(result.event_port, Some(7000));
         assert_eq!(flow.phase(), NativePhase::SessionSetup);
 
         server.join().unwrap();
     }
 
     #[test]
-    fn invalid_event_port_keeps_flow_at_timing_ready() {
+    fn invalid_event_port_is_best_effort_and_session_still_advances() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let key = [0x72u8; 32];
@@ -279,21 +272,13 @@ mod tests {
             let (mut socket, _) = listener.accept().unwrap();
             let mut cipher = HapControlCipher::new(key, key);
             let _ = read_one_hap_frame(&mut socket, &mut cipher);
-
             let reply = encrypted_response(4, &response_plist(80));
-            let wire = cipher.encrypt(&reply).unwrap();
-            socket.write_all(&wire).unwrap();
+            socket.write_all(&cipher.encrypt(&reply).unwrap()).unwrap();
         });
 
         let stream = TcpStream::connect(addr).unwrap();
         stream.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
-        let mut channel = EncryptedRtspChannel::new(
-            stream,
-            key,
-            key,
-            Duration::from_secs(2),
-        );
-
+        let mut channel = EncryptedRtspChannel::new(stream, key, key, Duration::from_secs(2));
         let mut flow = timing_ready_flow();
         let config = NtpSessionSetupConfig {
             cseq: 4,
@@ -304,13 +289,9 @@ mod tests {
             dacp_id: "AABBCCDDEEFF0011".into(),
             active_remote: "123456789".into(),
         };
-
-        assert!(matches!(
-            setup_ntp_session(&mut flow, &mut channel, &config),
-            Err(NtpSessionSetupError::InvalidEventPort)
-        ));
-        assert_eq!(flow.phase(), NativePhase::TimingReady);
-
+        let result = setup_ntp_session(&mut flow, &mut channel, &config).unwrap();
+        assert_eq!(result.event_port, None);
+        assert_eq!(flow.phase(), NativePhase::SessionSetup);
         server.join().unwrap();
     }
 }
