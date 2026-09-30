@@ -202,10 +202,10 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let secret = [0x55u8; 32];
-        let (sender_write, _) = derive_event_keys(&secret).unwrap();
+        let (_, receiver_write) = derive_event_keys(&secret).unwrap();
         let server = thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
-            let mut cipher = HapControlCipher::new(sender_write, sender_write);
+            let mut cipher = HapControlCipher::new(receiver_write, receiver_write);
             let mut wire = cipher.encrypt(b"one").unwrap();
             wire.extend_from_slice(&cipher.encrypt(b"two").unwrap());
             socket.write_all(&wire).unwrap();
