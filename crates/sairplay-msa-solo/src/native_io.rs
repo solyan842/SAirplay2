@@ -149,19 +149,22 @@ impl MediaIo for NativeMediaIo {
             Some(v) => v,
             None => return StreamWrite::Fatal,
         };
-        match stream.write(bytes) {
-            Ok(n) if n == bytes.len() => StreamWrite::Complete,
-            Ok(n) if n > 0 => StreamWrite::Partial(n),
-            Ok(_) => StreamWrite::WouldBlock,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
-                ) =>
-            {
-                StreamWrite::WouldBlock
+        loop {
+            match stream.write(bytes) {
+                Ok(n) if n == bytes.len() => return StreamWrite::Complete,
+                Ok(n) if n > 0 => return StreamWrite::Partial(n),
+                Ok(_) => return StreamWrite::WouldBlock,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return StreamWrite::WouldBlock;
+                }
+                Err(_) => return StreamWrite::Fatal,
             }
-            Err(_) => StreamWrite::Fatal,
         }
     }
 
