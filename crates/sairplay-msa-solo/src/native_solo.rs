@@ -1065,48 +1065,6 @@ impl NativeSoloEngine {
         }
     }
 
-    pub fn clear_mrp_artwork(&mut self) -> Result<Option<crate::MrpPushResult>, NativeSoloError> {
-        let Some(mrp) = self.mrp.clone() else { return Ok(None) };
-        mrp.clear_artwork_and_push().map(Some).map_err(|e| {
-            self.note_mrp_error(&e);
-            NativeSoloError::Command(format!("MRP clear artwork: {e:?}"))
-        })
-    }
-
-    pub fn mrp_register(&mut self) -> Result<i32, NativeSoloError> {
-        let Some(mrp) = self.mrp.clone() else { return Ok(-1) };
-        mrp.register().map_err(|e| {
-            self.note_mrp_error(&e);
-            NativeSoloError::Command(format!("MRP register: {e:?}"))
-        })
-    }
-
-    pub fn mrp_push(&mut self) -> Result<i32, NativeSoloError> {
-        let Some(mrp) = self.mrp.clone() else { return Ok(-1) };
-        mrp.push_full().map(|v| v.overall_status).map_err(|e| {
-            self.note_mrp_error(&e);
-            NativeSoloError::Command(format!("MRP push: {e:?}"))
-        })
-    }
-
-    pub fn mrp_push_progress(&mut self) -> Result<i32, NativeSoloError> {
-        let Some(mrp) = self.mrp.clone() else { return Ok(-1) };
-        mrp.push_progress().map(|v| v.overall_status).map_err(|e| {
-            self.note_mrp_error(&e);
-            NativeSoloError::Command(format!("MRP progress push: {e:?}"))
-        })
-    }
-
-    pub fn mrp_channel_status(&self) -> i32 {
-        if !self.ready.pair_verified || !env_enabled("CLIAIRPLAY_MRP_TYPE130", false) {
-            -1
-        } else if self.mrp_data.as_ref().is_some_and(MrpDataStreamWorker::healthy) {
-            1
-        } else {
-            0
-        }
-    }
-
     pub fn mrp_controller(&self) -> Option<MrpController> {
         self.mrp.clone()
     }
