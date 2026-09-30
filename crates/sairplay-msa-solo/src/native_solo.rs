@@ -305,9 +305,12 @@ impl NativeSoloEngine {
     }
 
     pub fn splice_hot(&self) -> bool {
+        // Exact ap2cl_splice_hot: wire-hot is a session/state property and
+        // does not require a frozen PTP anchor. NTP splice sessions still
+        // keep the realtime line fed with silence while STREAMING.
         self.runtime.splice_timeline
             && self.runtime.state == Ap2State::Streaming
-            && self.runtime.ptp_anchor.valid
+            && !self.rtsp_dead
     }
 
     pub fn set_volume(&mut self, percent: u8) -> Result<VolumeSetResult, NativeSoloError> {
