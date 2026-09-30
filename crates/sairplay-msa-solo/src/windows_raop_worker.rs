@@ -203,11 +203,17 @@ impl WindowsRaopAudioWorker {
 
     pub fn commit_start(&self,requested_unix_ms:u64)->Result<crate::timing::StartResolution,WindowsRaopWorkerError>{
         let mut session=self.session.lock().map_err(|_|WindowsRaopWorkerError::Worker("RAOP session mutex poisoned".into()))?;
-        let start=if self.first_start_done.load(Ordering::SeqCst) {
-            session.start_after_flush(requested_unix_ms)?
-        } else {
+        let first = !self.first_start_done.load(Ordering::SeqCst);
+        let start=if first {
             session.commit_start(requested_unix_ms)?
+        } else {
+            session.start_after_flush(requested_unix_ms)?
         };
+        if first {
+            // Same gate as cliairplay session_commit: metadata must land
+            // after the START commit but before captured PCM delivery opens.
+            session.ensure_initial_metadata()?;
+        }
         self.first_start_done.store(true,Ordering::SeqCst);
         self.delivery_enabled.store(true,Ordering::SeqCst);
         Ok(start)
