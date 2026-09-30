@@ -8,6 +8,7 @@
 use crate::timing::StartResolution;
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
+use std::net::IpAddr;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -42,6 +43,10 @@ pub struct MsaRaopConfig {
     pub password: Option<String>,
     pub compressed_alac: bool,
     pub mfi_auth: bool,
+    pub encrypt: bool,
+    pub dacp_id: String,
+    pub active_remote: String,
+    pub bind_ip: Option<IpAddr>,
     pub sample_rate: u32,
     pub bit_depth: u16,
     pub channels: u16,
@@ -59,6 +64,10 @@ impl MsaRaopConfig {
             password: None,
             compressed_alac: true,
             mfi_auth: false,
+            encrypt: false,
+            dacp_id: "1A2B3D4EA1B2C3D4".into(),
+            active_remote: "0".into(),
+            bind_ip: None,
             sample_rate: 44_100,
             bit_depth: 16,
             channels: 2,
@@ -171,8 +180,14 @@ impl MsaRaopSession {
             .arg("-r").arg(config.sample_rate.to_string())
             .arg("-b").arg(config.bit_depth.to_string())
             .arg("-c").arg(config.channels.to_string())
+            .arg("-D").arg(&config.dacp_id)
+            .arg("-R").arg(&config.active_remote)
             .arg("-t").arg(&config.et)
             .arg("-m").arg(&config.md);
+        if let Some(bind_ip) = config.bind_ip {
+            cmd.arg("--bind").arg(bind_ip.to_string());
+        }
+        if config.encrypt { cmd.arg("-e"); }
         if !config.compressed_alac { cmd.arg("--pcm"); }
         if config.mfi_auth { cmd.arg("-u"); }
         if let Some(secret) = config.secret.as_deref().filter(|v| !v.trim().is_empty()) {
