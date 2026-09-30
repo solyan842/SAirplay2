@@ -79,8 +79,14 @@ impl EventChannel {
     }
 
     pub fn read_plaintext(&mut self) -> Result<Option<Vec<u8>>, EventChannelError> {
-        let mut buf = [0u8; 4096];
+        // Upstream mrp_drain_channel_frames consumes every complete HAP frame
+        // already buffered before asking the socket for more bytes. This
+        // matters when one TCP read carries several 1024-byte HAP records.
+        if let Some(plain) = self.take_plaintext_frame()? {
+            return Ok(Some(plain));
+        }
 
+        let mut buf = [0u8; 4096];
         match self.stream.read(&mut buf) {
             Ok(0) => return Err(EventChannelError::Closed),
             Ok(n) => self.encrypted_carry.extend_from_slice(&buf[..n]),
@@ -93,21 +99,22 @@ impl EventChannel {
             Err(err) => return Err(EventChannelError::Read(err)),
         }
 
+        self.take_plaintext_frame()
+    }
+
+    fn take_plaintext_frame(&mut self) -> Result<Option<Vec<u8>>, EventChannelError> {
         if self.encrypted_carry.len() < 2 {
             return Ok(None);
         }
-
         let plain_len =
             u16::from_le_bytes([self.encrypted_carry[0], self.encrypted_carry[1]]) as usize;
         if plain_len > 1024 {
             return Err(EventChannelError::Crypto(HapCryptoError::InvalidFrame));
         }
-
         let frame_len = 2 + plain_len + 16;
         if self.encrypted_carry.len() < frame_len {
             return Ok(None);
         }
-
         let frame = self.encrypted_carry[..frame_len].to_vec();
         let plain = self.cipher.decrypt(&frame)?;
         self.encrypted_carry.drain(..frame_len);
@@ -188,6 +195,37 @@ mod tests {
         assert_eq!(out1, out2);
         assert_eq!(in1, in2);
         assert_ne!(out1, in1);
+    }
+
+    #[test]
+    fn event_reader_drains_second_complete_hap_frame_without_new_socket_bytes() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let secret = [0x55u8; 32];
+        let (sender_write, _) = derive_event_keys(&secret).unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut cipher = HapControlCipher::new(sender_write, sender_write);
+            let mut wire = cipher.encrypt(b"one").unwrap();
+            wire.extend_from_slice(&cipher.encrypt(b"two").unwrap());
+            socket.write_all(&wire).unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+
+        let mut channel = EventChannel::connect(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            addr.port(),
+            &secret,
+            Duration::from_secs(1),
+        ).unwrap();
+        // The receiver is the logical writer; construct a matching inbound
+        // cipher directly from the channel's derived read key contract.
+        // First call reads both records but returns only one plaintext.
+        assert_eq!(channel.read_plaintext().unwrap().as_deref(), Some(&b"one"[..]));
+        // Second call must consume carry immediately instead of waiting for a
+        // third socket write that may never arrive.
+        assert_eq!(channel.read_plaintext().unwrap().as_deref(), Some(&b"two"[..]));
+        server.join().unwrap();
     }
 
     #[test]
