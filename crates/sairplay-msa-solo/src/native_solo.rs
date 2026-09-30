@@ -24,7 +24,8 @@ use crate::{
     send_native_artwork, send_native_metadata, send_native_progress, send_teardown,
     set_native_volume, write_farewell_teardown_locked, Ap2AudioFormat,
     EncryptedRtspError, MetadataError, MetadataSetResult, ParameterError,
-    ParameterResult, VolumeError, VolumeSetResult,
+    ParameterResult, VolumeError, VolumeSetResult, mrp_post_command, MrpError,
+    MrpEventWorker, MrpPlaybackState, MrpRemoteCommand, MrpState,
 };
 use crate::ntp_timing::system_time_to_ntp;
 use std::thread;
@@ -35,6 +36,13 @@ pub const MSA_NATIVE_LEAD_MS: u64 = 2000;
 pub const MSA_SPLICE_DEPTH_MS: u64 = 600;
 pub const MSA_SPLICE_DEPTH_MAX_MS: u64 = 3000;
 pub const AP2_CLOCK_VERIFY_POLL_MS: u64 = 250;
+
+fn env_enabled(name: &str, unset_default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => !matches!(v.as_str(), "0" | "false" | "off"),
+        Err(_) => unset_default,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SoloClockVerifyOutcome {
@@ -81,6 +89,8 @@ pub struct NativeSoloEngine {
     pub runtime: NativeRuntime,
     feedback: FeedbackWorker,
     rtx_worker: Option<RtxWorker>,
+    mrp: Option<MrpState>,
+    mrp_event: Option<MrpEventWorker>,
     config: NativeSoloConfig,
     timeline_initialized: bool,
     first_start_done: bool,
@@ -104,7 +114,7 @@ pub struct NativeSoloEngine {
 
 impl NativeSoloEngine {
     pub fn connect(config: NativeSoloConfig) -> Result<Self, NativeSoloError> {
-        let ready = open_native_control(&config.control)?;
+        let mut ready = open_native_control(&config.control)?;
         let sample_rate = config.control.audio_format.sample_rate;
         let requested_frames = (MSA_NATIVE_LEAD_MS * u64::from(sample_rate) / 1000) as u32;
         let min_frames = ready.latency_min.unwrap_or(0);
@@ -160,6 +170,28 @@ impl NativeSoloEngine {
             reanchor_shifted_frames: 0,
         };
 
+        // Pinned ap2_mrp_ready(): MediaRemote is default-on only for a
+        // pair-verified native session with a live reverse event channel.
+        // Transient-paired third-party receivers remain DMAP-only.
+        let mrp = if env_enabled("CLIAIRPLAY_MRP", true)
+            && ready.pair_verified
+            && ready.event.is_some()
+        {
+            Some(MrpState::new(
+                config.control.dacp_id.clone(),
+                config.control.receiver_name.clone(),
+                ready.session_uuid.clone(),
+                ready.group_uuid.clone(),
+            ))
+        } else {
+            None
+        };
+        let mrp_event = if mrp.is_some() {
+            ready.event.take().map(MrpEventWorker::start)
+        } else {
+            None
+        };
+
         let feedback = FeedbackWorker::start(
             Arc::clone(&ready.control),
             Arc::clone(&ready.next_cseq),
@@ -187,6 +219,8 @@ impl NativeSoloEngine {
             runtime,
             feedback,
             rtx_worker,
+            mrp,
+            mrp_event,
             config,
             timeline_initialized: false,
             first_start_done: false,
