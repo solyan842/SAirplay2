@@ -125,6 +125,35 @@ impl NativeRuntime {
         }
     }
 
+    pub fn send_immediate_ptp_sync<I: SyncIo>(
+        &mut self,
+        io: &mut I,
+        timing: SyncTiming,
+    ) -> SendResult {
+        if !self.use_ptp || self.lane == NativeLane::Buffered {
+            return SendResult::Sent;
+        }
+        self.ptp_anchor.freeze_if_needed(
+            timing.master_now_ns,
+            timing.local_ptp_now_ns,
+            self.start_ntp,
+            self.lead_ms,
+            self.media.timeline.sample_rate,
+            self.media.timeline.rtp_offset,
+            self.media.timeline.wire_rtp,
+        );
+        let pkt = build_ptp_sync(
+            true,
+            self.media.timeline.wire_rtp,
+            self.lead_ms,
+            self.media.timeline.sample_rate,
+            timing.master_now_ns,
+            timing.master_clock_id,
+            self.ptp_anchor,
+        );
+        execute_sync(io, &mut self.health, &mut self.sync_counters, &pkt)
+    }
+
     /// Mirrors native ap2cl_send_chunk / ap2_native_send_chunk.
     pub fn send_chunk<E, C, I>(
         &mut self,
