@@ -33,6 +33,21 @@ fn request(
     }
 }
 
+
+pub fn write_farewell_teardown_locked(
+    channel: &mut crate::EncryptedRtspChannel,
+    next_cseq: &SharedCseq,
+    session_uri: &str,
+    dacp_id: &str,
+    active_remote: &str,
+) -> Result<(), TeardownError> {
+    let cseq = next_cseq.fetch_add(1, Ordering::SeqCst);
+    let farewell = request(cseq, session_uri, dacp_id, active_remote).encode();
+    channel
+        .write_only_with_timeout(&farewell, FAREWELL_TIMEOUT)
+        .map_err(TeardownError::Transport)
+}
+
 pub fn send_teardown(
     control: &SharedRtspControl,
     next_cseq: &SharedCseq,
@@ -70,17 +85,13 @@ pub fn send_teardown(
             // Match upstream farewell behavior: the read direction just failed,
             // so append one final TEARDOWN with a 250 ms write budget and do not
             // wait for its response.
-            let farewell_cseq = next_cseq.fetch_add(1, Ordering::SeqCst);
-            let farewell = request(
-                farewell_cseq,
+            write_farewell_teardown_locked(
+                &mut channel,
+                next_cseq,
                 session_uri,
                 dacp_id,
                 active_remote,
             )
-            .encode();
-            channel
-                .write_only_with_timeout(&farewell, FAREWELL_TIMEOUT)
-                .map_err(TeardownError::Transport)
         }
         Err(error) => Err(TeardownError::Transport(error)),
     }
