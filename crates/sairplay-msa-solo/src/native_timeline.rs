@@ -99,6 +99,26 @@ impl Timeline{
   }else{self.wire_rtp=(new_head_frame as u32).wrapping_add(self.rtp_offset);}
   self.first_packet=true;
  }
+ /// Exact ap2_reanchor_after_drain: preserve seq/offset/reanchor diagnostics,
+ /// move the scheduling head to the fresh line and mark only the next
+ /// realtime RTP packet as the first packet on that line.
+ pub fn reanchor_after_drain(&mut self,new_head_frame:u64){
+  self.head_frame=new_head_frame;
+  self.wire_rtp=(new_head_frame as u32).wrapping_add(self.rtp_offset);
+  self.first_packet=true;
+ }
+ /// Exact buffered ap2cl_play rebase. Unlike START/resume, un-pause does not
+ /// mark a new first packet; it only moves the head and raises the wire offset
+ /// when needed to leave the 100ms continuation gap.
+ pub fn rebase_buffered_play(&mut self,new_head_frame:u64,audio_packets_sent:u64){
+  let prev=self.wire_rtp;
+  self.head_frame=new_head_frame;
+  let (off,rtp)=buffered_reanchor(
+   prev,new_head_frame,self.rtp_offset,self.sample_rate,audio_packets_sent
+  );
+  self.rtp_offset=off;
+  self.wire_rtp=rtp;
+ }
  pub fn recover_stock(&mut self,now_frame:u64,floor_frames:u64,recovery_lead_frames:u64)->Option<StockRecoveryEffects>{
   let p=plan_stock_recovery(self.head_frame,self.wire_rtp,self.rtp_offset,now_frame,floor_frames,recovery_lead_frames)?;
   self.head_frame=p.head_frame;self.rtp_offset=p.rtp_offset;
@@ -115,6 +135,19 @@ impl Timeline{
 #[cfg(test)]
 mod tests{
  use super::*;
+ #[test]fn reanchor_after_drain_preserves_seq_offset_and_sets_marker(){
+  let mut t=Timeline{sample_rate:44100,head_frame:100,wire_rtp:5100,rtp_offset:5000,seq:77,first_packet:false};
+  t.reanchor_after_drain(22050);
+  assert_eq!(t.head_frame,22050);assert_eq!(t.wire_rtp,27050);
+  assert_eq!(t.rtp_offset,5000);assert_eq!(t.seq,77);assert!(t.first_packet);
+ }
+ #[test]fn buffered_play_rebase_preserves_non_first_marker(){
+  let mut t=Timeline{sample_rate:48000,head_frame:48000,wire_rtp:50000,rtp_offset:2000,seq:9,first_packet:false};
+  t.rebase_buffered_play(96000,1);
+  assert!(!t.first_packet);assert_eq!(t.seq,9);
+  assert_eq!((t.head_frame as u32).wrapping_add(t.rtp_offset),t.wire_rtp);
+  assert!(t.wire_rtp>=50000u32.wrapping_add(frames_for_ms(BUFFERED_RTP_GAP_MS,48000) as u32));
+ }
  #[test]fn stock_recovery_preserves_wire_rtp_and_moves_head(){
   let mut t=Timeline{sample_rate:44100,head_frame:100000,wire_rtp:105000,rtp_offset:5000,seq:7,first_packet:false};
   let effects=t.recover_stock(120000,11025,77175).unwrap();
