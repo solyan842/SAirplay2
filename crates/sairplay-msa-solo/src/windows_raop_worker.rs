@@ -52,6 +52,7 @@ pub struct WindowsRaopAudioWorker {
     first_start_done: Arc<AtomicBool>,
     capture_worker: Option<JoinHandle<()>>,
     writer_worker: Option<JoinHandle<()>>,
+    keepalive_worker: Option<JoinHandle<()>>,
     last_error: Arc<Mutex<Option<String>>>,
 }
 
@@ -106,6 +107,27 @@ impl WindowsRaopAudioWorker {
                 }
             }
         }).map_err(|e|WindowsRaopWorkerError::Worker(format!("spawn RAOP writer: {e}")))?;
+
+        let running_k=Arc::clone(&running);
+        let session_k=Arc::clone(&session);
+        let error_k=Arc::clone(&last_error);
+        let keepalive_worker=thread::Builder::new().name("msa-raop-keepalive".into()).spawn(move||{
+            while running_k.load(Ordering::SeqCst) {
+                for _ in 0..200 {
+                    if !running_k.load(Ordering::SeqCst) { return; }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                if !running_k.load(Ordering::SeqCst) { break; }
+                let result=session_k.lock()
+                    .map_err(|_|"RAOP session mutex poisoned".to_string())
+                    .and_then(|mut s|s.keepalive().map_err(|e|e.to_string()));
+                if let Err(e)=result {
+                    if let Ok(mut slot)=error_k.lock(){*slot=Some(format!("RAOP keepalive failed: {e}"));}
+                    running_k.store(false,Ordering::SeqCst);
+                    break;
+                }
+            }
+        }).map_err(|e|WindowsRaopWorkerError::Worker(format!("spawn RAOP keepalive: {e}")))?;
 
         let running_c=Arc::clone(&running);
         let enabled_c=Arc::clone(&delivery_enabled);
@@ -184,21 +206,21 @@ impl WindowsRaopAudioWorker {
             Ok(Ok(()))=>Ok(Self{
                 session,running,delivery_enabled,flush_generation,flush_ack_generation,
                 audio_ready,first_start_done,capture_worker:Some(capture_worker),
-                writer_worker:Some(writer_worker),last_error,
+                writer_worker:Some(writer_worker),keepalive_worker:Some(keepalive_worker),last_error,
             }),
             Ok(Err(message))=>{
                 running.store(false,Ordering::SeqCst);
-                let _=capture_worker.join();let _=writer_worker.join();
+                let _=capture_worker.join();let _=writer_worker.join();let _=keepalive_worker.join();
                 Err(WindowsRaopWorkerError::Worker(message))
             }
             Err(mpsc::RecvTimeoutError::Disconnected)=>{
                 running.store(false,Ordering::SeqCst);
-                let _=capture_worker.join();let _=writer_worker.join();
+                let _=capture_worker.join();let _=writer_worker.join();let _=keepalive_worker.join();
                 Err(WindowsRaopWorkerError::Worker("RAOP WASAPI worker disconnected before ready".into()))
             }
             Err(mpsc::RecvTimeoutError::Timeout)=>{
                 running.store(false,Ordering::SeqCst);
-                let _=capture_worker.join();let _=writer_worker.join();
+                let _=capture_worker.join();let _=writer_worker.join();let _=keepalive_worker.join();
                 Err(WindowsRaopWorkerError::Worker("RAOP WASAPI worker did not become ready".into()))
             }
         }
@@ -282,6 +304,7 @@ impl WindowsRaopAudioWorker {
         self.delivery_enabled.store(false,Ordering::SeqCst);
         if let Some(w)=self.capture_worker.take(){let _=w.join();}
         if let Some(w)=self.writer_worker.take(){let _=w.join();}
+        if let Some(w)=self.keepalive_worker.take(){let _=w.join();}
         if let Ok(mut session)=self.session.lock(){session.disconnect();}
     }
 }
