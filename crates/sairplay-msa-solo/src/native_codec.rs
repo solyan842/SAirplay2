@@ -47,10 +47,9 @@ pub fn pad_final_pcm_chunk(
     Ok(out)
 }
 
-fn encode_alac_raw_16_stereo_352(pcm: &[u8]) -> Result<Vec<u8>, CodecError> {
+fn encode_alac_raw_16_stereo(pcm: &[u8], frames: usize) -> Result<Vec<u8>, CodecError> {
     const BPF: usize = 4;
-    const PCM_BYTES: usize = ALAC_FRAMES_PER_CHUNK * BPF;
-    if pcm.len() != PCM_BYTES {
+    if frames == 0 || frames > ALAC_FRAMES_PER_CHUNK || pcm.len() != frames * BPF {
         return Err(CodecError::InvalidPcm);
     }
 
@@ -68,7 +67,7 @@ fn encode_alac_raw_16_stereo_352(pcm: &[u8]) -> Result<Vec<u8>, CodecError> {
     seventh |= ((first & 0x0000_8000) >> 15) as u8;
     out.push(seventh);
 
-    for frame_index in 0..ALAC_FRAMES_PER_CHUNK {
+    for frame_index in 0..frames {
         let off = frame_index * BPF;
         let word = u32::from_le_bytes(pcm[off..off + BPF].try_into().unwrap());
 
@@ -76,7 +75,7 @@ fn encode_alac_raw_16_stereo_352(pcm: &[u8]) -> Result<Vec<u8>, CodecError> {
         out.push((((word & 0x0000_007f) << 1) | ((word & 0x8000_0000) >> 31)) as u8);
         out.push(((word & 0x7f80_0000) >> 23) as u8);
 
-        let next_left_sign = if frame_index + 1 < ALAC_FRAMES_PER_CHUNK {
+        let next_left_sign = if frame_index + 1 < frames {
             let next_off = (frame_index + 1) * BPF;
             let next = u32::from_le_bytes(pcm[next_off..next_off + BPF].try_into().unwrap());
             ((next & 0x0000_8000) >> 15) as u8
@@ -85,6 +84,8 @@ fn encode_alac_raw_16_stereo_352(pcm: &[u8]) -> Result<Vec<u8>, CodecError> {
         };
         out.push((((word & 0x007f_0000) >> 15) as u8) | next_left_sign);
     }
+    // pcm_to_alac_raw pads the escape payload to bsize even when frames is short.
+    out.resize(7 + ALAC_FRAMES_PER_CHUNK * BPF, 0);
 
     if let Some(last) = out.last_mut() {
         *last |= 1;
@@ -112,7 +113,7 @@ mod native24 {
     use std::ptr::NonNull;
 
     type CreateFn = unsafe extern "C" fn(i32) -> *mut c_void;
-    type EncodeFn = unsafe extern "C" fn(*mut c_void, *const u8, i32, *mut u8, i32) -> i32;
+    type EncodeFn = unsafe extern "C" fn(*mut c_void, *const u8, i32, i32, *mut u8, i32) -> i32;
     type DestroyFn = unsafe extern "C" fn(*mut c_void);
 
     pub struct Alac24 {
@@ -137,7 +138,7 @@ mod native24 {
                     .map_err(|_| CodecError::BackendUnavailable)?
             };
             let encode: EncodeFn = unsafe {
-                *library.get::<EncodeFn>(b"sairplay_alac24_encode_352\0")
+                *library.get::<EncodeFn>(b"sairplay_alac24_encode\0")
                     .map_err(|_| CodecError::BackendUnavailable)?
             };
             let destroy: DestroyFn = unsafe {
@@ -149,9 +150,9 @@ mod native24 {
             Ok(Self { _library: library, encoder, encode, destroy })
         }
 
-        pub fn encode(&mut self, pcm_s32le: &[u8]) -> Result<Vec<u8>, CodecError> {
-            const INPUT_BYTES: usize = ALAC_FRAMES_PER_CHUNK * 2 * 4;
-            if pcm_s32le.len() != INPUT_BYTES {
+        pub fn encode(&mut self, pcm_s32le: &[u8], frames: usize) -> Result<Vec<u8>, CodecError> {
+            if frames == 0 || frames > ALAC_FRAMES_PER_CHUNK ||
+                pcm_s32le.len() != frames * 2 * 4 {
                 return Err(CodecError::InvalidPcm);
             }
             let packed = truncate_s32le_to_s24le(pcm_s32le)?;
@@ -160,6 +161,7 @@ mod native24 {
                 (self.encode)(
                     self.encoder.as_ptr(),
                     packed.as_ptr(),
+                    frames as i32,
                     packed.len() as i32,
                     output.as_mut_ptr(),
                     output.len() as i32,
@@ -208,13 +210,14 @@ impl AlacEncoder for NativeAlacEncoder {
     type Error = CodecError;
 
     fn encode(&mut self, pcm: &[u8], frames: u32) -> Result<Vec<u8>, Self::Error> {
-        if frames as usize != ALAC_FRAMES_PER_CHUNK {
+        let frames = frames as usize;
+        if frames == 0 || frames > ALAC_FRAMES_PER_CHUNK {
             return Err(CodecError::InvalidPcm);
         }
         match self {
-            Self::Raw16 => encode_alac_raw_16_stereo_352(pcm),
+            Self::Raw16 => encode_alac_raw_16_stereo(pcm, frames),
             #[cfg(windows)]
-            Self::Alac24(enc) => enc.encode(pcm),
+            Self::Alac24(enc) => enc.encode(pcm, frames),
         }
     }
 }
@@ -271,10 +274,18 @@ mod tests {
     #[test]
     fn raw_16_alac_matches_msa_packet_shape() {
         let pcm = vec![0u8; 352 * 4];
-        let encoded = encode_alac_raw_16_stereo_352(&pcm).unwrap();
+        let encoded = encode_alac_raw_16_stereo(&pcm, 352).unwrap();
         assert_eq!(encoded.len(), 7 + 352 * 4 + 1);
         assert_eq!(&encoded[..3], &[0x20, 0x00, 0x12]);
         assert_eq!(encoded[encoded.len() - 2] & 1, 1);
+        assert_eq!(*encoded.last().unwrap(), 0xc0);
+    }
+
+    #[test]
+    fn raw_16_short_core_chunk_zero_pads_escape_payload_like_msa() {
+        let pcm = vec![0u8; 7 * 4];
+        let encoded = encode_alac_raw_16_stereo(&pcm, 7).unwrap();
+        assert_eq!(encoded.len(), 7 + 352 * 4 + 1);
         assert_eq!(*encoded.last().unwrap(), 0xc0);
     }
 
