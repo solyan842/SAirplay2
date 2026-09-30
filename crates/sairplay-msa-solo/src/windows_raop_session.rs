@@ -22,6 +22,10 @@ use std::time::{Duration, Instant};
 pub const MSA_LIBRAOP_PIN: &str = "81c2182649da8645ac2a58b78e9f370c79a4165b";
 pub const RAOP_FRAMES_PER_PACKET: usize = 352;
 pub const RAOP_PCM_PACKET_BYTES: usize = RAOP_FRAMES_PER_PACKET * 4;
+
+fn input_bytes_per_frame(bit_depth: u16, channels: u16) -> usize {
+    (if bit_depth <= 16 { 2 } else { 4 }) * channels as usize
+}
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -38,6 +42,10 @@ pub struct MsaRaopConfig {
     pub password: Option<String>,
     pub compressed_alac: bool,
     pub mfi_auth: bool,
+    pub sample_rate: u32,
+    pub bit_depth: u16,
+    pub channels: u16,
+    pub lead_ms: u32,
 }
 impl MsaRaopConfig {
     pub fn new(host: impl Into<String>, port: u16) -> Self {
@@ -51,6 +59,10 @@ impl MsaRaopConfig {
             password: None,
             compressed_alac: true,
             mfi_auth: false,
+            sample_rate: 44_100,
+            bit_depth: 16,
+            channels: 2,
+            lead_ms: 2_000,
         }
     }
 }
@@ -92,18 +104,21 @@ impl std::error::Error for MsaRaopError {}
 pub struct MsaRaopReady {
     pub latency_frames: u32,
     pub sample_rate: u32,
+    pub bit_depth: u16,
+    pub channels: u16,
 }
 
 #[derive(Clone)]
 pub struct MsaRaopPcmWriter {
     stdin: Arc<Mutex<ChildStdin>>,
+    packet_bytes: usize,
 }
 impl MsaRaopPcmWriter {
     pub fn write_packet(&self, packet: &[u8]) -> Result<(), MsaRaopError> {
-        if packet.len() != RAOP_PCM_PACKET_BYTES {
+        if packet.len() != self.packet_bytes {
             return Err(MsaRaopError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("RAOP PCM packet must be {RAOP_PCM_PACKET_BYTES} bytes"),
+                format!("RAOP PCM packet must be {} bytes", self.packet_bytes),
             )));
         }
         self.stdin.lock().map_err(|_| MsaRaopError::Pipe)?
@@ -146,7 +161,10 @@ impl MsaRaopSession {
             .arg("--artwork").arg(&artwork_path)
             .arg("-p").arg(config.port.to_string())
             .arg("-v").arg(config.volume.min(100).to_string())
-            .arg("-l").arg("44100")
+            .arg("-l").arg(config.lead_ms.to_string())
+            .arg("-r").arg(config.sample_rate.to_string())
+            .arg("-b").arg(config.bit_depth.to_string())
+            .arg("-c").arg(config.channels.to_string())
             .arg("-t").arg(&config.et)
             .arg("-m").arg(&config.md);
         if !config.compressed_alac { cmd.arg("--pcm"); }
@@ -183,15 +201,24 @@ impl MsaRaopSession {
                 if let Some(rest) = line.strip_prefix("MSA-RAOP READY ") {
                     let mut latency = None;
                     let mut rate = None;
+                    let mut depth = None;
+                    let mut channels = None;
                     for token in rest.split_whitespace() {
                         if let Some(v) = token.strip_prefix("latency=") {
                             latency = v.parse::<u32>().ok();
                         } else if let Some(v) = token.strip_prefix("sample_rate=") {
                             rate = v.parse::<u32>().ok();
+                        } else if let Some(v) = token.strip_prefix("bit_depth=") {
+                            depth = v.parse::<u16>().ok();
+                        } else if let Some(v) = token.strip_prefix("channels=") {
+                            channels = v.parse::<u16>().ok();
                         }
                     }
-                    if let (Some(latency_frames), Some(sample_rate)) = (latency, rate) {
-                        let _ = ready_tx.send(Ok(MsaRaopReady { latency_frames, sample_rate }));
+                    if let (Some(latency_frames), Some(sample_rate), Some(bit_depth), Some(channels)) =
+                        (latency, rate, depth, channels) {
+                        let _ = ready_tx.send(Ok(MsaRaopReady {
+                            latency_frames, sample_rate, bit_depth, channels
+                        }));
                         reported = true;
                     }
                 } else if let Some(rest) = line.strip_prefix("MSA-RAOP HEAD ") {
@@ -313,7 +340,11 @@ impl MsaRaopSession {
     }
 
     pub fn pcm_writer(&self) -> MsaRaopPcmWriter {
-        MsaRaopPcmWriter { stdin: Arc::clone(&self.stdin) }
+        MsaRaopPcmWriter {
+            stdin: Arc::clone(&self.stdin),
+            packet_bytes: RAOP_FRAMES_PER_PACKET
+                * input_bytes_per_frame(self.ready.bit_depth, self.ready.channels),
+        }
     }
 
     pub fn write_pcm_packet(&self, packet: &[u8]) -> Result<(), MsaRaopError> {
