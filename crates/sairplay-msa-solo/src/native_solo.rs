@@ -1108,6 +1108,15 @@ impl NativeSoloEngine {
         self.mrp_event.as_ref()?.pop_command()
     }
 
+    pub fn set_remote_command_callback(
+        &self,
+        callback: Option<crate::MrpRemoteCommandCallback>,
+    ) {
+        if let Some(worker) = self.mrp_event.as_ref() {
+            worker.set_callback(callback);
+        }
+    }
+
     pub fn uses_ptp(&self) -> bool { self.runtime.use_ptp }
 
     pub fn splice_pad_frames(&self) -> u64 { self.runtime.splice_pad_frames }
