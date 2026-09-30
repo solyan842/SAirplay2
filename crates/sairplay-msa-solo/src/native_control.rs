@@ -37,6 +37,8 @@ pub struct NativeControlConfig {
     pub buffered_requested: bool,
     pub prefer_ptp: bool,
     pub follow_receiver_clock: bool,
+    pub bind_ip: Option<IpAddr>,
+    pub publish_ip: Option<IpAddr>,
 }
 
 impl NativeControlConfig {
@@ -53,6 +55,8 @@ impl NativeControlConfig {
             buffered_requested: false,
             prefer_ptp: false,
             follow_receiver_clock: false,
+            bind_ip: None,
+            publish_ip: None,
         }
     }
 }
@@ -61,6 +65,8 @@ impl NativeControlConfig {
 pub enum NativeControlError {
     Preflight(String),
     Pairing(String),
+    AuthRequired(String),
+    AuthFailed(String),
     Flow(String),
     Identity,
     SessionSetup(String),
@@ -77,6 +83,7 @@ pub struct NativeControlReady {
     pub info: Ap2Info,
     pub receiver: SocketAddr,
     pub local_ip: IpAddr,
+    pub publish_ip: IpAddr,
     pub session_uri: String,
     pub session_id: u32,
     pub ssrc: u32,
@@ -96,8 +103,8 @@ pub fn open_native_control(
     let preflight_client = Ap2PreflightClient::new(
         config.dacp_id.clone(),
         config.active_remote.clone(),
-    );
-    let (stream, preflight) = preflight_client
+    ).with_bind_ip(config.bind_ip);
+    let (stream, mut preflight) = preflight_client
         .open_info_connection(&config.host, config.port)
         .map_err(|e| NativeControlError::Preflight(format!("{e:?}")))?;
     flow.tcp_connected()
@@ -105,30 +112,64 @@ pub fn open_native_control(
     flow.info_loaded()
         .map_err(|e| NativeControlError::Flow(format!("{e:?}")))?;
 
-    let local_addr = stream.local_addr()
+    let mut local_addr = stream.local_addr()
         .map_err(|e| NativeControlError::Preflight(format!("local addr: {e}")))?;
-    let receiver = preflight.peer;
+    let mut receiver = preflight.peer;
+    let credentials = match config.auth_credentials.as_deref() {
+        Some(raw) => Some(StoredHapCredentials::from_hex(raw)
+            .map_err(|e| NativeControlError::Pairing(format!("{e:?}")))?),
+        None => None,
+    };
 
-    // Same TCP socket survives /info -> pairing -> encrypted RTSP.
-    let paired = if let Some(credentials_hex) = config.auth_credentials.as_deref() {
-        let credentials = StoredHapCredentials::from_hex(credentials_hex)
-            .map_err(|e| NativeControlError::Pairing(format!("{e:?}")))?;
+    // Pinned MSA password ladder:
+    //  1) transient pair-setup using the device password,
+    //  2) if the receiver rejects that leg and stored credentials exist,
+    //     reopen TCP, repeat GET /info, then pair-verify.
+    // A transport death during leg 1 is terminal; nothing was rejected.
+    let paired = if let Some(password) = config.password.as_deref().filter(|v| !v.is_empty()) {
+        match TransientPairingClient::default()
+            .pair_channel_on_stream(stream, receiver, Some(password))
+        {
+            Ok(session) => session,
+            Err(error) if !pairing_error_is_transport(&error) && credentials.is_some() => {
+                let (retry_stream, retry_preflight) = preflight_client
+                    .open_info_connection(&config.host, config.port)
+                    .map_err(|e| NativeControlError::Preflight(format!("pair-verify retry /info: {e:?}")))?;
+                local_addr = retry_stream.local_addr()
+                    .map_err(|e| NativeControlError::Preflight(format!("retry local addr: {e}")))?;
+                receiver = retry_preflight.peer;
+                preflight = retry_preflight;
+                NativeHapPairingClient::default()
+                    .pair_verify_on_stream(
+                        retry_stream,
+                        receiver,
+                        &config.dacp_id,
+                        credentials.as_ref().expect("checked"),
+                    )
+                    .map_err(|e| classify_pairing_error(e, true))?
+            }
+            Err(error) => return Err(classify_pairing_error(error, true)),
+        }
+    } else if let Some(credentials) = credentials.as_ref() {
         NativeHapPairingClient::default()
-            .pair_verify_on_stream(stream, receiver, &config.dacp_id, &credentials)
-            .map_err(|e| NativeControlError::Pairing(format!("{e:?}")))?
+            .pair_verify_on_stream(stream, receiver, &config.dacp_id, credentials)
+            .map_err(|e| classify_pairing_error(e, true))?
     } else {
         TransientPairingClient::default()
-            .pair_channel_on_stream(stream, receiver, config.password.as_deref())
-            .map_err(|e| NativeControlError::Pairing(format!("{e:?}")))?
+            .pair_channel_on_stream(stream, receiver, None)
+            .map_err(|e| classify_pairing_error(e, false))?
     };
     flow.paired()
         .map_err(|e| NativeControlError::Flow(format!("{e:?}")))?;
 
     // MSA requires timing to be live before encrypted session SETUP. PTP is
     // attempted first when requested and falls back to NTP on startup failure.
+    let bind_ip = config.bind_ip.unwrap_or(local_addr.ip());
+    let publish_ip = config.publish_ip.or(config.bind_ip).unwrap_or(local_addr.ip());
+
     let (timing_owner, timing) = NativeTimingOwner::start(
         receiver.ip(),
-        local_addr.ip(),
+        bind_ip,
         &config.dacp_id,
         config.prefer_ptp,
         config.follow_receiver_clock,
@@ -178,7 +219,7 @@ pub fn open_native_control(
                     device_id: device_id.clone(),
                     mac_address,
                     name: config.receiver_name.clone(),
-                    local_address: local_addr.ip().to_string(),
+                    local_address: publish_ip.to_string(),
                     clock_id: master_clock_id,
                     dacp_id: config.dacp_id.clone(),
                     active_remote: config.active_remote.clone(),
@@ -201,7 +242,7 @@ pub fn open_native_control(
     // MSA opens/binds RTP data+control sockets after session SETUP/event and
     // before RECORD/stream SETUP.
     let mut media = NativeMediaOwner::prepare(
-        local_addr.ip(),
+        bind_ip,
         config.audio_format.sample_rate,
         config.audio_format.bit_depth,
         config.audio_format.channels,
@@ -272,12 +313,12 @@ pub fn open_native_control(
                 cseq: 4,
                 session_uri: session_uri.clone(),
                 receiver_address: receiver.ip().to_string(),
-                local_address: local_addr.ip().to_string(),
+                local_address: publish_ip.to_string(),
                 dacp_id: config.dacp_id.clone(),
                 active_remote: config.active_remote.clone(),
             },
         ).map_err(|e| NativeControlError::SetPeers(format!("{e:?}")))?;
-        timing_owner.set_session_peers(receiver.ip(), local_addr.ip());
+        timing_owner.set_session_peers(receiver.ip(), publish_ip);
         5
     } else {
         4
@@ -299,6 +340,7 @@ pub fn open_native_control(
         info: preflight.info,
         receiver,
         local_ip: local_addr.ip(),
+        publish_ip,
         session_uri,
         session_id,
         ssrc,
@@ -309,6 +351,43 @@ pub fn open_native_control(
         latency_max,
         next_cseq,
     })
+}
+
+fn pairing_error_is_transport(error: &crate::PairingError) -> bool {
+    matches!(
+        error,
+        crate::PairingError::Resolve
+            | crate::PairingError::Connect(_)
+            | crate::PairingError::Configure(_)
+            | crate::PairingError::Write(_)
+            | crate::PairingError::Read(_)
+            | crate::PairingError::Timeout
+            | crate::PairingError::Closed
+    )
+}
+
+fn pairing_error_is_auth(error: &crate::PairingError) -> bool {
+    matches!(
+        error,
+        crate::PairingError::Status(401 | 403)
+            | crate::PairingError::TlvError(_)
+            | crate::PairingError::InvalidServerProof
+            | crate::PairingError::InvalidCredentials
+            | crate::PairingError::InvalidSignature
+    )
+}
+
+fn classify_pairing_error(error: crate::PairingError, presented_secret: bool) -> NativeControlError {
+    let detail = format!("{error:?}");
+    if pairing_error_is_auth(&error) {
+        if presented_secret {
+            NativeControlError::AuthFailed(detail)
+        } else {
+            NativeControlError::AuthRequired(detail)
+        }
+    } else {
+        NativeControlError::Pairing(detail)
+    }
 }
 
 fn format_session_uri(local_ip: IpAddr, session_id: u32) -> String {
