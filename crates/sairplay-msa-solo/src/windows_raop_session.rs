@@ -134,6 +134,12 @@ pub struct MsaRaopSession {
     metadata_path: PathBuf,
     artwork_path: PathBuf,
     head_audible_ms: Arc<AtomicU64>,
+    meta_delivered: bool,
+    meta_title: String,
+    meta_artist: String,
+    meta_album: String,
+    meta_duration_s: u32,
+    meta_item_id: String,
     next_seq: u64,
     state: MsaRaopState,
     ready: MsaRaopReady,
@@ -254,7 +260,14 @@ impl MsaRaopSession {
 
         Ok(Self {
             child, stdin, control_path, ack_path, metadata_path, artwork_path,
-            head_audible_ms, next_seq: 1,
+            head_audible_ms,
+            meta_delivered: false,
+            meta_title: String::new(),
+            meta_artist: String::new(),
+            meta_album: String::new(),
+            meta_duration_s: 0,
+            meta_item_id: String::new(),
+            next_seq: 1,
             state: MsaRaopState::Streaming, ready, log,
         })
     }
@@ -329,9 +342,40 @@ impl MsaRaopSession {
     }
 
 
-    pub fn set_metadata(&mut self, title: &str, artist: &str, album: &str) -> Result<(), MsaRaopError> {
+    pub fn set_metadata(
+        &mut self,
+        title: &str,
+        artist: &str,
+        album: &str,
+        duration_s: u32,
+        item_id: &str,
+    ) -> Result<(), MsaRaopError> {
+        if self.meta_delivered
+            && self.meta_title == title
+            && self.meta_artist == artist
+            && self.meta_album == album
+            && self.meta_duration_s == duration_s
+            && self.meta_item_id == item_id
+        {
+            return Ok(());
+        }
         write_metadata_sidecar(&self.metadata_path, title, artist, album)?;
-        self.command("METADATA", 0, 0).map(|_| ())
+        self.command("METADATA", 0, 0)?;
+        self.meta_delivered = true;
+        self.meta_title = title.to_owned();
+        self.meta_artist = artist.to_owned();
+        self.meta_album = album.to_owned();
+        self.meta_duration_s = duration_s;
+        self.meta_item_id = item_id.to_owned();
+        Ok(())
+    }
+
+    pub fn ensure_initial_metadata(&mut self) -> Result<(), MsaRaopError> {
+        if self.meta_delivered {
+            Ok(())
+        } else {
+            self.set_metadata("cliairplay", "", "", 0, "")
+        }
     }
 
     pub fn set_artwork(&mut self, content_type: &str, data: &[u8]) -> Result<(), MsaRaopError> {
