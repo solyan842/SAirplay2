@@ -3,14 +3,14 @@
 //! sockets and MSA command/timeline semantics without touching the legacy engine.
 
 use crate::ap2::{self, Ap2CommandError, Ap2State, NativeAp2Transport, NativeLane, ResumePlan};
-use crate::clock::{clock_floor, ClockFloor};
+use crate::clock::{clock_floor, ClockFloor, AP2_CLOCK_STALL_MS};
 use crate::native_commands::{
     buffered_anchor_start, send_flushbuffered, send_realtime_flush,
     send_setrateanchortime, NativeCommandError,
 };
 use crate::native_control::{open_native_control, NativeControlConfig, NativeControlError, NativeControlReady};
 use crate::native_media::{
-    drain_buffered_pending, BufferedPending, MediaCounters, MediaHealth, MediaIo, NativeMediaState, SendResult,
+    drain_buffered_pending, pacing_window_frames, BufferedPending, MediaCounters, MediaHealth, MediaIo, NativeMediaState, SendResult,
 };
 use crate::native_runtime::NativeRuntime;
 use crate::native_sync::{PtpAnchor, SyncCounters};
@@ -50,6 +50,35 @@ pub enum SoloClockVerifyOutcome {
     Pending,
     Verified { margin_ms: i64 },
     Unverified { readiness_late_ms: Option<u64> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeFormatCapabilities {
+    pub requested: u64,
+    pub realtime_formats: u64,
+    pub buffered_formats: u64,
+    pub realtime_known: bool,
+    pub buffered_known: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeLatencyInfo {
+    pub lead_ms: u64,
+    pub device_min_frames: u32,
+    pub device_max_frames: u32,
+    pub render_latency_ms: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoloClockReadinessState { Cold, Probing, Ready, Stalled }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SoloClockReadiness {
+    pub state: SoloClockReadinessState,
+    pub streak_age_ms: u64,
+    pub exchanges: u32,
+    pub ready_at_unix_ms: u64,
+    pub ready_in_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +129,8 @@ pub struct NativeSoloEngine {
     clock_verify_requested_unix_ms: u64,
     clock_verify_anchor_unix_ms: u64,
     clock_verify_packets_at_arm: u64,
+    clock_connected_unix_ms: u64,
+    clock_last_streak_unix_ms: u64,
     monotonic_zero: Instant,
     content_paused: bool,
     content_stopped: bool,
@@ -236,6 +267,10 @@ impl NativeSoloEngine {
             clock_verify_requested_unix_ms: 0,
             clock_verify_anchor_unix_ms: 0,
             clock_verify_packets_at_arm: 0,
+            clock_connected_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+                .unwrap_or(0),
+            clock_last_streak_unix_ms: 0,
             monotonic_zero: Instant::now(),
             content_paused: false,
             content_stopped: false,
@@ -791,6 +826,97 @@ impl NativeSoloEngine {
             };
         }
         SoloClockVerifyOutcome::Pending
+    }
+
+    pub fn format_capabilities(&self) -> NativeFormatCapabilities {
+        NativeFormatCapabilities {
+            requested: self.config.control.audio_format.audio_format_code(),
+            realtime_formats: self.ready.info.realtime_formats(),
+            buffered_formats: self.ready.info.buffered_formats(),
+            realtime_known: self.ready.info.realtime.known,
+            buffered_known: self.ready.info.buffered.known,
+        }
+    }
+
+    pub fn latency_info(&self) -> NativeLatencyInfo {
+        NativeLatencyInfo {
+            lead_ms: self.runtime.lead_ms,
+            device_min_frames: self.ready.latency_min.unwrap_or(0),
+            device_max_frames: self.ready.latency_max.unwrap_or(0),
+            render_latency_ms: self.ready.arrival_to_render_latency_ms.unwrap_or(0),
+        }
+    }
+
+    pub fn audible_lag_frames(&self) -> u64 {
+        if self.runtime.splice_timeline || self.runtime.lane == NativeLane::Buffered {
+            pacing_window_frames(
+                self.runtime.media.timeline.sample_rate,
+                self.runtime.dev_latency_max,
+                self.runtime.lane == NativeLane::Buffered,
+                self.runtime.splice_timeline,
+                self.runtime.splice_depth_ms,
+                self.runtime.splice_depth_explicit,
+            )
+        } else {
+            frames_for_ms(self.runtime.lead_ms, self.runtime.media.timeline.sample_rate)
+        }
+    }
+
+    pub fn warm_lead_ms(&self) -> u64 {
+        if self.runtime.splice_timeline { self.runtime.splice_depth_ms } else { 0 }
+    }
+
+    pub fn head_audible_unix_ms(&self) -> u64 {
+        if self.runtime.media.timeline.head_frame == 0 { 0 } else {
+            ms_for_frames(
+                self.runtime.media.timeline.head_frame,
+                self.runtime.media.timeline.sample_rate,
+            )
+        }
+    }
+
+    pub fn clock_watch_restart(&mut self) {
+        self.clock_last_streak_unix_ms = self.now_unix_ms();
+    }
+
+    pub fn clock_readiness(&mut self) -> SoloClockReadiness {
+        if !self.ready.timing_owner.use_ptp() || self.runtime.state == Ap2State::Down {
+            return SoloClockReadiness {
+                state: SoloClockReadinessState::Cold,
+                streak_age_ms: 0,
+                exchanges: 0,
+                ready_at_unix_ms: 0,
+                ready_in_ms: 0,
+            };
+        }
+        let now = self.now_unix_ms();
+        if let Some(ex) = self.ready.timing_owner.probe_streak() {
+            self.clock_last_streak_unix_ms = now;
+            let ready_at = crate::clock::ready_from(now, self.config.apple_model, ex);
+            return SoloClockReadiness {
+                state: if ready_at > now {
+                    SoloClockReadinessState::Probing
+                } else {
+                    SoloClockReadinessState::Ready
+                },
+                streak_age_ms: ex.first_age_ms,
+                exchanges: ex.exchanges,
+                ready_at_unix_ms: ready_at,
+                ready_in_ms: ready_at.saturating_sub(now),
+            };
+        }
+        let stall_from = self.clock_last_streak_unix_ms.max(self.clock_connected_unix_ms);
+        SoloClockReadiness {
+            state: if stall_from != 0 && now >= stall_from.saturating_add(AP2_CLOCK_STALL_MS) {
+                SoloClockReadinessState::Stalled
+            } else {
+                SoloClockReadinessState::Cold
+            },
+            streak_age_ms: 0,
+            exchanges: 0,
+            ready_at_unix_ms: 0,
+            ready_in_ms: 0,
+        }
     }
 
     pub fn mrp_controller(&self) -> Option<MrpController> {
