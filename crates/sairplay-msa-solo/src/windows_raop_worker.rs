@@ -48,6 +48,7 @@ pub struct WindowsRaopAudioWorker {
     delivery_enabled: Arc<AtomicBool>,
     flush_generation: Arc<AtomicU64>,
     flush_ack_generation: Arc<AtomicU64>,
+    audio_ready: Arc<AtomicBool>,
     first_start_done: Arc<AtomicBool>,
     capture_worker: Option<JoinHandle<()>>,
     writer_worker: Option<JoinHandle<()>>,
@@ -79,6 +80,7 @@ impl WindowsRaopAudioWorker {
         let delivery_enabled=Arc::new(AtomicBool::new(false));
         let flush_generation=Arc::new(AtomicU64::new(0));
         let flush_ack_generation=Arc::new(AtomicU64::new(0));
+        let audio_ready=Arc::new(AtomicBool::new(false));
         let first_start_done=Arc::new(AtomicBool::new(false));
         let last_error=Arc::new(Mutex::new(None));
 
@@ -109,6 +111,7 @@ impl WindowsRaopAudioWorker {
         let enabled_c=Arc::clone(&delivery_enabled);
         let flush_c=Arc::clone(&flush_generation);
         let flush_ack_c=Arc::clone(&flush_ack_generation);
+        let audio_ready_c=Arc::clone(&audio_ready);
         let error_c=Arc::clone(&last_error);
         let (ready_tx,ready_rx)=mpsc::sync_channel::<Result<(),String>>(1);
         let capture_worker=thread::Builder::new().name("msa-raop-wasapi".into()).spawn(move||{
@@ -134,6 +137,7 @@ impl WindowsRaopAudioWorker {
                     chunker.clear();
                     pending_packet=None;
                     local_flush=generation;
+                    audio_ready_c.store(false,Ordering::SeqCst);
                     flush_ack_c.store(generation,Ordering::SeqCst);
                 }
 
@@ -145,6 +149,9 @@ impl WindowsRaopAudioWorker {
                     }
                 };
                 let _=chunker.truncate_pending(ring_capacity_bytes);
+                if chunker.has_packet() {
+                    audio_ready_c.store(true, Ordering::SeqCst);
+                }
 
                 if !enabled_c.load(Ordering::SeqCst) {
                     if report.frames==0 { thread::sleep(Duration::from_millis(1)); }
@@ -176,7 +183,7 @@ impl WindowsRaopAudioWorker {
         match ready_rx.recv_timeout(Duration::from_secs(3)) {
             Ok(Ok(()))=>Ok(Self{
                 session,running,delivery_enabled,flush_generation,flush_ack_generation,
-                first_start_done,capture_worker:Some(capture_worker),
+                audio_ready,first_start_done,capture_worker:Some(capture_worker),
                 writer_worker:Some(writer_worker),last_error,
             }),
             Ok(Err(message))=>{
@@ -198,6 +205,7 @@ impl WindowsRaopAudioWorker {
     }
 
     pub fn session(&self)->SharedMsaRaopSession{Arc::clone(&self.session)}
+    pub fn audio_ready(&self)->bool{self.audio_ready.load(Ordering::SeqCst)}
     pub fn is_running(&self)->bool{self.running.load(Ordering::SeqCst)}
     pub fn last_error(&self)->Option<String>{self.last_error.lock().ok().and_then(|v|v.clone())}
 
