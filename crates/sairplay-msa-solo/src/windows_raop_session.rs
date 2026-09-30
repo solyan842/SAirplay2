@@ -349,10 +349,6 @@ impl MsaRaopSession {
         self.state = MsaRaopState::Down;
         Ok(())
     }
-    pub fn keepalive(&mut self) -> Result<(), MsaRaopError> {
-        self.command("KEEPALIVE", 0, 0).map(|_| ())
-    }
-
     pub fn set_volume(&mut self, percent: u8) -> Result<(), MsaRaopError> {
         self.command("VOLUME", percent.min(100) as u64, 0).map(|_| ())
     }
