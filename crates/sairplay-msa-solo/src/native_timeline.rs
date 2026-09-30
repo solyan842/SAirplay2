@@ -116,7 +116,7 @@ mod tests{
  }
  #[test]fn splice_padding_is_frame_exact(){let p=hot_splice(48_000,1125,48000);assert_eq!(p.pad_frames,6000);assert_eq!(p.accepted_unix_ms,1125);}
  #[test]fn splice_padding_preserves_nonzero_head_domain(){let p=hot_splice(88_200,2250,44100);assert_eq!(p.pad_frames,11025);assert_eq!(p.accepted_unix_ms,2250);}
- #[test]fn stale_splice_moves_one_lead_beyond_head(){let p=hot_splice(88_200,1900,44100);assert_eq!(p.accepted_unix_ms,2250);assert_eq!(p.pad_frames,11024);assert!(p.corrected);}
+ #[test]fn stale_splice_moves_one_lead_beyond_head(){let p=hot_splice(88_200,1900,44100);assert_eq!(p.accepted_unix_ms,2250);assert_eq!(p.pad_frames,11025);assert!(p.corrected);}
  #[test]fn ntp_frame_conversion_keeps_fractional_sample_contract(){
   let ntp=unix_ms_to_ntp(1125);assert_eq!(ntp_to_frames(ntp,44100),49612);
  }
