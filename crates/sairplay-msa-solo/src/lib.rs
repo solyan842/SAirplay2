@@ -19,6 +19,10 @@ pub mod wasapi_loopback;
 pub mod windows_audio_worker;
 #[cfg(windows)]
 pub mod windows_raop_session;
+#[cfg(windows)]
+pub mod windows_raop_worker;
+#[cfg(windows)]
+pub mod windows_solo_client;
 pub mod native_rtx_worker;
 pub mod feedback;
 pub mod native_commands;
@@ -284,7 +288,8 @@ pub use event_channel::{open_event_channel, open_event_channel_best_effort, Even
 
 pub use native_media_owner::{NativeMediaOwner, NativeMediaOwnerError};
 pub use native_control::{
-    open_native_control, LiveTiming, NativeControlConfig, NativeControlError, NativeControlReady,
+    open_native_control, LiveTiming, NativeControlConfig, NativeControlError,
+    NativeControlErrorClass, NativeControlReady,
 };
 
 pub use ntp_timing::{build_timing_response, system_time_to_ntp, NtpTimingError, NtpTimingResponder};
@@ -334,3 +339,13 @@ pub use mrp_datastream::{MrpDataStream, MrpDataStreamError, MrpDataStreamWorker,
 
 #[cfg(windows)]
 pub use windows_raop_session::{MsaRaopConfig, MsaRaopError, MsaRaopReady, MsaRaopSession, MsaRaopState, MSA_LIBRAOP_PIN, RAOP_FRAMES_PER_PACKET, RAOP_PCM_PACKET_BYTES};
+
+#[cfg(windows)]
+pub use windows_raop_worker::{
+    SharedMsaRaopSession, WindowsRaopAudioWorker, WindowsRaopWorkerError,
+};
+#[cfg(windows)]
+pub use windows_solo_client::{
+    SoloConnectError, SoloConnectErrorClass, SoloFlushAck, WindowsMsaSoloClient,
+    WindowsMsaSoloConfig, WindowsMsaSoloError,
+};
