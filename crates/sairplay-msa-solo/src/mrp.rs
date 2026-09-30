@@ -294,6 +294,14 @@ impl MrpState {
         ]
     }
 
+    pub(crate) fn build_type130_state_message(&self, include_artwork: bool) -> Vec<u8> {
+        self.build_set_state_proto(include_artwork)
+    }
+
+    pub(crate) fn build_type130_disconnect_message(&self) -> Vec<u8> {
+        build_connection_state_proto(3)
+    }
+
     fn build_device_info_proto(&self) -> Vec<u8> {
         let mut inner = Vec::new();
         pb_string(&mut inner, 1, &self.device_uuid);
