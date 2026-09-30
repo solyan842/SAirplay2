@@ -21,11 +21,6 @@ pub fn pacing_window_frames(sample_rate:u32,dev_latency_max:u64,buffered:bool,sp
  if buffered{return window.max(depth)}
  if splice{if !reported&&depth_explicit{return depth}window=window.min(depth);}
  window
- #[derive(Default)]struct FakeAlac;impl AlacEncoder for FakeAlac{type Error=();fn encode(&mut self,pcm:&[u8],_:u32)->Result<Vec<u8>,Self::Error>{Ok(pcm.to_vec())}}
- #[derive(Default)]struct FakeCipher;impl AudioCipher for FakeCipher{type Error=();fn seal(&mut self,_:&[u8;12],_:&[u8],plain:&[u8])->Result<(Vec<u8>,[u8;16]),Self::Error>{Ok((plain.to_vec(),[0xaa;16]))}}
- #[test]fn realtime_builder_matches_msa_wire_shape(){let s=state(true);let p=build_realtime_packet(&s,0x05060708,&[9,8,7],352,&mut FakeAlac,&mut FakeCipher).unwrap();assert_eq!(&p.bytes[..12],&[0x80,0xe0,0x12,0x34,0,0,0x13,0x88,5,6,7,8]);assert_eq!(&p.bytes[12..15],&[9,8,7]);assert_eq!(&p.bytes[p.bytes.len()-8..],&[0x34,0x12,0,0,0,0,0,0]);}
- #[test]fn buffered_builder_prefix_and_nonce_match_msa(){let mut s=state(true);s.counters.nonce_counter=0x0807060504030201;let p=build_buffered_frame(&s,0x05060708,&[9,8,7],352,&mut FakeAlac,&mut FakeCipher).unwrap();assert_eq!(u16::from_be_bytes([p.bytes[0],p.bytes[1]]) as usize,p.bytes.len());assert_eq!(p.bytes[3],0xe7);assert_eq!(&p.bytes[p.bytes.len()-8..],&[1,2,3,4,5,6,7,8]);}
-
 }
 
 pub fn pacing_accept(now_frame:u64,head_frame:u64,window_frames:u64,last_release_us:u64,now_us:u64)->bool{
@@ -117,6 +112,10 @@ impl BufferedPending{
 #[cfg(test)] mod tests{
  use super::*;
  fn state(first:bool)->NativeMediaState{NativeMediaState{timeline:Timeline{sample_rate:44100,head_frame:1000,wire_rtp:5000,rtp_offset:4000,seq:0x1234,first_packet:first},counters:MediaCounters{sent:0,dropped:0,nonce_counter:0}}}
+ #[derive(Default)]struct FakeAlac;impl AlacEncoder for FakeAlac{type Error=();fn encode(&mut self,pcm:&[u8],_:u32)->Result<Vec<u8>,Self::Error>{Ok(pcm.to_vec())}}
+ #[derive(Default)]struct FakeCipher;impl AudioCipher for FakeCipher{type Error=();fn seal(&mut self,_:&[u8;12],_:&[u8],plain:&[u8])->Result<(Vec<u8>,[u8;16]),Self::Error>{Ok((plain.to_vec(),[0xaa;16]))}}
+ #[test]fn realtime_builder_matches_msa_wire_shape(){let s=state(true);let p=build_realtime_packet(&s,0x05060708,&[9,8,7],352,&mut FakeAlac,&mut FakeCipher).unwrap();assert_eq!(&p.bytes[..12],&[0x80,0xe0,0x12,0x34,0,0,0x13,0x88,5,6,7,8]);assert_eq!(&p.bytes[12..15],&[9,8,7]);assert_eq!(&p.bytes[p.bytes.len()-8..],&[0x34,0x12,0,0,0,0,0,0]);}
+ #[test]fn buffered_builder_prefix_and_nonce_match_msa(){let mut s=state(true);s.counters.nonce_counter=0x0807060504030201;let p=build_buffered_frame(&s,0x05060708,&[9,8,7],352,&mut FakeAlac,&mut FakeCipher).unwrap();assert_eq!(u16::from_be_bytes([p.bytes[0],p.bytes[1]]) as usize,p.bytes.len());assert_eq!(p.bytes[3],0xe7);assert_eq!(&p.bytes[p.bytes.len()-8..],&[1,2,3,4,5,6,7,8]);}
  #[test]fn headers_match_msa(){let r=RtpHeader::new(false,true,0x1234,0x01020304,0x05060708);assert_eq!(r.bytes,[0x80,0xe0,0x12,0x34,1,2,3,4,5,6,7,8]);let b=RtpHeader::new(true,false,0x1234,0x01020304,0x05060708);assert_eq!(b.bytes[1],0x67);assert_eq!(b.aad(),&[1,2,3,4,5,6,7,8]);}
  #[test]fn nonce_contracts(){assert_eq!(realtime_nonce(0x1234),[0,0,0,0,0x34,0x12,0,0,0,0,0,0]);let n=buffered_nonce(0x0807060504030201);assert_eq!(n,[0,0,0,0,1,2,3,4,5,6,7,8]);assert_eq!(trailing_nonce(&n),[1,2,3,4,5,6,7,8]);}
  #[test]fn buffered_prefix_counts_itself(){assert_eq!(buffered_total_len(100),Some(138));}
