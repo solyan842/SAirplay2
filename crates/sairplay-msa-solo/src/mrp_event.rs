@@ -17,10 +17,13 @@ pub enum MrpRemoteCommand {
     Previous,
 }
 
+pub type MrpRemoteCommandCallback = Arc<dyn Fn(MrpRemoteCommand) + Send + Sync + 'static>;
+
 pub struct MrpEventWorker {
     stop: Arc<AtomicBool>,
     healthy: Arc<AtomicBool>,
     commands: Arc<Mutex<VecDeque<MrpRemoteCommand>>>,
+    callback: Arc<Mutex<Option<MrpRemoteCommandCallback>>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -29,10 +32,12 @@ impl MrpEventWorker {
         let stop = Arc::new(AtomicBool::new(false));
         let healthy = Arc::new(AtomicBool::new(true));
         let commands = Arc::new(Mutex::new(VecDeque::new()));
+        let callback = Arc::new(Mutex::new(None));
 
         let stop_thread = Arc::clone(&stop);
         let healthy_thread = Arc::clone(&healthy);
         let commands_thread = Arc::clone(&commands);
+        let callback_thread = Arc::clone(&callback);
 
         let worker = thread::spawn(move || {
             let mut plain = Vec::<u8>::with_capacity(16 * 1024);
@@ -40,7 +45,12 @@ impl MrpEventWorker {
                 match channel.read_plaintext() {
                     Ok(Some(frame)) => {
                         plain.extend_from_slice(&frame);
-                        if !process_requests(&mut channel, &mut plain, &commands_thread) {
+                        if !process_requests(
+                            &mut channel,
+                            &mut plain,
+                            &commands_thread,
+                            &callback_thread,
+                        ) {
                             healthy_thread.store(false, Ordering::SeqCst);
                             break;
                         }
@@ -58,6 +68,7 @@ impl MrpEventWorker {
             stop,
             healthy,
             commands,
+            callback,
             worker: Some(worker),
         }
     }
@@ -68,6 +79,12 @@ impl MrpEventWorker {
 
     pub fn pop_command(&self) -> Option<MrpRemoteCommand> {
         self.commands.lock().ok()?.pop_front()
+    }
+
+    pub fn set_callback(&self, callback: Option<MrpRemoteCommandCallback>) {
+        if let Ok(mut slot) = self.callback.lock() {
+            *slot = callback;
+        }
     }
 
     pub fn stop(&mut self) {
@@ -88,6 +105,7 @@ fn process_requests(
     channel: &mut EventChannel,
     plain: &mut Vec<u8>,
     commands: &Arc<Mutex<VecDeque<MrpRemoteCommand>>>,
+    callback: &Arc<Mutex<Option<MrpRemoteCommandCallback>>>,
 ) -> bool {
     let mut off = 0usize;
     while off < plain.len() {
@@ -128,6 +146,10 @@ fn process_requests(
             if let Some(command) = parse_remote_command(body) {
                 if let Ok(mut queue) = commands.lock() {
                     queue.push_back(command);
+                }
+                let cb = callback.lock().ok().and_then(|slot| slot.clone());
+                if let Some(cb) = cb {
+                    cb(command);
                 }
             }
         }
