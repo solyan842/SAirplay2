@@ -338,7 +338,7 @@ pub use mrp_event::{MrpEventWorker, MrpRemoteCommand};
 pub use mrp_datastream::{MrpDataStream, MrpDataStreamError, MrpDataStreamWorker, MRP_CLIENT_TYPE_UUID, MRP_STREAM_CONTROL_TYPE, MRP_STREAM_TYPE_REMOTE_CONTROL};
 
 #[cfg(windows)]
-pub use windows_raop_session::{MsaRaopConfig, MsaRaopError, MsaRaopReady, MsaRaopSession, MsaRaopState, MSA_LIBRAOP_PIN, RAOP_FRAMES_PER_PACKET, RAOP_PCM_PACKET_BYTES};
+pub use windows_raop_session::{MsaRaopConfig, MsaRaopError, MsaRaopPcmWriter, MsaRaopReady, MsaRaopSession, MsaRaopState, MSA_LIBRAOP_PIN, RAOP_FRAMES_PER_PACKET, RAOP_PCM_PACKET_BYTES};
 
 #[cfg(windows)]
 pub use windows_raop_worker::{
