@@ -158,6 +158,7 @@ impl BufferedPending{
 #[cfg(test)] mod tests{
  use super::*;
  struct FakeIo{rt:SendResult,writes:Vec<StreamWrite>,rtx:usize}
+ impl Default for FakeIo{fn default()->Self{Self{rt:SendResult::Sent,writes:Vec::new(),rtx:0}}}
  impl MediaIo for FakeIo{fn send_realtime(&mut self,_:&[u8])->SendResult{self.rt}fn send_buffered(&mut self,_:&[u8])->StreamWrite{if self.writes.is_empty(){StreamWrite::Complete}else{self.writes.remove(0)}}fn store_retransmit(&mut self,_:u16,_:&[u8]){self.rtx+=1}}
  #[test]fn realtime_executor_stores_rtx_only_on_sent(){let mut s=state(true);let mut h=MediaHealth::default();let mut io=FakeIo{rt:SendResult::Sent,..Default::default()};let p=BuiltPacket{bytes:vec![1],seq:s.timeline.seq,rtp:s.timeline.wire_rtp,frames:352};assert_eq!(execute_realtime(&mut s,&mut h,&mut io,&p,SendResult::Sent),SendResult::Sent);assert_eq!(io.rtx,1);assert!(h.healthy);let p2=BuiltPacket{bytes:vec![2],seq:s.timeline.seq,rtp:s.timeline.wire_rtp,frames:352};io.rt=SendResult::Dropped;execute_realtime(&mut s,&mut h,&mut io,&p2,SendResult::Sent);assert_eq!(io.rtx,1);assert_eq!(s.counters.dropped,1);}
  #[test]fn fatal_sync_never_sends_audio_and_marks_unhealthy(){let mut s=state(true);let mut h=MediaHealth::default();let mut io=FakeIo{rt:SendResult::Sent,..Default::default()};let p=BuiltPacket{bytes:vec![1],seq:s.timeline.seq,rtp:s.timeline.wire_rtp,frames:352};assert_eq!(execute_realtime(&mut s,&mut h,&mut io,&p,SendResult::Fatal),SendResult::Fatal);assert!(!h.healthy);assert_eq!(s.timeline.seq,0x1234);}
