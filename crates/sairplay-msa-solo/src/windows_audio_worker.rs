@@ -338,6 +338,13 @@ impl WindowsSoloAudioWorker {
                                 starvation_started = None;
                                 last_starvation_recovery = None;
                             }
+                            Ok(SendResult::Fatal) => {
+                                if let Ok(mut slot) = error_thread.lock() {
+                                    *slot = Some("native SOLO media send returned fatal".into());
+                                }
+                                running_thread.store(false, Ordering::SeqCst);
+                                return;
+                            }
                             Err(e) => {
                                 if let Ok(mut slot) = error_thread.lock() {
                                     *slot = Some(format!("native SOLO media send failed: {e:?}"));
