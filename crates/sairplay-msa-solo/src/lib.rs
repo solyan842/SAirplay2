@@ -20,6 +20,10 @@ pub mod windows_audio_worker;
 pub mod native_rtx_worker;
 pub mod feedback;
 pub mod native_commands;
+pub mod native_parameters;
+pub mod teardown;
+pub mod native_metadata;
+pub mod volume;
 pub mod native_timing_owner;
 pub mod ptp_engine;
 pub mod ntp_timing;
@@ -302,3 +306,10 @@ pub use windows_audio_worker::{
     SharedNativeSoloEngine, WindowsSoloAudioWorker, WindowsSoloAudioWorkerError,
     AIRPLAY_CLOCK_READY_TIMEOUT, STARVATION_RECOVERY_INTERVAL,
 };
+
+pub use volume::{set_native_volume, volume_percent_to_db, VolumeError, VolumeResult};
+pub use native_metadata::{send_native_metadata, MetadataError, MetadataResult};
+pub use native_parameters::{
+    send_native_artwork, send_native_progress, ParameterError, ParameterResult,
+};
+pub use teardown::{send_teardown, TeardownError, TeardownResult};
