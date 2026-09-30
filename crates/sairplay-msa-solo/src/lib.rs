@@ -288,8 +288,9 @@ pub use native_timing_owner::NativeTimingOwner;
 
 pub use native_commands::NativeCommandError;
 pub use native_solo::{
-    NativeSoloConfig, NativeSoloEngine, NativeSoloError,
-    MSA_NATIVE_LEAD_MS, MSA_SPLICE_DEPTH_MS,
+    NativeSoloConfig, NativeSoloEngine, NativeSoloError, SoloClockVerifyOutcome,
+    AP2_CLOCK_VERIFY_POLL_MS, MSA_NATIVE_LEAD_MS, MSA_SPLICE_DEPTH_MS,
+    MSA_SPLICE_DEPTH_MAX_MS,
 };
 
 pub use feedback::{
@@ -304,7 +305,7 @@ pub use wasapi_loopback::{WasapiDrainReport, WasapiLoopbackCapture, WasapiLoopba
 #[cfg(windows)]
 pub use windows_audio_worker::{
     SharedNativeSoloEngine, WindowsSoloAudioWorker, WindowsSoloAudioWorkerError,
-    AIRPLAY_CLOCK_READY_TIMEOUT, STARVATION_RECOVERY_INTERVAL,
+    AIRPLAY_CLOCK_READY_TIMEOUT, FLUSH_DRAIN_TIMEOUT, STARVATION_RECOVERY_INTERVAL,
 };
 
 pub use volume::{set_native_volume, volume_percent_to_db, NativeVolumeControl, VolumeError, VolumeSetResult};
