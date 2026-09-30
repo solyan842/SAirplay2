@@ -94,9 +94,26 @@ pub struct MsaRaopReady {
     pub sample_rate: u32,
 }
 
+#[derive(Clone)]
+pub struct MsaRaopPcmWriter {
+    stdin: Arc<Mutex<ChildStdin>>,
+}
+impl MsaRaopPcmWriter {
+    pub fn write_packet(&self, packet: &[u8]) -> Result<(), MsaRaopError> {
+        if packet.len() != RAOP_PCM_PACKET_BYTES {
+            return Err(MsaRaopError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("RAOP PCM packet must be {RAOP_PCM_PACKET_BYTES} bytes"),
+            )));
+        }
+        self.stdin.lock().map_err(|_| MsaRaopError::Pipe)?
+            .write_all(packet).map_err(MsaRaopError::Io)
+    }
+}
+
 pub struct MsaRaopSession {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Arc<Mutex<ChildStdin>>,
     control_path: PathBuf,
     ack_path: PathBuf,
     next_seq: u64,
@@ -138,7 +155,7 @@ impl MsaRaopSession {
             .creation_flags(CREATE_NO_WINDOW);
 
         let mut child = cmd.spawn().map_err(MsaRaopError::Spawn)?;
-        let stdin = child.stdin.take().ok_or(MsaRaopError::Pipe)?;
+        let stdin = Arc::new(Mutex::new(child.stdin.take().ok_or(MsaRaopError::Pipe)?));
         let stderr = child.stderr.take().ok_or(MsaRaopError::Pipe)?;
 
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<MsaRaopReady, String>>(1);
@@ -253,14 +270,12 @@ impl MsaRaopSession {
         self.command("PROGRESS", elapsed_s as u64, duration_s as u64).map(|_| ())
     }
 
-    pub fn write_pcm_packet(&mut self, packet: &[u8]) -> Result<(), MsaRaopError> {
-        if packet.len() != RAOP_PCM_PACKET_BYTES {
-            return Err(MsaRaopError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("RAOP PCM packet must be {RAOP_PCM_PACKET_BYTES} bytes"),
-            )));
-        }
-        self.stdin.write_all(packet).map_err(MsaRaopError::Io)
+    pub fn pcm_writer(&self) -> MsaRaopPcmWriter {
+        MsaRaopPcmWriter { stdin: Arc::clone(&self.stdin) }
+    }
+
+    pub fn write_pcm_packet(&self, packet: &[u8]) -> Result<(), MsaRaopError> {
+        self.pcm_writer().write_packet(packet)
     }
 
     fn command(&mut self, name: &str, arg1: u64, arg2: u64) -> Result<u64, MsaRaopError> {
