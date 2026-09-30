@@ -15,12 +15,15 @@ use crate::native_media::{
 use crate::native_runtime::NativeRuntime;
 use crate::native_sync::{PtpAnchor, SyncCounters};
 use crate::native_rtx::{RtxCounters, RtxRing};
+use crate::feedback::FeedbackWorker;
+use crate::native_rtx_worker::RtxWorker;
 use crate::native_timeline::{
     ms_for_frames, ntp_to_frames, unix_ms_to_ntp, Timeline,
 };
 use crate::ntp_timing::system_time_to_ntp;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, atomic::Ordering};
 
 pub const MSA_NATIVE_LEAD_MS: u64 = 2000;
 pub const MSA_SPLICE_DEPTH_MS: u64 = 600;
@@ -50,6 +53,7 @@ pub enum NativeSoloError {
     Command(String),
     Timing(String),
     MediaFatal,
+    Lifecycle(String),
 }
 
 impl From<NativeControlError> for NativeSoloError {
@@ -59,6 +63,8 @@ impl From<NativeControlError> for NativeSoloError {
 pub struct NativeSoloEngine {
     pub ready: NativeControlReady,
     pub runtime: NativeRuntime,
+    feedback: FeedbackWorker,
+    rtx_worker: Option<RtxWorker>,
     config: NativeSoloConfig,
     timeline_initialized: bool,
     anchored_buffered: bool,
@@ -118,8 +124,8 @@ impl NativeSoloEngine {
             health: MediaHealth::default(),
             pending: BufferedPending::default(),
             sync_counters: SyncCounters::default(),
-            rtx_ring: RtxRing::default(),
-            rtx_counters: RtxCounters::default(),
+            rtx_ring: Arc::new(Mutex::new(RtxRing::default())),
+            rtx_counters: Arc::new(Mutex::new(RtxCounters::default())),
             ptp_anchor: PtpAnchor::default(),
             pace_last_release_us: 0,
             splice_pad_frames: 0,
@@ -127,9 +133,32 @@ impl NativeSoloEngine {
             reanchor_shifted_frames: 0,
         };
 
+        let feedback = FeedbackWorker::start(
+            Arc::clone(&ready.control),
+            Arc::clone(&ready.next_cseq),
+            config.control.dacp_id.clone(),
+            config.control.active_remote.clone(),
+        ).map_err(|e| NativeSoloError::Lifecycle(format!("feedback worker: {e}")))?;
+
+        // Pinned MSA: retransmit responder is realtime-only and non-fatal if
+        // the worker cannot be started.
+        let rtx_worker = if lane == NativeLane::Realtime {
+            ready.media.io.clone_control_socket().ok().and_then(|socket| {
+                RtxWorker::start(
+                    socket,
+                    Arc::clone(&runtime.rtx_ring),
+                    Arc::clone(&runtime.rtx_counters),
+                ).ok()
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             ready,
             runtime,
+            feedback,
+            rtx_worker,
             config,
             timeline_initialized: false,
             anchored_buffered: false,
@@ -158,6 +187,8 @@ impl NativeSoloEngine {
     }
 
     pub fn accept_frames_now(&mut self) -> Result<bool, NativeSoloError> {
+        self.refresh_control_health();
+        if self.rtsp_dead { return Ok(false); }
         let ntp = system_time_to_ntp(SystemTime::now())
             .map_err(|e| NativeSoloError::Timing(format!("{e:?}")))?;
         let now_frame = ntp_to_frames(ntp, self.runtime.media.timeline.sample_rate);
@@ -166,6 +197,8 @@ impl NativeSoloEngine {
     }
 
     pub fn send_pcm_352(&mut self, pcm: &[u8]) -> Result<SendResult, NativeSoloError> {
+        self.refresh_control_health();
+        if self.rtsp_dead { return Err(NativeSoloError::MediaFatal); }
         let timing = self.ready.timing_owner.sync_timing().map_err(NativeSoloError::Timing)?;
         let media = &mut self.ready.media;
         let result = self.runtime.send_chunk(
@@ -183,6 +216,7 @@ impl NativeSoloEngine {
     }
 
     pub fn poll_rtx_once(&mut self) -> Result<bool, NativeSoloError> {
+        if self.rtx_worker.is_some() { return Ok(false); }
         let mut buf = [0u8; 2048];
         let received = self.ready.media.io
             .recv_control_nonblocking(&mut buf)
@@ -205,10 +239,20 @@ impl NativeSoloEngine {
     pub fn effective_lead_ms(&self) -> u64 { self.runtime.lead_ms }
     pub fn clock_verify_armed(&self) -> bool { self.clock_verify_armed }
 
-    fn next_cseq(&mut self) -> u32 {
-        let cseq = self.ready.next_cseq;
-        self.ready.next_cseq = self.ready.next_cseq.wrapping_add(1);
-        cseq
+    pub fn control_healthy(&mut self) -> bool {
+        self.refresh_control_health();
+        !self.rtsp_dead && self.runtime.health.healthy
+    }
+
+    fn refresh_control_health(&mut self) {
+        if !self.feedback.healthy() {
+            self.rtsp_dead = true;
+            self.runtime.rtsp_dead = true;
+        }
+    }
+
+    fn next_cseq(&self) -> u32 {
+        self.ready.next_cseq.fetch_add(1, Ordering::SeqCst)
     }
 
     fn note_command_error(&mut self, err: &NativeCommandError) {
@@ -292,7 +336,7 @@ impl NativeAp2Transport for NativeSoloEngine {
     }
 
     fn lane(&self) -> NativeLane { self.runtime.lane }
-    fn rtsp_alive(&self) -> bool { !self.rtsp_dead }
+    fn rtsp_alive(&self) -> bool { !self.rtsp_dead && self.feedback.healthy() }
 
     fn keep_splice_queue(&mut self) {
         self.runtime.splice_pad_frames = 0;
