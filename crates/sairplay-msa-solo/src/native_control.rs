@@ -165,11 +165,11 @@ pub fn open_native_control(
     //  2) if the receiver rejects that leg and stored credentials exist,
     //     reopen TCP, repeat GET /info, then pair-verify.
     // A transport death during leg 1 is terminal; nothing was rejected.
-    let paired = if let Some(password) = config.password.as_deref().filter(|v| !v.is_empty()) {
+    let (paired, pair_verified) = if let Some(password) = config.password.as_deref().filter(|v| !v.is_empty()) {
         match TransientPairingClient::default()
             .pair_channel_on_stream(stream, receiver, Some(password))
         {
-            Ok(session) => session,
+            Ok(session) => (session, false),
             Err(error) if !pairing_error_is_transport(&error) && credentials.is_some() => {
                 let (retry_stream, retry_preflight) = preflight_client
                     .open_info_connection(&config.host, config.port)
@@ -178,25 +178,34 @@ pub fn open_native_control(
                     .map_err(|e| NativeControlError::Preflight(format!("retry local addr: {e}")))?;
                 receiver = retry_preflight.peer;
                 preflight = retry_preflight;
-                NativeHapPairingClient::default()
-                    .pair_verify_on_stream(
-                        retry_stream,
-                        receiver,
-                        &config.dacp_id,
-                        credentials.as_ref().expect("checked"),
-                    )
-                    .map_err(|e| classify_pairing_error(e, true))?
+                (
+                    NativeHapPairingClient::default()
+                        .pair_verify_on_stream(
+                            retry_stream,
+                            receiver,
+                            &config.dacp_id,
+                            credentials.as_ref().expect("checked"),
+                        )
+                        .map_err(|e| classify_pairing_error(e, true))?,
+                    true,
+                )
             }
             Err(error) => return Err(classify_pairing_error(error, true)),
         }
     } else if let Some(credentials) = credentials.as_ref() {
-        NativeHapPairingClient::default()
-            .pair_verify_on_stream(stream, receiver, &config.dacp_id, credentials)
-            .map_err(|e| classify_pairing_error(e, true))?
+        (
+            NativeHapPairingClient::default()
+                .pair_verify_on_stream(stream, receiver, &config.dacp_id, credentials)
+                .map_err(|e| classify_pairing_error(e, true))?,
+            true,
+        )
     } else {
-        TransientPairingClient::default()
-            .pair_channel_on_stream(stream, receiver, None)
-            .map_err(|e| classify_pairing_error(e, false))?
+        (
+            TransientPairingClient::default()
+                .pair_channel_on_stream(stream, receiver, None)
+                .map_err(|e| classify_pairing_error(e, false))?,
+            false,
+        )
     };
     flow.paired()
         .map_err(|e| NativeControlError::Flow(format!("{e:?}")))?;
@@ -388,7 +397,7 @@ pub fn open_native_control(
         session_uri,
         session_uuid,
         group_uuid: group_uuid_for_mrp,
-        pair_verified: config.auth_credentials.is_some(),
+        pair_verified,
         hap_shared_secret: pairing.audio_secret,
         session_id,
         ssrc,
