@@ -9,6 +9,7 @@ use crate::{
     NativeHapPairingClient, NativeMediaOwner, NtpSessionSetupConfig,
     PtpSessionSetupConfig, RecordConfig, SetPeersConfig, StoredHapCredentials,
     TransientPairingClient, BufferedStreamSetupConfig, RealtimeStreamSetupConfig,
+    NativeTimingOwner,
 };
 use crate::event_channel::open_event_channel_best_effort;
 use rand::RngCore;
@@ -32,6 +33,8 @@ pub struct NativeControlConfig {
     pub receiver_name: String,
     pub audio_format: Ap2AudioFormat,
     pub buffered_requested: bool,
+    pub prefer_ptp: bool,
+    pub follow_receiver_clock: bool,
 }
 
 impl NativeControlConfig {
@@ -46,6 +49,8 @@ impl NativeControlConfig {
             receiver_name: "SAirplay2".into(),
             audio_format: Ap2AudioFormat::ALAC_44100_16_STEREO,
             buffered_requested: false,
+            prefer_ptp: false,
+            follow_receiver_clock: false,
         }
     }
 }
@@ -74,6 +79,7 @@ pub struct NativeControlReady {
     pub session_id: u32,
     pub ssrc: u32,
     pub timing: LiveTiming,
+    pub timing_owner: NativeTimingOwner,
     pub buffered: bool,
     pub latency_min: Option<u32>,
     pub latency_max: Option<u32>,
@@ -82,7 +88,6 @@ pub struct NativeControlReady {
 
 pub fn open_native_control(
     config: &NativeControlConfig,
-    timing: LiveTiming,
 ) -> Result<NativeControlReady, NativeControlError> {
     let mut flow = NativeConnectFlow::default();
 
@@ -117,7 +122,15 @@ pub fn open_native_control(
     flow.paired()
         .map_err(|e| NativeControlError::Flow(format!("{e:?}")))?;
 
-    // The timing engine/responder is already live when this function is called.
+    // MSA requires timing to be live before encrypted session SETUP. PTP is
+    // attempted first when requested and falls back to NTP on startup failure.
+    let (timing_owner, timing) = NativeTimingOwner::start(
+        receiver.ip(),
+        local_addr.ip(),
+        &config.dacp_id,
+        config.prefer_ptp,
+        config.follow_receiver_clock,
+    ).map_err(NativeControlError::SessionSetup)?;
     flow.timing_ready()
         .map_err(|e| NativeControlError::Flow(format!("{e:?}")))?;
 
@@ -262,6 +275,7 @@ pub fn open_native_control(
                 active_remote: config.active_remote.clone(),
             },
         ).map_err(|e| NativeControlError::SetPeers(format!("{e:?}")))?;
+        timing_owner.set_session_peers(receiver.ip(), local_addr.ip());
         5
     } else {
         4
@@ -284,6 +298,7 @@ pub fn open_native_control(
         session_id,
         ssrc,
         timing,
+        timing_owner,
         buffered,
         latency_min,
         latency_max,
