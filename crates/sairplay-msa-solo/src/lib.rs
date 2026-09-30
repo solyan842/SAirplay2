@@ -9,6 +9,12 @@ pub mod native_rtx;
 pub mod native_runtime;
 pub mod native_codec;
 pub mod native_io;
+pub mod hap_pairing;
+pub mod hap_rtsp;
+pub mod hap_crypto;
+pub mod hap_srp;
+pub mod hap_tlv8;
+pub mod rtsp;
 pub mod native_connect;
 pub mod clock;
 pub mod owned_session;
@@ -210,3 +216,13 @@ mod tests {
         assert_eq!(session.read_pcm(&mut out), None);
     }
 }
+
+pub use rtsp::{RtspCodec, RtspError, RtspRequest, RtspResponse};
+pub use hap_tlv8::{Tlv8, Tlv8Error, TlvTag, HAP_TRANSIENT_FLAG};
+pub use hap_srp::{srp_client_compute, SrpClientResult, SrpError, SRP_TRANSIENT_PIN};
+pub use hap_crypto::{derive_control_keys, HapControlCipher, HapCryptoError};
+pub use hap_rtsp::{EncryptedRtspChannel, EncryptedRtspError};
+pub use hap_pairing::{
+    NativeHapPairingClient, PairingError, StoredHapCredentials,
+    TransientPairingClient, TransientPairingResult, TransientPairingSession,
+};
