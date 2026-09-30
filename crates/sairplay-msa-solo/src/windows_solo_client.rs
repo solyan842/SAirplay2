@@ -5,8 +5,10 @@
 //! resolves to native AP2 or the exact-pin RAOP-compatible transport.
 
 use crate::{
-    MsaRaopConfig, NativeControlErrorClass, NativeFormatCapabilities,
+    MsaRaopConfig, NativeControlErrorClass, NativeDiagnostics, NativeFormatCapabilities,
     NativeLatencyInfo, NativeSoloConfig, NativeSoloEngine, NativeSoloError,
+    SoloClockReadiness, SoloClockReadinessState, SoloClockVerifyOutcome,
+    MrpPushResult, MrpRemoteCommand, MrpRemoteCommandCallback,
     WindowsSoloAudioWorker,
 };
 use crate::route::{
@@ -466,4 +468,177 @@ impl WindowsMsaSoloClient {
             }
         }
     }
+
+    pub fn render_latency_ms(&self) -> u32 {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock()
+                .ok().and_then(|v| v.render_latency_ms()).unwrap_or(0),
+            Transport::Raop { .. } => 0,
+        }
+    }
+
+    pub fn audible_lag_frames(&self) -> u64 {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock()
+                .map(|v| v.audible_lag_frames()).unwrap_or(0),
+            Transport::Raop { worker } => worker.session().lock()
+                .map(|v| u64::from(v.ready().latency_frames)).unwrap_or(0),
+        }
+    }
+
+    pub fn warm_lead_ms(&self) -> u64 {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock()
+                .map(|v| v.warm_lead_ms()).unwrap_or(0),
+            Transport::Raop { .. } => 0,
+        }
+    }
+
+    pub fn splice_head_unix_ms(&self) -> u64 {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock()
+                .map(|v| v.splice_head_unix_ms()).unwrap_or(0),
+            Transport::Raop { .. } => 0,
+        }
+    }
+
+    pub fn splice_hot(&self) -> bool {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock()
+                .map(|v| v.splice_hot()).unwrap_or(false),
+            Transport::Raop { .. } => false,
+        }
+    }
+
+    pub fn uses_ptp(&self) -> bool {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock()
+                .map(|v| v.uses_ptp()).unwrap_or(false),
+            Transport::Raop { .. } => false,
+        }
+    }
+
+    pub fn clock_readiness(&self) -> SoloClockReadiness {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock()
+                .map(|mut v| v.clock_readiness()).unwrap_or(SoloClockReadiness {
+                    state: SoloClockReadinessState::Cold,
+                    streak_age_ms: 0,
+                    exchanges: 0,
+                    ready_at_unix_ms: 0,
+                    ready_in_ms: 0,
+                }),
+            Transport::Raop { .. } => SoloClockReadiness {
+                state: SoloClockReadinessState::Cold,
+                streak_age_ms: 0,
+                exchanges: 0,
+                ready_at_unix_ms: 0,
+                ready_in_ms: 0,
+            },
+        }
+    }
+
+    pub fn clock_watch_restart(&self) {
+        if let Transport::Native { engine, .. } = &self.transport {
+            if let Ok(mut v) = engine.lock() {
+                v.clock_watch_restart();
+            }
+        }
+    }
+
+    pub fn clock_verify_armed(&self) -> bool {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock()
+                .map(|v| v.clock_verify_armed()).unwrap_or(false),
+            Transport::Raop { .. } => false,
+        }
+    }
+
+    pub fn poll_clock_verify(&self) -> SoloClockVerifyOutcome {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock()
+                .map(|mut v| v.poll_clock_verify()).unwrap_or(SoloClockVerifyOutcome::Idle),
+            Transport::Raop { .. } => SoloClockVerifyOutcome::Idle,
+        }
+    }
+
+    pub fn diagnostics(&self) -> Option<NativeDiagnostics> {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock().ok().map(|v| v.diagnostics()),
+            Transport::Raop { .. } => None,
+        }
+    }
+
+    pub fn mrp_register(&self) -> Result<i32, WindowsMsaSoloError> {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock()
+                .map_err(|_| WindowsMsaSoloError::Native("native engine mutex poisoned".into()))?
+                .mrp_register()
+                .map_err(|e| WindowsMsaSoloError::Native(format!("{e:?}"))),
+            Transport::Raop { .. } => Ok(-1),
+        }
+    }
+
+    pub fn mrp_push(&self) -> Result<MrpPushResult, WindowsMsaSoloError> {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock()
+                .map_err(|_| WindowsMsaSoloError::Native("native engine mutex poisoned".into()))?
+                .mrp_push()
+                .map_err(|e| WindowsMsaSoloError::Native(format!("{e:?}"))),
+            Transport::Raop { .. } => Ok(MrpPushResult::empty()),
+        }
+    }
+
+    pub fn mrp_push_progress(&self) -> Result<MrpPushResult, WindowsMsaSoloError> {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock()
+                .map_err(|_| WindowsMsaSoloError::Native("native engine mutex poisoned".into()))?
+                .mrp_push_progress()
+                .map_err(|e| WindowsMsaSoloError::Native(format!("{e:?}"))),
+            Transport::Raop { .. } => Ok(MrpPushResult::empty()),
+        }
+    }
+
+    pub fn mrp_channel_status(&self) -> i32 {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock()
+                .map(|v| v.mrp_channel_status()).unwrap_or(-1),
+            Transport::Raop { .. } => -1,
+        }
+    }
+
+    pub fn pop_remote_command(&self) -> Option<MrpRemoteCommand> {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock().ok()?.pop_remote_command(),
+            Transport::Raop { .. } => None,
+        }
+    }
+
+    pub fn set_remote_command_callback(&self, callback: Option<MrpRemoteCommandCallback>) {
+        if let Transport::Native { engine, .. } = &self.transport {
+            if let Ok(v) = engine.lock() {
+                v.set_remote_command_callback(callback);
+            }
+        }
+    }
+
+    pub fn disconnect(&mut self) -> Result<(), WindowsMsaSoloError> {
+        match &mut self.transport {
+            Transport::Native { engine, worker } => {
+                worker.stop();
+                engine.lock()
+                    .map_err(|_| WindowsMsaSoloError::Native("native engine mutex poisoned".into()))?
+                    .disconnect()
+                    .map_err(|e| WindowsMsaSoloError::Native(format!("{e:?}")))
+            }
+            Transport::Raop { worker } => {
+                worker.stop();
+                worker.session().lock()
+                    .map_err(|_| WindowsMsaSoloError::Raop("RAOP session mutex poisoned".into()))?
+                    .disconnect();
+                Ok(())
+            }
+        }
+    }
+
 }
