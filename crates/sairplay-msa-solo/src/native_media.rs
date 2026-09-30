@@ -10,6 +10,32 @@ pub const TRAILING_NONCE_SIZE:usize=8;
 pub const BUFFERED_PREFIX_SIZE:usize=2;
 pub const PERIODIC_SYNC_CHUNKS:u16=100;
 pub const FILL_MIN_PACKET_GAP_US:u64=1000;
+pub const PACING_MARGIN_MS:u64=250;
+pub const PACING_DEFAULT_BUFFER_MS:u64=2000;
+
+pub fn pacing_window_frames(sample_rate:u32,dev_latency_max:u64,buffered:bool,splice:bool,splice_depth_ms:u64,depth_explicit:bool)->u64{
+ let margin=crate::native_timeline::frames_for_ms(PACING_MARGIN_MS,sample_rate);
+ let reported=dev_latency_max>margin;
+ let mut window=if reported{dev_latency_max-margin}else{crate::native_timeline::frames_for_ms(PACING_DEFAULT_BUFFER_MS-PACING_MARGIN_MS,sample_rate)};
+ let depth=crate::native_timeline::frames_for_ms(splice_depth_ms,sample_rate);
+ if buffered{return window.max(depth)}
+ if splice{if !reported&&depth_explicit{return depth}window=window.min(depth);}
+ window
+}
+
+pub fn pacing_accept(now_frame:u64,head_frame:u64,window_frames:u64,last_release_us:u64,now_us:u64)->bool{
+ if now_frame.saturating_add(window_frames)<head_frame{return false}
+ if last_release_us!=0&&now_us.saturating_sub(last_release_us)<FILL_MIN_PACKET_GAP_US{return false}
+ true
+}
+
+pub fn recovery_lead_frames(lead_ms:u64,window_frames:u64,sample_rate:u32)->u64{
+ crate::native_timeline::frames_for_ms(lead_ms,sample_rate).min(window_frames)
+}
+
+pub fn splice_recovery_pad(effective_head:u64,now_frame:u64,lapse_frame:u64,recovery_lead:u64)->Option<u64>{
+ if effective_head>lapse_frame{return None}let target=now_frame.saturating_add(recovery_lead);if target<=effective_head{None}else{Some(target-effective_head)}
+}
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq)] pub enum SendResult{Sent,Dropped,Fatal}
 #[derive(Debug,Clone,Copy,PartialEq,Eq)] pub enum SyncKind{Initial,Periodic}
@@ -69,4 +95,11 @@ impl BufferedPending{
  #[test]fn fatal_does_not_advance(){let mut s=state(true);s.commit_realtime(352,SendResult::Fatal,SendResult::Sent);assert_eq!(s.timeline.seq,0x1234);}
  #[test]fn buffered_commits_nonce_and_line_once(){let mut s=state(true);s.commit_buffered_frame(352);assert_eq!(s.counters.nonce_counter,1);assert_eq!(s.timeline.seq,0x1235);}
  #[test]fn pending_tail_blocks_new_frame(){let mut p=BufferedPending::default();assert!(p.park(vec![1,2,3,4]).is_ok());p.consume(2);assert_eq!(p.remaining(),&[3,4]);assert!(p.park(vec![9]).is_err());p.consume(2);assert!(p.park(vec![9]).is_ok());}
+ #[test]fn pacing_matches_msa_window_and_release_floor(){let w=pacing_window_frames(48000,0,false,false,0,false);assert_eq!(w,84000);assert!(!pacing_accept(48000,132001,w,0,10000));assert!(pacing_accept(48000,132000,w,0,10000));assert!(!pacing_accept(48000,132000,w,9501,10000));}
+ #[test]fn buffered_depth_can_expand_window(){assert_eq!(pacing_window_frames(48000,96000,true,false,3000,true),144000);}
+ #[test]fn splice_reported_window_clamps_depth(){assert_eq!(pacing_window_frames(48000,144000,false,true,3000,true),132000);}
+ #[test]fn explicit_splice_depth_outranks_default_assumption(){assert_eq!(pacing_window_frames(48000,0,false,true,3000,true),144000);}
+ #[test]fn recovery_lead_is_min_latency_and_window(){assert_eq!(recovery_lead_frames(2000,72000,48000),72000);}
+ #[test]fn splice_starvation_is_anticipatory_but_delivery_is_not(){let lead=48000;assert_eq!(splice_recovery_pad(110000,100000,112000,lead),Some(38000));assert_eq!(splice_recovery_pad(110000,100000,100000,lead),None);}
+ #[test]fn queued_splice_pad_makes_recovery_idempotent(){assert_eq!(splice_recovery_pad(148000,100000,112000,48000),None);}
 }
