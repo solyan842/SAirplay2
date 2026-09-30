@@ -5,13 +5,16 @@
 //! resolves to native AP2 or the exact-pin RAOP-compatible transport.
 
 use crate::{
-    apple_model, buffered_route, follow_receiver_clock, resolve_route_from_txt,
-    Flow, MsaRaopConfig, NativeControlErrorClass, NativeFormatCapabilities,
+    MsaRaopConfig, NativeControlErrorClass, NativeFormatCapabilities,
     NativeLatencyInfo, NativeSoloConfig, NativeSoloEngine, NativeSoloError,
-    ProtocolPreference, RouteDecision, RouteTiming, StartResolution,
-    WindowsRaopAudioWorker, WindowsRaopWorkerError, WindowsSoloAudioWorker,
-    WindowsSoloAudioWorkerError,
+    WindowsSoloAudioWorker,
 };
+use crate::route::{
+    apple_model, buffered_route, follow_receiver_clock, resolve_route_from_txt,
+    Flow, ProtocolPreference, RouteDecision, Timing as RouteTiming,
+};
+use crate::timing::StartResolution;
+use crate::windows_raop_worker::WindowsRaopAudioWorker;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
@@ -342,7 +345,7 @@ impl WindowsMsaSoloClient {
                     realtime_known: false, buffered_known: false,
                 }),
             Transport::Raop { .. } => NativeFormatCapabilities {
-                requested: 0,
+                requested: crate::ALAC_44100_16_2,
                 realtime_formats: 0,
                 buffered_formats: 0,
                 realtime_known: false,
