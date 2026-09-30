@@ -278,6 +278,15 @@ impl NativeRuntime {
         if effects.immediate_sync {
             let first = true;
             let result = if self.use_ptp {
+                self.ptp_anchor.freeze_if_needed(
+                    timing.master_now_ns,
+                    timing.local_ptp_now_ns,
+                    self.start_ntp,
+                    self.lead_ms,
+                    self.media.timeline.sample_rate,
+                    self.media.timeline.rtp_offset,
+                    self.media.timeline.wire_rtp,
+                );
                 let pkt = build_ptp_sync(
                     first,
                     self.media.timeline.wire_rtp,
