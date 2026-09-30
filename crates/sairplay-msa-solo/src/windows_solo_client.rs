@@ -5,6 +5,7 @@
 //! resolves to native AP2 or the exact-pin RAOP-compatible transport.
 
 use crate::{
+    ap2::Ap2State,
     MsaRaopConfig, NativeControlErrorClass, NativeDiagnostics, NativeFormatCapabilities,
     NativeLatencyInfo, NativeSoloConfig, NativeSoloEngine, NativeSoloError,
     SoloClockReadiness, SoloClockReadinessState, SoloClockVerifyOutcome,
@@ -481,9 +482,9 @@ impl WindowsMsaSoloClient {
     pub fn state(&self) -> WindowsMsaSoloState {
         match &self.transport {
             Transport::Native { engine, .. } => match engine.lock().map(|v| v.state()) {
-                Ok(crate::Ap2State::Connected) => WindowsMsaSoloState::Connected,
-                Ok(crate::Ap2State::Streaming) => WindowsMsaSoloState::Streaming,
-                Ok(crate::Ap2State::Paused) => WindowsMsaSoloState::Paused,
+                Ok(Ap2State::Connected) => WindowsMsaSoloState::Connected,
+                Ok(Ap2State::Streaming) => WindowsMsaSoloState::Streaming,
+                Ok(Ap2State::Paused) => WindowsMsaSoloState::Paused,
                 _ => WindowsMsaSoloState::Down,
             },
             Transport::Raop { worker } => match worker.session().lock().map(|v| v.state()) {
