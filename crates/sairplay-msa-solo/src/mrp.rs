@@ -597,6 +597,27 @@ impl MrpController {
         self.state.lock().map(|v| v.clone()).map_err(|_| MrpError::Lock)
     }
 
+    pub(crate) fn publication_guard(&self) -> Result<MutexGuard<'_, ()>, MrpError> {
+        self.publish_lock.lock().map_err(|_| MrpError::Lock)
+    }
+
+    pub(crate) fn stage_track_locked(
+        &self,
+        title: &str,
+        artist: &str,
+        album: &str,
+        duration_ms: i64,
+        item_id: &str,
+        artwork: Option<(&str, &[u8])>,
+    ) -> Result<(bool, MrpArtworkInfo), MrpError> {
+        let mut state = self.state.lock().map_err(|_| MrpError::Lock)?;
+        Ok(state.set_track(title, artist, album, duration_ms, item_id, artwork))
+    }
+
+    pub(crate) fn push_full_under_publication_lock(&self) -> Result<MrpPushResult, MrpError> {
+        self.push_full_locked()
+    }
+
     pub(crate) fn prepare_type130_state_push(
         &self,
         periodic_due: bool,
