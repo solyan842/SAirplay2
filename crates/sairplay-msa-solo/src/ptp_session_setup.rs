@@ -27,7 +27,6 @@ pub enum PtpSessionSetupError {
     Status(u16),
     Plist(plist::Error),
     InvalidRoot,
-    MissingEventPort,
     InvalidEventPort,
 }
 
@@ -43,7 +42,7 @@ impl From<plist::Error> for PtpSessionSetupError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtpSessionSetupResult {
-    pub event_port: u16,
+    pub event_port: Option<u16>,
 }
 
 fn timing_peer(peer_uuid: &str, clock_id: u64, local_address: &str) -> Value {
@@ -83,20 +82,16 @@ pub fn build_ptp_session_plist(
     Ok(out)
 }
 
-fn parse_event_port(body: &[u8]) -> Result<u16, PtpSessionSetupError> {
+fn parse_event_port(body: &[u8]) -> Result<Option<u16>, PtpSessionSetupError> {
     let value = Value::from_reader(Cursor::new(body))?;
-    let root = value
-        .as_dictionary()
-        .ok_or(PtpSessionSetupError::InvalidRoot)?;
-    let event = root
-        .get("eventPort")
-        .and_then(Value::as_unsigned_integer)
-        .ok_or(PtpSessionSetupError::MissingEventPort)?;
-
+    let root = value.as_dictionary().ok_or(PtpSessionSetupError::InvalidRoot)?;
+    let Some(event) = root.get("eventPort").and_then(Value::as_unsigned_integer) else {
+        return Ok(None);
+    };
     if !(1024..=65535).contains(&event) {
-        return Err(PtpSessionSetupError::InvalidEventPort);
+        return Ok(None);
     }
-    Ok(event as u16)
+    Ok(Some(event as u16))
 }
 
 pub fn setup_ptp_session(
