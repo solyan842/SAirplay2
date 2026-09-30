@@ -9,6 +9,7 @@ authors.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+socket2 = "0.5"
 plist = "=1.10.1"
 x25519-dalek = "2.0"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
