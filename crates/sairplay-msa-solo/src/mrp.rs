@@ -91,6 +91,9 @@ pub struct MrpState {
     pub extended_registered: bool,
     pub last_playback_state: Option<MrpPlaybackState>,
     pub progress_push_full: bool,
+    pub state_generation: u64,
+    pub state_dirty: bool,
+    pub state_include_artwork: bool,
 }
 
 impl MrpState {
@@ -127,6 +130,9 @@ impl MrpState {
             extended_registered: false,
             last_playback_state: None,
             progress_push_full: false,
+            state_generation: 1,
+            state_dirty: true,
+            state_include_artwork: false,
         }
     }
 
@@ -181,6 +187,9 @@ impl MrpState {
                 }
             }
         };
+        self.state_generation = self.state_generation.wrapping_add(1);
+        self.state_dirty = true;
+        self.state_include_artwork = !self.artwork.is_empty();
         (track_changed, art_info)
     }
 
@@ -200,13 +209,22 @@ impl MrpState {
         let mut id = [0u8; 8];
         rand::thread_rng().fill_bytes(&mut id);
         self.artwork_id = id.iter().map(|b| format!("{b:02x}")).collect();
+        self.state_generation = self.state_generation.wrapping_add(1);
+        self.state_dirty = true;
+        self.state_include_artwork = true;
         info
     }
 
     pub fn clear_artwork(&mut self) {
+        let changed = !self.artwork.is_empty() || self.artwork_mime.is_some() || !self.artwork_id.is_empty();
         self.artwork.clear();
         self.artwork_mime = None;
         self.artwork_id.clear();
+        if changed {
+            self.state_generation = self.state_generation.wrapping_add(1);
+            self.state_dirty = true;
+        }
+        self.state_include_artwork = false;
     }
 
     pub fn set_progress(&mut self, elapsed_ms: i64, duration_ms: i64, playing: bool) {
@@ -220,6 +238,8 @@ impl MrpState {
             MrpPlaybackState::Paused
         };
         self.elapsed_set_at = SystemTime::now();
+        self.state_generation = self.state_generation.wrapping_add(1);
+        self.state_dirty = true;
     }
 
     pub fn set_playing(&mut self, playing: bool) {
@@ -237,11 +257,15 @@ impl MrpState {
             MrpPlaybackState::Paused
         };
         self.elapsed_set_at = now;
+        self.state_generation = self.state_generation.wrapping_add(1);
+        self.state_dirty = true;
     }
 
     pub fn set_stopped(&mut self) {
         self.playback_state = MrpPlaybackState::Stopped;
         self.elapsed_set_at = SystemTime::now();
+        self.state_generation = self.state_generation.wrapping_add(1);
+        self.state_dirty = true;
     }
 
     pub fn build_deviceinfo_command(&self) -> Result<Vec<u8>, MrpError> {
@@ -571,6 +595,37 @@ impl MrpController {
 
     pub fn snapshot(&self) -> Result<MrpState, MrpError> {
         self.state.lock().map(|v| v.clone()).map_err(|_| MrpError::Lock)
+    }
+
+    pub(crate) fn prepare_type130_state_push(
+        &self,
+        periodic_due: bool,
+    ) -> Result<Option<(Vec<u8>, u64)>, MrpError> {
+        let state = self.state.lock().map_err(|_| MrpError::Lock)?;
+        let periodic = periodic_due && state.playback_state == MrpPlaybackState::Playing;
+        if !state.state_dirty && !periodic {
+            return Ok(None);
+        }
+        Ok(Some((
+            state.build_set_state_proto(state.state_include_artwork),
+            state.state_generation,
+        )))
+    }
+
+    pub(crate) fn complete_type130_state_push(
+        &self,
+        generation: u64,
+        success: bool,
+    ) -> Result<(), MrpError> {
+        if !success {
+            return Ok(());
+        }
+        let mut state = self.state.lock().map_err(|_| MrpError::Lock)?;
+        if state.state_generation == generation {
+            state.state_dirty = false;
+            state.state_include_artwork = false;
+        }
+        Ok(())
     }
 
     pub fn stage_track(
