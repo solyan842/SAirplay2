@@ -370,12 +370,22 @@ impl WindowsMsaSoloClient {
                     requested: 0, realtime_formats: 0, buffered_formats: 0,
                     realtime_known: false, buffered_known: false,
                 }),
-            Transport::Raop { .. } => NativeFormatCapabilities {
-                requested: crate::ALAC_44100_16_2,
-                realtime_formats: 0,
-                buffered_formats: 0,
-                realtime_known: false,
-                buffered_known: false,
+            Transport::Raop { worker } => {
+                let requested = worker.session().lock().ok().map(|v| {
+                    let r = v.ready();
+                    crate::Ap2AudioFormat {
+                        sample_rate: r.sample_rate,
+                        bit_depth: r.bit_depth,
+                        channels: r.channels,
+                    }.audio_format_code()
+                }).unwrap_or(0);
+                NativeFormatCapabilities {
+                    requested,
+                    realtime_formats: 0,
+                    buffered_formats: 0,
+                    realtime_known: false,
+                    buffered_known: false,
+                }
             },
         }
     }
