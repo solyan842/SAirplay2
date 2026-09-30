@@ -20,6 +20,15 @@ pub struct SplicePlan{pub accepted_unix_ms:u64,pub pad_frames:u64,pub corrected:
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
 pub struct RecoveryPlan{pub head_frame:u64,pub rtp_offset:u32,pub shifted_frames:u64}
 
+#[derive(Debug,Clone,Copy,PartialEq,Eq)]
+pub struct StockRecoveryEffects{
+ pub shifted_frames:u64,
+ /// MSA moves the established realtime PTP anchor wall by the exact frame shift.
+ pub anchor_shift_ns:u64,
+ /// Stock realtime recovery immediately announces the corrected line.
+ pub immediate_sync:bool,
+}
+
 /// MSA stock realtime starvation recovery. Re-anchor only when the head is
 /// inside the floor and the RTP/head invariant is still intact. The wire RTP
 /// remains continuous; the head moves forward and the offset folds backward.
@@ -47,6 +56,9 @@ pub fn frames_for_ms(ms:u64,sample_rate:u32)->u64{
 }
 pub fn ms_for_frames(frames:u64,sample_rate:u32)->u64{
  if sample_rate==0{0}else{frames.saturating_mul(1000)/u64::from(sample_rate)}
+}
+pub fn ns_for_frames(frames:u64,sample_rate:u32)->u64{
+ if sample_rate==0{0}else{((u128::from(frames)*1_000_000_000u128)/u128::from(sample_rate)) as u64}
 }
 
 /// Hot splice keeps the immutable anchor line and advances it with encoded
@@ -87,9 +99,10 @@ impl Timeline{
   }else{self.wire_rtp=(new_head_frame as u32).wrapping_add(self.rtp_offset);}
   self.first_packet=true;
  }
- pub fn recover_stock(&mut self,now_frame:u64,floor_frames:u64,recovery_lead_frames:u64)->Option<u64>{
+ pub fn recover_stock(&mut self,now_frame:u64,floor_frames:u64,recovery_lead_frames:u64)->Option<StockRecoveryEffects>{
   let p=plan_stock_recovery(self.head_frame,self.wire_rtp,self.rtp_offset,now_frame,floor_frames,recovery_lead_frames)?;
-  self.head_frame=p.head_frame;self.rtp_offset=p.rtp_offset;Some(p.shifted_frames)
+  self.head_frame=p.head_frame;self.rtp_offset=p.rtp_offset;
+  Some(StockRecoveryEffects{shifted_frames:p.shifted_frames,anchor_shift_ns:ns_for_frames(p.shifted_frames,self.sample_rate),immediate_sync:true})
  }
  pub fn advance(&mut self,frames:u32){
   self.head_frame=self.head_frame.saturating_add(u64::from(frames));
@@ -104,9 +117,14 @@ mod tests{
  use super::*;
  #[test]fn stock_recovery_preserves_wire_rtp_and_moves_head(){
   let mut t=Timeline{sample_rate:44100,head_frame:100000,wire_rtp:105000,rtp_offset:5000,seq:7,first_packet:false};
-  let shifted=t.recover_stock(120000,11025,77175).unwrap();
-  assert_eq!(shifted,97175);assert_eq!(t.head_frame,197175);assert_eq!(t.wire_rtp,105000);
+  let effects=t.recover_stock(120000,11025,77175).unwrap();
+  assert_eq!(effects.shifted_frames,97175);assert_eq!(effects.anchor_shift_ns,2_203_514_739);assert!(effects.immediate_sync);assert_eq!(t.head_frame,197175);assert_eq!(t.wire_rtp,105000);
   assert_eq!((t.head_frame as u32).wrapping_add(t.rtp_offset),t.wire_rtp);
+ }
+ #[test]fn stock_recovery_effects_match_msa_ptp_anchor_shift(){
+  let mut t=Timeline{sample_rate:48000,head_frame:48_000,wire_rtp:49_000,rtp_offset:1_000,seq:1,first_packet:false};
+  let effects=t.recover_stock(60_000,12_000,48_000).unwrap();
+  assert_eq!(effects.shifted_frames,60_000);assert_eq!(effects.anchor_shift_ns,1_250_000_000);assert!(effects.immediate_sync);
  }
  #[test]fn stock_recovery_refuses_broken_rtp_head_invariant(){
   assert_eq!(plan_stock_recovery(100000,105001,5000,120000,11025,77175),None);
