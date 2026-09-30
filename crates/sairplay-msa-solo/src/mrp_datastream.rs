@@ -6,8 +6,11 @@ use rand::RngCore;
 use sha2::Sha512;
 use std::io::{Read, Write, Cursor};
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
 
 pub const MRP_STREAM_TYPE_REMOTE_CONTROL: u64 = 130;
 pub const MRP_STREAM_CONTROL_TYPE: u64 = 2;
@@ -194,6 +197,52 @@ impl MrpDataStream {
         Ok(())
     }
 }
+
+
+pub struct MrpDataStreamWorker {
+    stop: Arc<AtomicBool>,
+    healthy: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+impl MrpDataStreamWorker {
+    pub fn start(mut stream: MrpDataStream, controller: MrpController) -> Self {
+        let stop=Arc::new(AtomicBool::new(false));
+        let healthy=Arc::new(AtomicBool::new(true));
+        let stop_t=Arc::clone(&stop); let healthy_t=Arc::clone(&healthy);
+        let worker=thread::spawn(move||{
+            let mut last_push=Instant::now();
+            while !stop_t.load(Ordering::SeqCst) {
+                if stream.tick().is_err() {
+                    healthy_t.store(false,Ordering::SeqCst);
+                    break;
+                }
+                if last_push.elapsed()>=Duration::from_secs(15) {
+                    if let Ok(state)=controller.snapshot() {
+                        let msg=state.build_type130_state_message(false);
+                        if stream.send_protobuf(&msg).is_err() {
+                            healthy_t.store(false,Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                    last_push=Instant::now();
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            if stream.connected() {
+                if let Ok(state)=controller.snapshot() {
+                    let _=stream.send_protobuf(&state.build_type130_disconnect_message());
+                }
+            }
+        });
+        Self{stop,healthy,worker:Some(worker)}
+    }
+    pub fn healthy(&self)->bool{self.healthy.load(Ordering::SeqCst)}
+    pub fn stop(&mut self){
+        self.stop.store(true,Ordering::SeqCst);
+        if let Some(w)=self.worker.take(){let _=w.join();}
+    }
+}
+impl Drop for MrpDataStreamWorker { fn drop(&mut self){self.stop();} }
 
 fn encrypt_frames(key:&[u8;32],counter:&mut u64,input:&[u8])->Result<Vec<u8>,MrpDataStreamError>{
     let cipher=ChaCha20Poly1305::new(Key::from_slice(key));
