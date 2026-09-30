@@ -1,4 +1,5 @@
 use crate::native_media::SendResult;
+use crate::native_io::{send_datagram_deadline, UDP_SEND_TIMEOUT};
 use crate::native_rtx::{build_response, parse_request, RtxCounters, RtxRing};
 use std::io;
 use std::net::UdpSocket;
@@ -56,10 +57,12 @@ impl RtxWorker {
                                     }
                                     continue;
                                 };
-                                let result = match socket.send_to(&response, peer) {
-                                    Ok(n) if n == response.len() => SendResult::Sent,
-                                    _ => SendResult::Dropped,
-                                };
+                                let result = send_datagram_deadline(
+                                    &socket,
+                                    &response,
+                                    peer,
+                                    UDP_SEND_TIMEOUT,
+                                );
                                 if result == SendResult::Sent {
                                     if let Ok(mut c) = counters.lock() {
                                         c.answered = c.answered.saturating_add(1);
