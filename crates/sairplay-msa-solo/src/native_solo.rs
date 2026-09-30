@@ -678,6 +678,19 @@ impl NativeSoloEngine {
         if let Some(worker) = self.rtx_worker.as_mut() {
             worker.stop();
         }
+
+        // Pinned ap2cl_disconnect: final STOPPED state is published while the
+        // encrypted RTSP session is still alive, after feedback/RTX workers
+        // stop but before MediaRemote event teardown and RTSP TEARDOWN.
+        if let Some(mrp) = self.mrp.clone() {
+            if let Err(e) = mrp.publish_playback_state(MrpPlaybackState::Stopped, true) {
+                self.note_mrp_error(&e);
+            }
+        }
+        if let Some(worker) = self.mrp_event.as_mut() {
+            worker.stop();
+        }
+
         self.ready.media.io.close_buffered();
 
         if !self.rtsp_dead {
