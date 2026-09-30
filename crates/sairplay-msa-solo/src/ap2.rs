@@ -145,7 +145,7 @@ pub fn resume<T:NativeAp2Transport>(t:&mut T,requested:u64)->Result<ResumePlan,A
         NativeLane::Buffered=>t.anchor_buffered_start(s.at_unix_ms).map_err(Ap2CommandError::Transport)?,
         NativeLane::Realtime=>{
             t.sync_realtime_ptp_if_ready().map_err(Ap2CommandError::Transport)?;
-            if floor.cold{t.arm_clock_verify(requested,s.at_unix_ms,false);}
+            if floor.cold && t.clock_verify_applicable(s.at_unix_ms){t.arm_clock_verify(requested,s.at_unix_ms,false);}
         }
     }
     Ok(ResumePlan{start:s,silence_pad_ms:0,preserve_anchor_line:false})
@@ -168,7 +168,7 @@ mod tests {
  #[test] fn cold_start_skips_verify_when_msa_gate_rejects_it(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:false,log:vec![]};t.cold=true;let floor=t.start_floor();assert!(floor.cold);t.cold=false;start(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","rebase_rt","anchor","streaming","sync"]);}
  #[test] fn warm_solo_start_does_not_arm_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:false,log:vec![]};start(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","rebase_rt","anchor","streaming","sync"]);}
  #[test] fn cold_stock_resume_arms_non_enforcing_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:true,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","rebase_rt","anchor","streaming","sync","verify"]);}
- #[test] fn cold_buffered_start_anchors_and_skips_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Buffered,anchor:false,cold:true,log:vec![]};start(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","rebase_buf","anchor","streaming","buf_anchor"]);}
+ #[test] fn cold_resume_skips_verify_when_msa_gate_rejects_it(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:true,log:vec![]};let floor=t.start_floor();assert!(floor.cold);t.cold=false;resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","rebase_rt","anchor","streaming","sync"]);}\n #[test] fn cold_buffered_start_anchors_and_skips_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Buffered,anchor:false,cold:true,log:vec![]};start(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","rebase_buf","anchor","streaming","buf_anchor"]);}
  #[test] fn stock_resume_flushes_realtime_before_reanchor(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Realtime,anchor:true,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","flush_rt","clear","rebase_rt","anchor","streaming","sync"]);}
  #[test] fn stock_resume_flushes_anchored_buffered_before_reanchor(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Buffered,anchor:true,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","flush_buf","clear","rebase_buf","anchor","streaming","buf_anchor"]);}
  #[test] fn stock_resume_does_not_flush_unanchored_buffered(){let mut t=Mock{state:Ap2State::Streaming,lane:NativeLane::Buffered,anchor:false,cold:false,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","rebase_buf","anchor","streaming","buf_anchor"]);}
