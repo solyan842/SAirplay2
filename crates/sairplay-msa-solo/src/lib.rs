@@ -299,7 +299,7 @@ pub use native_timing_owner::NativeTimingOwner;
 pub use native_commands::NativeCommandError;
 pub use native_solo::{
     NativeSoloConfig, NativeSoloEngine, NativeSoloError, NativeDiagnostics,
-    NativeFormatCapabilities, NativeLatencyInfo, SoloClockReadiness, SoloClockReadinessState,
+    NativeMetadataBundleResult, NativeFormatCapabilities, NativeLatencyInfo, SoloClockReadiness, SoloClockReadinessState,
     SoloClockVerifyOutcome,
     AP2_CLOCK_VERIFY_POLL_MS, MSA_NATIVE_LEAD_MS, MSA_SPLICE_DEPTH_MS,
     MSA_SPLICE_DEPTH_MAX_MS,
