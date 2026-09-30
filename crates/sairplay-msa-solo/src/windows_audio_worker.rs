@@ -44,7 +44,7 @@ impl std::error::Error for WindowsSoloAudioWorkerError {}
 
 pub struct WindowsSoloAudioWorker {
     running: Arc<AtomicBool>,
-    content_enabled: Arc<AtomicBool>,
+    engine: SharedNativeSoloEngine,
     flush_generation: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
     last_error: Arc<Mutex<Option<String>>>,
@@ -67,7 +67,6 @@ impl WindowsSoloAudioWorker {
         };
 
         let running = Arc::new(AtomicBool::new(true));
-        let content_enabled = Arc::new(AtomicBool::new(true));
         let flush_generation = Arc::new(AtomicU64::new(0));
         let last_error = Arc::new(Mutex::new(None));
         let discontinuities = Arc::new(AtomicU64::new(0));
@@ -75,7 +74,6 @@ impl WindowsSoloAudioWorker {
         let startup_events = Arc::new(Mutex::new(Vec::<String>::new()));
 
         let running_thread = Arc::clone(&running);
-        let content_thread = Arc::clone(&content_enabled);
         let flush_thread = Arc::clone(&flush_generation);
         let error_thread = Arc::clone(&last_error);
         let discontinuities_thread = Arc::clone(&discontinuities);
@@ -145,11 +143,15 @@ impl WindowsSoloAudioWorker {
                     captured_frames_total =
                         captured_frames_total.saturating_add(report.frames as u64);
 
-                    if !content_thread.load(Ordering::SeqCst) {
+                    let content_paused_or_stopped = engine_thread
+                        .lock()
+                        .map(|guard| guard.content_paused() || guard.content_stopped())
+                        .unwrap_or(true);
+                    if content_paused_or_stopped {
                         // The transport may intentionally remain STREAMING on
                         // the splice path. Feed contiguous silence there, but
                         // never turn captured system PCM into content while the
-                        // session owner says content is paused/parked.
+                        // single authoritative engine state says content is paused.
                         chunker.clear();
                         let send_silence = {
                             let mut guard = match engine_thread.lock() {
@@ -418,7 +420,7 @@ impl WindowsSoloAudioWorker {
         match ready_rx.recv_timeout(Duration::from_secs(3)) {
             Ok(Ok(())) => Ok(Self {
                 running,
-                content_enabled,
+                engine,
                 flush_generation,
                 worker: Some(worker),
                 last_error,
@@ -441,8 +443,15 @@ impl WindowsSoloAudioWorker {
         }
     }
 
-    pub fn set_content_enabled(&self, enabled: bool) {
-        self.content_enabled.store(enabled, Ordering::SeqCst);
+    pub fn set_content_enabled(&self, enabled: bool) -> Result<(), WindowsSoloAudioWorkerError> {
+        let mut engine = self.engine.lock().map_err(|_| {
+            WindowsSoloAudioWorkerError::Engine("native SOLO engine mutex poisoned".into())
+        })?;
+        if enabled {
+            engine.play_content().map_err(|e| WindowsSoloAudioWorkerError::Engine(format!("play: {e:?}")))
+        } else {
+            engine.pause_content().map_err(|e| WindowsSoloAudioWorkerError::Engine(format!("pause: {e:?}")))
+        }
     }
 
     /// Clears capture bytes without changing the AP2 wire timeline. Session
