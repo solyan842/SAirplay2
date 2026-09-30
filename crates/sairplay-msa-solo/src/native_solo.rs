@@ -1125,6 +1125,12 @@ impl NativeSoloEngine {
         self.runtime.take_splice_pad_frames(frames)
     }
 
+    /// Corrected-JOIN content cuts are a MultiRoom-only contract. A SOLO
+    /// origin never arms start_join and therefore never accrues this debt.
+    pub fn content_skip_bytes(&self) -> u32 { 0 }
+
+    pub fn consume_content_skip_bytes(&mut self, _bytes: u32) {}
+
     pub fn diagnostics(&self) -> NativeDiagnostics {
         let now_frame = system_time_to_ntp(SystemTime::now())
             .map(|ntp| ntp_to_frames(ntp, self.runtime.media.timeline.sample_rate))
