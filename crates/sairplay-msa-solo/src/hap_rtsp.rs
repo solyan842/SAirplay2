@@ -92,12 +92,21 @@ impl EncryptedRtspChannel {
                 return Ok(response);
             }
 
-            if Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let _ = self.stream.set_read_timeout(Some(Duration::from_millis(500)));
                 return Err(EncryptedRtspError::Timeout);
             }
+            let read_budget = remaining.min(Duration::from_millis(500));
+            self.stream
+                .set_read_timeout(Some(read_budget))
+                .map_err(EncryptedRtspError::Read)?;
 
             match self.stream.read(&mut buf) {
-                Ok(0) => return Err(EncryptedRtspError::Closed),
+                Ok(0) => {
+                    let _ = self.stream.set_read_timeout(Some(Duration::from_millis(500)));
+                    return Err(EncryptedRtspError::Closed);
+                }
                 Ok(n) => self.encrypted_carry.extend_from_slice(&buf[..n]),
                 Err(err)
                     if err.kind() == std::io::ErrorKind::WouldBlock
@@ -105,7 +114,10 @@ impl EncryptedRtspChannel {
                 {
                     continue;
                 }
-                Err(err) => return Err(EncryptedRtspError::Read(err)),
+                Err(err) => {
+                    let _ = self.stream.set_read_timeout(Some(Duration::from_millis(500)));
+                    return Err(EncryptedRtspError::Read(err));
+                }
             }
         }
     }
