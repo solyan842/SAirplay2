@@ -70,8 +70,9 @@ impl NativeMediaState{
   self.timeline.head_frame=self.timeline.head_frame.saturating_add(u64::from(frames));
   self.timeline.wire_rtp=self.timeline.wire_rtp.wrapping_add(frames);self.timeline.seq=self.timeline.seq.wrapping_add(1);audio
  }
+ pub fn consume_buffered_nonce(&mut self){self.counters.nonce_counter=self.counters.nonce_counter.wrapping_add(1);}
  pub fn commit_buffered_frame(&mut self,frames:u32){
-  self.counters.nonce_counter=self.counters.nonce_counter.wrapping_add(1);self.counters.sent+=1;self.timeline.first_packet=false;
+  self.counters.sent+=1;self.timeline.first_packet=false;
   self.timeline.head_frame=self.timeline.head_frame.saturating_add(u64::from(frames));
   self.timeline.wire_rtp=self.timeline.wire_rtp.wrapping_add(frames);self.timeline.seq=self.timeline.seq.wrapping_add(1);
  }
@@ -107,6 +108,7 @@ pub fn build_buffered_frame<E:AlacEncoder,C:AudioCipher>(state:&NativeMediaState
 pub trait MediaIo{
  fn send_realtime(&mut self,packet:&[u8])->SendResult;
  fn send_buffered(&mut self,bytes:&[u8])->StreamWrite;
+ fn close_buffered(&mut self){}
  fn store_retransmit(&mut self,_seq:u16,_packet:&[u8]){}
 }
 #[derive(Debug,Clone,Copy,PartialEq,Eq)] pub struct MediaHealth{pub healthy:bool}
@@ -122,9 +124,10 @@ pub fn execute_realtime<I:MediaIo>(state:&mut NativeMediaState,health:&mut Media
 
 pub fn execute_buffered<I:MediaIo>(state:&mut NativeMediaState,health:&mut MediaHealth,pending:&mut BufferedPending,io:&mut I,packet:BuiltPacket)->SendResult{
  if !pending.is_empty(){return SendResult::Dropped}
+ state.consume_buffered_nonce();
  let frame_len=packet.bytes.len();
  match io.send_buffered(&packet.bytes){
-  StreamWrite::Fatal=>{health.healthy=false;SendResult::Fatal}
+  StreamWrite::Fatal=>{health.healthy=false;pending.clear();io.close_buffered();SendResult::Fatal}
   StreamWrite::Complete=>{state.commit_buffered_frame(packet.frames);SendResult::Sent}
   StreamWrite::Partial(n)=>{
    let n=n.min(frame_len);if n<frame_len{let mut tail=packet.bytes;tail.drain(..n);let _=pending.park(tail);}
@@ -141,7 +144,7 @@ pub fn drain_buffered_pending<I:MediaIo>(health:&mut MediaHealth,pending:&mut Bu
    StreamWrite::Complete=>{let n=rem.len();pending.consume(n);}
    StreamWrite::Partial(n)=>{if n==0{return false}pending.consume(n);}
    StreamWrite::WouldBlock=>return false,
-   StreamWrite::Fatal=>{health.healthy=false;pending.clear();return false}
+   StreamWrite::Fatal=>{health.healthy=false;pending.clear();io.close_buffered();return false}
   }
  }
  true
@@ -177,7 +180,8 @@ impl BufferedPending{
  #[test]fn realtime_drop_advances_without_retry(){let mut s=state(true);s.commit_realtime(352,SendResult::Dropped,SendResult::Sent);assert_eq!((s.timeline.seq,s.timeline.wire_rtp,s.timeline.head_frame),(0x1235,5352,1352));assert!(s.timeline.first_packet);assert_eq!(s.counters.dropped,1);}
  #[test]fn realtime_success_clears_marker_only_with_sync(){let mut s=state(true);s.commit_realtime(352,SendResult::Sent,SendResult::Dropped);assert!(s.timeline.first_packet);s.commit_realtime(352,SendResult::Sent,SendResult::Sent);assert!(!s.timeline.first_packet);}
  #[test]fn fatal_does_not_advance(){let mut s=state(true);s.commit_realtime(352,SendResult::Fatal,SendResult::Sent);assert_eq!(s.timeline.seq,0x1234);}
- #[test]fn buffered_commits_nonce_and_line_once(){let mut s=state(true);s.commit_buffered_frame(352);assert_eq!(s.counters.nonce_counter,1);assert_eq!(s.timeline.seq,0x1235);}
+ #[test]fn buffered_commit_advances_line_after_nonce_was_consumed(){let mut s=state(true);s.consume_buffered_nonce();s.commit_buffered_frame(352);assert_eq!(s.counters.nonce_counter,1);assert_eq!(s.timeline.seq,0x1235);}
+ #[test]fn buffered_hard_error_still_consumes_nonce_and_closes_channel(){struct HardIo{closed:bool}impl MediaIo for HardIo{fn send_realtime(&mut self,_:&[u8])->SendResult{SendResult::Fatal}fn send_buffered(&mut self,_:&[u8])->StreamWrite{StreamWrite::Fatal}fn close_buffered(&mut self){self.closed=true}}let mut s=state(true);let mut h=MediaHealth::default();let mut p=BufferedPending::default();let mut io=HardIo{closed:false};let b=BuiltPacket{bytes:vec![1,2,3],seq:s.timeline.seq,rtp:s.timeline.wire_rtp,frames:352};assert_eq!(execute_buffered(&mut s,&mut h,&mut p,&mut io,b),SendResult::Fatal);assert_eq!(s.counters.nonce_counter,1);assert_eq!(s.timeline.seq,0x1234);assert!(io.closed);assert!(!h.healthy);}
  #[test]fn pending_tail_blocks_new_frame(){let mut p=BufferedPending::default();assert!(p.park(vec![1,2,3,4]).is_ok());p.consume(2);assert_eq!(p.remaining(),&[3,4]);assert!(p.park(vec![9]).is_err());p.consume(2);assert!(p.park(vec![9]).is_ok());}
  #[test]fn pacing_matches_msa_window_and_release_floor(){let w=pacing_window_frames(48000,0,false,false,0,false);assert_eq!(w,84000);assert!(!pacing_accept(48000,132001,w,0,10000));assert!(pacing_accept(48000,132000,w,0,10000));assert!(!pacing_accept(48000,132000,w,9501,10000));}
  #[test]fn buffered_depth_can_expand_window(){assert_eq!(pacing_window_frames(48000,96000,true,false,3000,true),144000);}
