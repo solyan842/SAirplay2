@@ -1066,15 +1066,7 @@ impl NativeSoloEngine {
 
     pub fn mrp_push_progress(&mut self) -> Result<i32, NativeSoloError> {
         let Some(mrp) = self.mrp.clone() else { return Ok(-1) };
-        let snap = mrp.snapshot().map_err(|e| {
-            self.note_mrp_error(&e);
-            NativeSoloError::Command(format!("MRP snapshot: {e:?}"))
-        })?;
-        mrp.set_progress_and_push(
-            snap.elapsed_ms,
-            snap.duration_ms,
-            snap.playback_state == MrpPlaybackState::Playing,
-        ).map(|v| v.overall_status).map_err(|e| {
+        mrp.push_progress().map(|v| v.overall_status).map_err(|e| {
             self.note_mrp_error(&e);
             NativeSoloError::Command(format!("MRP progress push: {e:?}"))
         })
