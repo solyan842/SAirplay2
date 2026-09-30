@@ -74,13 +74,17 @@ impl WindowsRaopAudioWorker {
         let first_start_done=Arc::new(AtomicBool::new(false));
         let last_error=Arc::new(Mutex::new(None));
 
-        let (tx,rx)=mpsc::sync_channel::<[u8;RAOP_PCM_PACKET_BYTES]>(WRITER_QUEUE_PACKETS);
+        let (tx,rx)=mpsc::sync_channel::<(u64,[u8;RAOP_PCM_PACKET_BYTES])>(WRITER_QUEUE_PACKETS);
         let running_w=Arc::clone(&running);
+        let flush_w=Arc::clone(&flush_generation);
         let error_w=Arc::clone(&last_error);
         let writer_worker=thread::Builder::new().name("msa-raop-writer".into()).spawn(move||{
             while running_w.load(Ordering::SeqCst) {
                 match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(packet)=>{
+                    Ok((generation,packet))=>{
+                        if generation != flush_w.load(Ordering::SeqCst) {
+                            continue;
+                        }
                         if let Err(e)=pcm_writer.write_packet(&packet) {
                             if let Ok(mut slot)=error_w.lock(){*slot=Some(e.to_string());}
                             running_w.store(false,Ordering::SeqCst);
@@ -121,12 +125,6 @@ impl WindowsRaopAudioWorker {
                     // next persistent-session content.
                     chunker.clear();
                     pending_packet=None;
-                    while tx.try_send([0u8;RAOP_PCM_PACKET_BYTES]).is_ok() {
-                        // Never leave synthetic packets queued; this loop only
-                        // discovers free capacity and is intentionally undone
-                        // below by generation gating. Kept out: see no-op.
-                        break;
-                    }
                     local_flush=generation;
                     flush_ack_c.store(generation,Ordering::SeqCst);
                 }
@@ -151,9 +149,9 @@ impl WindowsRaopAudioWorker {
                         pending_packet=Some(packet.try_into().expect("RAOP chunker is fixed PCM16 stereo"));
                     }
                     let packet=pending_packet.take().unwrap();
-                    match tx.try_send(packet) {
+                    match tx.try_send((local_flush,packet)) {
                         Ok(())=>{}
-                        Err(TrySendError::Full(packet))=>{
+                        Err(TrySendError::Full((_generation,packet)))=>{
                             pending_packet=Some(packet);
                             break;
                         }
@@ -173,10 +171,15 @@ impl WindowsRaopAudioWorker {
                 first_start_done,capture_worker:Some(capture_worker),
                 writer_worker:Some(writer_worker),last_error,
             }),
-            Ok(Err(e))|Err(mpsc::RecvTimeoutError::Disconnected)=>{
+            Ok(Err(message))=>{
                 running.store(false,Ordering::SeqCst);
                 let _=capture_worker.join();let _=writer_worker.join();
-                Err(WindowsRaopWorkerError::Worker(match e_opt(Ok(Err(e))) {Some(v)=>v,None=>"RAOP WASAPI worker failed".into()}))
+                Err(WindowsRaopWorkerError::Worker(message))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected)=>{
+                running.store(false,Ordering::SeqCst);
+                let _=capture_worker.join();let _=writer_worker.join();
+                Err(WindowsRaopWorkerError::Worker("RAOP WASAPI worker disconnected before ready".into()))
             }
             Err(mpsc::RecvTimeoutError::Timeout)=>{
                 running.store(false,Ordering::SeqCst);
@@ -261,9 +264,3 @@ impl WindowsRaopAudioWorker {
     }
 }
 impl Drop for WindowsRaopAudioWorker{fn drop(&mut self){self.stop();}}
-
-// Helper only to keep the readiness match expression compact without hiding
-// any transport behavior.
-fn e_opt<T>(v:Result<Result<T,String>,mpsc::RecvTimeoutError>)->Option<String>{
-    match v{Ok(Err(e))=>Some(e),_=>None}
-}
