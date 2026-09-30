@@ -120,9 +120,16 @@ impl MrpDataStream {
             encrypted_carry:Vec::new(),plain_carry:Vec::new(),connected:true,
         };
         let state=controller.snapshot().map_err(|_|MrpDataStreamError::Crypto)?;
+        let opening_generation = state.state_generation;
         for msg in state.build_type130_opening_messages(){
             s.send_protobuf(&msg)?;
         }
+        // Pinned ap2_mrp_attach clears the dirty/artwork latches after the
+        // complete opening handshake so the worker does not immediately
+        // duplicate the initial SET_STATE push.
+        controller
+            .complete_type130_state_push(opening_generation, true)
+            .map_err(|_| MrpDataStreamError::Crypto)?;
         Ok(s)
     }
 
