@@ -48,9 +48,17 @@ impl NativeMediaIo {
         })
     }
 
-    pub fn attach_remote(&mut self, receiver_ip: IpAddr, data_port: u16, control_port: u16) {
+    pub fn attach_data_remote(&mut self, receiver_ip: IpAddr, data_port: u16) {
         self.remote_data = Some(SocketAddr::new(receiver_ip, data_port));
+    }
+
+    pub fn attach_control_remote(&mut self, receiver_ip: IpAddr, control_port: u16) {
         self.remote_control = Some(SocketAddr::new(receiver_ip, control_port));
+    }
+
+    pub fn attach_remote(&mut self, receiver_ip: IpAddr, data_port: u16, control_port: u16) {
+        self.attach_data_remote(receiver_ip, data_port);
+        self.attach_control_remote(receiver_ip, control_port);
     }
 
     pub fn connect_buffered(&mut self) -> io::Result<()> {
