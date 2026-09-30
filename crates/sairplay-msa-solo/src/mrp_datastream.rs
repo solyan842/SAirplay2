@@ -209,49 +209,57 @@ impl MrpDataStream {
 pub struct MrpDataStreamWorker {
     stop: Arc<AtomicBool>,
     healthy: Arc<AtomicBool>,
+    feedback_pulses: Arc<std::sync::atomic::AtomicU64>,
     worker: Option<JoinHandle<()>>,
 }
 impl MrpDataStreamWorker {
     pub fn start(mut stream: MrpDataStream, controller: MrpController) -> Self {
         let stop=Arc::new(AtomicBool::new(false));
         let healthy=Arc::new(AtomicBool::new(true));
+        let feedback_pulses=Arc::new(std::sync::atomic::AtomicU64::new(0));
         let stop_t=Arc::clone(&stop); let healthy_t=Arc::clone(&healthy);
+        let pulses_t=Arc::clone(&feedback_pulses);
         let worker=thread::spawn(move||{
             let mut last_push=Instant::now();
+            let mut seen_pulse=0u64;
             while !stop_t.load(Ordering::SeqCst) {
                 if stream.tick().is_err() {
                     healthy_t.store(false,Ordering::SeqCst);
                     break;
                 }
 
-                // Pinned ap2_mrp_prepare_state_push: send immediately when
-                // mutable MRP state is dirty; otherwise re-push every 15s
-                // only while playback is actually PLAYING.
-                let periodic_due = last_push.elapsed() >= Duration::from_secs(15);
-                match controller.try_publication_guard() {
-                    Ok(Some(_publish)) => match controller.prepare_type130_state_push(periodic_due) {
-                        Ok(Some((msg, generation))) => {
-                            let sent = stream.send_protobuf(&msg).is_ok();
-                            let _ = controller.complete_type130_state_push(generation, sent);
-                            if !sent {
+                // Pinned ap2cl_feedback owns type-130 state OUTPUT cadence:
+                // input is serviced continuously, but dirty/periodic state is
+                // considered only after a receiver keepalive tick. This avoids
+                // racing explicit metadata publication with eager 25 ms pushes.
+                let pulse = pulses_t.load(Ordering::SeqCst);
+                if pulse != seen_pulse {
+                    seen_pulse = pulse;
+                    let periodic_due = last_push.elapsed() >= Duration::from_secs(15);
+                    match controller.try_publication_guard() {
+                        Ok(Some(_publish)) => match controller.prepare_type130_state_push(periodic_due) {
+                            Ok(Some((msg, generation))) => {
+                                let sent = stream.send_protobuf(&msg).is_ok();
+                                let _ = controller.complete_type130_state_push(generation, sent);
+                                if !sent {
+                                    healthy_t.store(false,Ordering::SeqCst);
+                                    break;
+                                }
+                                last_push = Instant::now();
+                            }
+                            Ok(None) => {}
+                            Err(_) => {
                                 healthy_t.store(false,Ordering::SeqCst);
                                 break;
                             }
-                            last_push = Instant::now();
+                        },
+                        Ok(None) => {
+                            // Exact source behavior: defer behind publication.
                         }
-                        Ok(None) => {}
                         Err(_) => {
                             healthy_t.store(false,Ordering::SeqCst);
                             break;
                         }
-                    },
-                    Ok(None) => {
-                        // Exact pinned behavior: state push defers behind
-                        // metadata/artwork publication instead of blocking.
-                    }
-                    Err(_) => {
-                        healthy_t.store(false,Ordering::SeqCst);
-                        break;
                     }
                 }
                 thread::sleep(Duration::from_millis(25));
@@ -262,9 +270,12 @@ impl MrpDataStreamWorker {
                 }
             }
         });
-        Self{stop,healthy,worker:Some(worker)}
+        Self{stop,healthy,feedback_pulses,worker:Some(worker)}
     }
     pub fn healthy(&self)->bool{self.healthy.load(Ordering::SeqCst)}
+    pub fn feedback_pulse_handle(&self)->Arc<std::sync::atomic::AtomicU64>{
+        Arc::clone(&self.feedback_pulses)
+    }
     pub fn stop(&mut self){
         self.stop.store(true,Ordering::SeqCst);
         if let Some(w)=self.worker.take(){let _=w.join();}
