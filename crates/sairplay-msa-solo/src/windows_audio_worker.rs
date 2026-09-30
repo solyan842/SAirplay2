@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 pub const AIRPLAY_CLOCK_READY_TIMEOUT: Duration = Duration::from_millis(2500);
 pub const STARVATION_RECOVERY_INTERVAL: Duration = Duration::from_millis(250);
+pub const FLUSH_DRAIN_TIMEOUT: Duration = Duration::from_millis(2000);
 
 pub type SharedNativeSoloEngine = Arc<Mutex<NativeSoloEngine>>;
 
@@ -46,6 +47,7 @@ pub struct WindowsSoloAudioWorker {
     running: Arc<AtomicBool>,
     engine: SharedNativeSoloEngine,
     flush_generation: Arc<AtomicU64>,
+    flush_ack_generation: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
     last_error: Arc<Mutex<Option<String>>>,
     discontinuities: Arc<AtomicU64>,
@@ -68,6 +70,7 @@ impl WindowsSoloAudioWorker {
 
         let running = Arc::new(AtomicBool::new(true));
         let flush_generation = Arc::new(AtomicU64::new(0));
+        let flush_ack_generation = Arc::new(AtomicU64::new(0));
         let last_error = Arc::new(Mutex::new(None));
         let discontinuities = Arc::new(AtomicU64::new(0));
         let last_discontinuity_frame = Arc::new(AtomicU64::new(u64::MAX));
@@ -75,6 +78,7 @@ impl WindowsSoloAudioWorker {
 
         let running_thread = Arc::clone(&running);
         let flush_thread = Arc::clone(&flush_generation);
+        let flush_ack_thread = Arc::clone(&flush_ack_generation);
         let error_thread = Arc::clone(&last_error);
         let discontinuities_thread = Arc::clone(&discontinuities);
         let last_discontinuity_thread = Arc::clone(&last_discontinuity_frame);
@@ -115,6 +119,7 @@ impl WindowsSoloAudioWorker {
                         local_flush_generation = generation;
                         starvation_started = None;
                         last_starvation_recovery = None;
+                        flush_ack_thread.store(generation, Ordering::SeqCst);
                     }
 
                     let report = match capture.drain_into(&mut chunker) {
@@ -142,6 +147,13 @@ impl WindowsSoloAudioWorker {
                     }
                     captured_frames_total =
                         captured_frames_total.saturating_add(report.frames as u64);
+                    // MSA's persistent input ring is max(4 seconds, 1 MiB).
+                    // WASAPI cannot backpressure the system mixer, so preserve
+                    // the oldest resident bytes and discard only new excess.
+                    let byte_rate = audio_format.sample_rate as usize
+                        * audio_format.input_bytes_per_frame();
+                    let ring_capacity = (byte_rate.saturating_mul(4)).max(1 << 20);
+                    let _ = chunker.truncate_pending(ring_capacity);
 
                     let content_paused_or_stopped = engine_thread
                         .lock()
@@ -152,7 +164,6 @@ impl WindowsSoloAudioWorker {
                         // the splice path. Feed contiguous silence there, but
                         // never turn captured system PCM into content while the
                         // single authoritative engine state says content is paused.
-                        chunker.clear();
                         let send_silence = {
                             let mut guard = match engine_thread.lock() {
                                 Ok(v) => v,
@@ -422,6 +433,7 @@ impl WindowsSoloAudioWorker {
                 running,
                 engine,
                 flush_generation,
+                flush_ack_generation,
                 worker: Some(worker),
                 last_error,
                 discontinuities,
@@ -441,6 +453,67 @@ impl WindowsSoloAudioWorker {
                 ))
             }
         }
+    }
+
+    /// MSA ap2_session_flush equivalent for the WASAPI adapter: transport
+    /// FLUSH while sends are serialized, then wait until the capture worker
+    /// has reset exactly the pre-FLUSH PCM before returning the frozen warm head.
+    pub fn flush_content(&self) -> Result<Option<u64>, WindowsSoloAudioWorkerError> {
+        if !self.is_running() {
+            return Err(WindowsSoloAudioWorkerError::Engine("WASAPI worker is not running".into()));
+        }
+        let target_generation;
+        let warm_head = {
+            let mut engine = self.engine.lock().map_err(|_| {
+                WindowsSoloAudioWorkerError::Engine("native SOLO engine mutex poisoned".into())
+            })?;
+            engine.flush().map_err(|e| {
+                WindowsSoloAudioWorkerError::Engine(format!("FLUSH: {e:?}"))
+            })?;
+            let head = (engine.splice_head_unix_ms() != 0)
+                .then_some(engine.splice_head_unix_ms());
+            target_generation = self.flush_generation.fetch_add(1, Ordering::SeqCst) + 1;
+            head
+        };
+
+        let deadline = Instant::now() + FLUSH_DRAIN_TIMEOUT;
+        while self.flush_ack_generation.load(Ordering::SeqCst) < target_generation {
+            if !self.is_running() {
+                return Err(WindowsSoloAudioWorkerError::Engine(
+                    "WASAPI worker stopped during FLUSH drain".into(),
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(WindowsSoloAudioWorkerError::Engine(
+                    "WASAPI FLUSH drain acknowledgement timed out".into(),
+                ));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        Ok(warm_head)
+    }
+
+    /// START after either initial connect or a completed FLUSH. NativeSoloEngine
+    /// itself selects ap2cl_start for the first call and ap2cl_resume thereafter.
+    pub fn commit_start(
+        &self,
+        requested_unix_ms: u64,
+    ) -> Result<crate::timing::StartResolution, WindowsSoloAudioWorkerError> {
+        let mut engine = self.engine.lock().map_err(|_| {
+            WindowsSoloAudioWorkerError::Engine("native SOLO engine mutex poisoned".into())
+        })?;
+        engine.start(requested_unix_ms).map_err(|e| {
+            WindowsSoloAudioWorkerError::Engine(format!("START: {e:?}"))
+        })
+    }
+
+    pub fn standby_content(&self) -> Result<(), WindowsSoloAudioWorkerError> {
+        let mut engine = self.engine.lock().map_err(|_| {
+            WindowsSoloAudioWorkerError::Engine("native SOLO engine mutex poisoned".into())
+        })?;
+        engine.standby().map_err(|e| {
+            WindowsSoloAudioWorkerError::Engine(format!("STANDBY: {e:?}"))
+        })
     }
 
     pub fn set_content_enabled(&self, enabled: bool) -> Result<(), WindowsSoloAudioWorkerError> {
