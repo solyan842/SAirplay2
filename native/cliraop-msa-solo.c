@@ -124,7 +124,64 @@ static int available_stdin(void) {
 #endif
 }
 
+
+static bool read_u32_le(FILE *f, uint32_t *out) {
+    uint8_t b[4];
+    if (fread(b, 1, 4, f) != 4) return false;
+    *out = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+           ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+    return true;
+}
+
+static char *read_lp_string(FILE *f) {
+    uint32_t n = 0;
+    if (!read_u32_le(f, &n) || n > (1u << 20)) return NULL;
+    char *s = calloc((size_t)n + 1, 1);
+    if (!s) return NULL;
+    if (n && fread(s, 1, n, f) != n) { free(s); return NULL; }
+    s[n] = '\0';
+    return s;
+}
+
+static bool set_metadata_from_file(struct raopcl_s *p, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    char *title = read_lp_string(f);
+    char *artist = title ? read_lp_string(f) : NULL;
+    char *album = artist ? read_lp_string(f) : NULL;
+    fclose(f);
+    if (!title || !artist || !album) {
+        free(title); free(artist); free(album);
+        return false;
+    }
+    bool ok = raopcl_set_daap(p, 4,
+                              "minm", 's', title,
+                              "asar", 's', artist,
+                              "asal", 's', album,
+                              "astn", 'i', 1);
+    free(title); free(artist); free(album);
+    return ok;
+}
+
+static bool set_artwork_from_file(struct raopcl_s *p, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    char *mime = read_lp_string(f);
+    uint32_t n = 0;
+    if (!mime || !read_u32_le(f, &n) || n > (16u << 20)) {
+        free(mime); fclose(f); return false;
+    }
+    char *data = malloc(n ? n : 1);
+    if (!data) { free(mime); fclose(f); return false; }
+    bool ok = (!n || fread(data, 1, n, f) == n);
+    fclose(f);
+    if (ok) ok = raopcl_set_artwork(p, mime, (int)n, data);
+    free(mime); free(data);
+    return ok;
+}
+
 static bool process_command(const char *path, const char *ack_path,
+                            const char *metadata_path, const char *artwork_path,
                             uint64_t *last_seq, struct raopcl_s *p, bool *quit) {
     FILE *f = fopen(path, "rb");
     if (!f) return true;
@@ -161,6 +218,10 @@ static bool process_command(const char *path, const char *ack_path,
         ok = raopcl_set_volume(p, raopcl_float_volume((int)vol));
     } else if (!strcmp(cmd, "PROGRESS")) {
         ok = raopcl_set_progress_ms(p, (uint32_t)arg1 * 1000U, (uint32_t)arg2 * 1000U);
+    } else if (!strcmp(cmd, "METADATA")) {
+        ok = metadata_path && set_metadata_from_file(p, metadata_path);
+    } else if (!strcmp(cmd, "ARTWORK")) {
+        ok = artwork_path && set_artwork_from_file(p, artwork_path);
     } else if (!strcmp(cmd, "KEEPALIVE")) {
         ok = raopcl_keepalive(p);
     } else if (!strcmp(cmd, "QUIT")) {
@@ -178,11 +239,13 @@ int main(int argc, char **argv) {
     int port = 5000, volume = 50, latency = MS2TS(1000, 44100);
     bool alac = true, auth = false;
     char *secret = NULL, *password = NULL, *et = NULL, *md = NULL;
-    char *control = NULL, *ack = NULL, *host_name = NULL;
+    char *control = NULL, *ack = NULL, *metadata_path = NULL, *artwork_path = NULL, *host_name = NULL;
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--control") && i + 1 < argc) control = argv[++i];
         else if (!strcmp(argv[i], "--ack") && i + 1 < argc) ack = argv[++i];
+        else if (!strcmp(argv[i], "--metadata") && i + 1 < argc) metadata_path = argv[++i];
+        else if (!strcmp(argv[i], "--artwork") && i + 1 < argc) artwork_path = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-v") && i + 1 < argc) volume = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-l") && i + 1 < argc) latency = atoi(argv[++i]);
@@ -195,8 +258,8 @@ int main(int argc, char **argv) {
         else if (argv[i][0] != '-') host_name = argv[i];
     }
 
-    if (!control || !ack || !host_name) {
-        fprintf(stderr, "usage: cliraop-msa-solo --control FILE --ack FILE [opts] host\n");
+    if (!control || !ack || !metadata_path || !artwork_path || !host_name) {
+        fprintf(stderr, "usage: cliraop-msa-solo --control FILE --ack FILE --metadata FILE --artwork FILE [opts] host\n");
         return 2;
     }
 
@@ -243,7 +306,7 @@ int main(int argc, char **argv) {
     bool quit = false;
 
     while (!quit) {
-        process_command(control, ack, &last_seq, p, &quit);
+        process_command(control, ack, metadata_path, artwork_path, &last_seq, p, &quit);
         if (quit) break;
 
         uint64_t now = raopcl_get_ntp(NULL);
@@ -270,6 +333,10 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "MSA-RAOP ERROR send\n");
                     break;
                 }
+                uint64_t head = playtime + TS2NTP(FRAMES_PER_CHUNK, raopcl_sample_rate(p));
+                fprintf(stderr, "MSA-RAOP HEAD audible_ms=%llu\n",
+                        (unsigned long long)ntp_to_unix_ms(head));
+                fflush(stderr);
                 pcm_len = 0;
             }
         }
