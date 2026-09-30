@@ -22,8 +22,9 @@ use crate::native_timeline::{
 };
 use crate::{
     send_native_artwork, send_native_metadata, send_native_progress, send_teardown,
-    set_native_volume, Ap2AudioFormat, MetadataSetResult, ParameterResult,
-    TeardownError, VolumeSetResult,
+    set_native_volume, write_farewell_teardown_locked, Ap2AudioFormat,
+    EncryptedRtspError, MetadataError, MetadataSetResult, ParameterError,
+    ParameterResult, VolumeError, VolumeSetResult,
 };
 use crate::ntp_timing::system_time_to_ntp;
 use std::thread;
@@ -206,7 +207,11 @@ impl NativeSoloEngine {
         } else {
             ap2::start(self, requested_unix_ms)
         };
-        if result.is_ok() { self.first_start_done = true; }
+        if result.is_ok() {
+            self.first_start_done = true;
+            self.content_paused = false;
+            self.content_stopped = false;
+        }
         result
     }
 
@@ -217,11 +222,25 @@ impl NativeSoloEngine {
     }
 
     pub fn flush(&mut self) -> Result<(), Ap2CommandError<NativeSoloError>> {
-        ap2::flush(self)
+        let result = ap2::flush(self);
+        if result.is_ok() {
+            // Mirrors cliairplay's session_flush_op: transport can remain hot
+            // (splice), but content delivery is paused until the next START.
+            self.content_paused = true;
+            self.content_stopped = false;
+        }
+        result
     }
 
     pub fn standby(&mut self) -> Result<(), Ap2CommandError<NativeSoloError>> {
-        ap2::standby(self)
+        let result = ap2::standby(self);
+        if result.is_ok() {
+            // The outer session status is paused for both stock and splice;
+            // splice keeps the wire alive with silence.
+            self.content_paused = false;
+            self.content_stopped = true;
+        }
+        result
     }
 
     pub fn state(&self) -> Ap2State { self.runtime.state }
