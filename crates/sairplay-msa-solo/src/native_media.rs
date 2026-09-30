@@ -153,6 +153,7 @@ pub fn drain_buffered_pending<I:MediaIo>(health:&mut MediaHealth,pending:&mut Bu
 #[derive(Debug,Clone,PartialEq,Eq,Default)] pub struct BufferedPending{bytes:Vec<u8>,off:usize}
 impl BufferedPending{
  pub fn is_empty(&self)->bool{self.off>=self.bytes.len()}
+ pub fn started(&self)->bool{!self.bytes.is_empty()&&self.off>0}
  pub fn remaining(&self)->&[u8]{if self.is_empty(){&[]}else{&self.bytes[self.off..]}}
  pub fn park(&mut self,frame:Vec<u8>)->Result<(),Vec<u8>>{if !self.is_empty(){return Err(frame)}self.bytes=frame;self.off=0;Ok(())}
  pub fn consume(&mut self,n:usize){self.off=self.off.saturating_add(n).min(self.bytes.len());if self.is_empty(){self.bytes.clear();self.off=0;}}
