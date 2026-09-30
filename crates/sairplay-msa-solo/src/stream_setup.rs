@@ -54,6 +54,7 @@ pub struct RealtimeStreamSetupResult {
     pub ports: StreamPorts,
     pub latency_min: Option<u32>,
     pub latency_max: Option<u32>,
+    pub arrival_to_render_latency_ms: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -281,6 +282,7 @@ pub fn parse_stream_setup_response(
         },
         latency_min,
         latency_max,
+        arrival_to_render_latency_ms,
     })
 }
 
