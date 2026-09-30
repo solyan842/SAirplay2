@@ -85,6 +85,9 @@ pub struct NativeControlReady {
     pub local_ip: IpAddr,
     pub publish_ip: IpAddr,
     pub session_uri: String,
+    pub session_uuid: String,
+    pub group_uuid: Option<String>,
+    pub pair_verified: bool,
     pub session_id: u32,
     pub ssrc: u32,
     pub timing: LiveTiming,
@@ -183,6 +186,7 @@ pub fn open_native_control(
     let mut rng = rand::thread_rng();
     let session_id = rng.next_u32();
     let session_uuid = random_uuid_upper(&mut rng);
+    let mut group_uuid_for_mrp: Option<String> = None;
     let session_uri = format_session_uri(local_addr.ip(), session_id);
     let device_id = dacp_device_id(&config.dacp_id).ok_or(NativeControlError::Identity)?;
     let buffered = config.buffered_requested && matches!(timing, LiveTiming::Ptp { .. });
@@ -208,6 +212,8 @@ pub fn open_native_control(
         LiveTiming::Ptp { master_clock_id } => {
             let mac_address = dacp_mac_address(&config.dacp_id)
                 .ok_or(NativeControlError::Identity)?;
+            let group_uuid = random_uuid_upper(&mut rng);
+            group_uuid_for_mrp = Some(group_uuid.clone());
             setup_ptp_session(
                 &mut flow,
                 &mut control,
@@ -215,7 +221,7 @@ pub fn open_native_control(
                     cseq: 1,
                     session_uri: session_uri.clone(),
                     session_uuid: session_uuid.clone(),
-                    group_uuid: random_uuid_upper(&mut rng),
+                    group_uuid,
                     peer_uuid: random_uuid_upper(&mut rng),
                     device_id: device_id.clone(),
                     mac_address,
@@ -345,6 +351,9 @@ pub fn open_native_control(
         local_ip: local_addr.ip(),
         publish_ip,
         session_uri,
+        session_uuid,
+        group_uuid: group_uuid_for_mrp,
+        pair_verified: config.auth_credentials.is_some(),
         session_id,
         ssrc,
         timing,
