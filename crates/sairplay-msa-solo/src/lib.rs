@@ -10,6 +10,15 @@ pub mod native_runtime;
 pub mod native_codec;
 pub mod native_io;
 pub mod native_media_owner;
+pub mod event_channel;
+pub mod setpeers;
+pub mod stream_setup;
+pub mod record;
+pub mod ptp_session_setup;
+pub mod ntp_session_setup;
+pub mod native_preflight;
+pub mod preflight;
+pub mod ap2_info;
 pub mod hap_pairing;
 pub mod hap_rtsp;
 pub mod hap_crypto;
@@ -227,3 +236,26 @@ pub use hap_pairing::{
     NativeHapPairingClient, PairingError, StoredHapCredentials,
     TransientPairingClient, TransientPairingResult, TransientPairingSession,
 };
+
+
+pub use ap2_info::{
+    Ap2AudioFormat, Ap2Info, Ap2InfoError, AudioFormatCapability,
+    AIRPLAY_HIRES_AUDIO_FORMATS, ALAC_44100_16_2, ALAC_44100_24_2,
+    ALAC_48000_16_2, ALAC_48000_24_2,
+};
+pub use preflight::{Ap2PreflightClient, PreflightError, PreflightResult};
+pub use native_preflight::{NativeConnectError, NativeConnectFlow, NativePhase};
+pub use ntp_session_setup::{
+    setup_ntp_session, NtpSessionSetupConfig, NtpSessionSetupError, NtpSessionSetupResult,
+};
+pub use ptp_session_setup::{
+    setup_ptp_session, PtpSessionSetupConfig, PtpSessionSetupError, PtpSessionSetupResult,
+};
+pub use record::{send_record, RecordConfig, RecordError};
+pub use stream_setup::{
+    setup_buffered_stream, setup_realtime_stream, BufferedStreamSetupConfig,
+    BufferedStreamSetupResult, RealtimeStreamSetupConfig, RealtimeStreamSetupResult,
+    StreamPorts, StreamSetupError,
+};
+pub use setpeers::{send_setpeers, SetPeersConfig, SetPeersError};
+pub use event_channel::{open_event_channel, EventChannel, EventChannelError};
