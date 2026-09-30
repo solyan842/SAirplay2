@@ -54,7 +54,7 @@ fn encode_alac_raw_16_stereo(pcm: &[u8], frames: usize) -> Result<Vec<u8>, Codec
     }
 
     let bsize = ALAC_FRAMES_PER_CHUNK as u32;
-    let mut out = Vec::with_capacity(PCM_BYTES + 16);
+    let mut out = Vec::with_capacity(ALAC_FRAMES_PER_CHUNK * BPF + 16);
     out.push(1 << 5);
     out.push(0);
     out.push((1 << 4) | (1 << 1) | (((bsize & 0x8000_0000) >> 31) as u8));
