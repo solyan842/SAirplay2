@@ -27,6 +27,9 @@ pub trait NativeAp2Transport {
     /// MSA native feasibility floor, already raised for live PTP clock readiness.
     fn start_floor(&self) -> ClockFloor;
     fn splice_timeline(&self) -> bool;
+    /// Exact MSA ap2_clock_verify_arm applicability: splice timeline + PTP,
+    /// with enough runway before initial fill to make verification actionable.
+    fn clock_verify_applicable(&self, at_unix_ms:u64) -> bool;
     fn anchor_valid(&self) -> bool;
     fn audible_head_unix_ms(&self) -> u64;
     fn lane(&self) -> NativeLane;
@@ -65,7 +68,7 @@ pub fn start<T: NativeAp2Transport>(t:&mut T, requested:u64)->Result<StartResolu
         NativeLane::Buffered=>t.anchor_buffered_start(s.at_unix_ms).map_err(Ap2CommandError::Transport)?,
         NativeLane::Realtime=>{
             t.sync_realtime_ptp_if_ready().map_err(Ap2CommandError::Transport)?;
-            if floor.cold{t.arm_clock_verify(requested,s.at_unix_ms,false);}
+            if floor.cold && t.clock_verify_applicable(s.at_unix_ms){t.arm_clock_verify(requested,s.at_unix_ms,false);}
         }
     }
     Ok(s)
@@ -156,12 +159,13 @@ mod tests {
  impl Default for NativeLane{fn default()->Self{Self::Realtime}}
  impl NativeAp2Transport for Mock{
   type Error=();fn state(&self)->Ap2State{self.state}fn now_unix_ms(&self)->u64{1000}fn start_floor(&self)->ClockFloor{ClockFloor{floor_ntp:(2u64)<<32,cold:self.cold}}
-  fn splice_timeline(&self)->bool{false}fn anchor_valid(&self)->bool{self.anchor}fn audible_head_unix_ms(&self)->u64{0}fn lane(&self)->NativeLane{self.lane}fn rtsp_alive(&self)->bool{true}
+  fn splice_timeline(&self)->bool{false}fn clock_verify_applicable(&self,_:u64)->bool{self.cold}fn anchor_valid(&self)->bool{self.anchor}fn audible_head_unix_ms(&self)->u64{0}fn lane(&self)->NativeLane{self.lane}fn rtsp_alive(&self)->bool{true}
   fn keep_splice_queue(&mut self){}fn flush_realtime(&mut self)->Result<(),Self::Error>{self.log.push("flush_rt");Ok(())}fn flush_buffered(&mut self)->Result<(),Self::Error>{self.log.push("flush_buf");Ok(())}
   fn park_buffered(&mut self)->Result<(),Self::Error>{Ok(())}fn set_connected(&mut self){self.state=Ap2State::Connected}fn set_streaming(&mut self){self.state=Ap2State::Streaming;self.log.push("streaming")}
   fn clear_anchor(&mut self){self.anchor=false;self.log.push("clear")}fn reanchor_stock_timeline(&mut self,_:u64,buffered:bool){self.log.push(if buffered{"rebase_buf"}else{"rebase_rt"})}fn anchor_start(&mut self,_:u64)->Result<(),Self::Error>{self.anchor=true;self.log.push("anchor");Ok(())}fn anchor_buffered_start(&mut self,_:u64)->Result<(),Self::Error>{self.log.push("buf_anchor");Ok(())}fn sync_realtime_ptp_if_ready(&mut self)->Result<(),Self::Error>{self.log.push("sync");Ok(())}fn disarm_clock_verify(&mut self){self.log.push("disarm")}fn arm_clock_verify(&mut self,_:u64,_:u64,enforce:bool){assert!(!enforce);self.log.push("verify")}
  }
  #[test] fn cold_solo_start_arms_non_enforcing_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:true,log:vec![]};start(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","rebase_rt","anchor","streaming","sync","verify"]);}
+ #[test] fn cold_start_skips_verify_when_msa_gate_rejects_it(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:false,log:vec![]};t.cold=true;let floor=t.start_floor();assert!(floor.cold);t.cold=false;start(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","rebase_rt","anchor","streaming","sync"]);}
  #[test] fn warm_solo_start_does_not_arm_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:false,log:vec![]};start(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","rebase_rt","anchor","streaming","sync"]);}
  #[test] fn cold_stock_resume_arms_non_enforcing_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Realtime,anchor:false,cold:true,log:vec![]};resume(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","rebase_rt","anchor","streaming","sync","verify"]);}
  #[test] fn cold_buffered_start_anchors_and_skips_clock_verify(){let mut t=Mock{state:Ap2State::Connected,lane:NativeLane::Buffered,anchor:false,cold:true,log:vec![]};start(&mut t,0).unwrap();assert_eq!(t.log,vec!["disarm","rebase_buf","anchor","streaming","buf_anchor"]);}
