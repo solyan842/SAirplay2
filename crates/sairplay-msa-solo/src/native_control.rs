@@ -397,7 +397,10 @@ pub fn open_native_control(
         session_uri,
         session_uuid,
         group_uuid: group_uuid_for_mrp,
-        pair_verified,
+        // Pinned ap2_mrp_ready/ap2cl_mrp_channel_status gate on stored
+        // auth_credentials being configured, not on which password ladder
+        // leg happened to win this socket.
+        pair_verified: config.auth_credentials.is_some(),
         hap_shared_secret: pairing.audio_secret,
         session_id,
         ssrc,
