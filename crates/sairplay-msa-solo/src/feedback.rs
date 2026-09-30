@@ -124,10 +124,18 @@ impl FeedbackWorker {
                         remaining,
                     );
 
-                    // Source order: after the keepalive exchange, service
-                    // MediaRemote output on the same feedback cadence.
-                    if let Some(pulses) = mrp_feedback_pulses.as_ref() {
-                        pulses.fetch_add(1, Ordering::SeqCst);
+                    // Source order: service MediaRemote after a normal
+                    // response or timeout-shaped miss while the RTSP channel
+                    // is still considered alive. A hard peer/control failure
+                    // makes rtsp_dead immediately and skips MRP work.
+                    let service_mrp = match &result {
+                        Ok(_) => true,
+                        Err(error) => feedback_transport_error_is_timeout(error),
+                    };
+                    if service_mrp {
+                        if let Some(pulses) = mrp_feedback_pulses.as_ref() {
+                            pulses.fetch_add(1, Ordering::SeqCst);
+                        }
                     }
 
                     match result {
