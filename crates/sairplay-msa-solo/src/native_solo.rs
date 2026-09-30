@@ -838,43 +838,6 @@ impl NativeSoloEngine {
         }
     }
 
-    pub fn latency_info(&self) -> NativeLatencyInfo {
-        NativeLatencyInfo {
-            lead_ms: self.runtime.lead_ms,
-            device_min_frames: self.ready.latency_min.unwrap_or(0),
-            device_max_frames: self.ready.latency_max.unwrap_or(0),
-            render_latency_ms: self.ready.arrival_to_render_latency_ms.unwrap_or(0),
-        }
-    }
-
-    pub fn audible_lag_frames(&self) -> u64 {
-        if self.runtime.splice_timeline || self.runtime.lane == NativeLane::Buffered {
-            pacing_window_frames(
-                self.runtime.media.timeline.sample_rate,
-                self.runtime.dev_latency_max,
-                self.runtime.lane == NativeLane::Buffered,
-                self.runtime.splice_timeline,
-                self.runtime.splice_depth_ms,
-                self.runtime.splice_depth_explicit,
-            )
-        } else {
-            frames_for_ms(self.runtime.lead_ms, self.runtime.media.timeline.sample_rate)
-        }
-    }
-
-    pub fn warm_lead_ms(&self) -> u64 {
-        if self.runtime.splice_timeline { self.runtime.splice_depth_ms } else { 0 }
-    }
-
-    pub fn head_audible_unix_ms(&self) -> u64 {
-        if self.runtime.media.timeline.head_frame == 0 { 0 } else {
-            ms_for_frames(
-                self.runtime.media.timeline.head_frame,
-                self.runtime.media.timeline.sample_rate,
-            )
-        }
-    }
-
     pub fn clock_watch_restart(&mut self) {
         self.clock_last_streak_unix_ms = self.now_unix_ms();
     }
