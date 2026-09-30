@@ -1,4 +1,4 @@
-use socket2::SockRef;
+use socket2::{Domain, Protocol, SockAddr, SockRef, Socket, Type};
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -284,9 +284,9 @@ impl PtpEngine {
             IpAddr::V6(_) => return Err(PtpEngineError::Ipv4Required),
         };
 
-        let event = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, EVENT_PORT))
+        let event = bind_ptp_socket(EVENT_PORT)
             .map_err(|source| PtpEngineError::Bind { port: EVENT_PORT, source })?;
-        let general = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, GENERAL_PORT)) {
+        let general = match bind_ptp_socket(GENERAL_PORT) {
             Ok(socket) => socket,
             Err(source) => {
                 drop(event);
@@ -503,6 +503,16 @@ impl Drop for PtpEngine {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn bind_ptp_socket(port: u16) -> io::Result<UdpSocket> {
+    // Exact ptp_open_socket shape: SO_REUSEADDR before bind, deliberately no
+    // SO_REUSEPORT so a second PTP owner fails and the caller falls back NTP.
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+    socket.bind(&SockAddr::from(addr))?;
+    Ok(socket.into())
 }
 
 fn run_ptp_loop(
