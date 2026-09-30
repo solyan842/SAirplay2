@@ -36,9 +36,18 @@ log_level main_log;
 log_level *loglevel = &main_log;
 
 #define FRAMES_PER_CHUNK 352
-#define PCM_BYTES (FRAMES_PER_CHUNK * 4)
 #define KEEPALIVE_MS 20000
 #define START_LEAD_MS 200
+
+static int truncate_32to24(const uint8_t *in, int in_bytes, uint8_t *out) {
+    int samples = in_bytes / 4;
+    for (int i = 0; i < samples; i++) {
+        out[i * 3 + 0] = in[i * 4 + 1];
+        out[i * 3 + 1] = in[i * 4 + 2];
+        out[i * 3 + 2] = in[i * 4 + 3];
+    }
+    return samples * 3;
+}
 
 static uint64_t unix_ms_to_ntp(uint64_t ms) {
     return ((ms / 1000ULL) << 32) | (((ms % 1000ULL) << 32) / 1000ULL);
@@ -236,7 +245,7 @@ static bool process_command(const char *path, const char *ack_path,
 }
 
 int main(int argc, char **argv) {
-    int port = 5000, volume = 50, latency = MS2TS(1000, 44100);
+    int port = 5000, volume = 50, lead_ms = 2000, sample_rate = 44100, bit_depth = 16, channels = 2;
     bool alac = true, auth = false;
     char *secret = NULL, *password = NULL, *et = NULL, *md = NULL;
     char *control = NULL, *ack = NULL, *metadata_path = NULL, *artwork_path = NULL, *host_name = NULL;
@@ -248,7 +257,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--artwork") && i + 1 < argc) artwork_path = argv[++i];
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-v") && i + 1 < argc) volume = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-l") && i + 1 < argc) latency = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-l") && i + 1 < argc) lead_ms = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-r") && i + 1 < argc) sample_rate = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-b") && i + 1 < argc) bit_depth = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-c") && i + 1 < argc) channels = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-s") && i + 1 < argc) secret = argv[++i];
         else if (!strcmp(argv[i], "-P") && i + 1 < argc) password = argv[++i];
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) et = argv[++i];
@@ -280,10 +292,16 @@ int main(int argc, char **argv) {
     struct in_addr player = {0}, local = {0};
     memcpy(&player.s_addr, he->h_addr_list[0], he->h_length);
 
+    if (channels <= 0 || (bit_depth != 16 && bit_depth != 24) ||
+        (sample_rate != 44100 && sample_rate != 48000)) {
+        fprintf(stderr, "MSA-RAOP ERROR unsupported_format\n");
+        return 2;
+    }
+    int latency = MS2TS(lead_ms, sample_rate);
     struct raopcl_s *p = raopcl_create(
-        local, 0, 0, NULL, NULL, alac ? RAOP_ALAC : RAOP_PCM,
+        local, 0, 0, NULL, NULL, alac ? RAOP_ALAC : RAOP_ALAC_RAW,
         FRAMES_PER_CHUNK, latency, RAOP_CLEAR, auth, secret, password,
-        et, md, 44100, 16, 2, raopcl_float_volume(volume)
+        et, md, sample_rate, bit_depth, channels, raopcl_float_volume(volume)
     );
     if (!p) {
         fprintf(stderr, "MSA-RAOP ERROR create\n");
@@ -295,11 +313,21 @@ int main(int argc, char **argv) {
         return 5;
     }
 
-    fprintf(stderr, "MSA-RAOP READY latency=%u sample_rate=%u\n",
-            raopcl_latency(p), raopcl_sample_rate(p));
+    fprintf(stderr, "MSA-RAOP READY latency=%u sample_rate=%u bit_depth=%d channels=%d\n",
+            raopcl_latency(p), raopcl_sample_rate(p), bit_depth, channels);
     fflush(stderr);
 
-    uint8_t pcm[PCM_BYTES];
+    int input_bpf = (bit_depth <= 16 ? 2 : 4) * channels;
+    int alac_bpf = (bit_depth <= 16 ? 2 : 3) * channels;
+    size_t pcm_bytes = (size_t)FRAMES_PER_CHUNK * (size_t)input_bpf;
+    size_t alac_bytes = (size_t)FRAMES_PER_CHUNK * (size_t)alac_bpf;
+    uint8_t *pcm = malloc(pcm_bytes);
+    uint8_t *alac_buf = bit_depth > 16 ? malloc(alac_bytes) : NULL;
+    if (!pcm || (bit_depth > 16 && !alac_buf)) {
+        fprintf(stderr, "MSA-RAOP ERROR alloc\n");
+        free(pcm); free(alac_buf); raopcl_disconnect(p); raopcl_destroy(p);
+        return 6;
+    }
     size_t pcm_len = 0;
     uint64_t last_seq = 0;
     uint64_t last_keepalive = raopcl_get_ntp(NULL);
@@ -317,8 +345,8 @@ int main(int argc, char **argv) {
 
         if (raopcl_state(p) == RAOP_STREAMING && raopcl_accept_frames(p)) {
             int avail = available_stdin();
-            if (avail > 0 && pcm_len < PCM_BYTES) {
-                int want = (int)(PCM_BYTES - pcm_len);
+            if (avail > 0 && pcm_len < pcm_bytes) {
+                int want = (int)(pcm_bytes - pcm_len);
                 if (want > avail) want = avail;
 #if WIN
                 int got = _read(_fileno(stdin), pcm + pcm_len, want);
@@ -327,9 +355,14 @@ int main(int argc, char **argv) {
 #endif
                 if (got > 0) pcm_len += (size_t)got;
             }
-            if (pcm_len == PCM_BYTES) {
+            if (pcm_len == pcm_bytes) {
+                uint8_t *send_buf = pcm;
+                if (bit_depth > 16) {
+                    truncate_32to24(pcm, (int)pcm_len, alac_buf);
+                    send_buf = alac_buf;
+                }
                 uint64_t playtime = 0;
-                if (!raopcl_send_chunk(p, pcm, FRAMES_PER_CHUNK, &playtime)) {
+                if (!raopcl_send_chunk(p, send_buf, FRAMES_PER_CHUNK, &playtime)) {
                     fprintf(stderr, "MSA-RAOP ERROR send\n");
                     break;
                 }
@@ -348,6 +381,8 @@ int main(int argc, char **argv) {
 #endif
     }
 
+    free(pcm);
+    free(alac_buf);
     raopcl_disconnect(p);
     raopcl_destroy(p);
     cross_ssl_free();
