@@ -13,6 +13,7 @@ use crate::native_sync::{
     build_ntp_sync, build_ptp_sync, execute_sync, PtpAnchor, SyncCounters, SyncIo,
 };
 use crate::native_timeline::{frames_for_ms, MIN_WARM_LEAD_MS};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncTiming {
@@ -39,8 +40,8 @@ pub struct NativeRuntime {
     pub health: MediaHealth,
     pub pending: BufferedPending,
     pub sync_counters: SyncCounters,
-    pub rtx_ring: RtxRing,
-    pub rtx_counters: RtxCounters,
+    pub rtx_ring: Arc<Mutex<RtxRing>>,
+    pub rtx_counters: Arc<Mutex<RtxCounters>>,
     pub ptp_anchor: PtpAnchor,
     pub pace_last_release_us: u64,
     pub splice_pad_frames: u64,
@@ -220,7 +221,7 @@ impl NativeRuntime {
 
         struct RtxAdapter<'a, I> {
             io: &'a mut I,
-            ring: &'a mut RtxRing,
+            ring: &'a Arc<Mutex<RtxRing>>,
         }
         impl<I: MediaIo> MediaIo for RtxAdapter<'_, I> {
             fn send_realtime(&mut self, packet: &[u8]) -> SendResult {
@@ -233,11 +234,11 @@ impl NativeRuntime {
                 self.io.close_buffered()
             }
             fn store_retransmit(&mut self, seq: u16, packet: &[u8]) {
-                let _ = self.ring.store(seq, packet);
+                if let Ok(mut ring) = self.ring.lock() { let _ = ring.store(seq, packet); }
             }
         }
 
-        let mut adapter = RtxAdapter { io, ring: &mut self.rtx_ring };
+        let mut adapter = RtxAdapter { io, ring: &self.rtx_ring };
         execute_realtime(
             &mut self.media,
             &mut self.health,
@@ -385,13 +386,9 @@ impl NativeRuntime {
         peer: &I::Peer,
         datagram: &[u8],
     ) -> bool {
-        serve_request(
-            &self.rtx_ring,
-            &mut self.rtx_counters,
-            io,
-            peer,
-            datagram,
-        )
+        let Ok(ring) = self.rtx_ring.lock() else { return false };
+        let Ok(mut counters) = self.rtx_counters.lock() else { return false };
+        serve_request(&ring, &mut counters, io, peer, datagram)
     }
 }
 
@@ -428,8 +425,8 @@ mod tests {
             health: MediaHealth::default(),
             pending: BufferedPending::default(),
             sync_counters: SyncCounters::default(),
-            rtx_ring: RtxRing::default(),
-            rtx_counters: RtxCounters::default(),
+            rtx_ring: Arc::new(Mutex::new(RtxRing::default())),
+            rtx_counters: Arc::new(Mutex::new(RtxCounters::default())),
             ptp_anchor: PtpAnchor::default(),
             pace_last_release_us: 0,
             splice_pad_frames: 0,
@@ -525,7 +522,7 @@ mod tests {
         );
         assert_eq!(result, SendResult::Sent);
         assert_eq!(r.sync_counters.sent, 1);
-        assert!(r.rtx_ring.get(1).is_some());
+        assert!(r.rtx_ring.lock().unwrap().get(1).is_some());
         assert_eq!(r.media.timeline.seq, 2);
         assert!(!r.media.timeline.first_packet);
     }
@@ -568,7 +565,7 @@ mod tests {
         assert_eq!(r.media.counters.nonce_counter, 1);
         assert_eq!(r.media.timeline.seq, 2);
         assert!(!r.pending.is_empty());
-        assert!(r.rtx_ring.get(1).is_none());
+        assert!(r.rtx_ring.lock().unwrap().get(1).is_none());
     }
 
     #[test]
