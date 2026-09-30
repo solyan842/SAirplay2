@@ -82,6 +82,13 @@ impl NativeTimingOwner {
         }
     }
 
+    pub fn ptp_clock(&self) -> Option<&PtpClock> {
+        match self {
+            Self::Ptp { clock, .. } => Some(clock),
+            Self::Ntp { .. } => None,
+        }
+    }
+
     pub fn probe_streak(&self) -> Option<ProbeStreak> {
         let Self::Ptp { clock, .. } = self else { return None };
         let exchange = clock.exchange()?;
