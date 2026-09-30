@@ -288,6 +288,10 @@ impl MsaRaopSession {
     }
 
     pub fn ready(&self) -> MsaRaopReady { self.ready }
+    pub fn helper_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
     pub fn state(&self) -> MsaRaopState { self.state }
     pub fn logs(&self) -> Vec<String> {
         self.log.lock().map(|v| v.clone()).unwrap_or_default()
