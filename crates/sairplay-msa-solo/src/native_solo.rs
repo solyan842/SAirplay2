@@ -209,6 +209,275 @@ impl NativeSoloEngine {
         ap2::standby(self)
     }
 
+    pub fn state(&self) -> Ap2State { self.runtime.state }
+
+    pub fn is_connected(&mut self) -> bool {
+        self.runtime.state != Ap2State::Down && self.control_healthy()
+    }
+
+    pub fn is_playing(&mut self) -> bool {
+        self.runtime.state == Ap2State::Streaming && !self.content_paused && self.control_healthy()
+    }
+
+    pub fn content_paused(&self) -> bool { self.content_paused }
+    pub fn content_stopped(&self) -> bool { self.content_stopped }
+
+    pub fn format_capability(&self) -> (Ap2AudioFormat, crate::AudioFormatCapability, crate::AudioFormatCapability) {
+        (self.config.control.audio_format, self.ready.info.realtime, self.ready.info.buffered)
+    }
+
+    pub fn latency_info(&self) -> (u64, Option<u32>, Option<u32>) {
+        (self.runtime.lead_ms, self.ready.latency_min, self.ready.latency_max)
+    }
+
+    pub fn render_latency_ms(&self) -> Option<u32> {
+        self.ready.arrival_to_render_latency_ms
+    }
+
+    pub fn audible_lag_frames(&self) -> u64 {
+        if self.runtime.splice_timeline || self.runtime.lane == NativeLane::Buffered {
+            self.runtime.pacing_window_frames()
+        } else {
+            frames_for_ms(self.runtime.lead_ms, self.runtime.media.timeline.sample_rate)
+        }
+    }
+
+    pub fn warm_lead_ms(&self) -> u64 {
+        if self.runtime.splice_timeline {
+            self.runtime.splice_depth_ms
+        } else {
+            0
+        }
+    }
+
+    pub fn splice_head_unix_ms(&self) -> u64 {
+        if self.runtime.splice_timeline && self.runtime.media.timeline.head_frame != 0 {
+            ms_for_frames(
+                self.runtime.media.timeline.head_frame,
+                self.runtime.media.timeline.sample_rate,
+            )
+        } else {
+            0
+        }
+    }
+
+    pub fn head_audible_unix_ms(&self) -> u64 {
+        if self.runtime.media.timeline.head_frame == 0 { 0 } else {
+            ms_for_frames(
+                self.runtime.media.timeline.head_frame,
+                self.runtime.media.timeline.sample_rate,
+            )
+        }
+    }
+
+    pub fn splice_hot(&self) -> bool {
+        self.runtime.splice_timeline
+            && self.runtime.state == Ap2State::Streaming
+            && self.runtime.ptp_anchor.valid
+    }
+
+    pub fn set_volume(&mut self, percent: u8) -> Result<VolumeSetResult, NativeSoloError> {
+        let result = set_native_volume(
+            &self.ready.control,
+            &self.ready.next_cseq,
+            &self.ready.session_uri,
+            &self.config.control.dacp_id,
+            &self.config.control.active_remote,
+            percent,
+        ).map_err(|e| NativeSoloError::Command(format!("volume: {e:?}")))?;
+        if !(200..300).contains(&result.status) {
+            return Err(NativeSoloError::Command(format!("volume status {}", result.status)));
+        }
+        Ok(result)
+    }
+
+    pub fn set_metadata(
+        &mut self,
+        title: &str,
+        artist: &str,
+        album: &str,
+        duration_s: u32,
+        item_id: &str,
+    ) -> Result<MetadataSetResult, NativeSoloError> {
+        if self.meta_delivered
+            && self.meta_duration_s == duration_s
+            && self.meta_title == title
+            && self.meta_artist == artist
+            && self.meta_album == album
+            && self.meta_item_id == item_id
+        {
+            return Ok(MetadataSetResult { status: 200, bytes: 0 });
+        }
+        let result = send_native_metadata(
+            &self.ready.control,
+            &self.ready.next_cseq,
+            &self.ready.session_uri,
+            &self.config.control.dacp_id,
+            &self.config.control.active_remote,
+            title,
+            artist,
+            album,
+            self.runtime.media.timeline.wire_rtp,
+        ).map_err(|e| NativeSoloError::Command(format!("metadata: {e:?}")))?;
+        self.meta_delivered = (200..300).contains(&result.status);
+        if self.meta_delivered {
+            self.meta_title = title.to_owned();
+            self.meta_artist = artist.to_owned();
+            self.meta_album = album.to_owned();
+            self.meta_duration_s = duration_s;
+            self.meta_item_id = item_id.to_owned();
+        }
+        Ok(result)
+    }
+
+    pub fn set_artwork(
+        &mut self,
+        content_type: &str,
+        data: &[u8],
+    ) -> Result<ParameterResult, NativeSoloError> {
+        send_native_artwork(
+            &self.ready.control,
+            &self.ready.next_cseq,
+            &self.ready.session_uri,
+            &self.config.control.dacp_id,
+            &self.config.control.active_remote,
+            content_type,
+            data,
+            self.runtime.media.timeline.wire_rtp,
+        ).map_err(|e| NativeSoloError::Command(format!("artwork: {e:?}")))
+    }
+
+    pub fn set_progress(
+        &mut self,
+        elapsed_s: u32,
+        duration_s: u32,
+    ) -> Result<ParameterResult, NativeSoloError> {
+        let now_ntp = system_time_to_ntp(SystemTime::now())
+            .map_err(|e| NativeSoloError::Timing(format!("{e:?}")))?;
+        let wall = ntp_to_frames(now_ntp, self.runtime.media.timeline.sample_rate) as u32;
+        let now_wire_rtp = wall.wrapping_add(self.runtime.media.timeline.rtp_offset);
+        send_native_progress(
+            &self.ready.control,
+            &self.ready.next_cseq,
+            &self.ready.session_uri,
+            &self.config.control.dacp_id,
+            &self.config.control.active_remote,
+            now_wire_rtp,
+            self.runtime.media.timeline.sample_rate,
+            elapsed_s,
+            duration_s,
+        ).map_err(|e| NativeSoloError::Command(format!("progress: {e:?}")))
+    }
+
+    pub fn pause_content(&mut self) -> Result<(), NativeSoloError> {
+        self.content_stopped = false;
+        if self.runtime.splice_timeline {
+            self.content_paused = true;
+            return Ok(());
+        }
+
+        if self.runtime.lane == NativeLane::Buffered && self.anchored_buffered {
+            self.park_buffered()?;
+        }
+        self.runtime.ptp_anchor = PtpAnchor::default();
+        self.runtime.state = Ap2State::Paused;
+        self.content_paused = true;
+        Ok(())
+    }
+
+    pub fn play_content(&mut self) -> Result<(), NativeSoloError> {
+        self.content_paused = false;
+        self.content_stopped = false;
+        let now_ntp = system_time_to_ntp(SystemTime::now())
+            .map_err(|e| NativeSoloError::Timing(format!("{e:?}")))?;
+        let now_frame = ntp_to_frames(now_ntp, self.runtime.media.timeline.sample_rate);
+        let warm = frames_for_ms(crate::timing::AP2_MIN_WARM_LEAD_MS, self.runtime.media.timeline.sample_rate);
+
+        if self.runtime.splice_timeline && self.runtime.ptp_anchor.valid {
+            let target = now_frame.saturating_add(warm);
+            if self.runtime.media.timeline.head_frame > now_frame {
+                if target > self.runtime.media.timeline.head_frame {
+                    self.runtime.splice_pad_frames =
+                        target - self.runtime.media.timeline.head_frame;
+                }
+            } else {
+                self.runtime.splice_pad_frames = 0;
+                let at = ms_for_frames(target, self.runtime.media.timeline.sample_rate);
+                self.reanchor_stock_timeline(at, false);
+                self.anchor_start(at)?;
+            }
+            self.runtime.state = Ap2State::Streaming;
+            self.runtime.health.healthy = true;
+            return Ok(());
+        }
+
+        if self.runtime.lane == NativeLane::Realtime && self.runtime.state == Ap2State::Paused {
+            if self.runtime.media.timeline.head_frame <= now_frame {
+                let target = now_frame.saturating_add(warm);
+                let at = ms_for_frames(target, self.runtime.media.timeline.sample_rate);
+                self.reanchor_stock_timeline(at, false);
+                self.anchor_start(at)?;
+            }
+            self.runtime.state = Ap2State::Streaming;
+            self.runtime.health.healthy = true;
+            return Ok(());
+        }
+
+        if self.runtime.lane == NativeLane::Buffered {
+            let target = now_frame.saturating_add(warm);
+            let at = ms_for_frames(target, self.runtime.media.timeline.sample_rate);
+            self.reanchor_stock_timeline(at, true);
+            self.anchor_start(at)?;
+            self.runtime.state = Ap2State::Streaming;
+            self.runtime.health.healthy = true;
+            self.anchor_buffered_start(at)?;
+            return Ok(());
+        }
+
+        self.runtime.state = Ap2State::Streaming;
+        self.runtime.health.healthy = true;
+        Ok(())
+    }
+
+    pub fn stop_content(&mut self) -> Result<(), NativeSoloError> {
+        self.disarm_clock_verify();
+        self.content_paused = false;
+        self.content_stopped = false;
+        if self.runtime.lane == NativeLane::Buffered && !self.rtsp_dead {
+            let _ = self.flush_buffered();
+        }
+        self.clear_anchor();
+        self.runtime.state = Ap2State::Down;
+        Ok(())
+    }
+
+    pub fn disconnect(&mut self) -> Result<(), NativeSoloError> {
+        if self.disconnected {
+            return Ok(());
+        }
+        self.disarm_clock_verify();
+        self.feedback.stop();
+        if let Some(worker) = self.rtx_worker.as_mut() {
+            worker.stop();
+        }
+        self.ready.media.io.close_buffered();
+
+        if !self.rtsp_dead {
+            send_teardown(
+                &self.ready.control,
+                &self.ready.next_cseq,
+                &self.ready.session_uri,
+                &self.config.control.dacp_id,
+                &self.config.control.active_remote,
+            ).map_err(|e| NativeSoloError::Command(format!("TEARDOWN: {e:?}")))?;
+        }
+        self.meta_delivered = false;
+        self.clear_anchor();
+        self.runtime.state = Ap2State::Down;
+        self.disconnected = true;
+        Ok(())
+    }
+
     pub fn accept_frames_now(&mut self) -> Result<bool, NativeSoloError> {
         self.refresh_control_health();
         if self.rtsp_dead { return Ok(false); }
