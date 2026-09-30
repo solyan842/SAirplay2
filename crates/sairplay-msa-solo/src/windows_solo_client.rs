@@ -113,6 +113,15 @@ pub struct SoloFlushAck {
     pub head_unix_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsMsaSoloState {
+    Down,
+    Connected,
+    Streaming,
+    Paused,
+}
+
+
 enum Transport {
     Native {
         engine: Arc<Mutex<NativeSoloEngine>>,
@@ -466,6 +475,77 @@ impl WindowsMsaSoloClient {
                     }
                 }
             }
+        }
+    }
+
+    pub fn state(&self) -> WindowsMsaSoloState {
+        match &self.transport {
+            Transport::Native { engine, .. } => match engine.lock().map(|v| v.state()) {
+                Ok(crate::Ap2State::Connected) => WindowsMsaSoloState::Connected,
+                Ok(crate::Ap2State::Streaming) => WindowsMsaSoloState::Streaming,
+                Ok(crate::Ap2State::Paused) => WindowsMsaSoloState::Paused,
+                _ => WindowsMsaSoloState::Down,
+            },
+            Transport::Raop { worker } => match worker.session().lock().map(|v| v.state()) {
+                Ok(crate::MsaRaopState::Connected) => WindowsMsaSoloState::Connected,
+                // Pinned ap2cl_flush leaves the public client state STREAMING.
+                Ok(crate::MsaRaopState::Streaming | crate::MsaRaopState::Flushed) =>
+                    WindowsMsaSoloState::Streaming,
+                Ok(crate::MsaRaopState::Paused) => WindowsMsaSoloState::Paused,
+                Ok(crate::MsaRaopState::Stopped | crate::MsaRaopState::Down) | Err(_) =>
+                    WindowsMsaSoloState::Down,
+            },
+        }
+    }
+
+    pub fn control_healthy(&self) -> bool {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock()
+                .map(|mut v| v.control_healthy()).unwrap_or(false),
+            // Exact ap2cl_control_healthy: non-native flow returns true.
+            Transport::Raop { .. } => true,
+        }
+    }
+
+    pub fn splice_pad_frames(&self) -> u64 {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock()
+                .map(|v| v.splice_pad_frames()).unwrap_or(0),
+            Transport::Raop { .. } => 0,
+        }
+    }
+
+    pub fn consume_splice_pad_frames(&self, frames: u32) -> u32 {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock()
+                .map(|mut v| v.consume_splice_pad_frames(frames)).unwrap_or(0),
+            Transport::Raop { .. } => 0,
+        }
+    }
+
+    pub fn content_skip_bytes(&self) -> u32 {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock()
+                .map(|v| v.content_skip_bytes()).unwrap_or(0),
+            Transport::Raop { .. } => 0,
+        }
+    }
+
+    pub fn consume_content_skip_bytes(&self, bytes: u32) {
+        if let Transport::Native { engine, .. } = &self.transport {
+            if let Ok(mut v) = engine.lock() {
+                v.consume_content_skip_bytes(bytes);
+            }
+        }
+    }
+
+    pub fn clear_mrp_artwork(&self) -> Result<Option<MrpPushResult>, WindowsMsaSoloError> {
+        match &self.transport {
+            Transport::Native { engine, .. } => engine.lock()
+                .map_err(|_| WindowsMsaSoloError::Native("native engine mutex poisoned".into()))?
+                .clear_mrp_artwork()
+                .map_err(|e| WindowsMsaSoloError::Native(format!("{e:?}"))),
+            Transport::Raop { .. } => Ok(None),
         }
     }
 
