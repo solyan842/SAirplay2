@@ -319,8 +319,8 @@ pub use teardown::{send_teardown, write_farewell_teardown_locked, TeardownError}
 
 pub use mrp::{
     post_command as mrp_post_command, probe_artwork as mrp_probe_artwork,
-    MrpArtworkInfo, MrpArtworkResult, MrpError, MrpPlaybackState, MrpPostResult,
-    MrpState, ARTWORK_STAGING_MAX_BYTES,
+    MrpArtworkInfo, MrpArtworkResult, MrpController, MrpError, MrpPlaybackState,
+    MrpPostResult, MrpPushResult, MrpState, ARTWORK_STAGING_MAX_BYTES,
 };
 
 pub use mrp_event::{MrpEventWorker, MrpRemoteCommand};
