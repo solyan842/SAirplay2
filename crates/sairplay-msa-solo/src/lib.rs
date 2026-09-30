@@ -313,4 +313,4 @@ pub use native_metadata::{build_dmap_metadata, send_native_metadata, MetadataErr
 pub use native_parameters::{
     send_native_artwork, send_native_progress, ParameterError, ParameterResult,
 };
-pub use teardown::{send_teardown, TeardownError};
+pub use teardown::{send_teardown, write_farewell_teardown_locked, TeardownError};
