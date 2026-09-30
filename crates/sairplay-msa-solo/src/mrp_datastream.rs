@@ -216,15 +216,26 @@ impl MrpDataStreamWorker {
                     healthy_t.store(false,Ordering::SeqCst);
                     break;
                 }
-                if last_push.elapsed()>=Duration::from_secs(15) {
-                    if let Ok(state)=controller.snapshot() {
-                        let msg=state.build_type130_state_message(false);
-                        if stream.send_protobuf(&msg).is_err() {
+
+                // Pinned ap2_mrp_prepare_state_push: send immediately when
+                // mutable MRP state is dirty; otherwise re-push every 15s
+                // only while playback is actually PLAYING.
+                let periodic_due = last_push.elapsed() >= Duration::from_secs(15);
+                match controller.prepare_type130_state_push(periodic_due) {
+                    Ok(Some((msg, generation))) => {
+                        let sent = stream.send_protobuf(&msg).is_ok();
+                        let _ = controller.complete_type130_state_push(generation, sent);
+                        if !sent {
                             healthy_t.store(false,Ordering::SeqCst);
                             break;
                         }
+                        last_push = Instant::now();
                     }
-                    last_push=Instant::now();
+                    Ok(None) => {}
+                    Err(_) => {
+                        healthy_t.store(false,Ordering::SeqCst);
+                        break;
+                    }
                 }
                 thread::sleep(Duration::from_millis(25));
             }
