@@ -24,6 +24,7 @@ pub mod native_parameters;
 pub mod teardown;
 pub mod native_metadata;
 pub mod volume;
+pub mod mrp;
 pub mod native_timing_owner;
 pub mod ptp_engine;
 pub mod ntp_timing;
@@ -314,3 +315,9 @@ pub use native_parameters::{
     send_native_artwork, send_native_progress, ParameterError, ParameterResult,
 };
 pub use teardown::{send_teardown, write_farewell_teardown_locked, TeardownError};
+
+pub use mrp::{
+    post_command as mrp_post_command, probe_artwork as mrp_probe_artwork,
+    MrpArtworkInfo, MrpArtworkResult, MrpError, MrpPlaybackState, MrpPostResult,
+    MrpState, ARTWORK_STAGING_MAX_BYTES,
+};
