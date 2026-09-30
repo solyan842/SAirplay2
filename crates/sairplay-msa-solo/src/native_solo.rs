@@ -25,7 +25,7 @@ use crate::{
     set_native_volume, write_farewell_teardown_locked, Ap2AudioFormat,
     EncryptedRtspError, MetadataError, MetadataSetResult, ParameterError,
     ParameterResult, VolumeError, VolumeSetResult, mrp_post_command, MrpError,
-    MrpController, MrpEventWorker, MrpPlaybackState, MrpRemoteCommand, MrpState,
+    MrpArtworkResult, MrpController, MrpEventWorker, MrpPlaybackState, MrpRemoteCommand, MrpState,
 };
 use crate::ntp_timing::system_time_to_ntp;
 use std::thread;
