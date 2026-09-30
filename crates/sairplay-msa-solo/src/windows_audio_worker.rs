@@ -499,32 +499,77 @@ impl WindowsSoloAudioWorker {
         &self,
         requested_unix_ms: u64,
     ) -> Result<crate::timing::StartResolution, WindowsSoloAudioWorkerError> {
-        let mut engine = self.engine.lock().map_err(|_| {
-            WindowsSoloAudioWorkerError::Engine("native SOLO engine mutex poisoned".into())
-        })?;
-        engine.start(requested_unix_ms).map_err(|e| {
-            WindowsSoloAudioWorkerError::Engine(format!("START: {e:?}"))
-        })
+        let (started, mrp) = {
+            let mut engine = self.engine.lock().map_err(|_| {
+                WindowsSoloAudioWorkerError::Engine("native SOLO engine mutex poisoned".into())
+            })?;
+            let started = engine.start(requested_unix_ms).map_err(|e| {
+                WindowsSoloAudioWorkerError::Engine(format!("START: {e:?}"))
+            })?;
+            (started, engine.mrp_controller())
+        };
+        // Pinned cliairplay publishes MRP only after leaving the audio-send
+        // quiesce bracket. A failed decoration never turns a valid START into
+        // a transport failure.
+        if let Some(mrp) = mrp {
+            let _ = mrp.publish_playback_state_on_transition(crate::MrpPlaybackState::Playing);
+        }
+        Ok(started)
     }
 
     pub fn standby_content(&self) -> Result<(), WindowsSoloAudioWorkerError> {
-        let mut engine = self.engine.lock().map_err(|_| {
-            WindowsSoloAudioWorkerError::Engine("native SOLO engine mutex poisoned".into())
-        })?;
-        engine.standby().map_err(|e| {
-            WindowsSoloAudioWorkerError::Engine(format!("STANDBY: {e:?}"))
-        })
+        let mrp = {
+            let mut engine = self.engine.lock().map_err(|_| {
+                WindowsSoloAudioWorkerError::Engine("native SOLO engine mutex poisoned".into())
+            })?;
+            engine.standby().map_err(|e| {
+                WindowsSoloAudioWorkerError::Engine(format!("STANDBY: {e:?}"))
+            })?;
+            engine.mrp_controller()
+        };
+        if let Some(mrp) = mrp {
+            let _ = mrp.publish_playback_state(crate::MrpPlaybackState::Paused, true);
+        }
+        Ok(())
     }
 
     pub fn set_content_enabled(&self, enabled: bool) -> Result<(), WindowsSoloAudioWorkerError> {
-        let mut engine = self.engine.lock().map_err(|_| {
-            WindowsSoloAudioWorkerError::Engine("native SOLO engine mutex poisoned".into())
-        })?;
-        if enabled {
-            engine.play_content().map_err(|e| WindowsSoloAudioWorkerError::Engine(format!("play: {e:?}")))
-        } else {
-            engine.pause_content().map_err(|e| WindowsSoloAudioWorkerError::Engine(format!("pause: {e:?}")))
+        let mrp = {
+            let mut engine = self.engine.lock().map_err(|_| {
+                WindowsSoloAudioWorkerError::Engine("native SOLO engine mutex poisoned".into())
+            })?;
+            if enabled {
+                engine.play_content().map_err(|e| WindowsSoloAudioWorkerError::Engine(format!("play: {e:?}")))?;
+            } else {
+                engine.pause_content().map_err(|e| WindowsSoloAudioWorkerError::Engine(format!("pause: {e:?}")))?;
+            }
+            engine.mrp_controller()
+        };
+        if let Some(mrp) = mrp {
+            let state = if enabled {
+                crate::MrpPlaybackState::Playing
+            } else {
+                crate::MrpPlaybackState::Paused
+            };
+            let _ = mrp.publish_playback_state(state, true);
         }
+        Ok(())
+    }
+
+    pub fn stop_content(&self) -> Result<(), WindowsSoloAudioWorkerError> {
+        let mrp = {
+            let mut engine = self.engine.lock().map_err(|_| {
+                WindowsSoloAudioWorkerError::Engine("native SOLO engine mutex poisoned".into())
+            })?;
+            engine.stop_content().map_err(|e| {
+                WindowsSoloAudioWorkerError::Engine(format!("STOP: {e:?}"))
+            })?;
+            engine.mrp_controller()
+        };
+        if let Some(mrp) = mrp {
+            let _ = mrp.publish_playback_state(crate::MrpPlaybackState::Stopped, true);
+        }
+        Ok(())
     }
 
     /// Clears capture bytes without changing the AP2 wire timeline. Session
