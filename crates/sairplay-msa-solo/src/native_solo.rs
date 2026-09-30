@@ -408,7 +408,10 @@ impl NativeSoloEngine {
     }
 
     pub fn is_playing(&mut self) -> bool {
-        self.runtime.state == Ap2State::Streaming && !self.content_paused && self.control_healthy()
+        // Exact ap2cl_is_playing: this reports the transport/wire state.
+        // Splice pause keeps AP2_STREAMING while content_paused carries the
+        // user-visible content state separately.
+        self.runtime.state == Ap2State::Streaming && self.control_healthy()
     }
 
     pub fn content_paused(&self) -> bool { self.content_paused }
