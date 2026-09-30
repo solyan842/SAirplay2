@@ -4,6 +4,8 @@
 use crate::{SessionState, StartAck};
 use crate::persistent_input::{PersistentInput, PersistentReader, ReaderError, ReaderState};
 
+pub const SESSION_IDLE_TIMEOUT_MS: u64 = 120_000;
+
 pub trait OwnedTransport {
     type Error;
     fn quiesce(&mut self);
@@ -34,7 +36,7 @@ pub struct OwnedSoloSession<T:OwnedTransport,I:PersistentInput>{
 }
 
 impl<T:OwnedTransport,I:PersistentInput> OwnedSoloSession<T,I>{
-    pub fn new(transport:T,input:I,byte_rate:usize,ready_bytes:usize)->Result<Self,OwnedError<T::Error,I::Error>>{Self::new_at(transport,input,byte_rate,ready_bytes,0,0)}
+    pub fn new(transport:T,input:I,byte_rate:usize,ready_bytes:usize)->Result<Self,OwnedError<T::Error,I::Error>>{Self::new_at(transport,input,byte_rate,ready_bytes,SESSION_IDLE_TIMEOUT_MS,0)}
     pub fn new_at(transport:T,input:I,byte_rate:usize,ready_bytes:usize,idle_timeout_ms:u64,now_ms:u64)->Result<Self,OwnedError<T::Error,I::Error>>{
         let reader=PersistentReader::new(input,byte_rate,ready_bytes).map_err(|e|match e{ReaderError::InvalidConfig=>OwnedError::InvalidConfig,ReaderError::InvalidState=>OwnedError::ReaderState,ReaderError::Input(e)=>OwnedError::Input(e)})?;
         Ok(Self{transport,reader,state:SessionState::Idle,epoch:0,byte_rate,idle_timeout_ms,idle_since_ms:now_ms,last_audio_ready:false,pending_event:None})
