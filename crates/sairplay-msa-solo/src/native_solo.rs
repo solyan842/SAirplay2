@@ -344,6 +344,13 @@ impl NativeSoloEngine {
             ap2::start(self, requested_unix_ms)
         };
         if result.is_ok() {
+            if !self.first_start_done {
+                if let Some(mrp) = self.mrp.clone() {
+                    if let Err(e) = mrp.stage_playing_for_start() {
+                        self.note_mrp_error(&e);
+                    }
+                }
+            }
             // Pinned cliairplay session_commit: before the first audio can
             // leave the send gate, metadata-gated receivers get a placeholder
             // unless real metadata was already delivered pre-START.
