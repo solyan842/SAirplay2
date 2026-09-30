@@ -12,9 +12,11 @@ use crate::{
     NativeTimingOwner,
 };
 use crate::event_channel::open_event_channel_best_effort;
+use crate::feedback::{SharedCseq, SharedRtspControl};
 use rand::RngCore;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
+use std::sync::{Arc, Mutex, atomic::AtomicU32};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveTiming {
@@ -69,7 +71,7 @@ pub enum NativeControlError {
 }
 
 pub struct NativeControlReady {
-    pub control: EncryptedRtspChannel,
+    pub control: SharedRtspControl,
     pub event: Option<EventChannel>,
     pub media: NativeMediaOwner,
     pub info: Ap2Info,
@@ -83,7 +85,7 @@ pub struct NativeControlReady {
     pub buffered: bool,
     pub latency_min: Option<u32>,
     pub latency_max: Option<u32>,
-    pub next_cseq: u32,
+    pub next_cseq: SharedCseq,
 }
 
 pub fn open_native_control(
@@ -286,6 +288,9 @@ pub fn open_native_control(
 
     // Pinned MSA: NTP SSRC == streamConnectionID; PTP SSRC == 0.
     let ssrc = if matches!(timing, LiveTiming::Ptp { .. }) { 0 } else { session_id };
+
+    let control = Arc::new(Mutex::new(control));
+    let next_cseq = Arc::new(AtomicU32::new(next_cseq));
 
     Ok(NativeControlReady {
         control,
