@@ -700,6 +700,16 @@ impl MrpController {
         self.push_full_locked()
     }
 
+    pub fn stage_playing_for_start(&self) -> Result<(), MrpError> {
+        // Exact ap2cl_start ordering: stage PLAYING under the MediaRemote
+        // publication lock before the outer session path sends initial
+        // metadata / publishes the transition.
+        let _publish = self.publish_lock.lock().map_err(|_| MrpError::Lock)?;
+        let mut state = self.state.lock().map_err(|_| MrpError::Lock)?;
+        state.set_playing(true);
+        Ok(())
+    }
+
     pub fn stage_progress(
         &self,
         elapsed_ms: i64,
