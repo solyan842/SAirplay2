@@ -1,6 +1,7 @@
 use crate::{Ap2Info, Ap2InfoError, RtspCodec, RtspError, RtspRequest, RtspResponse};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use socket2::{Domain, Protocol, Socket, Type};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -41,6 +42,7 @@ pub struct Ap2PreflightClient {
     exchange_timeout: Duration,
     dacp_id: String,
     active_remote: String,
+    bind_ip: Option<IpAddr>,
 }
 
 impl Ap2PreflightClient {
@@ -50,12 +52,18 @@ impl Ap2PreflightClient {
             exchange_timeout: Duration::from_secs(8),
             dacp_id: dacp_id.into(),
             active_remote: active_remote.into(),
+            bind_ip: None,
         }
     }
 
     pub fn with_timeouts(mut self, connect: Duration, exchange: Duration) -> Self {
         self.connect_timeout = connect;
         self.exchange_timeout = exchange;
+        self
+    }
+
+    pub fn with_bind_ip(mut self, bind_ip: Option<IpAddr>) -> Self {
+        self.bind_ip = bind_ip;
         self
     }
 
@@ -76,14 +84,29 @@ impl Ap2PreflightClient {
         host: &str,
         port: u16,
     ) -> Result<(TcpStream, PreflightResult), PreflightError> {
-        let peer = (host, port)
+        let resolved: Vec<SocketAddr> = (host, port)
             .to_socket_addrs()
             .map_err(|_| PreflightError::Resolve)?
-            .next()
-            .ok_or(PreflightError::Resolve)?;
+            .collect();
+        let peer = if let Some(bind_ip) = self.bind_ip {
+            resolved.iter().copied().find(|p| p.is_ipv4() == bind_ip.is_ipv4())
+        } else {
+            // Pinned native MSA opens AF_INET; prefer IPv4 when both exist.
+            resolved.iter().copied().find(SocketAddr::is_ipv4).or_else(|| resolved.first().copied())
+        }.ok_or(PreflightError::Resolve)?;
 
-        let mut stream = TcpStream::connect_timeout(&peer, self.connect_timeout)
+        let domain = if peer.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
             .map_err(PreflightError::Connect)?;
+        if let Some(bind_ip) = self.bind_ip {
+            let local = SocketAddr::new(bind_ip, 0);
+            // Source treats interface bind failure as diagnostic and still
+            // attempts the connection, so the bind is deliberately best-effort.
+            let _ = socket.bind(&local.into());
+        }
+        socket.connect_timeout(&peer.into(), self.connect_timeout)
+            .map_err(PreflightError::Connect)?;
+        let mut stream: TcpStream = socket.into();
         stream
             .set_nodelay(true)
             .map_err(PreflightError::Configure)?;
