@@ -311,14 +311,22 @@ impl NativeSoloEngine {
     }
 
     pub fn set_volume(&mut self, percent: u8) -> Result<VolumeSetResult, NativeSoloError> {
-        let result = set_native_volume(
+        let result = match set_native_volume(
             &self.ready.control,
             &self.ready.next_cseq,
             &self.ready.session_uri,
             &self.config.control.dacp_id,
             &self.config.control.active_remote,
             percent,
-        ).map_err(|e| NativeSoloError::Command(format!("volume: {e:?}")))?;
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                if let VolumeError::Transport(ref transport) = e {
+                    self.mark_rtsp_transport_error(transport);
+                }
+                return Err(NativeSoloError::Command(format!("volume: {e:?}")));
+            }
+        };
         if !(200..300).contains(&result.status) {
             return Err(NativeSoloError::Command(format!("volume status {}", result.status)));
         }
@@ -342,7 +350,7 @@ impl NativeSoloEngine {
         {
             return Ok(MetadataSetResult { status: 200, bytes: 0 });
         }
-        let result = send_native_metadata(
+        let result = match send_native_metadata(
             &self.ready.control,
             &self.ready.next_cseq,
             &self.ready.session_uri,
@@ -352,7 +360,15 @@ impl NativeSoloEngine {
             artist,
             album,
             self.runtime.media.timeline.wire_rtp,
-        ).map_err(|e| NativeSoloError::Command(format!("metadata: {e:?}")))?;
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                if let MetadataError::Transport(ref transport) = e {
+                    self.mark_rtsp_transport_error(transport);
+                }
+                return Err(NativeSoloError::Command(format!("metadata: {e:?}")));
+            }
+        };
         self.meta_delivered = (200..300).contains(&result.status);
         if self.meta_delivered {
             self.meta_title = title.to_owned();
@@ -369,7 +385,7 @@ impl NativeSoloEngine {
         content_type: &str,
         data: &[u8],
     ) -> Result<ParameterResult, NativeSoloError> {
-        send_native_artwork(
+        match send_native_artwork(
             &self.ready.control,
             &self.ready.next_cseq,
             &self.ready.session_uri,
@@ -378,7 +394,15 @@ impl NativeSoloEngine {
             content_type,
             data,
             self.runtime.media.timeline.wire_rtp,
-        ).map_err(|e| NativeSoloError::Command(format!("artwork: {e:?}")))
+        ) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if let ParameterError::Transport(ref transport) = e {
+                    self.mark_rtsp_transport_error(transport);
+                }
+                Err(NativeSoloError::Command(format!("artwork: {e:?}")))
+            }
+        }
     }
 
     pub fn set_progress(
@@ -390,7 +414,7 @@ impl NativeSoloEngine {
             .map_err(|e| NativeSoloError::Timing(format!("{e:?}")))?;
         let wall = ntp_to_frames(now_ntp, self.runtime.media.timeline.sample_rate) as u32;
         let now_wire_rtp = wall.wrapping_add(self.runtime.media.timeline.rtp_offset);
-        send_native_progress(
+        match send_native_progress(
             &self.ready.control,
             &self.ready.next_cseq,
             &self.ready.session_uri,
@@ -400,7 +424,15 @@ impl NativeSoloEngine {
             self.runtime.media.timeline.sample_rate,
             elapsed_s,
             duration_s,
-        ).map_err(|e| NativeSoloError::Command(format!("progress: {e:?}")))
+        ) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if let ParameterError::Transport(ref transport) = e {
+                    self.mark_rtsp_transport_error(transport);
+                }
+                Err(NativeSoloError::Command(format!("progress: {e:?}")))
+            }
+        }
     }
 
     pub fn pause_content(&mut self) -> Result<(), NativeSoloError> {
@@ -581,10 +613,28 @@ impl NativeSoloEngine {
         self.ready.next_cseq.fetch_add(1, Ordering::SeqCst)
     }
 
+    fn mark_rtsp_transport_error(&mut self, err: &EncryptedRtspError) {
+        if matches!(err, EncryptedRtspError::Timeout) {
+            // The request was fully written and the read side timed out. MSA
+            // appends one final encrypted TEARDOWN before abandoning the
+            // still-intact write direction.
+            if let Ok(mut control) = self.ready.control.lock() {
+                let _ = write_farewell_teardown_locked(
+                    &mut control,
+                    &self.ready.next_cseq,
+                    &self.ready.session_uri,
+                    &self.config.control.dacp_id,
+                    &self.config.control.active_remote,
+                );
+            }
+        }
+        self.rtsp_dead = true;
+        self.runtime.rtsp_dead = true;
+    }
+
     fn note_command_error(&mut self, err: &NativeCommandError) {
-        if matches!(err, NativeCommandError::Transport(_)) {
-            self.rtsp_dead = true;
-            self.runtime.rtsp_dead = true;
+        if let NativeCommandError::Transport(transport) = err {
+            self.mark_rtsp_transport_error(transport);
         }
     }
 
