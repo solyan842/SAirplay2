@@ -353,6 +353,12 @@ int main(int argc, char **argv) {
         process_command(control, ack, metadata_path, artwork_path, &last_seq, p, &quit);
         if (quit) break;
 
+        if (!raopcl_is_connected(p) || !raopcl_is_sane(p)) {
+            fprintf(stderr, "MSA-RAOP ERROR health\n");
+            fflush(stderr);
+            break;
+        }
+
         uint64_t now = raopcl_get_ntp(NULL);
         if (now - last_keepalive >= MS2NTP(KEEPALIVE_MS)) {
             raopcl_keepalive(p);
