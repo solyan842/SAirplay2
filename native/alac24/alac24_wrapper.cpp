@@ -71,9 +71,10 @@ extern "C" SAIRPLAY_EXPORT void* sairplay_alac24_create(int sample_rate) {
     return state;
 }
 
-extern "C" SAIRPLAY_EXPORT int sairplay_alac24_encode_352(
+extern "C" SAIRPLAY_EXPORT int sairplay_alac24_encode(
     void* opaque,
     const uint8_t* packed_s24le,
+    int frames,
     int input_bytes,
     uint8_t* output,
     int output_capacity
@@ -81,11 +82,14 @@ extern "C" SAIRPLAY_EXPORT int sairplay_alac24_encode_352(
     if (!opaque || !packed_s24le || !output) {
         return -1;
     }
-    if (input_bytes != 352 * 2 * 3 || output_capacity < 8192) {
+    if (frames <= 0 || frames > 352 ||
+        input_bytes != frames * 2 * 3 || output_capacity < 8192) {
         return -2;
     }
 
     auto* state = static_cast<sairplay_alac24_encoder*>(opaque);
+    // Mirrors pcm_to_alac(): io_bytes is the actual input payload size, while
+    // the encoder's configured frame size remains the 352-frame AirPlay packet.
     int32_t io_bytes = input_bytes;
     const int32_t status = state->encoder->Encode(
         state->input_format,
@@ -101,6 +105,18 @@ extern "C" SAIRPLAY_EXPORT int sairplay_alac24_encode_352(
         return -4;
     }
     return io_bytes;
+}
+
+extern "C" SAIRPLAY_EXPORT int sairplay_alac24_encode_352(
+    void* opaque,
+    const uint8_t* packed_s24le,
+    int input_bytes,
+    uint8_t* output,
+    int output_capacity
+) {
+    return sairplay_alac24_encode(
+        opaque, packed_s24le, 352, input_bytes, output, output_capacity
+    );
 }
 
 extern "C" SAIRPLAY_EXPORT void sairplay_alac24_destroy(void* opaque) {
