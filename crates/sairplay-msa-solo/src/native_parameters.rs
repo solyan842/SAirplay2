@@ -6,6 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const PARAM_TIMEOUT: Duration = Duration::from_millis(5000);
+const ARTWORK_TIMEOUT: Duration = Duration::from_millis(15000);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParameterResult {
@@ -81,7 +82,7 @@ pub fn send_native_artwork(
     rtp_timestamp: u32,
 ) -> Result<ParameterResult, ParameterError> {
     if content_type.is_empty() || data.is_empty() { return Err(ParameterError::InvalidInput); }
-    let deadline = Instant::now() + PARAM_TIMEOUT;
+    let deadline = Instant::now() + ARTWORK_TIMEOUT;
     let mut channel = lock_control(control, deadline)?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() { return Err(ParameterError::LockTimeout); }
