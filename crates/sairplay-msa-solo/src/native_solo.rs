@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex, atomic::Ordering};
 
 pub const MSA_NATIVE_LEAD_MS: u64 = 2000;
 pub const MSA_SPLICE_DEPTH_MS: u64 = 600;
+pub const MSA_SPLICE_DEPTH_MAX_MS: u64 = 3000;
 
 #[derive(Debug, Clone)]
 pub struct NativeSoloConfig {
@@ -72,6 +73,7 @@ pub struct NativeSoloEngine {
     rtx_worker: Option<RtxWorker>,
     config: NativeSoloConfig,
     timeline_initialized: bool,
+    first_start_done: bool,
     anchored_buffered: bool,
     rtsp_dead: bool,
     clock_verify_armed: bool,
@@ -120,7 +122,7 @@ impl NativeSoloEngine {
             splice_timeline,
             lead_ms,
             dev_latency_max: u64::from(ready.latency_max.unwrap_or(0)),
-            splice_depth_ms: config.splice_depth_ms.max(1),
+            splice_depth_ms: config.splice_depth_ms.clamp(1, MSA_SPLICE_DEPTH_MAX_MS),
             splice_depth_explicit: config.splice_depth_explicit,
             ssrc,
             start_ntp: 0,
@@ -175,6 +177,7 @@ impl NativeSoloEngine {
             rtx_worker,
             config,
             timeline_initialized: false,
+            first_start_done: false,
             anchored_buffered: false,
             rtsp_dead: false,
             clock_verify_armed: false,
@@ -194,11 +197,22 @@ impl NativeSoloEngine {
     }
 
     pub fn start(&mut self, requested_unix_ms: u64) -> Result<crate::timing::StartResolution, Ap2CommandError<NativeSoloError>> {
-        ap2::start(self, requested_unix_ms)
+        // Pinned cliairplay session_commit(): the first START uses ap2cl_start
+        // (fresh seq/rtp seed); every START after FLUSH uses ap2cl_resume so
+        // sequence/audio-nonce continuity is preserved.
+        let result = if self.first_start_done {
+            ap2::resume(self, requested_unix_ms).map(|plan| plan.start)
+        } else {
+            ap2::start(self, requested_unix_ms)
+        };
+        if result.is_ok() { self.first_start_done = true; }
+        result
     }
 
     pub fn resume(&mut self, requested_unix_ms: u64) -> Result<ResumePlan, Ap2CommandError<NativeSoloError>> {
-        ap2::resume(self, requested_unix_ms)
+        let result = ap2::resume(self, requested_unix_ms);
+        if result.is_ok() { self.first_start_done = true; }
+        result
     }
 
     pub fn flush(&mut self) -> Result<(), Ap2CommandError<NativeSoloError>> {
@@ -831,5 +845,6 @@ mod tests {
     fn native_lead_default_is_exact_pinned_value() {
         assert_eq!(MSA_NATIVE_LEAD_MS, 2000);
         assert_eq!(MSA_SPLICE_DEPTH_MS, 600);
+        assert_eq!(MSA_SPLICE_DEPTH_MAX_MS, 3000);
     }
 }
