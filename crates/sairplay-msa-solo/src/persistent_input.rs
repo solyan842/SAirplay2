@@ -137,6 +137,15 @@ mod tests{
   r.pump_once().unwrap();assert_eq!(r.read_playing(&mut out,true),3);assert_eq!(&out[..3],&[1,2,3]);
   assert_eq!(r.discard_playing(1,true),-1);assert_eq!(r.read_playing(&mut out,false),0);
  }
+ #[test] fn short_final_packet_is_released_only_after_eof(){
+  let i=Input{chunks:vec![vec![1,2,3],vec![]],i:0};
+  let mut r=PersistentReader::new(i,100,4).unwrap();
+  assert_eq!(r.pump_once().unwrap(),3);assert!(!r.audio_ready());
+  let mut out=[0u8;4];assert_eq!(r.read_playing(&mut out,true),0);
+  r.pump_once().unwrap();assert!(r.audio_ready());assert!(r.eof());
+  assert_eq!(r.read_playing(&mut out,true),3);assert_eq!(&out[..3],&[1,2,3]);
+  assert_eq!(r.read_playing(&mut out,true),-1);
+ }
  #[test] fn reader_never_touches_input_during_drain_handshake(){
   let i=Input{chunks:vec![vec![1]],i:0};let mut r=PersistentReader::new(i,100,1).unwrap();
   r.request_drain();assert_eq!(r.pump_once().unwrap(),0);assert!(r.acknowledge_pause());
