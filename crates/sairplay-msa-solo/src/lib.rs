@@ -12,6 +12,8 @@ pub mod native_io;
 pub mod native_media_owner;
 pub mod native_control;
 pub mod native_solo;
+pub mod native_rtx_worker;
+pub mod feedback;
 pub mod native_commands;
 pub mod native_timing_owner;
 pub mod ptp_engine;
@@ -280,3 +282,9 @@ pub use native_solo::{
     NativeSoloConfig, NativeSoloEngine, NativeSoloError,
     MSA_NATIVE_LEAD_MS, MSA_SPLICE_DEPTH_MS,
 };
+
+pub use feedback::{
+    FeedbackWorker, SharedCseq, SharedRtspControl,
+    FEEDBACK_INTERVAL, FEEDBACK_TIMEOUT, MAX_CONSECUTIVE_MISSES,
+};
+pub use native_rtx_worker::RtxWorker;
