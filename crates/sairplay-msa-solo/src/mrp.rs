@@ -2,8 +2,7 @@ use crate::{EncryptedRtspError, RtspRequest, SharedCseq, SharedRtspControl};
 use plist::{Dictionary, Value};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use std::sync::atomic::Ordering;
-use std::sync::TryLockError;
+use std::sync::{Arc, Mutex, TryLockError, atomic::Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -417,6 +416,274 @@ impl MrpState {
         root.insert("params".into(), Value::Dictionary(nested));
         binary_plist(Value::Dictionary(root))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MrpPushResult {
+    pub overall_status: i32,
+    pub nowplaying_status: i32,
+}
+
+impl MrpPushResult {
+    pub const fn empty() -> Self {
+        Self { overall_status: -1, nowplaying_status: 0 }
+    }
+}
+
+#[derive(Clone)]
+pub struct MrpController {
+    state: Arc<Mutex<MrpState>>,
+    publish_lock: Arc<Mutex<()>>,
+    control: SharedRtspControl,
+    next_cseq: SharedCseq,
+    dacp_id: String,
+    active_remote: String,
+}
+
+impl MrpController {
+    pub fn new(
+        state: MrpState,
+        control: SharedRtspControl,
+        next_cseq: SharedCseq,
+        dacp_id: impl Into<String>,
+        active_remote: impl Into<String>,
+    ) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(state)),
+            publish_lock: Arc::new(Mutex::new(())),
+            control,
+            next_cseq,
+            dacp_id: dacp_id.into(),
+            active_remote: active_remote.into(),
+        }
+    }
+
+    pub fn snapshot(&self) -> Result<MrpState, MrpError> {
+        self.state.lock().map(|v| v.clone()).map_err(|_| MrpError::Lock)
+    }
+
+    pub fn stage_track(
+        &self,
+        title: &str,
+        artist: &str,
+        album: &str,
+        duration_ms: i64,
+        item_id: &str,
+        artwork: Option<(&str, &[u8])>,
+    ) -> Result<(bool, MrpArtworkInfo), MrpError> {
+        let mut state = self.state.lock().map_err(|_| MrpError::Lock)?;
+        Ok(state.set_track(title, artist, album, duration_ms, item_id, artwork))
+    }
+
+    pub fn stage_artwork(
+        &self,
+        mime: &str,
+        data: &[u8],
+    ) -> Result<MrpArtworkInfo, MrpError> {
+        let mut state = self.state.lock().map_err(|_| MrpError::Lock)?;
+        Ok(state.set_artwork(mime, data))
+    }
+
+    pub fn clear_artwork_and_push(&self) -> Result<MrpPushResult, MrpError> {
+        let _publish = self.publish_lock.lock().map_err(|_| MrpError::Lock)?;
+        {
+            let mut state = self.state.lock().map_err(|_| MrpError::Lock)?;
+            state.clear_artwork();
+        }
+        self.push_full_locked()
+    }
+
+    pub fn push_full(&self) -> Result<MrpPushResult, MrpError> {
+        let _publish = self.publish_lock.lock().map_err(|_| MrpError::Lock)?;
+        self.push_full_locked()
+    }
+
+    pub fn set_progress_and_push(
+        &self,
+        elapsed_ms: i64,
+        duration_ms: i64,
+        playing: bool,
+    ) -> Result<MrpPushResult, MrpError> {
+        let _publish = self.publish_lock.lock().map_err(|_| MrpError::Lock)?;
+        {
+            let mut state = self.state.lock().map_err(|_| MrpError::Lock)?;
+            state.set_progress(elapsed_ms, duration_ms, playing);
+        }
+        self.push_progress_locked()
+    }
+
+    pub fn publish_playback_state(
+        &self,
+        state: MrpPlaybackState,
+        force: bool,
+    ) -> Result<i32, MrpError> {
+        let _publish = self.publish_lock.lock().map_err(|_| MrpError::Lock)?;
+        self.publish_playback_locked(state, force)
+    }
+
+    pub fn publish_playback_state_on_transition(
+        &self,
+        state: MrpPlaybackState,
+    ) -> Result<i32, MrpError> {
+        let changed = {
+            let current = self.state.lock().map_err(|_| MrpError::Lock)?;
+            current.last_playback_state != Some(state)
+        };
+        if !changed {
+            return Ok(200);
+        }
+        self.publish_playback_state(state, true)
+    }
+
+    fn post_body(&self, body: Vec<u8>) -> Result<i32, MrpError> {
+        Ok(post_command(
+            &self.control,
+            &self.next_cseq,
+            &self.dacp_id,
+            &self.active_remote,
+            body,
+        )?.status as i32)
+    }
+
+    fn register_locked(&self) -> Result<i32, MrpError> {
+        let already = self.state.lock().map_err(|_| MrpError::Lock)?.device_registered;
+        if already {
+            return Ok(1);
+        }
+        let body = self.state.lock().map_err(|_| MrpError::Lock)?
+            .build_deviceinfo_command()?;
+        let status = self.post_body(body)?;
+        let ok = status_ok(status);
+        if ok {
+            self.state.lock().map_err(|_| MrpError::Lock)?.device_registered = true;
+        }
+        Ok(if ok { 1 } else { 0 })
+    }
+
+    fn send_playback_state_locked(
+        &self,
+        state: MrpPlaybackState,
+        force: bool,
+    ) -> Result<i32, MrpError> {
+        let (last, body) = {
+            let current = self.state.lock().map_err(|_| MrpError::Lock)?;
+            if !force && current.last_playback_state == Some(state) {
+                return Ok(200);
+            }
+            (current.last_playback_state, current.build_playbackstate_command()?)
+        };
+        let _ = last;
+        let status = self.post_body(body)?;
+        if status_ok(status) {
+            self.state.lock().map_err(|_| MrpError::Lock)?.last_playback_state = Some(state);
+        }
+        Ok(status)
+    }
+
+    fn send_extended_registration_locked(&self) -> Result<i32, MrpError> {
+        let commands = self.state.lock().map_err(|_| MrpError::Lock)?
+            .build_supportedcommands_command()?;
+        let st_cmd = self.post_body(commands)?;
+
+        let state_value = self.state.lock().map_err(|_| MrpError::Lock)?.playback_state;
+        let st_state = self.send_playback_state_locked(state_value, true)?;
+
+        let client = self.state.lock().map_err(|_| MrpError::Lock)?
+            .build_nowplayingclient_command()?;
+        let st_client = self.post_body(client)?;
+
+        let ok = status_ok(st_cmd) && status_ok(st_state) && status_ok(st_client);
+        self.state.lock().map_err(|_| MrpError::Lock)?.extended_registered = ok;
+
+        if !status_ok(st_cmd) {
+            Ok(st_cmd)
+        } else if !status_ok(st_state) {
+            Ok(st_state)
+        } else {
+            Ok(st_client)
+        }
+    }
+
+    fn push_with_locked(&self, progress_only: bool) -> Result<MrpPushResult, MrpError> {
+        let mut result = MrpPushResult::empty();
+        if self.register_locked()? != 1 {
+            result.overall_status = 0;
+            return Ok(result);
+        }
+
+        let body = {
+            let state = self.state.lock().map_err(|_| MrpError::Lock)?;
+            if progress_only {
+                state.build_progress_command()?
+            } else {
+                state.build_nowplaying_command()?
+            }
+        };
+        let status = self.post_body(body)?;
+        result.nowplaying_status = status;
+        result.overall_status = status;
+        if !status_ok(status) {
+            return Ok(result);
+        }
+
+        let extended = self.state.lock().map_err(|_| MrpError::Lock)?.extended_registered;
+        let ext_status = if !extended {
+            self.send_extended_registration_locked()?
+        } else {
+            let playback = self.state.lock().map_err(|_| MrpError::Lock)?.playback_state;
+            self.send_playback_state_locked(playback, false)?
+        };
+        if !status_ok(ext_status) {
+            result.overall_status = ext_status;
+        }
+        Ok(result)
+    }
+
+    fn push_full_locked(&self) -> Result<MrpPushResult, MrpError> {
+        self.push_with_locked(false)
+    }
+
+    fn push_progress_locked(&self) -> Result<MrpPushResult, MrpError> {
+        let full = self.state.lock().map_err(|_| MrpError::Lock)?.progress_push_full;
+        if !full {
+            let result = self.push_with_locked(true)?;
+            if result.nowplaying_status >= 300 {
+                self.state.lock().map_err(|_| MrpError::Lock)?.progress_push_full = true;
+            } else {
+                return Ok(result);
+            }
+        }
+        self.push_full_locked()
+    }
+
+    fn publish_playback_locked(
+        &self,
+        state: MrpPlaybackState,
+        mut force: bool,
+    ) -> Result<i32, MrpError> {
+        let state_was_current = {
+            let mut current = self.state.lock().map_err(|_| MrpError::Lock)?;
+            let was = current.last_playback_state == Some(state);
+            match state {
+                MrpPlaybackState::Stopped => current.set_stopped(),
+                MrpPlaybackState::Playing => current.set_playing(true),
+                MrpPlaybackState::Paused => current.set_playing(false),
+            }
+            was
+        };
+
+        if state != MrpPlaybackState::Stopped {
+            let pushed = self.push_progress_locked()?;
+            if status_ok(pushed.overall_status) && !state_was_current {
+                force = false;
+            }
+        }
+        self.send_playback_state_locked(state, force)
+    }
+}
+
+fn status_ok(status: i32) -> bool {
+    (200..300).contains(&status)
 }
 
 pub fn post_command(
