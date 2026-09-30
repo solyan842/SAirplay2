@@ -77,7 +77,7 @@ impl MsaRaopConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MsaRaopState { Streaming, Flushed, Stopped, Down }
+pub enum MsaRaopState { Connected, Streaming, Flushed, Paused, Stopped, Down }
 
 #[derive(Debug)]
 pub enum MsaRaopError {
@@ -283,7 +283,7 @@ impl MsaRaopSession {
             meta_duration_s: 0,
             meta_item_id: String::new(),
             next_seq: 1,
-            state: MsaRaopState::Streaming, ready, log,
+            state: MsaRaopState::Connected, ready, log,
         })
     }
 
@@ -328,13 +328,13 @@ impl MsaRaopSession {
     pub fn standby(&mut self) -> Result<(), MsaRaopError> {
         self.head_audible_ms.store(0, Ordering::SeqCst);
         self.command("STANDBY", 0, 0)?;
-        self.state = MsaRaopState::Flushed;
+        self.state = MsaRaopState::Connected;
         Ok(())
     }
     pub fn pause(&mut self) -> Result<(), MsaRaopError> {
         self.head_audible_ms.store(0, Ordering::SeqCst);
         self.command("PAUSE", 0, 0)?;
-        self.state = MsaRaopState::Flushed;
+        self.state = MsaRaopState::Paused;
         Ok(())
     }
     pub fn play(&mut self) -> Result<(), MsaRaopError> {
@@ -346,7 +346,7 @@ impl MsaRaopSession {
     pub fn stop(&mut self) -> Result<(), MsaRaopError> {
         self.head_audible_ms.store(0, Ordering::SeqCst);
         self.command("STOP", 0, 0)?;
-        self.state = MsaRaopState::Stopped;
+        self.state = MsaRaopState::Down;
         Ok(())
     }
     pub fn set_volume(&mut self, percent: u8) -> Result<(), MsaRaopError> {
