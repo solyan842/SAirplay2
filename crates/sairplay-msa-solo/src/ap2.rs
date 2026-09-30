@@ -5,7 +5,7 @@ use crate::clock::{resolve_at_floor,ClockFloor};
 use crate::timing::{StartResolution, AP2_MIN_WARM_LEAD_MS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Ap2State { Down, Connected, Streaming }
+pub enum Ap2State { Down, Connected, Paused, Streaming }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeLane { Realtime, Buffered }
