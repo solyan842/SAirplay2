@@ -23,6 +23,7 @@ pub struct WindowsMsaSoloConfig {
     pub txt: Option<String>,
     pub am: Option<String>,
     pub raop_cn: Option<String>,
+    pub raop_pk: Option<String>,
     pub pw_txt: Option<String>,
     pub force_native: bool,
     pub ptp_override: Option<bool>,
@@ -39,6 +40,7 @@ impl WindowsMsaSoloConfig {
             txt: None,
             am: None,
             raop_cn: None,
+            raop_pk: None,
             pw_txt: None,
             force_native: false,
             ptp_override: None,
@@ -177,16 +179,34 @@ impl WindowsMsaSoloClient {
                 })
             }
             Flow::Raop | Flow::AirPlay2Compat => {
+                if route.flow == Flow::Raop
+                    && config.am.as_deref().is_some_and(|v| v.to_ascii_lowercase().contains("appletv"))
+                    && config.raop_pk.as_deref().is_some_and(|v| !v.is_empty())
+                    && config.raop.secret.as_deref().is_none_or(|v| v.is_empty())
+                {
+                    return Err(SoloConnectError {
+                        class: SoloConnectErrorClass::Generic,
+                        http_status: 0,
+                        detail: "AppleTV requires authentication (need secret)".into(),
+                        route,
+                    });
+                }
                 if route.flow == Flow::AirPlay2Compat {
                     // ap2_client.c RAOP-compatible flow always uses compressed
                     // ALAC and clear transport; cn/raw policy belongs to the
                     // explicit legacy RAOP CLI route.
                     config.raop.compressed_alac = true;
                     config.raop.encrypt = false;
-                } else if let Some(cn) = config.raop_cn.as_deref() {
-                    if !cn.split(',').any(|v| v.trim() == "1") {
-                        config.raop.compressed_alac = false;
+                } else {
+                    if let Some(cn) = config.raop_cn.as_deref() {
+                        if !cn.contains('1') {
+                            config.raop.compressed_alac = false;
+                        }
                     }
+                    // Exact cliairplay RAOP rule: RSA is legal only when the
+                    // caller requested encryption and the receiver advertises
+                    // et type 1.
+                    config.raop.encrypt = config.raop.encrypt && config.raop.et.contains('1');
                 }
                 let worker = WindowsRaopAudioWorker::connect(config.raop)
                     .map_err(|e| SoloConnectError::raop(route, e))?;
