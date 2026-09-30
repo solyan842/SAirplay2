@@ -333,7 +333,7 @@ pub use mrp::{
     MrpPostResult, MrpPushResult, MrpState, ARTWORK_STAGING_MAX_BYTES,
 };
 
-pub use mrp_event::{MrpEventWorker, MrpRemoteCommand};
+pub use mrp_event::{MrpEventWorker, MrpRemoteCommand, MrpRemoteCommandCallback};
 
 pub use mrp_datastream::{MrpDataStream, MrpDataStreamError, MrpDataStreamWorker, MRP_CLIENT_TYPE_UUID, MRP_STREAM_CONTROL_TYPE, MRP_STREAM_TYPE_REMOTE_CONTROL};
 
