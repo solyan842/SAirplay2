@@ -7,6 +7,8 @@ pub mod native_media;
 pub mod native_sync;
 pub mod native_rtx;
 pub mod native_runtime;
+pub mod native_codec;
+pub mod native_io;
 pub mod native_connect;
 pub mod clock;
 pub mod owned_session;
