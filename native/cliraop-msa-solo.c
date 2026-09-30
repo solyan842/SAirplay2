@@ -313,8 +313,11 @@ int main(int argc, char **argv) {
         dacp_id ? dacp_id : "1A2B3D4EA1B2C3D4",
         active_remote ? active_remote : "0",
         alac ? RAOP_ALAC : RAOP_ALAC_RAW,
-        FRAMES_PER_CHUNK, latency, crypto, auth, secret, password,
-        et, md, sample_rate, bit_depth, channels, raopcl_float_volume(volume)
+        FRAMES_PER_CHUNK, latency, crypto, auth,
+        secret ? secret : "", password,
+        et ? et : "0,4", md ? md : "0,1,2",
+        sample_rate, bit_depth, channels,
+        volume > 0 ? raopcl_float_volume(volume) : -144.0f
     );
     if (!p) {
         fprintf(stderr, "MSA-RAOP ERROR create\n");
