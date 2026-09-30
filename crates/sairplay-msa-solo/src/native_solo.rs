@@ -71,6 +71,22 @@ pub struct NativeLatencyInfo {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeDiagnostics {
+    pub state: Ap2State,
+    pub seq: u16,
+    pub rtp: u32,
+    pub head_frame: u64,
+    pub pacing_ahead_frames: i64,
+    pub audio_sent: u64,
+    pub audio_dropped: u64,
+    pub sync_sent: u64,
+    pub sync_dropped: u64,
+    pub reanchors: u64,
+    pub splice_pad_frames: u64,
+    pub uses_ptp: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SoloClockReadinessState { Cold, Probing, Ready, Stalled }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -978,6 +994,40 @@ impl NativeSoloEngine {
 
     pub fn pop_remote_command(&self) -> Option<MrpRemoteCommand> {
         self.mrp_event.as_ref()?.pop_command()
+    }
+
+    pub fn uses_ptp(&self) -> bool { self.runtime.use_ptp }
+
+    pub fn splice_pad_frames(&self) -> u64 { self.runtime.splice_pad_frames }
+
+    pub fn consume_splice_pad_frames(&mut self, frames: u32) -> u32 {
+        self.runtime.take_splice_pad_frames(frames)
+    }
+
+    pub fn diagnostics(&self) -> NativeDiagnostics {
+        let now_frame = system_time_to_ntp(SystemTime::now())
+            .map(|ntp| ntp_to_frames(ntp, self.runtime.media.timeline.sample_rate))
+            .unwrap_or(0);
+        let head = self.runtime.media.timeline.head_frame;
+        let pacing_ahead_frames = if head >= now_frame {
+            (head - now_frame).min(i64::MAX as u64) as i64
+        } else {
+            -((now_frame - head).min(i64::MAX as u64) as i64)
+        };
+        NativeDiagnostics {
+            state: self.runtime.state,
+            seq: self.runtime.media.timeline.seq,
+            rtp: self.runtime.media.timeline.wire_rtp,
+            head_frame: head,
+            pacing_ahead_frames,
+            audio_sent: self.runtime.media.counters.sent,
+            audio_dropped: self.runtime.media.counters.dropped,
+            sync_sent: self.runtime.sync_counters.sent,
+            sync_dropped: self.runtime.sync_counters.dropped,
+            reanchors: self.runtime.timeline_reanchors,
+            splice_pad_frames: self.runtime.splice_pad_frames,
+            uses_ptp: self.runtime.use_ptp,
+        }
     }
 
     pub fn effective_lead_ms(&self) -> u64 { self.runtime.lead_ms }
