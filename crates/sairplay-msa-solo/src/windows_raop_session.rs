@@ -116,6 +116,9 @@ pub struct MsaRaopSession {
     stdin: Arc<Mutex<ChildStdin>>,
     control_path: PathBuf,
     ack_path: PathBuf,
+    metadata_path: PathBuf,
+    artwork_path: PathBuf,
+    head_audible_ms: Arc<AtomicU64>,
     next_seq: u64,
     state: MsaRaopState,
     ready: MsaRaopReady,
@@ -129,12 +132,18 @@ impl MsaRaopSession {
         let stem = format!("sairplay-msa-raop-{}-{id}", std::process::id());
         let control_path = std::env::temp_dir().join(format!("{stem}.cmd"));
         let ack_path = std::env::temp_dir().join(format!("{stem}.ack"));
+        let metadata_path = std::env::temp_dir().join(format!("{stem}.meta"));
+        let artwork_path = std::env::temp_dir().join(format!("{stem}.art"));
         let _ = std::fs::remove_file(&control_path);
         let _ = std::fs::remove_file(&ack_path);
+        let _ = std::fs::remove_file(&metadata_path);
+        let _ = std::fs::remove_file(&artwork_path);
 
         let mut cmd = Command::new(&helper);
         cmd.arg("--control").arg(&control_path)
             .arg("--ack").arg(&ack_path)
+            .arg("--metadata").arg(&metadata_path)
+            .arg("--artwork").arg(&artwork_path)
             .arg("-p").arg(config.port.to_string())
             .arg("-v").arg(config.volume.min(100).to_string())
             .arg("-l").arg("44100")
@@ -160,7 +169,9 @@ impl MsaRaopSession {
 
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<MsaRaopReady, String>>(1);
         let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let head_audible_ms = Arc::new(AtomicU64::new(0));
         let log_t = Arc::clone(&log);
+        let head_t = Arc::clone(&head_audible_ms);
         thread::Builder::new().name("msa-raop-log".into()).spawn(move || {
             let mut reported = false;
             let mut last_error = None::<String>;
@@ -182,6 +193,14 @@ impl MsaRaopSession {
                     if let (Some(latency_frames), Some(sample_rate)) = (latency, rate) {
                         let _ = ready_tx.send(Ok(MsaRaopReady { latency_frames, sample_rate }));
                         reported = true;
+                    }
+                } else if let Some(rest) = line.strip_prefix("MSA-RAOP HEAD ") {
+                    for token in rest.split_whitespace() {
+                        if let Some(v) = token.strip_prefix("audible_ms=") {
+                            if let Ok(ms) = v.parse::<u64>() {
+                                head_t.store(ms, Ordering::SeqCst);
+                            }
+                        }
                     }
                 } else if line.starts_with("MSA-RAOP ERROR ") {
                     last_error = Some(line);
@@ -207,7 +226,8 @@ impl MsaRaopSession {
         };
 
         Ok(Self {
-            child, stdin, control_path, ack_path, next_seq: 1,
+            child, stdin, control_path, ack_path, metadata_path, artwork_path,
+            head_audible_ms, next_seq: 1,
             state: MsaRaopState::Streaming, ready, log,
         })
     }
@@ -218,7 +238,12 @@ impl MsaRaopSession {
         self.log.lock().map(|v| v.clone()).unwrap_or_default()
     }
 
+    pub fn head_audible_unix_ms(&self) -> u64 {
+        self.head_audible_ms.load(Ordering::SeqCst)
+    }
+
     pub fn commit_start(&mut self, requested_unix_ms: u64) -> Result<StartResolution, MsaRaopError> {
+        self.head_audible_ms.store(0, Ordering::SeqCst);
         let at = self.command("START", requested_unix_ms, 0)?;
         self.state = MsaRaopState::Streaming;
         Ok(StartResolution {
@@ -229,6 +254,7 @@ impl MsaRaopSession {
     }
 
     pub fn start_after_flush(&mut self, requested_unix_ms: u64) -> Result<StartResolution, MsaRaopError> {
+        self.head_audible_ms.store(0, Ordering::SeqCst);
         let at = self.command("START_AFTER_FLUSH", requested_unix_ms, 0)?;
         self.state = MsaRaopState::Streaming;
         Ok(StartResolution {
@@ -239,26 +265,31 @@ impl MsaRaopSession {
     }
 
     pub fn flush(&mut self) -> Result<(), MsaRaopError> {
+        self.head_audible_ms.store(0, Ordering::SeqCst);
         self.command("FLUSH", 0, 0)?;
         self.state = MsaRaopState::Flushed;
         Ok(())
     }
     pub fn standby(&mut self) -> Result<(), MsaRaopError> {
+        self.head_audible_ms.store(0, Ordering::SeqCst);
         self.command("STANDBY", 0, 0)?;
         self.state = MsaRaopState::Flushed;
         Ok(())
     }
     pub fn pause(&mut self) -> Result<(), MsaRaopError> {
+        self.head_audible_ms.store(0, Ordering::SeqCst);
         self.command("PAUSE", 0, 0)?;
         self.state = MsaRaopState::Flushed;
         Ok(())
     }
     pub fn play(&mut self) -> Result<(), MsaRaopError> {
+        self.head_audible_ms.store(0, Ordering::SeqCst);
         self.command("PLAY", 0, 0)?;
         self.state = MsaRaopState::Streaming;
         Ok(())
     }
     pub fn stop(&mut self) -> Result<(), MsaRaopError> {
+        self.head_audible_ms.store(0, Ordering::SeqCst);
         self.command("STOP", 0, 0)?;
         self.state = MsaRaopState::Stopped;
         Ok(())
@@ -268,6 +299,17 @@ impl MsaRaopSession {
     }
     pub fn set_progress(&mut self, elapsed_s: u32, duration_s: u32) -> Result<(), MsaRaopError> {
         self.command("PROGRESS", elapsed_s as u64, duration_s as u64).map(|_| ())
+    }
+
+
+    pub fn set_metadata(&mut self, title: &str, artist: &str, album: &str) -> Result<(), MsaRaopError> {
+        write_metadata_sidecar(&self.metadata_path, title, artist, album)?;
+        self.command("METADATA", 0, 0).map(|_| ())
+    }
+
+    pub fn set_artwork(&mut self, content_type: &str, data: &[u8]) -> Result<(), MsaRaopError> {
+        write_artwork_sidecar(&self.artwork_path, content_type, data)?;
+        self.command("ARTWORK", 0, 0).map(|_| ())
     }
 
     pub fn pcm_writer(&self) -> MsaRaopPcmWriter {
@@ -332,9 +374,38 @@ impl MsaRaopSession {
         self.state = MsaRaopState::Down;
         let _ = std::fs::remove_file(&self.control_path);
         let _ = std::fs::remove_file(&self.ack_path);
+        let _ = std::fs::remove_file(&self.metadata_path);
+        let _ = std::fs::remove_file(&self.artwork_path);
     }
 }
 impl Drop for MsaRaopSession { fn drop(&mut self) { self.disconnect(); } }
+
+
+fn write_u32_le(out: &mut Vec<u8>, value: usize) -> Result<(), MsaRaopError> {
+    let value = u32::try_from(value).map_err(|_| {
+        MsaRaopError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "sidecar field too large"))
+    })?;
+    out.extend_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn write_metadata_sidecar(path: &Path, title: &str, artist: &str, album: &str) -> Result<(), MsaRaopError> {
+    let mut out = Vec::new();
+    for value in [title.as_bytes(), artist.as_bytes(), album.as_bytes()] {
+        write_u32_le(&mut out, value.len())?;
+        out.extend_from_slice(value);
+    }
+    std::fs::write(path, out).map_err(MsaRaopError::Io)
+}
+
+fn write_artwork_sidecar(path: &Path, content_type: &str, data: &[u8]) -> Result<(), MsaRaopError> {
+    let mut out = Vec::new();
+    write_u32_le(&mut out, content_type.len())?;
+    out.extend_from_slice(content_type.as_bytes());
+    write_u32_le(&mut out, data.len())?;
+    out.extend_from_slice(data);
+    std::fs::write(path, out).map_err(MsaRaopError::Io)
+}
 
 fn parse_ack(line: &str) -> Option<(u64, bool, u64, &str)> {
     let mut parts = line.trim().splitn(4, ' ');
