@@ -263,7 +263,7 @@ impl NativeSoloEngine {
             // leave the send gate, metadata-gated receivers get a placeholder
             // unless real metadata was already delivered pre-START.
             if !self.first_start_done && !self.meta_delivered {
-                match send_native_metadata(
+                let dmap_ok = match send_native_metadata(
                     &self.ready.control,
                     &self.ready.next_cseq,
                     &self.ready.session_uri,
@@ -274,11 +274,21 @@ impl NativeSoloEngine {
                     "",
                     self.runtime.media.timeline.wire_rtp,
                 ) {
-                    Ok(_) => {}
+                    Ok(v) => (200..300).contains(&v.status),
                     Err(MetadataError::Transport(ref transport)) => {
                         self.mark_rtsp_transport_error(transport);
+                        false
                     }
-                    Err(_) => {}
+                    Err(_) => false,
+                };
+                if dmap_ok {
+                    if let Some(mrp) = self.mrp.clone() {
+                        if mrp.stage_track("cliairplay", "", "", 0, "", None).is_ok() {
+                            if let Err(e) = mrp.push_full() {
+                                self.note_mrp_error(&e);
+                            }
+                        }
+                    }
                 }
             }
             self.first_start_done = true;
