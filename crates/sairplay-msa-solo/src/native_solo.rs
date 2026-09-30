@@ -269,7 +269,7 @@ impl NativeSoloEngine {
                     &self.ready.session_uri,
                     &self.config.control.dacp_id,
                     &self.config.control.active_remote,
-                    "SAirplay2",
+                    "cliairplay",
                     "",
                     "",
                     self.runtime.media.timeline.wire_rtp,
@@ -426,6 +426,18 @@ impl NativeSoloEngine {
         {
             return Ok(MetadataSetResult { status: 200, bytes: 0 });
         }
+        let mrp = self.mrp.clone();
+        if let Some(mrp) = mrp.as_ref() {
+            mrp.stage_track(
+                title,
+                artist,
+                album,
+                i64::from(duration_s) * 1000,
+                item_id,
+                None,
+            ).map_err(|e| NativeSoloError::Command(format!("MRP metadata stage: {e:?}")))?;
+        }
+
         let result = match send_native_metadata(
             &self.ready.control,
             &self.ready.next_cseq,
@@ -445,8 +457,19 @@ impl NativeSoloEngine {
                 return Err(NativeSoloError::Command(format!("metadata: {e:?}")));
             }
         };
-        self.meta_delivered = (200..300).contains(&result.status);
-        if self.meta_delivered {
+
+        let mut delivered = (200..300).contains(&result.status);
+        if let Some(mrp) = mrp {
+            match mrp.push_full() {
+                Ok(push) => delivered &= (200..300).contains(&push.overall_status),
+                Err(e) => {
+                    self.note_mrp_error(&e);
+                    delivered = false;
+                }
+            }
+        }
+        self.meta_delivered = delivered;
+        if delivered {
             self.meta_title = title.to_owned();
             self.meta_artist = artist.to_owned();
             self.meta_album = album.to_owned();
@@ -461,7 +484,16 @@ impl NativeSoloEngine {
         content_type: &str,
         data: &[u8],
     ) -> Result<ParameterResult, NativeSoloError> {
-        match send_native_artwork(
+        let mrp = self.mrp.clone();
+        if let Some(mrp) = mrp.as_ref() {
+            let info = mrp.stage_artwork(content_type, data)
+                .map_err(|e| NativeSoloError::Command(format!("MRP artwork stage: {e:?}")))?;
+            if info.result == MrpArtworkResult::Unchanged {
+                return Ok(ParameterResult { status: 200, bytes: 0 });
+            }
+        }
+
+        let result = match send_native_artwork(
             &self.ready.control,
             &self.ready.next_cseq,
             &self.ready.session_uri,
@@ -471,14 +503,24 @@ impl NativeSoloEngine {
             data,
             self.runtime.media.timeline.wire_rtp,
         ) {
-            Ok(v) => Ok(v),
+            Ok(v) => v,
             Err(e) => {
                 if let ParameterError::Transport(ref transport) = e {
                     self.mark_rtsp_transport_error(transport);
                 }
-                Err(NativeSoloError::Command(format!("artwork: {e:?}")))
+                return Err(NativeSoloError::Command(format!("artwork: {e:?}")));
+            }
+        };
+
+        if let Some(mrp) = mrp {
+            if let Err(e) = mrp.push_full() {
+                // Source returns the DMAP result independently; MRP failure is
+                // surfaced through control health/status, not by rewriting the
+                // already completed SET_PARAMETER result.
+                self.note_mrp_error(&e);
             }
         }
+        Ok(result)
     }
 
     pub fn set_progress(
@@ -486,6 +528,30 @@ impl NativeSoloEngine {
         elapsed_s: u32,
         duration_s: u32,
     ) -> Result<ParameterResult, NativeSoloError> {
+        if let Some(mrp) = self.mrp.clone() {
+            let playing = self.runtime.state == Ap2State::Streaming
+                && !self.content_paused
+                && !self.content_stopped;
+            return match mrp.set_progress_and_push(
+                i64::from(elapsed_s) * 1000,
+                i64::from(duration_s) * 1000,
+                playing,
+            ) {
+                Ok(push) => Ok(ParameterResult {
+                    status: if push.overall_status >= 0 {
+                        push.overall_status.min(u16::MAX as i32) as u16
+                    } else {
+                        0
+                    },
+                    bytes: 0,
+                }),
+                Err(e) => {
+                    self.note_mrp_error(&e);
+                    Err(NativeSoloError::Command(format!("MRP progress: {e:?}")))
+                }
+            };
+        }
+
         let now_ntp = system_time_to_ntp(SystemTime::now())
             .map_err(|e| NativeSoloError::Timing(format!("{e:?}")))?;
         let wall = ntp_to_frames(now_ntp, self.runtime.media.timeline.sample_rate) as u32;
