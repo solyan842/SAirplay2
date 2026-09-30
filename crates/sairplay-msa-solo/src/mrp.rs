@@ -284,6 +284,109 @@ impl MrpState {
         binary_plist(Value::Dictionary(root))
     }
 
+    pub(crate) fn build_type130_opening_messages(&self) -> Vec<Vec<u8>> {
+        vec![
+            self.build_device_info_proto(),
+            build_connection_state_proto(2),
+            build_client_updates_config_proto(),
+            self.build_now_playing_client_proto(),
+            self.build_set_state_proto(true),
+        ]
+    }
+
+    fn build_device_info_proto(&self) -> Vec<u8> {
+        let mut inner = Vec::new();
+        pb_string(&mut inner, 1, &self.device_uuid);
+        pb_string(&mut inner, 2, &self.name);
+        pb_string(&mut inner, 3, "iPhone");
+        pb_string(&mut inner, 4, "21F90");
+        pb_string(&mut inner, 5, "com.apple.Music");
+        pb_varint_field(&mut inner, 7, 1);
+        pb_varint_field(&mut inner, 8, 139);
+        pb_varint_field(&mut inner, 9, 1);
+        pb_varint_field(&mut inner, 10, 1);
+        pb_string(&mut inner, 12, "com.apple.Music");
+        pb_varint_field(&mut inner, 13, 1);
+        pb_varint_field(&mut inner, 14, 1);
+        pb_varint_field(&mut inner, 15, 1);
+        pb_varint_field(&mut inner, 17, 2);
+        pb_string(&mut inner, 19, &self.dacp_id);
+        pb_varint_field(&mut inner, 21, 1);
+        pb_varint_field(&mut inner, 22, 1);
+        pb_string(&mut inner, 31, "com.apple.podcasts");
+        pb_string(&mut inner, 39, "iPhone17,1");
+        if !self.session_uuid.is_empty() { pb_string(&mut inner, 41, &self.session_uuid); }
+        if !self.group_uuid.is_empty() { pb_string(&mut inner, 42, &self.group_uuid); }
+        pb_string(&mut inner, 43, "com.apple.iBooks");
+        mrp_envelope(15, 20, &inner)
+    }
+
+    fn build_now_playing_client_proto(&self) -> Vec<u8> {
+        let mut client = Vec::new();
+        pb_varint_field(&mut client, 1, std::process::id() as u64);
+        pb_string(&mut client, 2, "com.apple.Music");
+        pb_string(&mut client, 7, &self.name);
+        let mut inner = Vec::new();
+        pb_bytes(&mut inner, 1, &client);
+        mrp_envelope(46, 50, &inner)
+    }
+
+    fn build_set_state_proto(&self, include_artwork: bool) -> Vec<u8> {
+        let now_cf = cf_absolute_time(SystemTime::now());
+
+        let mut npi = Vec::new();
+        pb_string(&mut npi, 1, &self.album);
+        pb_string(&mut npi, 2, &self.artist);
+        if self.duration_ms > 0 { pb_double_field(&mut npi, 3, self.duration_ms as f64 / 1000.0); }
+        pb_double_field(&mut npi, 4, self.elapsed_ms as f64 / 1000.0);
+        pb_float_field(&mut npi, 5, if self.playback_state == MrpPlaybackState::Playing { 1.0 } else { 0.0 });
+        pb_double_field(&mut npi, 8, now_cf);
+        pb_string(&mut npi, 9, &self.title);
+        pb_varint_field(&mut npi, 12, 1);
+
+        let mut meta = Vec::new();
+        pb_string(&mut meta, 1, &self.title);
+        pb_string(&mut meta, 6, &self.album);
+        pb_string(&mut meta, 7, &self.artist);
+        if self.duration_ms > 0 { pb_double_field(&mut meta, 14, self.duration_ms as f64 / 1000.0); }
+        pb_varint_field(&mut meta, 19, (!self.artwork.is_empty()) as u64);
+        pb_varint_field(&mut meta, 27, (self.playback_state != MrpPlaybackState::Stopped) as u64);
+        if let Some(mime) = self.artwork_mime.as_deref().filter(|_| !self.artwork.is_empty()) {
+            pb_string(&mut meta, 31, mime);
+        }
+        pb_double_field(&mut meta, 35, self.elapsed_ms as f64 / 1000.0);
+        pb_float_field(&mut meta, 39, if self.playback_state == MrpPlaybackState::Playing { 1.0 } else { 0.0 });
+        pb_varint_field(&mut meta, 64, 1);
+        pb_varint_field(&mut meta, 65, 1);
+        pb_double_field(&mut meta, 74, cf_absolute_time(self.elapsed_set_at));
+
+        let mut item = Vec::new();
+        pb_string(&mut item, 1, &self.dacp_id);
+        pb_bytes(&mut item, 2, &meta);
+        if include_artwork && !self.artwork.is_empty() { pb_bytes(&mut item, 3, &self.artwork); }
+
+        let mut queue = Vec::new();
+        pb_varint_field(&mut queue, 1, 0);
+        pb_bytes(&mut queue, 2, &item);
+
+        let mut supported = Vec::new();
+        for cmd in [1u64, 2, 3, 5, 6] {
+            let mut ci = Vec::new();
+            pb_varint_field(&mut ci, 1, cmd);
+            pb_varint_field(&mut ci, 2, 1);
+            pb_bytes(&mut supported, 1, &ci);
+        }
+
+        let mut inner = Vec::new();
+        pb_bytes(&mut inner, 1, &npi);
+        pb_bytes(&mut inner, 2, &supported);
+        pb_bytes(&mut inner, 3, &queue);
+        pb_string(&mut inner, 5, &self.name);
+        pb_varint_field(&mut inner, 6, self.playback_state as u64);
+        pb_double_field(&mut inner, 11, now_cf);
+        mrp_envelope(4, 9, &inner)
+    }
+
     pub fn build_supportedcommands_command(&self) -> Result<Vec<u8>, MrpError> {
         let mut arr = Vec::new();
         arr.push(command_info_blob(26, true, Some(("kMRMediaRemoteCommandInfoShuffleMode", Value::Integer(1.into()))))?);
@@ -834,6 +937,36 @@ fn uuid_from_bytes(b: &[u8; 16]) -> String {
 
 fn random_u63() -> u64 {
     rand::thread_rng().next_u64() & 0x7fff_ffff_ffff_ffff
+}
+
+
+fn build_connection_state_proto(state: u64) -> Vec<u8> {
+    let mut inner = Vec::new();
+    pb_varint_field(&mut inner, 1, state);
+    mrp_envelope(38, 42, &inner)
+}
+
+fn build_client_updates_config_proto() -> Vec<u8> {
+    let mut inner = Vec::new();
+    for field in 1..=5 { pb_varint_field(&mut inner, field, 0); }
+    mrp_envelope(16, 21, &inner)
+}
+
+fn cf_absolute_time(t: SystemTime) -> f64 {
+    const APPLE_EPOCH_OFFSET: f64 = 978_307_200.0;
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64() - APPLE_EPOCH_OFFSET)
+        .unwrap_or(-APPLE_EPOCH_OFFSET)
+}
+
+fn pb_double_field(out: &mut Vec<u8>, field: u32, value: f64) {
+    pb_key(out, field, 1);
+    out.extend_from_slice(&value.to_bits().to_le_bytes());
+}
+
+fn pb_float_field(out: &mut Vec<u8>, field: u32, value: f32) {
+    pb_key(out, field, 5);
+    out.extend_from_slice(&value.to_bits().to_le_bytes());
 }
 
 fn binary_plist(value: Value) -> Result<Vec<u8>, MrpError> {
