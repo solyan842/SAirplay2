@@ -344,15 +344,19 @@ impl NativeAp2Transport for NativeSoloEngine {
 
     fn flush_realtime(&mut self) -> Result<(), Self::Error> {
         let cseq = self.next_cseq();
-        let result = send_realtime_flush(
-            &mut self.ready.control,
-            cseq,
-            &self.ready.session_uri,
-            &self.config.control.dacp_id,
-            &self.config.control.active_remote,
-            self.runtime.media.timeline.seq,
-            self.runtime.media.timeline.wire_rtp,
-        );
+        let result = {
+            let mut control = self.ready.control.lock()
+                .map_err(|_| NativeSoloError::Lifecycle("RTSP control mutex poisoned".into()))?;
+            send_realtime_flush(
+                &mut control,
+                cseq,
+                &self.ready.session_uri,
+                &self.config.control.dacp_id,
+                &self.config.control.active_remote,
+                self.runtime.media.timeline.seq,
+                self.runtime.media.timeline.wire_rtp,
+            )
+        };
         if let Err(err) = result {
             self.note_command_error(&err);
             return Err(NativeSoloError::Command(format!("FLUSH: {err:?}")));
@@ -363,15 +367,19 @@ impl NativeAp2Transport for NativeSoloEngine {
     fn flush_buffered(&mut self) -> Result<(), Self::Error> {
         self.quiesce_buffered_pending();
         let cseq = self.next_cseq();
-        let result = send_flushbuffered(
-            &mut self.ready.control,
-            cseq,
-            &self.ready.session_uri,
-            &self.config.control.dacp_id,
-            &self.config.control.active_remote,
-            self.runtime.media.timeline.seq,
-            self.runtime.media.timeline.wire_rtp,
-        );
+        let result = {
+            let mut control = self.ready.control.lock()
+                .map_err(|_| NativeSoloError::Lifecycle("RTSP control mutex poisoned".into()))?;
+            send_flushbuffered(
+                &mut control,
+                cseq,
+                &self.ready.session_uri,
+                &self.config.control.dacp_id,
+                &self.config.control.active_remote,
+                self.runtime.media.timeline.seq,
+                self.runtime.media.timeline.wire_rtp,
+            )
+        };
         self.anchored_buffered = false;
         if let Err(err) = result {
             self.note_command_error(&err);
@@ -384,17 +392,21 @@ impl NativeAp2Transport for NativeSoloEngine {
         if !self.anchored_buffered { return Ok(()) }
         let Some(clock) = self.ready.timing_owner.ptp_clock().cloned() else { return Ok(()) };
         let cseq = self.next_cseq();
-        let result = send_setrateanchortime(
-            &mut self.ready.control,
-            cseq,
-            &self.ready.session_uri,
-            &self.config.control.dacp_id,
-            &self.config.control.active_remote,
-            &clock,
-            self.runtime.media.timeline.wire_rtp,
-            clock.master_now_ns(),
-            0,
-        );
+        let result = {
+            let mut control = self.ready.control.lock()
+                .map_err(|_| NativeSoloError::Lifecycle("RTSP control mutex poisoned".into()))?;
+            send_setrateanchortime(
+                &mut control,
+                cseq,
+                &self.ready.session_uri,
+                &self.config.control.dacp_id,
+                &self.config.control.active_remote,
+                &clock,
+                self.runtime.media.timeline.wire_rtp,
+                clock.master_now_ns(),
+                0,
+            )
+        };
         // MSA standby treats the rate-0 park as best effort and continues to
         // FLUSHBUFFERED even when the anchor request is rejected.
         if let Err(err) = result {
@@ -448,16 +460,20 @@ impl NativeAp2Transport for NativeSoloEngine {
         let active = self.config.control.active_remote.clone();
         let rtp = self.runtime.media.timeline.wire_rtp;
         let ntp = self.runtime.start_ntp;
-        let result = buffered_anchor_start(
-            &mut self.ready.control,
-            &mut self.ready.next_cseq,
-            &session_uri,
-            &dacp,
-            &active,
-            &clock,
-            rtp,
-            ntp,
-        );
+        let result = {
+            let mut control = self.ready.control.lock()
+                .map_err(|_| NativeSoloError::Lifecycle("RTSP control mutex poisoned".into()))?;
+            buffered_anchor_start(
+                &mut control,
+                self.ready.next_cseq.as_ref(),
+                &session_uri,
+                &dacp,
+                &active,
+                &clock,
+                rtp,
+                ntp,
+            )
+        };
         match result {
             Ok(_) => {
                 self.anchored_buffered = true;
@@ -498,6 +514,15 @@ impl NativeAp2Transport for NativeSoloEngine {
         self.clock_verify_armed = true;
         self.clock_verify_requested_unix_ms = requested_unix_ms;
         self.clock_verify_anchor_unix_ms = at_unix_ms;
+    }
+}
+
+impl Drop for NativeSoloEngine {
+    fn drop(&mut self) {
+        self.feedback.stop();
+        if let Some(worker) = self.rtx_worker.as_mut() {
+            worker.stop();
+        }
     }
 }
 
