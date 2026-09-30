@@ -141,6 +141,26 @@ pub fn open_event_channel(
     Ok(channel)
 }
 
+pub fn open_event_channel_best_effort(
+    flow: &mut NativeConnectFlow,
+    host: IpAddr,
+    event_port: Option<u16>,
+    shared_secret: &[u8; 32],
+    timeout: Duration,
+) -> Result<Option<EventChannel>, EventChannelError> {
+    if flow.phase() != crate::NativePhase::SessionSetup {
+        flow.event_channel_open()?;
+        unreachable!("event_channel_open succeeds only from SessionSetup");
+    }
+    let channel = match event_port {
+        Some(port) => EventChannel::connect(host, port, shared_secret, timeout).ok(),
+        None => None,
+    };
+    // Pinned MSA treats reverse event TCP as best effort; RECORD must proceed.
+    flow.event_channel_open()?;
+    Ok(channel)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
