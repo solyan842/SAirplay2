@@ -92,6 +92,7 @@ pub struct NativeControlReady {
     pub buffered: bool,
     pub latency_min: Option<u32>,
     pub latency_max: Option<u32>,
+    pub arrival_to_render_latency_ms: Option<u32>,
     pub next_cseq: SharedCseq,
 }
 
@@ -264,6 +265,7 @@ pub fn open_native_control(
 
     let mut latency_min = None;
     let mut latency_max = None;
+    let mut arrival_to_render_latency_ms = None;
     if buffered {
         let result = setup_buffered_stream(
             &mut flow,
@@ -304,6 +306,7 @@ pub fn open_native_control(
         );
         latency_min = result.latency_min;
         latency_max = result.latency_max;
+        arrival_to_render_latency_ms = result.arrival_to_render_latency_ms;
     }
 
     let next_cseq = if matches!(timing, LiveTiming::Ptp { .. }) {
@@ -349,6 +352,7 @@ pub fn open_native_control(
         buffered,
         latency_min,
         latency_max,
+        arrival_to_render_latency_ms,
         next_cseq,
     })
 }
