@@ -25,8 +25,8 @@ use crate::{
     set_native_volume, write_farewell_teardown_locked, Ap2AudioFormat,
     EncryptedRtspError, MetadataError, MetadataSetResult, ParameterError,
     ParameterResult, VolumeError, VolumeSetResult, mrp_post_command, MrpError,
-    MrpArtworkResult, MrpController, MrpDataStream, MrpDataStreamWorker, MrpEventWorker,
-    MrpPlaybackState, MrpRemoteCommand, MrpState,
+    MrpArtworkInfo, MrpArtworkResult, MrpController, MrpDataStream, MrpDataStreamWorker, MrpEventWorker,
+    MrpPlaybackState, MrpPushResult, MrpRemoteCommand, MrpState,
 };
 use crate::ntp_timing::system_time_to_ntp;
 use std::thread;
@@ -68,6 +68,16 @@ pub struct NativeLatencyInfo {
     pub device_min_frames: u32,
     pub device_max_frames: u32,
     pub render_latency_ms: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeMetadataBundleResult {
+    pub metadata: MetadataSetResult,
+    pub artwork: Option<ParameterResult>,
+    pub track_changed: bool,
+    pub mrp_artwork: Option<MrpArtworkInfo>,
+    pub mrp_push: Option<MrpPushResult>,
+    pub delivered: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -502,36 +512,73 @@ impl NativeSoloEngine {
         Ok(result)
     }
 
-    pub fn set_metadata(
+    pub fn set_metadata_bundle(
         &mut self,
         title: &str,
         artist: &str,
         album: &str,
         duration_s: u32,
         item_id: &str,
-    ) -> Result<MetadataSetResult, NativeSoloError> {
-        if self.meta_delivered
+        artwork: Option<(&str, &[u8])>,
+    ) -> Result<NativeMetadataBundleResult, NativeSoloError> {
+        let mrp = self.mrp.clone();
+        let mut track_changed = false;
+        let mut mrp_artwork = None;
+        let mut mrp_push = None;
+
+        // Exact ap2cl_set_metadata_ex serialization: the MRP mutation,
+        // DMAP metadata/artwork delivery and the ONE full MRP replace push
+        // share one publication scope. This prevents tvOS rebuilding its
+        // Now Playing view twice for one track.
+        let _publication = if let Some(mrp) = mrp.as_ref() {
+            Some(
+                mrp.publication_guard()
+                    .map_err(|e| NativeSoloError::Command(format!("MRP publication lock: {e:?}")))?,
+            )
+        } else {
+            None
+        };
+
+        if let Some(mrp) = mrp.as_ref() {
+            let (changed, info) = mrp
+                .stage_track_locked(
+                    title,
+                    artist,
+                    album,
+                    i64::from(duration_s) * 1000,
+                    item_id,
+                    artwork,
+                )
+                .map_err(|e| NativeSoloError::Command(format!("MRP metadata bundle stage: {e:?}")))?;
+            track_changed = changed;
+            mrp_artwork = Some(info);
+        }
+
+        let metadata_identical = self.meta_delivered
             && self.meta_duration_s == duration_s
             && self.meta_title == title
             && self.meta_artist == artist
             && self.meta_album == album
-            && self.meta_item_id == item_id
-        {
-            return Ok(MetadataSetResult { status: 200, bytes: 0 });
-        }
-        let mrp = self.mrp.clone();
-        if let Some(mrp) = mrp.as_ref() {
-            mrp.stage_track(
-                title,
-                artist,
-                album,
-                i64::from(duration_s) * 1000,
-                item_id,
-                None,
-            ).map_err(|e| NativeSoloError::Command(format!("MRP metadata stage: {e:?}")))?;
+            && self.meta_item_id == item_id;
+        let artwork_identical = match artwork {
+            None => true,
+            Some(_) => mrp_artwork
+                .as_ref()
+                .is_some_and(|info| info.result == MrpArtworkResult::Unchanged),
+        };
+
+        if metadata_identical && artwork_identical {
+            return Ok(NativeMetadataBundleResult {
+                metadata: MetadataSetResult { status: 200, bytes: 0 },
+                artwork: None,
+                track_changed,
+                mrp_artwork,
+                mrp_push: None,
+                delivered: true,
+            });
         }
 
-        let result = match send_native_metadata(
+        let metadata = match send_native_metadata(
             &self.ready.control,
             &self.ready.next_cseq,
             &self.ready.session_uri,
@@ -544,6 +591,7 @@ impl NativeSoloEngine {
         ) {
             Ok(v) => v,
             Err(e) => {
+                self.meta_delivered = false;
                 if let MetadataError::Transport(ref transport) = e {
                     self.mark_rtsp_transport_error(transport);
                 }
@@ -551,16 +599,55 @@ impl NativeSoloEngine {
             }
         };
 
-        let mut delivered = (200..300).contains(&result.status);
-        if let Some(mrp) = mrp {
-            match mrp.push_full() {
-                Ok(push) => delivered &= (200..300).contains(&push.overall_status),
+        let mut artwork_result = None;
+        if let Some((content_type, data)) = artwork {
+            // MSA re-sends DMAP art for a new track even when the bytes are
+            // identical; same-item identical art is the only no-op. MRP
+            // rejected artwork still goes to the DMAP path for Sonos-class
+            // receivers.
+            let should_send = mrp.is_none()
+                || track_changed
+                || mrp_artwork
+                    .as_ref()
+                    .is_none_or(|info| info.result != MrpArtworkResult::Unchanged);
+            if should_send {
+                match send_native_artwork(
+                    &self.ready.control,
+                    &self.ready.next_cseq,
+                    &self.ready.session_uri,
+                    &self.config.control.dacp_id,
+                    &self.config.control.active_remote,
+                    content_type,
+                    data,
+                    self.runtime.media.timeline.wire_rtp,
+                ) {
+                    Ok(v) => artwork_result = Some(v),
+                    Err(e) => {
+                        // Source does not fold artwork SET_PARAMETER success
+                        // into the metadata identity latch, but a transport
+                        // failure still kills the shared RTSP channel.
+                        if let ParameterError::Transport(ref transport) = e {
+                            self.mark_rtsp_transport_error(transport);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut delivered = (200..300).contains(&metadata.status);
+        if let Some(mrp) = mrp.as_ref() {
+            match mrp.push_full_under_publication_lock() {
+                Ok(push) => {
+                    delivered &= (200..300).contains(&push.overall_status);
+                    mrp_push = Some(push);
+                }
                 Err(e) => {
                     self.note_mrp_error(&e);
                     delivered = false;
                 }
             }
         }
+
         self.meta_delivered = delivered;
         if delivered {
             self.meta_title = title.to_owned();
@@ -569,7 +656,27 @@ impl NativeSoloEngine {
             self.meta_duration_s = duration_s;
             self.meta_item_id = item_id.to_owned();
         }
-        Ok(result)
+
+        Ok(NativeMetadataBundleResult {
+            metadata,
+            artwork: artwork_result,
+            track_changed,
+            mrp_artwork,
+            mrp_push,
+            delivered,
+        })
+    }
+
+    pub fn set_metadata(
+        &mut self,
+        title: &str,
+        artist: &str,
+        album: &str,
+        duration_s: u32,
+        item_id: &str,
+    ) -> Result<MetadataSetResult, NativeSoloError> {
+        self.set_metadata_bundle(title, artist, album, duration_s, item_id, None)
+            .map(|result| result.metadata)
     }
 
     pub fn set_artwork(
