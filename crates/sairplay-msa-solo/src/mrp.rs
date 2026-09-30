@@ -604,6 +604,11 @@ impl MrpController {
         self.push_full_locked()
     }
 
+    pub fn register(&self) -> Result<i32, MrpError> {
+        let _publish = self.publish_lock.lock().map_err(|_| MrpError::Lock)?;
+        self.register_locked()
+    }
+
     pub fn push_full(&self) -> Result<MrpPushResult, MrpError> {
         let _publish = self.publish_lock.lock().map_err(|_| MrpError::Lock)?;
         self.push_full_locked()
