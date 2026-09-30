@@ -276,7 +276,7 @@ impl WindowsMsaSoloClient {
             Transport::Raop { worker } => {
                 worker.session().lock()
                     .map_err(|_| WindowsMsaSoloError::Raop("RAOP session mutex poisoned".into()))?
-                    .set_metadata(title, artist, album)
+                    .set_metadata(title, artist, album, duration_s, item_id)
                     .map_err(|e| WindowsMsaSoloError::Raop(e.to_string()))
             }
         }
