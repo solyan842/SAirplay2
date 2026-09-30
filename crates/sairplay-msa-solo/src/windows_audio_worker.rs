@@ -458,6 +458,10 @@ impl WindowsSoloAudioWorker {
     /// MSA ap2_session_flush equivalent for the WASAPI adapter: transport
     /// FLUSH while sends are serialized, then wait until the capture worker
     /// has reset exactly the pre-FLUSH PCM before returning the frozen warm head.
+    pub fn engine(&self) -> SharedNativeSoloEngine {
+        Arc::clone(&self.engine)
+    }
+
     pub fn flush_content(&self) -> Result<Option<u64>, WindowsSoloAudioWorkerError> {
         if !self.is_running() {
             return Err(WindowsSoloAudioWorkerError::Engine("WASAPI worker is not running".into()));
