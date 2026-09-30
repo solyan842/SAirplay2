@@ -154,6 +154,7 @@ impl NativeSoloEngine {
             Arc::clone(&ready.next_cseq),
             config.control.dacp_id.clone(),
             config.control.active_remote.clone(),
+            ready.session_uri.clone(),
         ).map_err(|e| NativeSoloError::Lifecycle(format!("feedback worker: {e}")))?;
 
         // Pinned MSA: retransmit responder is realtime-only and non-fatal if
