@@ -11,6 +11,9 @@ pub mod native_codec;
 pub mod native_io;
 pub mod native_media_owner;
 pub mod native_control;
+pub mod native_timing_owner;
+pub mod ptp_engine;
+pub mod ntp_timing;
 pub mod event_channel;
 pub mod setpeers;
 pub mod stream_setup;
@@ -265,3 +268,7 @@ pub use native_media_owner::{NativeMediaOwner, NativeMediaOwnerError};
 pub use native_control::{
     open_native_control, LiveTiming, NativeControlConfig, NativeControlError, NativeControlReady,
 };
+
+pub use ntp_timing::{build_timing_response, system_time_to_ntp, NtpTimingError, NtpTimingResponder};
+pub use ptp_engine::{PtpClock, PtpEngine, PtpEngineError, PtpExchange};
+pub use native_timing_owner::NativeTimingOwner;
