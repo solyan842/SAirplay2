@@ -208,6 +208,28 @@ impl NativeSoloEngine {
             ap2::start(self, requested_unix_ms)
         };
         if result.is_ok() {
+            // Pinned cliairplay session_commit: before the first audio can
+            // leave the send gate, metadata-gated receivers get a placeholder
+            // unless real metadata was already delivered pre-START.
+            if !self.first_start_done && !self.meta_delivered {
+                match send_native_metadata(
+                    &self.ready.control,
+                    &self.ready.next_cseq,
+                    &self.ready.session_uri,
+                    &self.config.control.dacp_id,
+                    &self.config.control.active_remote,
+                    "SAirplay2",
+                    "",
+                    "",
+                    self.runtime.media.timeline.wire_rtp,
+                ) {
+                    Ok(_) => {}
+                    Err(MetadataError::Transport(ref transport)) => {
+                        self.mark_rtsp_transport_error(transport);
+                    }
+                    Err(_) => {}
+                }
+            }
             self.first_start_done = true;
             self.content_paused = false;
             self.content_stopped = false;
