@@ -274,6 +274,14 @@ pub fn parse_stream_setup_response(
         .and_then(Value::as_unsigned_integer)
         .filter(|v| *v > 0 && *v <= u32::MAX as u64)
         .map(|v| v as u32);
+    // Pinned MSA parses this for diagnostics/caller planning only; it must
+    // never be applied to the AP2 schedule because the receiver already
+    // compensates its own render pipeline.
+    let arrival_to_render_latency_ms = stream
+        .get("arrivalToRenderLatencyMs")
+        .and_then(Value::as_unsigned_integer)
+        .filter(|v| *v <= 2000)
+        .map(|v| v as u32);
 
     Ok(RealtimeStreamSetupResult {
         ports: StreamPorts {
