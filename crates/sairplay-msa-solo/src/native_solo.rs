@@ -985,7 +985,17 @@ impl NativeSoloEngine {
 
     pub fn control_healthy(&mut self) -> bool {
         self.refresh_control_health();
-        !self.rtsp_dead && self.runtime.health.healthy
+        if self.rtsp_dead || !self.runtime.health.healthy {
+            return false;
+        }
+        // Pinned ap2cl_control_healthy: no MRP/event attachment is -1 and
+        // therefore healthy; once MediaRemote owns the reverse event channel,
+        // losing that channel makes the control plane unhealthy.
+        match (&self.mrp, &self.mrp_event) {
+            (None, _) => true,
+            (Some(_), Some(worker)) => worker.healthy(),
+            (Some(_), None) => false,
+        }
     }
 
     fn refresh_control_health(&mut self) {
