@@ -10,7 +10,7 @@ use crate::native_commands::{
 };
 use crate::native_control::{open_native_control, NativeControlConfig, NativeControlError, NativeControlReady};
 use crate::native_media::{
-    drain_buffered_pending, BufferedPending, MediaCounters, MediaHealth, NativeMediaState, SendResult,
+    drain_buffered_pending, BufferedPending, MediaCounters, MediaHealth, MediaIo, NativeMediaState, SendResult,
 };
 use crate::native_runtime::NativeRuntime;
 use crate::native_sync::{PtpAnchor, SyncCounters};
@@ -811,10 +811,7 @@ impl NativeAp2Transport for NativeSoloEngine {
 
 impl Drop for NativeSoloEngine {
     fn drop(&mut self) {
-        self.feedback.stop();
-        if let Some(worker) = self.rtx_worker.as_mut() {
-            worker.stop();
-        }
+        let _ = self.disconnect();
     }
 }
 
