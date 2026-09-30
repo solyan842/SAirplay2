@@ -61,12 +61,19 @@ impl NativeControlConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeControlErrorClass {
+    Generic,
+    AuthRequired,
+    AuthFailed,
+}
+
 #[derive(Debug)]
 pub enum NativeControlError {
     Preflight(String),
     Pairing(String),
-    AuthRequired(String),
-    AuthFailed(String),
+    AuthRequired { http_status: u16, detail: String },
+    AuthFailed { http_status: u16, detail: String },
     Flow(String),
     Identity,
     SessionSetup(String),
@@ -74,6 +81,33 @@ pub enum NativeControlError {
     Media(String),
     Record(String),
     SetPeers(String),
+}
+
+impl NativeControlError {
+    pub fn class(&self) -> NativeControlErrorClass {
+        match self {
+            Self::AuthRequired { .. } => NativeControlErrorClass::AuthRequired,
+            Self::AuthFailed { .. } => NativeControlErrorClass::AuthFailed,
+            _ => NativeControlErrorClass::Generic,
+        }
+    }
+
+    pub fn http_status(&self) -> u16 {
+        match self {
+            Self::AuthRequired { http_status, .. } | Self::AuthFailed { http_status, .. } => *http_status,
+            _ => 0,
+        }
+    }
+
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Preflight(v) | Self::Pairing(v) | Self::Flow(v)
+            | Self::SessionSetup(v) | Self::Event(v) | Self::Media(v)
+            | Self::Record(v) | Self::SetPeers(v) => v.clone(),
+            Self::AuthRequired { detail, .. } | Self::AuthFailed { detail, .. } => detail.clone(),
+            Self::Identity => "invalid sender identity".into(),
+        }
+    }
 }
 
 pub struct NativeControlReady {
@@ -393,12 +427,16 @@ fn pairing_error_is_auth(error: &crate::PairingError) -> bool {
 }
 
 fn classify_pairing_error(error: crate::PairingError, presented_secret: bool) -> NativeControlError {
+    let http_status = match error {
+        crate::PairingError::Status(status) => status,
+        _ => 0,
+    };
     let detail = format!("{error:?}");
     if pairing_error_is_auth(&error) {
         if presented_secret {
-            NativeControlError::AuthFailed(detail)
+            NativeControlError::AuthFailed { http_status, detail }
         } else {
-            NativeControlError::AuthRequired(detail)
+            NativeControlError::AuthRequired { http_status, detail }
         }
     } else {
         NativeControlError::Pairing(detail)
