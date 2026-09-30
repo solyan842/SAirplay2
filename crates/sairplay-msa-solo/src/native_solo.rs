@@ -608,8 +608,10 @@ impl NativeSoloEngine {
         self.content_stopped = false;
         let now_ntp = system_time_to_ntp(SystemTime::now())
             .map_err(|e| NativeSoloError::Timing(format!("{e:?}")))?;
-        let now_frame = ntp_to_frames(now_ntp, self.runtime.media.timeline.sample_rate);
-        let warm = frames_for_ms(crate::timing::AP2_MIN_WARM_LEAD_MS, self.runtime.media.timeline.sample_rate);
+        let sample_rate = self.runtime.media.timeline.sample_rate;
+        let now_frame = ntp_to_frames(now_ntp, sample_rate);
+        let warm = frames_for_ms(crate::timing::AP2_MIN_WARM_LEAD_MS, sample_rate);
+        let warm_ntp = unix_ms_to_ntp(crate::timing::AP2_MIN_WARM_LEAD_MS);
 
         if self.runtime.splice_timeline && self.runtime.ptp_anchor.valid {
             let target = now_frame.saturating_add(warm);
@@ -619,41 +621,49 @@ impl NativeSoloEngine {
                         target - self.runtime.media.timeline.head_frame;
                 }
             } else {
+                // Exact ap2_reanchor_after_drain: do not round through unix
+                // milliseconds, do not reset sequence/reanchor diagnostics,
+                // and do mark the first packet on the fresh realtime line.
                 self.runtime.splice_pad_frames = 0;
-                let at = ms_for_frames(target, self.runtime.media.timeline.sample_rate);
-                self.reanchor_stock_timeline(at, false);
-                self.anchor_start(at)?;
+                let start_ntp = now_ntp.saturating_add(warm_ntp);
+                let head = ntp_to_frames(start_ntp, sample_rate);
+                self.runtime.start_ntp = start_ntp;
+                self.runtime.media.timeline.reanchor_after_drain(head);
+                self.runtime.ptp_anchor = PtpAnchor::default();
             }
             self.runtime.state = Ap2State::Streaming;
-            self.runtime.health.healthy = true;
             return Ok(());
         }
 
         if self.runtime.lane == NativeLane::Realtime && self.runtime.state == Ap2State::Paused {
             if self.runtime.media.timeline.head_frame <= now_frame {
-                let target = now_frame.saturating_add(warm);
-                let at = ms_for_frames(target, self.runtime.media.timeline.sample_rate);
-                self.reanchor_stock_timeline(at, false);
-                self.anchor_start(at)?;
+                let start_ntp = now_ntp.saturating_add(warm_ntp);
+                let head = ntp_to_frames(start_ntp, sample_rate);
+                self.runtime.start_ntp = start_ntp;
+                self.runtime.media.timeline.reanchor_after_drain(head);
+                self.runtime.ptp_anchor = PtpAnchor::default();
             }
             self.runtime.state = Ap2State::Streaming;
-            self.runtime.health.healthy = true;
             return Ok(());
         }
 
         if self.runtime.lane == NativeLane::Buffered {
-            let target = now_frame.saturating_add(warm);
-            let at = ms_for_frames(target, self.runtime.media.timeline.sample_rate);
-            self.reanchor_stock_timeline(at, true);
-            self.anchor_start(at)?;
+            // Pinned ap2cl_play keeps seq and first_packet untouched on a
+            // buffered un-pause. It only rebases head/RTP continuity and then
+            // establishes rate=1; state becomes STREAMING only after success.
+            let resume_ntp = now_ntp.saturating_add(warm_ntp);
+            let head = ntp_to_frames(resume_ntp, sample_rate);
+            let sent = self.runtime.media.counters.sent;
+            self.runtime.media.timeline.rebase_buffered_play(head, sent);
+            if let Err(err) = self.buffered_anchor_at_ntp(resume_ntp) {
+                self.runtime.health.healthy = false;
+                return Err(err);
+            }
             self.runtime.state = Ap2State::Streaming;
-            self.runtime.health.healthy = true;
-            self.anchor_buffered_start(at)?;
             return Ok(());
         }
 
         self.runtime.state = Ap2State::Streaming;
-        self.runtime.health.healthy = true;
         Ok(())
     }
 
@@ -864,6 +874,40 @@ impl NativeSoloEngine {
         }
     }
 
+    fn buffered_anchor_at_ntp(&mut self, ntp: u64) -> Result<(), NativeSoloError> {
+        let Some(clock) = self.ready.timing_owner.ptp_clock().cloned() else {
+            return Err(NativeSoloError::Command("buffered anchor without PTP".into()));
+        };
+        let session_uri = self.ready.session_uri.clone();
+        let dacp = self.config.control.dacp_id.clone();
+        let active = self.config.control.active_remote.clone();
+        let rtp = self.runtime.media.timeline.wire_rtp;
+        let result = {
+            let mut control = self.ready.control.lock()
+                .map_err(|_| NativeSoloError::Lifecycle("RTSP control mutex poisoned".into()))?;
+            buffered_anchor_start(
+                &mut control,
+                self.ready.next_cseq.as_ref(),
+                &session_uri,
+                &dacp,
+                &active,
+                &clock,
+                rtp,
+                ntp,
+            )
+        };
+        match result {
+            Ok(_) => {
+                self.anchored_buffered = true;
+                Ok(())
+            }
+            Err(err) => {
+                self.note_command_error(&err);
+                Err(NativeSoloError::Command(format!("buffered anchor: {err:?}")))
+            }
+        }
+    }
+
     fn process_seed() -> (u32, u16) {
         let pid = std::process::id();
         let offset = pid.wrapping_mul(2_654_435_761u32) & 0x0fff_ff00;
@@ -1035,38 +1079,7 @@ impl NativeAp2Transport for NativeSoloEngine {
     }
 
     fn anchor_buffered_start(&mut self, _at_unix_ms: u64) -> Result<(), Self::Error> {
-        let Some(clock) = self.ready.timing_owner.ptp_clock().cloned() else {
-            return Err(NativeSoloError::Command("buffered anchor without PTP".into()));
-        };
-        let session_uri = self.ready.session_uri.clone();
-        let dacp = self.config.control.dacp_id.clone();
-        let active = self.config.control.active_remote.clone();
-        let rtp = self.runtime.media.timeline.wire_rtp;
-        let ntp = self.runtime.start_ntp;
-        let result = {
-            let mut control = self.ready.control.lock()
-                .map_err(|_| NativeSoloError::Lifecycle("RTSP control mutex poisoned".into()))?;
-            buffered_anchor_start(
-                &mut control,
-                self.ready.next_cseq.as_ref(),
-                &session_uri,
-                &dacp,
-                &active,
-                &clock,
-                rtp,
-                ntp,
-            )
-        };
-        match result {
-            Ok(_) => {
-                self.anchored_buffered = true;
-                Ok(())
-            }
-            Err(err) => {
-                self.note_command_error(&err);
-                Err(NativeSoloError::Command(format!("buffered anchor: {err:?}")))
-            }
-        }
+        self.buffered_anchor_at_ntp(self.runtime.start_ntp)
     }
 
     fn sync_realtime_ptp_if_ready(&mut self) -> Result<(), Self::Error> {
