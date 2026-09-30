@@ -25,7 +25,8 @@ use crate::{
     set_native_volume, write_farewell_teardown_locked, Ap2AudioFormat,
     EncryptedRtspError, MetadataError, MetadataSetResult, ParameterError,
     ParameterResult, VolumeError, VolumeSetResult, mrp_post_command, MrpError,
-    MrpArtworkResult, MrpController, MrpEventWorker, MrpPlaybackState, MrpRemoteCommand, MrpState,
+    MrpArtworkResult, MrpController, MrpDataStream, MrpDataStreamWorker, MrpEventWorker,
+    MrpPlaybackState, MrpRemoteCommand, MrpState,
 };
 use crate::ntp_timing::system_time_to_ntp;
 use std::thread;
@@ -120,6 +121,7 @@ pub struct NativeSoloEngine {
     rtx_worker: Option<RtxWorker>,
     mrp: Option<MrpController>,
     mrp_event: Option<MrpEventWorker>,
+    mrp_data: Option<MrpDataStreamWorker>,
     config: NativeSoloConfig,
     timeline_initialized: bool,
     first_start_done: bool,
@@ -223,6 +225,27 @@ impl NativeSoloEngine {
         } else {
             None
         };
+        let mrp_data = if env_enabled("CLIAIRPLAY_MRP_TYPE130", false) {
+            if let Some(controller) = mrp.clone() {
+                let setup = ready.control.lock().ok().and_then(|mut control| {
+                    MrpDataStream::setup(
+                        &mut control,
+                        &ready.next_cseq,
+                        &ready.session_uri,
+                        &config.control.dacp_id,
+                        &config.control.active_remote,
+                        ready.receiver.ip(),
+                        &ready.hap_shared_secret,
+                        &controller,
+                    ).ok()
+                });
+                setup.map(|stream| MrpDataStreamWorker::start(stream, controller))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let mrp_event = if mrp.is_some() {
             ready.event.take().map(MrpEventWorker::start)
         } else {
@@ -258,6 +281,7 @@ impl NativeSoloEngine {
             rtx_worker,
             mrp,
             mrp_event,
+            mrp_data,
             config,
             timeline_initialized: false,
             first_start_done: false,
@@ -732,6 +756,9 @@ impl NativeSoloEngine {
                 self.note_mrp_error(&e);
             }
         }
+        if let Some(worker) = self.mrp_data.as_mut() {
+            worker.stop();
+        }
         if let Some(worker) = self.mrp_event.as_mut() {
             worker.stop();
         }
@@ -888,6 +915,10 @@ impl NativeSoloEngine {
 
     pub fn mrp_event_healthy(&self) -> Option<bool> {
         self.mrp_event.as_ref().map(MrpEventWorker::healthy)
+    }
+
+    pub fn mrp_data_healthy(&self) -> Option<bool> {
+        self.mrp_data.as_ref().map(MrpDataStreamWorker::healthy)
     }
 
     pub fn pop_remote_command(&self) -> Option<MrpRemoteCommand> {
