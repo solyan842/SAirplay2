@@ -34,6 +34,15 @@ use std::sync::{Arc, Mutex, atomic::Ordering};
 pub const MSA_NATIVE_LEAD_MS: u64 = 2000;
 pub const MSA_SPLICE_DEPTH_MS: u64 = 600;
 pub const MSA_SPLICE_DEPTH_MAX_MS: u64 = 3000;
+pub const AP2_CLOCK_VERIFY_POLL_MS: u64 = 250;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoloClockVerifyOutcome {
+    Idle,
+    Pending,
+    Verified { margin_ms: i64 },
+    Unverified { readiness_late_ms: Option<u64> },
+}
 
 #[derive(Debug, Clone)]
 pub struct NativeSoloConfig {
@@ -80,6 +89,7 @@ pub struct NativeSoloEngine {
     clock_verify_armed: bool,
     clock_verify_requested_unix_ms: u64,
     clock_verify_anchor_unix_ms: u64,
+    clock_verify_packets_at_arm: u64,
     monotonic_zero: Instant,
     content_paused: bool,
     content_stopped: bool,
@@ -185,6 +195,7 @@ impl NativeSoloEngine {
             clock_verify_armed: false,
             clock_verify_requested_unix_ms: 0,
             clock_verify_anchor_unix_ms: 0,
+            clock_verify_packets_at_arm: 0,
             monotonic_zero: Instant::now(),
             content_paused: false,
             content_stopped: false,
@@ -608,15 +619,39 @@ impl NativeSoloEngine {
         Ok(self.runtime.serve_rtx(&mut self.ready.media.io, &peer, &buf[..n]))
     }
 
-    /// SOLO clock verification is observation-only. A fresh probe streak
-    /// satisfies the verification without moving the committed anchor.
-    pub fn poll_clock_verify(&mut self) -> bool {
-        if !self.clock_verify_armed { return false; }
-        if self.ready.timing_owner.probe_streak().is_some() {
-            self.clock_verify_armed = false;
-            return true;
+    /// Exact SOLO/origin branch of pinned ap2cl_clock_verify_poll:
+    /// verification is observation-only (enforce=false), so the committed
+    /// anchor never moves. We still distinguish ready-before-anchor from a
+    /// late/no-probe close of the verification window.
+    pub fn poll_clock_verify(&mut self) -> SoloClockVerifyOutcome {
+        if !self.clock_verify_armed {
+            return SoloClockVerifyOutcome::Idle;
         }
-        false
+        let now_ms = self.now_unix_ms();
+        let anchor_ms = self.clock_verify_anchor_unix_ms;
+        let sent = self.runtime.media.counters.sent != self.clock_verify_packets_at_arm;
+
+        if let Some(ex) = self.ready.timing_owner.probe_streak() {
+            let ready_ms = crate::clock::ready_from(now_ms, self.config.apple_model, ex);
+            self.clock_verify_armed = false;
+            if ready_ms <= anchor_ms {
+                return SoloClockVerifyOutcome::Verified {
+                    margin_ms: (anchor_ms - ready_ms) as i64,
+                };
+            }
+            return SoloClockVerifyOutcome::Unverified {
+                readiness_late_ms: Some(ready_ms - anchor_ms),
+            };
+        }
+
+        let window_close_ms = anchor_ms.saturating_sub(self.runtime.splice_depth_ms);
+        if sent || now_ms.saturating_add(AP2_CLOCK_VERIFY_POLL_MS) >= window_close_ms {
+            self.clock_verify_armed = false;
+            return SoloClockVerifyOutcome::Unverified {
+                readiness_late_ms: None,
+            };
+        }
+        SoloClockVerifyOutcome::Pending
     }
 
     pub fn effective_lead_ms(&self) -> u64 { self.runtime.lead_ms }
@@ -903,6 +938,7 @@ impl NativeAp2Transport for NativeSoloEngine {
         self.clock_verify_armed = false;
         self.clock_verify_requested_unix_ms = 0;
         self.clock_verify_anchor_unix_ms = 0;
+        self.clock_verify_packets_at_arm = 0;
     }
 
     fn arm_clock_verify(
@@ -915,6 +951,7 @@ impl NativeAp2Transport for NativeSoloEngine {
         self.clock_verify_armed = true;
         self.clock_verify_requested_unix_ms = requested_unix_ms;
         self.clock_verify_anchor_unix_ms = at_unix_ms;
+        self.clock_verify_packets_at_arm = self.runtime.media.counters.sent;
     }
 }
 
