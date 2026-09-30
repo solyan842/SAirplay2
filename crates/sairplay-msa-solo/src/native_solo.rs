@@ -694,6 +694,18 @@ impl NativeSoloEngine {
         SoloClockVerifyOutcome::Pending
     }
 
+    pub fn mrp_controller(&self) -> Option<MrpController> {
+        self.mrp.clone()
+    }
+
+    pub fn mrp_event_healthy(&self) -> Option<bool> {
+        self.mrp_event.as_ref().map(MrpEventWorker::healthy)
+    }
+
+    pub fn pop_remote_command(&self) -> Option<MrpRemoteCommand> {
+        self.mrp_event.as_ref()?.pop_command()
+    }
+
     pub fn effective_lead_ms(&self) -> u64 { self.runtime.lead_ms }
     pub fn clock_verify_armed(&self) -> bool { self.clock_verify_armed }
 
@@ -730,6 +742,12 @@ impl NativeSoloEngine {
         }
         self.rtsp_dead = true;
         self.runtime.rtsp_dead = true;
+    }
+
+    fn note_mrp_error(&mut self, err: &MrpError) {
+        if let MrpError::Transport(transport) = err {
+            self.mark_rtsp_transport_error(transport);
+        }
     }
 
     fn note_command_error(&mut self, err: &NativeCommandError) {
