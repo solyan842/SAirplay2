@@ -117,7 +117,7 @@ fn transient_udp(error: &io::Error) -> bool {
     false
 }
 
-fn send_datagram_deadline(
+pub(crate) fn send_datagram_deadline(
     socket: &UdpSocket,
     packet: &[u8],
     remote: SocketAddr,
