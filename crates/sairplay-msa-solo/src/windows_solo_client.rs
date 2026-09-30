@@ -295,6 +295,38 @@ impl WindowsMsaSoloClient {
         }
     }
 
+    pub fn set_metadata_bundle(
+        &self,
+        title: &str,
+        artist: &str,
+        album: &str,
+        duration_s: u32,
+        item_id: &str,
+        artwork: Option<(&str, &[u8])>,
+    ) -> Result<(), WindowsMsaSoloError> {
+        match &self.transport {
+            Transport::Native { engine, .. } => {
+                engine.lock()
+                    .map_err(|_| WindowsMsaSoloError::Native("native engine mutex poisoned".into()))?
+                    .set_metadata_bundle(title, artist, album, duration_s, item_id, artwork)
+                    .map(|_| ())
+                    .map_err(|e| WindowsMsaSoloError::Native(format!("{e:?}")))
+            }
+            Transport::Raop { worker } => {
+                let session = worker.session();
+                let mut guard = session.lock()
+                    .map_err(|_| WindowsMsaSoloError::Raop("RAOP session mutex poisoned".into()))?;
+                guard.set_metadata(title, artist, album, duration_s, item_id)
+                    .map_err(|e| WindowsMsaSoloError::Raop(e.to_string()))?;
+                if let Some((content_type, data)) = artwork {
+                    guard.set_artwork(content_type, data)
+                        .map_err(|e| WindowsMsaSoloError::Raop(e.to_string()))?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub fn set_metadata(
         &self,
         title: &str,
