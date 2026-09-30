@@ -48,6 +48,7 @@ pub struct WindowsSoloAudioWorker {
     engine: SharedNativeSoloEngine,
     flush_generation: Arc<AtomicU64>,
     flush_ack_generation: Arc<AtomicU64>,
+    audio_ready: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     last_error: Arc<Mutex<Option<String>>>,
     discontinuities: Arc<AtomicU64>,
@@ -71,6 +72,7 @@ impl WindowsSoloAudioWorker {
         let running = Arc::new(AtomicBool::new(true));
         let flush_generation = Arc::new(AtomicU64::new(0));
         let flush_ack_generation = Arc::new(AtomicU64::new(0));
+        let audio_ready = Arc::new(AtomicBool::new(false));
         let last_error = Arc::new(Mutex::new(None));
         let discontinuities = Arc::new(AtomicU64::new(0));
         let last_discontinuity_frame = Arc::new(AtomicU64::new(u64::MAX));
@@ -79,6 +81,7 @@ impl WindowsSoloAudioWorker {
         let running_thread = Arc::clone(&running);
         let flush_thread = Arc::clone(&flush_generation);
         let flush_ack_thread = Arc::clone(&flush_ack_generation);
+        let audio_ready_thread = Arc::clone(&audio_ready);
         let error_thread = Arc::clone(&last_error);
         let discontinuities_thread = Arc::clone(&discontinuities);
         let last_discontinuity_thread = Arc::clone(&last_discontinuity_frame);
@@ -107,8 +110,6 @@ impl WindowsSoloAudioWorker {
                     Pcm352Chunker::new_with_bytes_per_frame(audio_format.input_bytes_per_frame());
                 let mut captured_frames_total = 0u64;
                 let mut local_flush_generation = flush_thread.load(Ordering::SeqCst);
-                let mut cold_started = false;
-                let mut ptp_wait_started: Option<Instant> = None;
                 let mut starvation_started: Option<Instant> = None;
                 let mut last_starvation_recovery: Option<Instant> = None;
 
@@ -143,6 +144,7 @@ impl WindowsSoloAudioWorker {
                         local_flush_generation = generation;
                         starvation_started = None;
                         last_starvation_recovery = None;
+                        audio_ready_thread.store(false, Ordering::SeqCst);
                         flush_ack_thread.store(generation, Ordering::SeqCst);
                     }
 
@@ -178,6 +180,9 @@ impl WindowsSoloAudioWorker {
                         * audio_format.input_bytes_per_frame();
                     let ring_capacity = (byte_rate.saturating_mul(4)).max(1 << 20);
                     let _ = chunker.truncate_pending(ring_capacity);
+                    if chunker.has_packet() {
+                        audio_ready_thread.store(true, Ordering::SeqCst);
+                    }
 
                     let content_paused_or_stopped = engine_thread
                         .lock()
@@ -226,74 +231,18 @@ impl WindowsSoloAudioWorker {
                         continue;
                     }
 
-                    if !cold_started {
-                        if !chunker.has_packet() {
-                            if report.frames == 0 {
-                                thread::sleep(Duration::from_millis(1));
-                            }
-                            continue;
+                    // Pinned ap2_session ownership: the reader only announces
+                    // audio readiness. START is committed exclusively by the
+                    // command/session path (commit_start), never by capture.
+                    let transport_streaming = engine_thread
+                        .lock()
+                        .map(|guard| guard.runtime.state == Ap2State::Streaming)
+                        .unwrap_or(false);
+                    if !transport_streaming {
+                        if report.frames == 0 {
+                            thread::sleep(Duration::from_millis(1));
                         }
-
-                        let should_wait_for_ptp = {
-                            let guard = match engine_thread.lock() {
-                                Ok(v) => v,
-                                Err(_) => {
-                                    if let Ok(mut slot) = error_thread.lock() {
-                                        *slot = Some("native SOLO engine mutex poisoned".into());
-                                    }
-                                    running_thread.store(false, Ordering::SeqCst);
-                                    return;
-                                }
-                            };
-                            guard.ready.timing_owner.use_ptp()
-                                && guard.ready.timing_owner.probe_streak().is_none()
-                        };
-                        if should_wait_for_ptp {
-                            let since = ptp_wait_started.get_or_insert_with(Instant::now);
-                            if since.elapsed() < AIRPLAY_CLOCK_READY_TIMEOUT {
-                                if report.frames == 0 {
-                                    thread::sleep(Duration::from_millis(1));
-                                }
-                                continue;
-                            }
-                        } else {
-                            ptp_wait_started = None;
-                        }
-
-                        let start = {
-                            let mut guard = match engine_thread.lock() {
-                                Ok(v) => v,
-                                Err(_) => {
-                                    if let Ok(mut slot) = error_thread.lock() {
-                                        *slot = Some("native SOLO engine mutex poisoned".into());
-                                    }
-                                    running_thread.store(false, Ordering::SeqCst);
-                                    return;
-                                }
-                            };
-                            guard.start(0)
-                        };
-                        match start {
-                            Ok(resolution) => {
-                                cold_started = true;
-                                if let Ok(mut events) = events_thread.lock() {
-                                    events.push(format!(
-                                        "WASAPI cold START committed at {} ms · format={}/{} · pending_bytes={}.",
-                                        resolution.at_unix_ms,
-                                        audio_format.bit_depth,
-                                        audio_format.sample_rate,
-                                        chunker.pending_bytes(),
-                                    ));
-                                }
-                            }
-                            Err(e) => {
-                                if let Ok(mut slot) = error_thread.lock() {
-                                    *slot = Some(format!("native SOLO cold START failed: {e:?}"));
-                                }
-                                running_thread.store(false, Ordering::SeqCst);
-                                return;
-                            }
-                        }
+                        continue;
                     }
 
                     // Source-order delivery-stall guard: pacing gate first,
@@ -458,6 +407,7 @@ impl WindowsSoloAudioWorker {
                 engine,
                 flush_generation,
                 flush_ack_generation,
+                audio_ready,
                 worker: Some(worker),
                 last_error,
                 discontinuities,
@@ -523,6 +473,10 @@ impl WindowsSoloAudioWorker {
 
     /// START after either initial connect or a completed FLUSH. NativeSoloEngine
     /// itself selects ap2cl_start for the first call and ap2cl_resume thereafter.
+    pub fn audio_ready(&self) -> bool {
+        self.audio_ready.load(Ordering::SeqCst)
+    }
+
     pub fn commit_start(
         &self,
         requested_unix_ms: u64,
