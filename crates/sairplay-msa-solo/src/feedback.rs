@@ -2,7 +2,7 @@ use crate::{write_farewell_teardown_locked, EncryptedRtspChannel, EncryptedRtspE
 use plist::Value;
 use std::io::Cursor;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc, Mutex, TryLockError,
 };
 use std::thread::{self, JoinHandle};
@@ -36,6 +36,7 @@ impl FeedbackWorker {
         dacp_id: String,
         active_remote: String,
         session_uri: String,
+        mrp_feedback_pulses: Option<Arc<AtomicU64>>,
     ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
@@ -122,6 +123,12 @@ impl FeedbackWorker {
                         cseq,
                         remaining,
                     );
+
+                    // Source order: after the keepalive exchange, service
+                    // MediaRemote output on the same feedback cadence.
+                    if let Some(pulses) = mrp_feedback_pulses.as_ref() {
+                        pulses.fetch_add(1, Ordering::SeqCst);
+                    }
 
                     match result {
                         Ok(response) if response.status == 200 => {
