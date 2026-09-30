@@ -127,6 +127,14 @@ impl WindowsMsaSoloClient {
         let have_credentials = config.native.control.auth_credentials.is_some();
         let have_password = config.native.control.password.is_some()
             || config.raop.password.is_some();
+        // Pinned ap2cl_s owns one requested format independent of the
+        // route selected underneath it. RAOP-compatible must therefore use
+        // the same sample-rate/bit-depth/channels requested for native AP2.
+        config.raop.sample_rate = config.native.control.audio_format.sample_rate;
+        config.raop.bit_depth = config.native.control.audio_format.bit_depth;
+        config.raop.channels = config.native.control.audio_format.channels;
+        config.raop.lead_ms = 2_000;
+
         let route = resolve_route_from_txt(
             config.protocol,
             config.txt.as_deref(),
