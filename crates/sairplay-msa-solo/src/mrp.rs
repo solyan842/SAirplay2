@@ -601,6 +601,16 @@ impl MrpController {
         self.publish_lock.lock().map_err(|_| MrpError::Lock)
     }
 
+    pub(crate) fn try_publication_guard(
+        &self,
+    ) -> Result<Option<MutexGuard<'_, ()>>, MrpError> {
+        match self.publish_lock.try_lock() {
+            Ok(guard) => Ok(Some(guard)),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err(MrpError::Lock),
+        }
+    }
+
     pub(crate) fn stage_track_locked(
         &self,
         title: &str,
