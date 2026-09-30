@@ -9,6 +9,7 @@ pub mod native_rtx;
 pub mod native_runtime;
 pub mod native_codec;
 pub mod native_io;
+pub mod native_media_owner;
 pub mod hap_pairing;
 pub mod hap_rtsp;
 pub mod hap_crypto;
