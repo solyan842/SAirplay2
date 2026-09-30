@@ -25,7 +25,7 @@ use crate::{
     set_native_volume, write_farewell_teardown_locked, Ap2AudioFormat,
     EncryptedRtspError, MetadataError, MetadataSetResult, ParameterError,
     ParameterResult, VolumeError, VolumeSetResult, mrp_post_command, MrpError,
-    MrpEventWorker, MrpPlaybackState, MrpRemoteCommand, MrpState,
+    MrpController, MrpEventWorker, MrpPlaybackState, MrpRemoteCommand, MrpState,
 };
 use crate::ntp_timing::system_time_to_ntp;
 use std::thread;
@@ -89,7 +89,7 @@ pub struct NativeSoloEngine {
     pub runtime: NativeRuntime,
     feedback: FeedbackWorker,
     rtx_worker: Option<RtxWorker>,
-    mrp: Option<MrpState>,
+    mrp: Option<MrpController>,
     mrp_event: Option<MrpEventWorker>,
     config: NativeSoloConfig,
     timeline_initialized: bool,
@@ -177,11 +177,17 @@ impl NativeSoloEngine {
             && ready.pair_verified
             && ready.event.is_some()
         {
-            Some(MrpState::new(
+            Some(MrpController::new(
+                MrpState::new(
+                    config.control.dacp_id.clone(),
+                    config.control.receiver_name.clone(),
+                    ready.session_uuid.clone(),
+                    ready.group_uuid.clone(),
+                ),
+                Arc::clone(&ready.control),
+                Arc::clone(&ready.next_cseq),
                 config.control.dacp_id.clone(),
-                config.control.receiver_name.clone(),
-                ready.session_uuid.clone(),
-                ready.group_uuid.clone(),
+                config.control.active_remote.clone(),
             ))
         } else {
             None
