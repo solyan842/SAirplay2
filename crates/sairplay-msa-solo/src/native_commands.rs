@@ -6,6 +6,7 @@ use crate::ntp_timing::system_time_to_ntp;
 use plist::{Dictionary, Value};
 use std::io::Cursor;
 use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
 #[derive(Debug)]
@@ -167,7 +168,7 @@ fn remaining_lead_ns(commanded_start_ntp: u64, now_ntp: u64) -> u64 {
 
 pub fn buffered_anchor_start(
     channel: &mut EncryptedRtspChannel,
-    next_cseq: &mut u32,
+    next_cseq: &AtomicU32,
     session_uri: &str,
     dacp_id: &str,
     active_remote: &str,
@@ -180,8 +181,7 @@ pub fn buffered_anchor_start(
         let now_ntp = system_time_to_ntp(SystemTime::now()).map_err(|_| NativeCommandError::Time)?;
         let lead_ns = remaining_lead_ns(commanded_start_ntp, now_ntp);
         let anchor_ns = clock.master_now_ns().saturating_add(lead_ns);
-        let cseq = *next_cseq;
-        *next_cseq = next_cseq.wrapping_add(1);
+        let cseq = next_cseq.fetch_add(1, Ordering::SeqCst);
         if send_setrateanchortime(
             channel, cseq, session_uri, dacp_id, active_remote,
             clock, rtp_time, anchor_ns, 1,
