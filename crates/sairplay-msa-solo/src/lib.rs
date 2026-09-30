@@ -10,6 +10,7 @@ pub mod native_runtime;
 pub mod native_codec;
 pub mod native_io;
 pub mod native_media_owner;
+pub mod native_control;
 pub mod event_channel;
 pub mod setpeers;
 pub mod stream_setup;
@@ -258,4 +259,9 @@ pub use stream_setup::{
     StreamPorts, StreamSetupError,
 };
 pub use setpeers::{send_setpeers, SetPeersConfig, SetPeersError};
-pub use event_channel::{open_event_channel, EventChannel, EventChannelError};
+pub use event_channel::{open_event_channel, open_event_channel_best_effort, EventChannel, EventChannelError};
+
+pub use native_media_owner::{NativeMediaOwner, NativeMediaOwnerError};
+pub use native_control::{
+    open_native_control, LiveTiming, NativeControlConfig, NativeControlError, NativeControlReady,
+};
