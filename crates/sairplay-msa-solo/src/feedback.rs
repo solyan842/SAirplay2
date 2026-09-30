@@ -1,4 +1,4 @@
-use crate::{EncryptedRtspChannel, EncryptedRtspError, RtspRequest};
+use crate::{write_farewell_teardown_locked, EncryptedRtspChannel, EncryptedRtspError, RtspRequest};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Mutex, TryLockError,
@@ -32,6 +32,7 @@ impl FeedbackWorker {
         next_cseq: SharedCseq,
         dacp_id: String,
         active_remote: String,
+        session_uri: String,
     ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
@@ -116,7 +117,6 @@ impl FeedbackWorker {
                         cseq,
                         remaining,
                     );
-                    drop(channel);
 
                     match result {
                         Ok(response) if response.status == 200 => {
@@ -141,6 +141,17 @@ impl FeedbackWorker {
                                     "/feedback CSeq {cseq} timed out (miss {now_misses}/{MAX_CONSECUTIVE_MISSES})"
                                 ));
                             }
+                            if now_misses >= MAX_CONSECUTIVE_MISSES {
+                                // Pinned MSA appends one final encrypted TEARDOWN
+                                // on a timeout-dead but still intact control stream.
+                                let _ = write_farewell_teardown_locked(
+                                    &mut channel,
+                                    &next_cseq,
+                                    &session_uri,
+                                    &dacp_id,
+                                    &active_remote,
+                                );
+                            }
                         }
                         Err(error) => {
                             if let Ok(mut slot) = error_thread.lock() {
@@ -153,6 +164,7 @@ impl FeedbackWorker {
                         }
                     }
 
+                    drop(channel);
                     if misses_thread.load(Ordering::SeqCst) >= MAX_CONSECUTIVE_MISSES {
                         break;
                     }
