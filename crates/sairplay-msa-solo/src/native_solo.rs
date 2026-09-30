@@ -1178,9 +1178,8 @@ impl NativeSoloEngine {
         if !self.ready.pair_verified || !env_enabled("CLIAIRPLAY_MRP_TYPE130", false) {
             return -1;
         }
-        if self.mrp.is_none() {
-            return -1;
-        }
+        // With stored credentials and type-130 explicitly enabled, MSA
+        // reports 0 when the MRP/data channel was attempted but is not up.
         match self.mrp_data.as_ref() {
             Some(worker) if worker.healthy() => 1,
             _ => 0,
