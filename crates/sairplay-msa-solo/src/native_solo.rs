@@ -18,7 +18,12 @@ use crate::native_rtx::{RtxCounters, RtxRing};
 use crate::feedback::FeedbackWorker;
 use crate::native_rtx_worker::RtxWorker;
 use crate::native_timeline::{
-    ms_for_frames, ntp_to_frames, unix_ms_to_ntp, Timeline,
+    frames_for_ms, ms_for_frames, ntp_to_frames, unix_ms_to_ntp, Timeline,
+};
+use crate::{
+    send_native_artwork, send_native_metadata, send_native_progress, send_teardown,
+    set_native_volume, Ap2AudioFormat, MetadataSetResult, ParameterResult,
+    TeardownError, VolumeSetResult,
 };
 use crate::ntp_timing::system_time_to_ntp;
 use std::thread;
@@ -73,6 +78,15 @@ pub struct NativeSoloEngine {
     clock_verify_requested_unix_ms: u64,
     clock_verify_anchor_unix_ms: u64,
     monotonic_zero: Instant,
+    content_paused: bool,
+    content_stopped: bool,
+    disconnected: bool,
+    meta_delivered: bool,
+    meta_title: String,
+    meta_artist: String,
+    meta_album: String,
+    meta_duration_s: u32,
+    meta_item_id: String,
 }
 
 impl NativeSoloEngine {
@@ -167,6 +181,15 @@ impl NativeSoloEngine {
             clock_verify_requested_unix_ms: 0,
             clock_verify_anchor_unix_ms: 0,
             monotonic_zero: Instant::now(),
+            content_paused: false,
+            content_stopped: false,
+            disconnected: false,
+            meta_delivered: false,
+            meta_title: String::new(),
+            meta_artist: String::new(),
+            meta_album: String::new(),
+            meta_duration_s: 0,
+            meta_item_id: String::new(),
         })
     }
 
