@@ -52,6 +52,7 @@ pub struct WindowsRaopAudioWorker {
     first_start_done: Arc<AtomicBool>,
     capture_worker: Option<JoinHandle<()>>,
     writer_worker: Option<JoinHandle<()>>,
+    health_worker: Option<JoinHandle<()>>,
     last_error: Arc<Mutex<Option<String>>>,
 }
 
@@ -106,6 +107,21 @@ impl WindowsRaopAudioWorker {
                 }
             }
         }).map_err(|e|WindowsRaopWorkerError::Worker(format!("spawn RAOP writer: {e}")))?;
+
+        let running_h=Arc::clone(&running);
+        let session_h=Arc::clone(&session);
+        let error_h=Arc::clone(&last_error);
+        let health_worker=thread::Builder::new().name("msa-raop-health".into()).spawn(move||{
+            while running_h.load(Ordering::SeqCst) {
+                let alive=session_h.lock().map(|mut s|s.helper_alive()).unwrap_or(false);
+                if !alive {
+                    if let Ok(mut slot)=error_h.lock(){*slot=Some("RAOP helper exited (control/media unhealthy)".into());}
+                    running_h.store(false,Ordering::SeqCst);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }).map_err(|e|WindowsRaopWorkerError::Worker(format!("spawn RAOP health monitor: {e}")))?;
 
         let running_c=Arc::clone(&running);
         let enabled_c=Arc::clone(&delivery_enabled);
@@ -184,7 +200,7 @@ impl WindowsRaopAudioWorker {
             Ok(Ok(()))=>Ok(Self{
                 session,running,delivery_enabled,flush_generation,flush_ack_generation,
                 audio_ready,first_start_done,capture_worker:Some(capture_worker),
-                writer_worker:Some(writer_worker),last_error,
+                writer_worker:Some(writer_worker),health_worker:Some(health_worker),last_error,
             }),
             Ok(Err(message))=>{
                 running.store(false,Ordering::SeqCst);
@@ -282,6 +298,7 @@ impl WindowsRaopAudioWorker {
         self.delivery_enabled.store(false,Ordering::SeqCst);
         if let Some(w)=self.capture_worker.take(){let _=w.join();}
         if let Some(w)=self.writer_worker.take(){let _=w.join();}
+        if let Some(w)=self.health_worker.take(){let _=w.join();}
         if let Ok(mut session)=self.session.lock(){session.disconnect();}
     }
 }
