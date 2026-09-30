@@ -17,6 +17,8 @@ pub mod pcm_chunker;
 pub mod wasapi_loopback;
 #[cfg(windows)]
 pub mod windows_audio_worker;
+#[cfg(windows)]
+pub mod windows_raop_session;
 pub mod native_rtx_worker;
 pub mod feedback;
 pub mod native_commands;
@@ -329,3 +331,6 @@ pub use mrp::{
 pub use mrp_event::{MrpEventWorker, MrpRemoteCommand};
 
 pub use mrp_datastream::{MrpDataStream, MrpDataStreamError, MrpDataStreamWorker, MRP_CLIENT_TYPE_UUID, MRP_STREAM_CONTROL_TYPE, MRP_STREAM_TYPE_REMOTE_CONTROL};
+
+#[cfg(windows)]
+pub use windows_raop_session::{MsaRaopConfig, MsaRaopError, MsaRaopReady, MsaRaopSession, MsaRaopState, MSA_LIBRAOP_PIN, RAOP_FRAMES_PER_PACKET, RAOP_PCM_PACKET_BYTES};
