@@ -154,6 +154,51 @@ mod tests{
   s.begin_flush().unwrap();assert!(s.reader_acknowledge_pause());assert_eq!(s.complete_flush_at(20).unwrap(),None);
   assert_eq!(s.take_event(),Some(SessionEvent::Flushed{head_unix_ms:None}));
  }
+ #[test] fn failed_flush_preserves_pending_audio_and_playing_state(){
+  struct FailT{log:Vec<&'static str>}
+  impl OwnedTransport for FailT{
+   type Error=();
+   fn quiesce(&mut self){self.log.push("quiesce")}
+   fn flush(&mut self)->Result<(),Self::Error>{self.log.push("flush");Err(())}
+   fn commit_start(&mut self,r:u64)->Result<u64,Self::Error>{self.log.push("commit");Ok(r)}
+   fn stop(&mut self){self.log.push("stop")}
+   fn resume(&mut self){self.log.push("resume")}
+   fn disconnect(&mut self){self.log.push("disconnect")}
+  }
+  let i=I{chunks:vec![vec![1,2,3,4]],i:0};
+  let mut s=OwnedSoloSession::new(FailT{log:vec![]},i,100,4).unwrap();
+  s.pump_input_once_at(0).unwrap();s.start_at(1000,10).unwrap();
+  assert_eq!(s.begin_flush(),Err(OwnedError::Transport(())));
+  assert_eq!(s.state(),SessionState::Playing);
+  let mut out=[0u8;4];assert_eq!(s.read(&mut out),4);assert_eq!(out,[1,2,3,4]);
+  assert_eq!(s.transport.log,vec!["quiesce","commit","resume","quiesce","flush","resume"]);
+ }
+ #[test] fn flush_before_first_start_is_valid_and_remains_idle(){
+  let i=I{chunks:vec![],i:0};let mut s=OwnedSoloSession::new(T::default(),i,100,4).unwrap();
+  s.begin_flush().unwrap();assert!(s.reader_acknowledge_pause());
+  assert_eq!(s.complete_flush_at(10).unwrap(),Some(777));
+  assert_eq!(s.state(),SessionState::Idle);assert_eq!(s.epoch(),0);
+ }
+ #[test] fn standby_then_start_resumes_persistent_input(){
+  let i=I{chunks:vec![vec![1,2,3,4],vec![5,6,7,8]],i:0};
+  let mut s=OwnedSoloSession::new(T::default(),i,100,4).unwrap();
+  s.pump_input_once_at(0).unwrap();s.start_at(1000,10).unwrap();
+  let mut out=[0u8;4];assert_eq!(s.read(&mut out),4);
+  s.standby_at(20).unwrap();assert_eq!(s.state(),SessionState::Standby);
+  s.pump_input_once_at(25).unwrap();s.start_at(2000,30).unwrap();
+  assert_eq!(s.state(),SessionState::Playing);assert_eq!(s.read(&mut out),4);assert_eq!(out,[5,6,7,8]);
+ }
+ #[test] fn start_after_eof_reopens_orphan_window(){
+  let i=I{chunks:vec![vec![1,2],vec![]],i:0};
+  let mut s=OwnedSoloSession::new_at(T::default(),i,100,1,20,0).unwrap();
+  s.pump_input_once_at(1).unwrap();s.start_at(1000,2).unwrap();
+  let mut out=[0u8;2];assert_eq!(s.read(&mut out),2);
+  s.pump_input_once_at(3).unwrap();assert!(s.reader.eof());
+  // START before polling the expired window re-opens it from this command.
+  s.start_at(2000,100).unwrap();assert_eq!(s.poll_at(119),None);
+  assert_eq!(s.poll_at(120),Some(SessionEvent::IdleTimeout));
+ }
+
  #[test] fn idle_timeout_tracks_start_and_eof_window(){
   let i=I{chunks:vec![vec![]],i:0};let mut s=OwnedSoloSession::new_at(T::default(),i,100,4,100,5).unwrap();
   s.start_at(1000,50).unwrap();s.pump_input_once_at(80).unwrap();assert_eq!(s.poll_at(179),None);
