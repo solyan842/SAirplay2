@@ -26,6 +26,7 @@ pub mod native_metadata;
 pub mod volume;
 pub mod mrp;
 pub mod mrp_event;
+pub mod mrp_datastream;
 pub mod native_timing_owner;
 pub mod ptp_engine;
 pub mod ntp_timing;
@@ -326,3 +327,5 @@ pub use mrp::{
 };
 
 pub use mrp_event::{MrpEventWorker, MrpRemoteCommand};
+
+pub use mrp_datastream::{MrpDataStream, MrpDataStreamError, MrpDataStreamWorker, MRP_CLIENT_TYPE_UUID, MRP_STREAM_CONTROL_TYPE, MRP_STREAM_TYPE_REMOTE_CONTROL};
