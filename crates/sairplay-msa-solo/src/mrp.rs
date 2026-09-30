@@ -2,7 +2,7 @@ use crate::{EncryptedRtspError, RtspRequest, SharedCseq, SharedRtspControl};
 use plist::{Dictionary, Value};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, Mutex, TryLockError, atomic::Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, atomic::Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
