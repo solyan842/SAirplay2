@@ -47,10 +47,9 @@ pub fn send_record(
     };
 
     let response = channel.exchange(&request.encode(), config.cseq)?;
-    if response.status != 200 {
-        return Err(RecordError::Status(response.status));
-    }
-
+    // Pinned MSA treats any received RECORD status as non-fatal; only the
+    // encrypted exchange/transport failing aborts the session.
+    let _status = response.status;
     flow.recorded()?;
     Ok(())
 }
@@ -137,7 +136,7 @@ mod tests {
     }
 
     #[test]
-    fn non_200_record_keeps_flow_at_event_channel_open() {
+    fn non_200_record_is_warning_only_and_flow_advances() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let key = [0x62u8; 32];
@@ -162,11 +161,8 @@ mod tests {
             active_remote: "123456789".into(),
         };
 
-        assert!(matches!(
-            send_record(&mut flow, &mut channel, &config),
-            Err(RecordError::Status(453))
-        ));
-        assert_eq!(flow.phase(), NativePhase::EventChannelOpen);
+        send_record(&mut flow, &mut channel, &config).unwrap();
+        assert_eq!(flow.phase(), NativePhase::Recorded);
 
         server.join().unwrap();
     }
