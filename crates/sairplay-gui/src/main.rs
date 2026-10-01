@@ -2563,8 +2563,26 @@ impl SairplayApp {
                             .into(),
                     );
                 }
-                // Native workers currently have bounded local shutdown and stay
-                // on the existing path; do not change their proven stop behavior.
+                // Pinned MSA terminal STOP is not a standby/park: ACTION=STOP
+                // serializes against audio sends, runs ap2cl_stop(), then the
+                // audio loop exits and normal destroy/disconnect sends TEARDOWN.
+                // WindowsSoloAudioWorker::stop_content() takes the same engine
+                // mutex used by sends, so invoke it before dropping the owner.
+                ActiveSession::MsaSolo(session) => {
+                    let stop_result = session.client.stop_content();
+                    drop(session);
+                    match stop_result {
+                        Ok(()) => self.log.push(
+                            "Playback stopped; MSA SOLO STOP completed before AirPlay teardown."
+                                .into(),
+                        ),
+                        Err(error) => self.log.push(format!(
+                            "Playback stopped; MSA SOLO STOP reported {error}; teardown still completed."
+                        )),
+                    }
+                }
+                // Other native/group workers keep their existing bounded local
+                // shutdown path; this change is intentionally SOLO-only.
                 session => {
                     drop(session);
                     self.log
