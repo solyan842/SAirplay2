@@ -10,6 +10,7 @@ eframe = "0.31"
 egui_extras = { version = "0.31", features = ["svg", "image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 sairplay-engine = { path = "../sairplay-engine" }
+sairplay-msa-solo = { path = "../sairplay-msa-solo" }
 
 
 

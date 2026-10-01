@@ -9,6 +9,10 @@ use sairplay_engine::{
     ALAC_44100_16_2, ALAC_44100_24_2, ALAC_48000_16_2,
     ALAC_48000_24_2,
 };
+use sairplay_msa_solo::{
+    Ap2AudioFormat as MsaAp2AudioFormat, WindowsMsaSoloClient, WindowsMsaSoloConfig,
+};
+use sairplay_msa_solo::route::ProtocolPreference as MsaProtocolPreference;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::IpAddr;
@@ -17,9 +21,9 @@ use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PlaybackUiState {
@@ -36,7 +40,24 @@ enum PlaybackMode {
     StereoPair,
 }
 
+struct MsaSoloGuiSession {
+    client: WindowsMsaSoloClient,
+    format: sairplay_engine::Ap2AudioFormat,
+    initial_volume: Option<u8>,
+    startup_events: Mutex<Vec<String>>,
+}
+
+impl MsaSoloGuiSession {
+    fn drain_startup_events(&self) -> Vec<String> {
+        self.startup_events
+            .lock()
+            .map(|mut events| events.drain(..).collect())
+            .unwrap_or_default()
+    }
+}
+
 enum ActiveSession {
+    MsaSolo(MsaSoloGuiSession),
     Single(NativeSession),
     StereoPair(NativeGroupSession),
     MultiRoom(NativeGroupSession),
@@ -61,6 +82,7 @@ impl ActiveVolumeControl {
 impl ActiveSession {
     fn audio_running(&self) -> bool {
         match self {
+            Self::MsaSolo(session) => session.client.is_playing(),
             Self::Single(session) => session.audio_running(),
             Self::StereoPair(session) => session.audio_running(),
             Self::MultiRoom(session) => session.audio_running(),
@@ -70,6 +92,8 @@ impl ActiveSession {
 
     fn audio_error(&self) -> Option<String> {
         match self {
+            Self::MsaSolo(session) => (!session.client.is_connected())
+                .then(|| "MSA SOLO transport disconnected".to_owned()),
             Self::Single(session) => session.audio_error(),
             Self::StereoPair(session) => session.audio_error(),
             Self::MultiRoom(session) => session.audio_error(),
@@ -79,6 +103,7 @@ impl ActiveSession {
 
     fn audio_format(&self) -> Option<sairplay_engine::Ap2AudioFormat> {
         match self {
+            Self::MsaSolo(session) => Some(session.format),
             Self::Single(session) => Some(session.audio_format()),
             Self::StereoPair(session) => session.audio_format(),
             Self::MultiRoom(session) => session.audio_format(),
@@ -88,6 +113,7 @@ impl ActiveSession {
 
     fn drain_startup_events(&self) -> Vec<String> {
         match self {
+            Self::MsaSolo(session) => session.drain_startup_events(),
             Self::Single(session) => session.drain_startup_events(),
             Self::StereoPair(session) => session.drain_startup_events(),
             Self::MultiRoom(session) => session.drain_startup_events(),
@@ -97,6 +123,7 @@ impl ActiveSession {
 
     fn retransmit_stats(&self) -> RetransmitStats {
         match self {
+            Self::MsaSolo(_) => RetransmitStats::default(),
             Self::Single(session) => session.retransmit_stats(),
             Self::StereoPair(session) => session.retransmit_stats(),
             Self::MultiRoom(session) => session.retransmit_stats(),
@@ -109,12 +136,13 @@ impl ActiveSession {
             Self::StereoPair(session) | Self::MultiRoom(session) => {
                 session.member_retransmit_stats()
             }
-            Self::Single(_) | Self::Legacy(_) => Vec::new(),
+            Self::MsaSolo(_) | Self::Single(_) | Self::Legacy(_) => Vec::new(),
         }
     }
 
     fn feedback_running(&self) -> bool {
         match self {
+            Self::MsaSolo(session) => session.client.control_healthy(),
             Self::Single(session) => session.feedback_running(),
             Self::StereoPair(session) => session.feedback_running(),
             Self::MultiRoom(session) => session.feedback_running(),
@@ -124,6 +152,8 @@ impl ActiveSession {
 
     fn feedback_error(&self) -> Option<String> {
         match self {
+            Self::MsaSolo(session) => (!session.client.control_healthy())
+                .then(|| "MSA SOLO control channel unhealthy".to_owned()),
             Self::Single(session) => session.feedback_error(),
             Self::StereoPair(session) => session.feedback_error(),
             Self::MultiRoom(session) => session.feedback_error(),
@@ -133,6 +163,7 @@ impl ActiveSession {
 
     fn volume_controls(&self) -> Vec<ActiveVolumeControl> {
         match self {
+            Self::MsaSolo(_) => Vec::new(),
             Self::Single(session) => vec![ActiveVolumeControl::Native(session.volume_control())],
             Self::StereoPair(session) => session
                 .volume_controls()
@@ -154,6 +185,14 @@ impl ActiveSession {
 
     fn initial_volume_results(&self) -> Vec<(String, VolumeSetResult)> {
         match self {
+            Self::MsaSolo(session) => session.initial_volume.map(|percent| vec![(
+                "MSA SOLO".to_owned(),
+                VolumeSetResult {
+                    percent,
+                    db: sairplay_engine::volume_percent_to_db(percent),
+                    status: 200,
+                },
+            )]).unwrap_or_default(),
             Self::Single(session) => session
                 .initial_volume_result()
                 .map(|result| vec![("receiver".to_owned(), result)])
@@ -169,7 +208,7 @@ impl ActiveSession {
             Self::StereoPair(session) | Self::MultiRoom(session) => {
                 session.failed_group_members()
             }
-            Self::Single(_) | Self::Legacy(_) => Vec::new(),
+            Self::MsaSolo(_) | Self::Single(_) | Self::Legacy(_) => Vec::new(),
         }
     }
 
@@ -178,7 +217,7 @@ impl ActiveSession {
             Self::StereoPair(session) | Self::MultiRoom(session) => {
                 session.recovery_join_handle()
             }
-            Self::Single(_) | Self::Legacy(_) => None,
+            Self::MsaSolo(_) | Self::Single(_) | Self::Legacy(_) => None,
         }
     }
 
@@ -187,7 +226,7 @@ impl ActiveSession {
             Self::StereoPair(session) | Self::MultiRoom(session) => {
                 session.detach_failed_member(name).map_err(|error| error.to_string())
             }
-            Self::Single(_) | Self::Legacy(_) => Ok(false),
+            Self::MsaSolo(_) | Self::Single(_) | Self::Legacy(_) => Ok(false),
         }
     }
 
@@ -197,7 +236,7 @@ impl ActiveSession {
                 group.adopt_member(name, session);
                 true
             }
-            Self::Single(_) | Self::Legacy(_) => false,
+            Self::MsaSolo(_) | Self::Single(_) | Self::Legacy(_) => false,
         }
     }
 }
@@ -1248,6 +1287,13 @@ impl SairplayApp {
         let Some(session) = self.session.as_ref() else {
             return;
         };
+        if matches!(session, ActiveSession::MsaSolo(_)) {
+            self.log.push(
+                "MSA SOLO hardware-test path: volume change saved and will apply on next Start."
+                    .into(),
+            );
+            return;
+        }
 
         let controls = session.volume_controls();
         let (tx, rx) = mpsc::sync_channel(1);
@@ -1896,7 +1942,8 @@ impl SairplayApp {
                             && error.contains("peer/control channel closed");
                         let native_session = matches!(
                             self.session,
-                            Some(ActiveSession::Single(_))
+                            Some(ActiveSession::MsaSolo(_))
+                                | Some(ActiveSession::Single(_))
                                 | Some(ActiveSession::StereoPair(_))
                                 | Some(ActiveSession::MultiRoom(_))
                         );
@@ -2086,13 +2133,18 @@ impl SairplayApp {
         if all_native {
             if requested_mode == PlaybackMode::Single && member_count == 1 {
                 let (fullname, device) = &selected_devices[0];
-                let hires_override = self.hires_overrides.get(fullname).copied();
-                let mut config = match native_config_for_device(
+                let hires_enabled = self
+                    .hires_overrides
+                    .get(fullname)
+                    .copied()
+                    .unwrap_or(false);
+                let credentials = self.native_credentials.get(fullname).cloned();
+                let (config, format, connect_summary) = match msa_solo_config_for_device(
                     device,
-                    initial_volume,
-                    hires_override,
+                    credentials.clone(),
+                    hires_enabled,
                 ) {
-                    Ok(config) => config,
+                    Ok(value) => value,
                     Err(message) => {
                         self.log.push(message.clone());
                         self.playback = PlaybackUiState::Error(message);
@@ -2100,32 +2152,56 @@ impl SairplayApp {
                         return;
                     }
                 };
-                config.auth_credentials = self.native_credentials.get(fullname).cloned();
-                config.buffered_auto_enabled = true;
-                let native_configs =
-                    BTreeMap::from([(fullname.clone(), config.clone())]);
+                let native_configs = BTreeMap::new();
 
                 thread::Builder::new()
-                    .name("sairplay-native-single-connect".into())
+                    .name("sairplay-msa-solo-connect".into())
                     .spawn(move || {
-                        let result = NativeSession::connect(&config)
-                            .map_err(|e| e.to_string())
-                            .and_then(|mut session| {
-                                session
-                                    .start_windows_audio()
-                                    .map_err(|e| e.to_string())?;
-                                Ok(ActiveSession::Single(session))
-                            })
-                            .map(|session| ConnectSuccess {
-                                session,
-                                active_fullnames,
-                                native_configs,
-                                label,
-                                mode: requested_mode,
-                            });
+                        let credential_for_redaction = credentials.as_deref();
+                        let result = (|| -> Result<ActiveSession, String> {
+                            let mut startup_events = vec![connect_summary];
+                            let client = WindowsMsaSoloClient::connect(config).map_err(|error| {
+                                format!(
+                                    "MSA SOLO CONNECT class={:?} status={} route={:?} detail={}",
+                                    error.class,
+                                    error.http_status,
+                                    error.route,
+                                    redact_msa_detail(&error.detail, credential_for_redaction),
+                                )
+                            })?;
+                            startup_events.push(format!(
+                                "MSA SOLO READY route={:?} capabilities={:?} latency={:?} ptp={}.",
+                                client.route(),
+                                client.format_capabilities(),
+                                client.latency_info(),
+                                client.uses_ptp(),
+                            ));
+                            if let Some(volume) = initial_volume {
+                                client
+                                    .set_volume(volume)
+                                    .map_err(|error| format!("MSA SOLO volume: {error:?}"))?;
+                            }
+                            let start = client
+                                .commit_start(unix_ms_now())
+                                .map_err(|error| format!("MSA SOLO START: {error:?}"))?;
+                            startup_events.push(format!("MSA SOLO START {start:?}."));
+                            Ok(ActiveSession::MsaSolo(MsaSoloGuiSession {
+                                client,
+                                format,
+                                initial_volume,
+                                startup_events: Mutex::new(startup_events),
+                            }))
+                        })()
+                        .map(|session| ConnectSuccess {
+                            session,
+                            active_fullnames,
+                            native_configs,
+                            label,
+                            mode: requested_mode,
+                        });
                         let _ = tx.send(result);
                     })
-                    .expect("failed to spawn native single connect worker");
+                    .expect("failed to spawn MSA SOLO connect worker");
             } else {
                 let mut configs = Vec::<NativeGroupMemberConfig>::with_capacity(member_count);
                 for (fullname, device) in &selected_devices {
@@ -4547,6 +4623,109 @@ fn legacy_config_for_device(
     }
 
     Ok(config)
+}
+
+fn msa_solo_route_txt(service: &DiscoveredService) -> Result<String, String> {
+    const ROUTE_KEYS: &[&str] = &[
+        "features", "ft", "flags", "sf", "model", "am", "igl", "pgid", "tsid",
+        "osvers", "ov", "srcvers", "vs", "cn", "pk", "pw", "et",
+    ];
+
+    let mut parts = Vec::new();
+    for key in ROUTE_KEYS {
+        if let Some(value) = service.txt.fields.get(*key) {
+            if value.chars().any(char::is_whitespace) {
+                return Err(format!(
+                    "{}: mDNS TXT field {key} contains whitespace; refusing an ambiguous MSA SOLO route input.",
+                    service.display_name
+                ));
+            }
+            parts.push(format!("{key}={value}"));
+        }
+    }
+    if parts.is_empty() {
+        return Err(format!(
+            "{}: mDNS did not provide MSA SOLO route TXT fields; connection not attempted.",
+            service.display_name
+        ));
+    }
+    Ok(parts.join(" "))
+}
+
+fn msa_solo_config_for_device(
+    device: &DeviceRecord,
+    credentials: Option<String>,
+    hires_enabled: bool,
+) -> Result<(WindowsMsaSoloConfig, sairplay_engine::Ap2AudioFormat, String), String> {
+    let service = device
+        .airplay
+        .as_ref()
+        .ok_or_else(|| format!("{} has no AirPlay service", device.display_name))?;
+    let host = preferred_service_address(service);
+    let raop_service = device.raop.as_ref().unwrap_or(service);
+    let txt = msa_solo_route_txt(service)?;
+
+    let (sample_rate, bit_depth) = if hires_enabled {
+        (48_000, 24)
+    } else {
+        (44_100, 16)
+    };
+
+    let mut config = WindowsMsaSoloConfig::new(host.clone(), service.port, raop_service.port);
+    config.protocol = MsaProtocolPreference::AirPlay2;
+    config.txt = Some(txt.clone());
+    config.am = service
+        .txt
+        .fields
+        .get("model")
+        .or_else(|| service.txt.fields.get("am"))
+        .cloned();
+    config.pw_txt = service.txt.fields.get("pw").cloned();
+    config.raop_cn = raop_service.txt.fields.get("cn").cloned();
+    config.raop_pk = raop_service.txt.fields.get("pk").cloned();
+    if let Some(et) = raop_service.txt.fields.get("et") {
+        config.raop.et = et.clone();
+    }
+    config.native.control.receiver_name = device.display_name.clone();
+    config.native.control.auth_credentials = credentials;
+    config.native.control.audio_format = MsaAp2AudioFormat {
+        sample_rate,
+        bit_depth,
+        channels: 2,
+    };
+
+    let format = sairplay_engine::Ap2AudioFormat {
+        sample_rate,
+        bit_depth,
+        channels: 2,
+    };
+    let features = sairplay_msa_solo::route::txt_features(Some(&txt));
+    let flags = sairplay_msa_solo::route::txt_flags(Some(&txt));
+    let summary = format!(
+        "MSA SOLO CONNECT target={} endpoint={}:{} requested={}/{} features={:#018x} flags={:#x}; credentials are never printed.",
+        device.display_name,
+        host,
+        service.port,
+        sample_rate,
+        bit_depth,
+        features,
+        flags,
+    );
+    Ok((config, format, summary))
+}
+
+fn redact_msa_detail(detail: &str, credentials: Option<&str>) -> String {
+    match credentials {
+        Some(secret) if !secret.is_empty() => detail.replace(secret, "<redacted>"),
+        _ => detail.to_owned(),
+    }
+}
+
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn native_config_for_device(
