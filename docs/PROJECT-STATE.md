@@ -55,6 +55,20 @@ Rules:
 6. CI PASS proves build/tests only. Hardware/audible PASS must be recorded
    separately.
 7. Do not alter either protected stable checkpoint while developing this path.
+8. **Before adding any model-specific protocol exception, audit the full pinned
+   MSA decision chain: Server -> per-device `streaming_mode` -> cliairplay
+   protocol/timing arguments -> airplay-cli route -> transport.** Do not stop at
+   the transport library when MSA has a higher-level general mechanism.
+9. Per-device protocol selection follows MSA's architecture: default
+   **Automatic**, with explicit user-owned overrides only when needed
+   (`AirPlay 2 PTP`, `AirPlay 2 NTP` when eligible, `AirPlay 2 compatibility`,
+   `AirPlay 1 / RAOP`). A transient failure must never silently rewrite that
+   choice.
+10. **Do not hard-code device-model -> whole-protocol routing** when the behavior
+    can be expressed by MSA's per-device `streaming_mode`. Model deny-lists are
+    reserved for narrowly scoped transport behaviors that MSA itself models that
+    way (for example measured buffered/splice hostility), or for a documented
+    hardware exception that cannot be represented by the general mechanism.
 
 The detailed lock is duplicated intentionally in
 `docs/MSA-SOLO-SOURCE-LOCK.md` so a future handoff cannot silently drift from
@@ -74,9 +88,20 @@ Black HomePod, native AP2, 16-bit / 44.1 kHz is **audibly PASS** as of
 Commit `a85beb5fded804bdff45987d39ab0e2fafc76318` additionally surfaces the
 Windows input-format diagnostic to the GUI log. Windows Action #1303 passed.
 
-The next hardware gate is **Black SOLO 24-bit / 48 kHz**. Do not move to
-Stereo Pair, MultiRoom or unrelated transport tuning before that gate is
-evaluated.
+The next hardware gate is **Black SOLO 24-bit / 48 kHz**. Current physical
+testing is **not PASS**: some tracks lose audio and some produce repeated
+pops/dropouts. Diagnostic work must stay source-aligned and must not retune
+352-frame packetization, PTP or ALAC without evidence.
+
+AirPort Express `AirPort10,115` is a separate 16/44.1 hardware gate. Its
+2026-10-01 test showed native AP2/PTP control and volume ACKs but no audible
+media. Commit `59bff8cb19d95d136525266edf902d9360d5cfe9` pins that model to
+RAOP only as a **temporary hardware-validation patch**. It is not the final
+routing architecture and must be superseded by the MSA-style per-device
+`streaming_mode` mechanism before the routing design is considered complete.
+
+Do not move to Stereo Pair, MultiRoom or unrelated transport tuning before the
+active SOLO hardware gates are evaluated.
 
 ## 3. Last fully validated transport checkpoint
 

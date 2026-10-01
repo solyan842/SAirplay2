@@ -69,6 +69,44 @@ Therefore:
 - reset converter history at the same content/flush boundary where MSA replaces
   its per-player conversion pipeline.
 
+## Route-selection discipline
+
+Route decisions must be audited **end-to-end**, not only in airplay-cli:
+
+```
+MSA Server
+  -> per-device streaming_mode
+  -> cliairplay --protocol / --timing
+  -> airplay-cli route resolution
+  -> native AP2 / AP2-compat / RAOP transport
+```
+
+Locked rules:
+
+- Default is **Automatic**, matching MSA.
+- If Auto misbehaves on a particular receiver, use a persistent **per-device
+  streaming-mode override** rather than adding a new model hard-code.
+- The override choices mirror MSA and are capability-gated: AirPlay 2 PTP,
+  AirPlay 2 NTP where eligible, AirPlay 2 compatibility, and AirPlay 1 / RAOP.
+- A playback failure may be logged and surfaced to the user, but must **not**
+  silently change or persist a different protocol.
+- Before proposing any model-specific exception, first verify whether the MSA
+  Server already has a general configuration/override mechanism for that
+  behavior.
+- Model deny-lists are acceptable only for narrowly scoped transport behavior
+  that MSA itself expresses as a deny-list (or for a documented hardware case
+  that cannot be represented by the general per-device mechanism).
+- A model-specific whole-protocol pin is therefore **not** the default solution.
+
+### AirPort10,115 note
+
+Physical testing on 2026-10-01 showed this receiver can ACK native AP2/PTP
+control and volume while rendering no audible media. The temporary
+`AirPort10,115 -> RAOP` patch in
+`59bff8cb19d95d136525266edf902d9360d5cfe9` exists only to validate the
+RAOP lane. It must be replaced by the general per-device `streaming_mode`
+architecture; do not copy this pattern to additional models.
+
 ## Evidence discipline
 
 A change is allowed only when at least one of these exists:
@@ -115,6 +153,15 @@ MSA transport PCM, for example:
 Do not proceed to Stereo Pair or MultiRoom until this gate is evaluated.
 
 ## Drift prevention
+
+For every future route/protocol change, first answer all four questions:
+
+1. What does pinned MSA Server decide?
+2. What `streaming_mode` options does it expose for this receiver?
+3. What arguments are passed to cliairplay?
+4. What route/transport does pinned airplay-cli then select?
+
+Only after that chain is established may transport code be changed.
 
 If a future patch would make SAirplay2 behave differently from pinned MSA,
 the patch must explicitly document:
