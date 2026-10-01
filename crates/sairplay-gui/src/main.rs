@@ -13,7 +13,7 @@ use sairplay_msa_solo::{
     validate_immediate_start, Ap2AudioFormat as MsaAp2AudioFormat,
     WindowsMsaSoloClient, WindowsMsaSoloConfig, WindowsMsaSoloVolumeControl,
 };
-use sairplay_msa_solo::route::ProtocolPreference as MsaProtocolPreference;
+use sairplay_msa_solo::route::{Flow as MsaFlow, ProtocolPreference as MsaProtocolPreference};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::IpAddr;
@@ -118,6 +118,17 @@ impl ActiveSession {
             Self::StereoPair(session) => session.audio_format(),
             Self::MultiRoom(session) => session.audio_format(),
             Self::Legacy(_) => None,
+        }
+    }
+
+    fn transport_label(&self) -> &'static str {
+        match self {
+            Self::MsaSolo(session) => match session.client.route().flow {
+                MsaFlow::Raop => "AirPlay 1",
+                MsaFlow::AirPlay2Compat | MsaFlow::AirPlay2Native => "AirPlay 2",
+            },
+            Self::Legacy(_) => "AirPlay 1",
+            Self::Single(_) | Self::StereoPair(_) | Self::MultiRoom(_) => "AirPlay 2",
         }
     }
 
@@ -2475,7 +2486,11 @@ impl SairplayApp {
             PlaybackUiState::Playing(_) => {
                 let detail = match self.session.as_ref().and_then(ActiveSession::audio_format) {
                     Some(format) => format!(
-                        "AirPlay 2 · ALAC · {}-bit / {} kHz",
+                        "{} · ALAC · {}-bit / {} kHz",
+                        self.session
+                            .as_ref()
+                            .map(ActiveSession::transport_label)
+                            .unwrap_or("AirPlay"),
                         format.bit_depth,
                         if format.sample_rate == 44_100 { "44.1".to_owned() } else { (format.sample_rate / 1000).to_string() }
                     ),
@@ -4878,6 +4893,36 @@ fn msa_solo_route_txt(service: &DiscoveredService) -> Result<String, String> {
     Ok(parts.join(" "))
 }
 
+fn msa_solo_airport_raop_pinned(device: &DeviceRecord) -> bool {
+    // Pinned MSA documents AirPort Express as a RAOP-class receiver and keeps
+    // an AirPlay-1 escape lane. This exact AirPort10,115 was hardware-validated
+    // on 2026-10-01: AUTO/native AP2 + PTP accepted RTSP/control and volume
+    // commands but rendered silence. Keep the exception model-scoped rather
+    // than changing generic MSA route policy.
+    let model = device
+        .airplay
+        .as_ref()
+        .and_then(|service| {
+            service
+                .txt
+                .fields
+                .get("model")
+                .or_else(|| service.txt.fields.get("am"))
+        })
+        .or_else(|| {
+            device.raop.as_ref().and_then(|service| {
+                service
+                    .txt
+                    .fields
+                    .get("am")
+                    .or_else(|| service.txt.fields.get("model"))
+            })
+        })
+        .map(String::as_str)
+        .unwrap_or("");
+    model.eq_ignore_ascii_case("AirPort10,115") && device.raop.is_some()
+}
+
 fn msa_solo_config_for_device(
     device: &DeviceRecord,
     credentials: Option<String>,
@@ -4887,18 +4932,32 @@ fn msa_solo_config_for_device(
         .airplay
         .as_ref()
         .ok_or_else(|| format!("{} has no AirPlay service", device.display_name))?;
-    let host = preferred_service_address(service);
     let raop_service = device.raop.as_ref().unwrap_or(service);
+    let airport_raop = msa_solo_airport_raop_pinned(device);
+    let host = if airport_raop {
+        preferred_service_address(raop_service)
+    } else {
+        preferred_service_address(service)
+    };
     let txt = msa_solo_route_txt(service)?;
 
-    let (sample_rate, bit_depth) = if hires_enabled {
+    // MSA server normally invokes cliairplay with --protocol auto whenever a
+    // receiver exposes both _airplay and _raop. Preserve that default. The
+    // hardware-proven AirPort10,115 exception above is pinned to the RAOP
+    // escape lane and therefore remains 16/44.1.
+    let effective_hires = hires_enabled && !airport_raop;
+    let (sample_rate, bit_depth) = if effective_hires {
         (48_000, 24)
     } else {
         (44_100, 16)
     };
 
     let mut config = WindowsMsaSoloConfig::new(host.clone(), service.port, raop_service.port);
-    config.protocol = MsaProtocolPreference::AirPlay2;
+    config.protocol = if airport_raop {
+        MsaProtocolPreference::Raop
+    } else {
+        MsaProtocolPreference::Auto
+    };
     config.txt = Some(txt.clone());
     config.am = service
         .txt
@@ -4927,13 +4986,15 @@ fn msa_solo_config_for_device(
     };
     let features = sairplay_msa_solo::route::txt_features(Some(&txt));
     let flags = sairplay_msa_solo::route::txt_flags(Some(&txt));
+    let endpoint_port = if airport_raop { raop_service.port } else { service.port };
     let summary = format!(
-        "MSA SOLO CONNECT target={} endpoint={}:{} requested={}/{} features={:#018x} flags={:#x}; credentials are never printed.",
+        "MSA SOLO CONNECT target={} endpoint={}:{} requested={}/{} protocol={:?} features={:#018x} flags={:#x}; credentials are never printed.",
         device.display_name,
         host,
-        service.port,
+        endpoint_port,
         sample_rate,
         bit_depth,
+        config.protocol,
         features,
         flags,
     );
@@ -5278,6 +5339,47 @@ mod gui_tests {
         );
 
         assert_eq!(build_homepod_stereo_pairs(&[one, two]).len(), 0);
+    }
+
+    #[test]
+    fn airport10_115_is_pinned_to_msa_raop_16_44100() {
+        let airplay = DiscoveredService {
+            kind: ServiceKind::AirPlay,
+            fullname: "AirPort._airplay._tcp.local.".into(),
+            display_name: "AirPort".into(),
+            host: "airport.local.".into(),
+            port: 7000,
+            addresses: vec!["192.168.1.50".into()],
+            txt: AirPlayTxt::parse([
+                ("model", "AirPort10,115"),
+                ("features", "0x0001c340445d0a00"),
+                ("flags", "0x4"),
+            ]).unwrap(),
+        };
+        let raop = DiscoveredService {
+            kind: ServiceKind::Raop,
+            fullname: "AirPort._raop._tcp.local.".into(),
+            display_name: "AirPort".into(),
+            host: "airport.local.".into(),
+            port: 7000,
+            addresses: vec!["192.168.1.50".into()],
+            txt: AirPlayTxt::parse([
+                ("am", "AirPort10,115"),
+                ("cn", "0,1"),
+                ("et", "0,4"),
+            ]).unwrap(),
+        };
+        let device = DeviceRecord {
+            display_name: "SOLYAN's AirPort Express".into(),
+            airplay: Some(airplay),
+            raop: Some(raop),
+        };
+
+        assert!(msa_solo_airport_raop_pinned(&device));
+        let (config, format, _) = msa_solo_config_for_device(&device, None, true).unwrap();
+        assert_eq!(config.protocol, MsaProtocolPreference::Raop);
+        assert_eq!(format.sample_rate, 44_100);
+        assert_eq!(format.bit_depth, 16);
     }
 
     #[test]
