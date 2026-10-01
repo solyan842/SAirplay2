@@ -133,7 +133,17 @@ impl ActiveSession {
 
     fn retransmit_stats(&self) -> RetransmitStats {
         match self {
-            Self::MsaSolo(_) => RetransmitStats::default(),
+            Self::MsaSolo(session) => session
+                .client
+                .diagnostics()
+                .map(|diag| RetransmitStats {
+                    requested: diag.rtx_requested,
+                    answered: diag.rtx_answered,
+                    expired: diag.rtx_expired,
+                    requested_over_1472: diag.rtx_requested_over_1472,
+                    max_requested_wire_len: diag.rtx_max_requested_wire_len,
+                })
+                .unwrap_or_default(),
             Self::Single(session) => session.retransmit_stats(),
             Self::StereoPair(session) => session.retransmit_stats(),
             Self::MultiRoom(session) => session.retransmit_stats(),
@@ -451,6 +461,8 @@ struct SairplayApp {
     last_feedback_error: Option<String>,
     last_retransmit_stats: RetransmitStats,
     last_member_retransmit_stats: BTreeMap<String, RetransmitStats>,
+    last_msa_wire_over_1472: u64,
+    last_msa_input_discontinuities: u64,
     hires_quality_warning_open: bool,
     hires_quality_warning_shown: bool,
     hires_quality_warning_text: String,
@@ -539,6 +551,8 @@ impl Default for SairplayApp {
             last_feedback_error: None,
             last_retransmit_stats: RetransmitStats::default(),
             last_member_retransmit_stats: BTreeMap::new(),
+            last_msa_wire_over_1472: 0,
+            last_msa_input_discontinuities: 0,
             hires_quality_warning_open: false,
             hires_quality_warning_shown: false,
             hires_quality_warning_text: String::new(),
@@ -1863,6 +1877,28 @@ impl SairplayApp {
             self.log.push(event);
         }
 
+        if let ActiveSession::MsaSolo(msa) = session {
+            if let Some(diag) = msa.client.diagnostics() {
+                if self.last_msa_wire_over_1472 == 0 && diag.realtime_wire_over_1472 > 0 {
+                    self.log.push(format!(
+                        "MSA SOLO 24-bit wire diagnostic: realtime UDP crossed 1472 B · packets_over_1472={} · max_wire={} B.",
+                        diag.realtime_wire_over_1472,
+                        diag.realtime_wire_max_bytes
+                    ));
+                }
+                self.last_msa_wire_over_1472 = diag.realtime_wire_over_1472;
+            }
+            let discontinuities = msa.client.input_discontinuities();
+            if discontinuities > self.last_msa_input_discontinuities {
+                self.log.push(format!(
+                    "MSA INPUT discontinuity: +{} (total {}).",
+                    discontinuities.saturating_sub(self.last_msa_input_discontinuities),
+                    discontinuities
+                ));
+                self.last_msa_input_discontinuities = discontinuities;
+            }
+        }
+
         let rtx = session.retransmit_stats();
         for (name, member_rtx) in session.member_retransmit_stats() {
             let prev = self
@@ -2183,6 +2219,9 @@ impl SairplayApp {
         self.playback = PlaybackUiState::Connecting(label.clone());
         self.session = None;
         self.muted = false;
+        self.last_retransmit_stats = RetransmitStats::default();
+        self.last_msa_wire_over_1472 = 0;
+        self.last_msa_input_discontinuities = 0;
         self.active_fullnames.clear();
         self.last_feedback_error = None;
 
@@ -2417,6 +2456,8 @@ impl SairplayApp {
         self.muted = false;
         self.last_retransmit_stats = RetransmitStats::default();
         self.last_member_retransmit_stats.clear();
+        self.last_msa_wire_over_1472 = 0;
+        self.last_msa_input_discontinuities = 0;
     }
 
     fn header_status(&self) -> (&'static str, String, egui::Color32) {

@@ -699,6 +699,13 @@ impl WindowsMsaSoloClient {
         }
     }
 
+    pub fn input_discontinuities(&self) -> u64 {
+        match &self.transport {
+            Transport::Native { worker, .. } => worker.discontinuities(),
+            Transport::Raop { .. } => 0,
+        }
+    }
+
     pub fn mrp_register(&self) -> Result<i32, WindowsMsaSoloError> {
         match &self.transport {
             Transport::Native { engine, .. } => engine.lock()

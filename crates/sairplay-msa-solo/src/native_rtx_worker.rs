@@ -51,6 +51,15 @@ impl RtxWorker {
                                     }
                                     continue;
                                 };
+                                if let Ok(mut c) = counters.lock() {
+                                    let wire_len = original.len() as u64;
+                                    if wire_len > 1472 {
+                                        c.requested_over_1472 =
+                                            c.requested_over_1472.saturating_add(1);
+                                    }
+                                    c.max_requested_wire_len =
+                                        c.max_requested_wire_len.max(wire_len);
+                                }
                                 let Some(response) = build_response(req.request_seq, &original) else {
                                     if let Ok(mut c) = counters.lock() {
                                         c.expired = c.expired.saturating_add(1);

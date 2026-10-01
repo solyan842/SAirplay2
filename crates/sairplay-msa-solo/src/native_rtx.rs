@@ -79,6 +79,8 @@ pub struct RtxCounters {
     pub requested: u64,
     pub answered: u64,
     pub expired: u64,
+    pub requested_over_1472: u64,
+    pub max_requested_wire_len: u64,
 }
 
 pub trait RtxIo {
@@ -107,6 +109,13 @@ pub fn serve_request<I: RtxIo>(
                 continue;
             }
         };
+        let wire_len = original.len() as u64;
+        if wire_len > 1472 {
+            counters.requested_over_1472 =
+                counters.requested_over_1472.saturating_add(1);
+        }
+        counters.max_requested_wire_len =
+            counters.max_requested_wire_len.max(wire_len);
         let response = match build_response(request.request_seq, original) {
             Some(v) => v,
             None => {

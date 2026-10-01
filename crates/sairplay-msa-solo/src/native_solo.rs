@@ -87,6 +87,13 @@ pub struct NativeDiagnostics {
     pub pacing_ahead_frames: i64,
     pub audio_sent: u64,
     pub audio_dropped: u64,
+    pub realtime_wire_max_bytes: u64,
+    pub realtime_wire_over_1472: u64,
+    pub rtx_requested: u64,
+    pub rtx_answered: u64,
+    pub rtx_expired: u64,
+    pub rtx_requested_over_1472: u64,
+    pub rtx_max_requested_wire_len: u64,
     pub sync_sent: u64,
     pub sync_dropped: u64,
     pub reanchors: u64,
@@ -220,6 +227,8 @@ impl NativeSoloEngine {
             sync_counters: SyncCounters::default(),
             rtx_ring: Arc::new(Mutex::new(RtxRing::default())),
             rtx_counters: Arc::new(Mutex::new(RtxCounters::default())),
+            realtime_wire_max_bytes: 0,
+            realtime_wire_over_1472: 0,
             ptp_anchor: PtpAnchor::default(),
             pace_last_release_us: 0,
             splice_pad_frames: 0,
@@ -1186,6 +1195,7 @@ impl NativeSoloEngine {
         } else {
             -((now_frame - head).min(i64::MAX as u64) as i64)
         };
+        let rtx = self.runtime.rtx_counters.lock().map(|v| *v).unwrap_or_default();
         NativeDiagnostics {
             state: self.runtime.state,
             seq: self.runtime.media.timeline.seq,
@@ -1194,6 +1204,13 @@ impl NativeSoloEngine {
             pacing_ahead_frames,
             audio_sent: self.runtime.media.counters.sent,
             audio_dropped: self.runtime.media.counters.dropped,
+            realtime_wire_max_bytes: self.runtime.realtime_wire_max_bytes as u64,
+            realtime_wire_over_1472: self.runtime.realtime_wire_over_1472,
+            rtx_requested: rtx.requested,
+            rtx_answered: rtx.answered,
+            rtx_expired: rtx.expired,
+            rtx_requested_over_1472: rtx.requested_over_1472,
+            rtx_max_requested_wire_len: rtx.max_requested_wire_len,
             sync_sent: self.runtime.sync_counters.sent,
             sync_dropped: self.runtime.sync_counters.dropped,
             reanchors: self.runtime.timeline_reanchors,

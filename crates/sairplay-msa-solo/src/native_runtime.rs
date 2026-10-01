@@ -43,6 +43,8 @@ pub struct NativeRuntime {
     pub sync_counters: SyncCounters,
     pub rtx_ring: Arc<Mutex<RtxRing>>,
     pub rtx_counters: Arc<Mutex<RtxCounters>>,
+    pub realtime_wire_max_bytes: usize,
+    pub realtime_wire_over_1472: u64,
     pub ptp_anchor: PtpAnchor,
     pub pace_last_release_us: u64,
     pub splice_pad_frames: u64,
@@ -219,6 +221,12 @@ impl NativeRuntime {
                 return SendResult::Fatal;
             }
         };
+        let wire_len = packet.bytes.len();
+        self.realtime_wire_max_bytes = self.realtime_wire_max_bytes.max(wire_len);
+        if wire_len > 1472 {
+            self.realtime_wire_over_1472 =
+                self.realtime_wire_over_1472.saturating_add(1);
+        }
 
         struct RtxAdapter<'a, I> {
             io: &'a mut I,
@@ -428,6 +436,8 @@ mod tests {
             sync_counters: SyncCounters::default(),
             rtx_ring: Arc::new(Mutex::new(RtxRing::default())),
             rtx_counters: Arc::new(Mutex::new(RtxCounters::default())),
+            realtime_wire_max_bytes: 0,
+            realtime_wire_over_1472: 0,
             ptp_anchor: PtpAnchor::default(),
             pace_last_release_us: 0,
             splice_pad_frames: 0,
