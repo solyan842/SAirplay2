@@ -3138,35 +3138,56 @@ impl SairplayApp {
                             } else {
                                 self.t("Đang bật âm", "Audio On")
                             };
-                            let tooltip = if self.muted {
+                            let tooltip = if !audio_active {
+                                self.t("Chưa có âm thanh", "No audio")
+                            } else if self.muted {
                                 self.t("Bật âm", "Unmute")
                             } else {
                                 self.t("Tắt âm", "Mute")
                             };
 
+                            // Keep the speaker control in a fixed-width column.
+                            // An unconstrained vertical_centered() expands to the
+                            // whole remaining row and previously pushed the
+                            // volume slider outside its card.
                             let mut mute_clicked = false;
-                            ui.vertical_centered(|ui| {
-                                let response = draw_speaker_mute_button(
-                                    ui,
-                                    egui::vec2(29.0, 27.0),
-                                    icon_color,
-                                    audio_active,
-                                    tooltip,
-                                );
-                                mute_clicked = response.clicked();
-                                ui.label(
-                                    egui::RichText::new(status_text)
-                                        .size(9.0)
-                                        .strong()
-                                        .color(icon_color),
-                                );
-                            });
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(64.0, CARD_INNER_H),
+                                egui::Layout::top_down(egui::Align::Center),
+                                |ui| {
+                                    ui.set_min_width(64.0);
+                                    ui.set_max_width(64.0);
+                                    let response = draw_speaker_mute_button(
+                                        ui,
+                                        egui::vec2(31.0, 27.0),
+                                        icon_color,
+                                        audio_active,
+                                        tooltip,
+                                    );
+                                    mute_clicked = response.clicked();
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(status_text)
+                                                .size(9.0)
+                                                .strong()
+                                                .color(icon_color),
+                                        )
+                                        .truncate(),
+                                    );
+                                },
+                            );
                             if mute_clicked {
                                 self.toggle_mute();
                             }
-                            ui.add_space(6.0);
+                            ui.add_space(4.0);
 
-                            ui.vertical(|ui| {
+                            let volume_controls_w = (card_inner_w - 68.0).max(110.0);
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(volume_controls_w, CARD_INNER_H),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ui.set_min_width(volume_controls_w);
+                                    ui.set_max_width(volume_controls_w);
                                 ui.label(
                                     egui::RichText::new(self.t("Âm lượng", "Receiver Volume"))
                                         .size(12.0)
@@ -3180,8 +3201,13 @@ impl SairplayApp {
                                     .unwrap_or(50);
 
                                 ui.horizontal(|ui| {
-                                    let response =
-                                        draw_volume_slider(ui, &mut volume, egui::vec2(140.0, 18.0));
+                                    let slider_width =
+                                        (ui.available_width() - 50.0).clamp(72.0, 140.0);
+                                    let response = draw_volume_slider(
+                                        ui,
+                                        &mut volume,
+                                        egui::vec2(slider_width, 18.0),
+                                    );
 
                                     if response.changed() {
                                         self.initial_volume_text = volume.to_string();
@@ -3919,26 +3945,36 @@ fn draw_speaker_mute_button(
     enabled: bool,
     tooltip: &str,
 ) -> egui::Response {
-    let sense = if enabled {
-        egui::Sense::click()
-    } else {
-        egui::Sense::hover()
-    };
-    let (rect, response) = ui.allocate_exact_size(size, sense);
-    let shrink = if enabled && response.hovered() { 1.5 } else { 3.0 };
-    let icon_rect = rect.shrink(shrink);
-    ui.put(
-        icon_rect,
-        egui::Image::new(egui::include_image!("../assets/fluent_speaker_2_24_filled.svg"))
-            .fit_to_exact_size(icon_rect.size())
-            .tint(color),
-    );
+    // Use a real egui button hit target instead of painting an Image over a
+    // separately allocated response. This guarantees hover/click ownership.
+    let image = egui::Image::new(
+        egui::include_image!("../assets/fluent_speaker_2_24_filled.svg"),
+    )
+    .fit_to_exact_size(egui::vec2(23.0, 23.0))
+    .tint(color);
 
-    if enabled {
-        response.on_hover_text(tooltip)
-    } else {
-        response
+    #[allow(deprecated)]
+    let button = egui::ImageButton::new(image)
+        .frame(true)
+        .corner_radius(egui::CornerRadius::same(7));
+    #[allow(deprecated)]
+    let mut response = ui.add_sized(size, button);
+
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(if enabled {
+            egui::CursorIcon::PointingHand
+        } else {
+            egui::CursorIcon::Default
+        });
     }
+
+    response = response.on_hover_text(tooltip);
+    if !enabled {
+        // Keep hover/tooltip active while idle, but never allow an idle click
+        // to mutate receiver volume state.
+        response = response.interact(egui::Sense::hover());
+    }
+    response
 }
 
 fn homepod_tsid(device: &DeviceRecord) -> Option<&str> {
