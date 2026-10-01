@@ -82,7 +82,7 @@ impl ActiveVolumeControl {
                     db: result.db,
                     status: result.status,
                 })
-                .map_err(|e| e.to_string()),
+                .map_err(|e| format!("{e:?}")),
             Self::Native(control) => control.set(percent).map_err(|e| format!("{e:?}")),
             Self::Legacy(control) => control.set(percent).map_err(|e| e.to_string()),
         }
