@@ -541,6 +541,13 @@ impl WindowsMsaSoloClient {
         }
     }
 
+    pub fn startup_events(&self) -> Vec<String> {
+        match &self.transport {
+            Transport::Native { worker, .. } => worker.startup_events(),
+            Transport::Raop { .. } => Vec::new(),
+        }
+    }
+
     pub fn control_healthy(&self) -> bool {
         match &self.transport {
             Transport::Native { engine, .. } => engine.lock()

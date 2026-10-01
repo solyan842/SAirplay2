@@ -2184,6 +2184,7 @@ impl SairplayApp {
                                 client.latency_info(),
                                 client.uses_ptp(),
                             ));
+                            startup_events.extend(client.startup_events());
                             if let Some(volume) = initial_volume {
                                 client
                                     .set_volume(volume)
