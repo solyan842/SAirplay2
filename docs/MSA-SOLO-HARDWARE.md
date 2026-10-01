@@ -4,8 +4,16 @@ Uses only sairplay-msa-solo; frozen GUI/legacy engines are not invoked.
 Extract the entire MSA-SOLO-Test-Windows artifact. Run from PowerShell:
 
 ```powershell
-.\msa-solo-test.exe White.local 7000 ap2 44100 16 2>&1 | Tee-Object solo-homepod.log
+.\msa-solo-test.exe Black.local 7000 ap2 44100 16 2>&1 | Tee-Object solo-black.log
 ```
+
+The harness first discovers the exact host/IP and port through mDNS (up to 6 s).
+AP2/auto/compat use `_airplay._tcp`; explicit raop uses `_raop._tcp`.
+It connects to the observed IP, passes actual TXT route fields and model, and
+prints endpoint/features/flags. Missing or ambiguous discovery stops before
+CONNECT; it never silently substitutes an empty TXT capability mask.
+`MSA_TEST_TXT` is an explicit manual input override and bypasses discovery;
+only use it with actual observed route fields and the matching host/port.
 
 For interactive commands, run directly in a console; type quit for explicit teardown.
 Audio comes from the Windows default playback device through real WASAPI loopback.
@@ -25,7 +33,15 @@ Environment inputs (PowerShell $env:NAME = 'value'):
 - MSA_TEST_CN / MSA_TEST_PK / MSA_TEST_PW: actual RAOP discovery values.
 - CLIAIRPLAY_MRP_TYPE130=1: opt-in only, default OFF.
 
-Credentials are not printed by the harness. CONNECT errors show class/status/route.
+Credentials are not printed by the harness. CONNECT errors show class/status/route
+and redacted detail, including the failing control phase when available.
+In Windows PowerShell, ordinary stderr can appear as NativeCommandError;
+the initial CONNECT/discovery notices now use stdout. A CONNECT notice alone
+does not mean the connection succeeded: wait for READY and START.
+
+The #1292 command supplied no discovery TXT and hid the error detail. Its
+`features=0 flags=0 timing=Ntp` log is an incomplete-input connection failure,
+not evidence that NTP caused the failure or that HomePod playback passed.
 
 Commands:
 - pause / play: content gate, persistent session.

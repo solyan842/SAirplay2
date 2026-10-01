@@ -101,9 +101,14 @@ impl NativeControlError {
 
     pub fn detail(&self) -> String {
         match self {
-            Self::Preflight(v) | Self::Pairing(v) | Self::Flow(v)
-            | Self::SessionSetup(v) | Self::Event(v) | Self::Media(v)
-            | Self::Record(v) | Self::SetPeers(v) => v.clone(),
+            Self::Preflight(v) => format!("preflight: {v}"),
+            Self::Pairing(v) => format!("pairing: {v}"),
+            Self::Flow(v) => format!("connect-order: {v}"),
+            Self::SessionSetup(v) => format!("timing/session-setup: {v}"),
+            Self::Event(v) => format!("event-channel: {v}"),
+            Self::Media(v) => format!("media-prepare/stream-setup: {v}"),
+            Self::Record(v) => format!("record: {v}"),
+            Self::SetPeers(v) => format!("set-peers: {v}"),
             Self::AuthRequired { detail, .. } | Self::AuthFailed { detail, .. } => detail.clone(),
             Self::Identity => "invalid sender identity".into(),
         }

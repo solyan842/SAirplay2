@@ -42,6 +42,10 @@ fn txt_hex_field(txt: Option<&str>, key1: &str, key2: Option<&str>) -> u64 {
     };
     let value = find_value(key1).or_else(|| key2.and_then(find_value));
     let Some(value) = value else { return 0 };
+    // sscanf in pinned MSA only consumes this field. A comma in a later
+    // model (AudioAccessory5,1) must never become this mask's high half.
+    let first_token = value.split_whitespace().next().unwrap_or("");
+    let value = if first_token.contains(',') { value } else { first_token };
     let mut parts = value.splitn(2, ',');
     let low = parts.next()
         .and_then(|s| s.split_whitespace().next())
@@ -226,6 +230,12 @@ mod tests {
     #[test] fn parses_split_feature_mask_exactly() {
         assert_eq!(txt_features(Some("features=0x1,0x2 sf=0x8")), 0x0000_0002_0000_0001);
         assert_eq!(txt_flags(Some("features=0x1,0x2 sf=0x200")), 0x200);
+    }
+    #[test] fn later_model_comma_does_not_change_feature_or_flag_mask() {
+        assert_eq!(txt_features(Some("features=0x123 model=AudioAccessory5,1")), 0x123);
+        assert_eq!(txt_flags(Some("sf=0x4 model=AudioAccessory5,1")), 0x4);
+        assert_eq!(txt_flags(Some("flags=0x0 model=AudioAccessory5,1")), 0);
+        assert_eq!(txt_features(Some("features=0x1, 0x2 model=AudioAccessory5,1")), 0x0000_0002_0000_0001);
     }
     #[test] fn legacy_auto_is_raop() {
         assert_eq!(resolve_route(ProtocolPreference::Auto,0,0,false,false,false,false,None).flow,Flow::Raop);

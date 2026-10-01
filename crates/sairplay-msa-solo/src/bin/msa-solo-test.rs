@@ -1,4 +1,7 @@
 //! Hardware harness for the independent MSA SOLO engine.
+#[path = "support/discovery.rs"]
+mod discovery;
+
 #[cfg(not(windows))]
 fn main() { eprintln!("msa-solo-test requires Windows WASAPI"); std::process::exit(1); }
 
@@ -25,18 +28,42 @@ fn run() -> Result<(), String> {
     if !matches!(rate, 44100 | 48000) || !matches!(bits, 16 | 24) || args.next().is_some() {
         return Err("expected 44100/48000 Hz and 16/24 bits; too many arguments are rejected".into());
     }
-    let mut config = WindowsMsaSoloConfig::new(host, port, port);
+    // Discovery is a test-input adapter, independent of the frozen engine.
+    // Never silently route an ordinary hardware test with an empty TXT mask.
+    let observed = if std::env::var("MSA_TEST_TXT").is_ok() {
+        None
+    } else {
+        let kind = if protocol == ProtocolPreference::Raop {
+            discovery::ServiceKind::Raop
+        } else {
+            discovery::ServiceKind::AirPlay
+        };
+        println!("DISCOVERY target={host}:{port} service={kind:?}");
+        Some(discovery::resolve(&host, port, kind, Duration::from_secs(6))?)
+    };
+    let connect_host = observed.as_ref().map(|v| v.address.clone()).unwrap_or(host.clone());
+    let connect_port = observed.as_ref().map(|v| v.port).unwrap_or(port);
+    let mut config = WindowsMsaSoloConfig::new(connect_host.clone(), connect_port, connect_port);
     config.protocol = protocol;
-    config.txt = std::env::var("MSA_TEST_TXT").ok();
-    config.am = std::env::var("MSA_TEST_MODEL").ok();
+    config.txt = std::env::var("MSA_TEST_TXT").ok()
+        .or_else(|| observed.as_ref().map(|v| v.txt.clone()));
+    if config.txt.as_deref().is_none_or(|v| v.trim().is_empty()) {
+        return Err("DISCOVERY empty TXT; supply observed MSA_TEST_TXT or use live mDNS".into());
+    }
+    config.am = std::env::var("MSA_TEST_MODEL").ok()
+        .or_else(|| observed.as_ref().and_then(|v| v.field("model").or_else(|| v.field("am"))));
     config.native.control.audio_format = Ap2AudioFormat { sample_rate: rate, bit_depth: bits, channels: 2 };
     config.native.control.auth_credentials = std::env::var("MSA_TEST_CREDENTIALS").ok();
     config.native.control.password = std::env::var("MSA_TEST_PASSWORD").ok();
     config.raop.password = config.native.control.password.clone();
     config.raop.secret = std::env::var("MSA_TEST_RAOP_SECRET").ok();
-    config.raop_cn = std::env::var("MSA_TEST_CN").ok();
-    config.raop_pk = std::env::var("MSA_TEST_PK").ok();
-    config.pw_txt = std::env::var("MSA_TEST_PW").ok();
+    config.raop_cn = std::env::var("MSA_TEST_CN").ok()
+        .or_else(|| observed.as_ref().and_then(|v| v.field("cn")));
+    config.raop_pk = std::env::var("MSA_TEST_PK").ok()
+        .or_else(|| observed.as_ref().and_then(|v| v.field("pk")));
+    config.pw_txt = std::env::var("MSA_TEST_PW").ok()
+        .or_else(|| observed.as_ref().and_then(|v| v.field("pw")));
+    if let Some(et) = observed.as_ref().and_then(|v| v.field("et")) { config.raop.et = et; }
     if let Ok(value) = std::env::var("MSA_TEST_TIMING") {
         config.ptp_override = Some(match value.as_str() {
             "ptp" => true, "ntp" => false, _ => return Err("MSA_TEST_TIMING must be ptp or ntp".into()),
@@ -46,9 +73,11 @@ fn run() -> Result<(), String> {
         Ok("1") => true, Ok("0") | Err(_) => false, _ => return Err("MSA_TEST_BUFFERED must be 0 or 1".into()),
     };
     let now = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-    eprintln!("CONNECT requested={rate}/{bits}; credentials are never printed");
+    let features = sairplay_msa_solo::route::txt_features(config.txt.as_deref());
+    let flags = sairplay_msa_solo::route::txt_flags(config.txt.as_deref());
+    println!("CONNECT target={host} endpoint={connect_host}:{connect_port} requested={rate}/{bits} features={features:#018x} flags={flags:#x} discovery={}; credentials are never printed", observed.is_some());
     let mut client = WindowsMsaSoloClient::connect(config)
-        .map_err(|e| format!("CONNECT class={:?} status={} route={:?}", e.class, e.http_status, e.route))?;
+        .map_err(|e| format!("CONNECT class={:?} status={} route={:?} detail={}", e.class, e.http_status, e.route, discovery::redact_error(&e.detail)))?;
     let result = (|| -> Result<(), String> {
         eprintln!("READY route={:?} capabilities={:?} latency={:?} ptp={}", client.route(), client.format_capabilities(), client.latency_info(), client.uses_ptp());
         client.set_volume(50).map_err(|e| format!("volume: {e:?}"))?;
