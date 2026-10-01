@@ -146,3 +146,23 @@ jobs:
         with:
           name: SAirplay2-v0.1.0-Windows
           path: target/release/SAirplay2/*
+
+      - name: Build independent MSA SOLO hardware harness
+        run: cargo build --release -p sairplay-msa-solo --bin msa-solo-test
+      - name: Package independent MSA SOLO hardware harness
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $out = "target/release/MSA-SOLO-Test"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item "target/release/msa-solo-test.exe" "$out/msa-solo-test.exe"
+          Copy-Item "target/alac24-build/Release/sairplay-alac24.dll" "$out/sairplay-alac24.dll"
+          Copy-Item "target/vendor/libraop-msa-solo/bin/cliraop-msa-solo.exe" "$out/cliraop-msa-solo.exe"
+          Copy-Item "target/release/SAirplay2/libcrypto-1_1.dll" "$out/libcrypto-1_1.dll"
+          Copy-Item "target/release/SAirplay2/libssl-1_1.dll" "$out/libssl-1_1.dll"
+          Copy-Item "docs/MSA-SOLO-HARDWARE.md" "$out/MSA-SOLO-HARDWARE.md"
+      - name: Upload independent MSA SOLO hardware harness
+        uses: actions/upload-artifact@v4
+        with:
+          name: MSA-SOLO-Test-Windows
+          path: target/release/MSA-SOLO-Test/*
