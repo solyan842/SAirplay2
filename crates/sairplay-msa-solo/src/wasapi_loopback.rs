@@ -328,12 +328,15 @@ unsafe fn parse_mix_format(
             "GetMixFormat returned null".into(),
         ));
     }
+    // WAVEFORMATEX is packed in windows-rs. Copy every scalar field out
+    // before formatting/comparing it so Rust never creates an unaligned ref.
     let base = &*format;
     let channels = base.nChannels;
     let sample_rate = base.nSamplesPerSec;
     let block_align = base.nBlockAlign as usize;
     let bits = base.wBitsPerSample;
     let tag = base.wFormatTag;
+    let cb_size = base.cbSize;
 
     if channels == 0 || sample_rate == 0 || block_align == 0 || bits == 0 {
         return Err(WasapiLoopbackError::UnsupportedFormat(format!(
@@ -347,13 +350,13 @@ unsafe fn parse_mix_format(
     }
 
     let (effective_tag, valid_bits) = if tag == WAVE_FORMAT_EXTENSIBLE_TAG {
-        if base.cbSize as usize < WAVEFORMATEXTENSIBLE_EXTRA_BYTES {
+        if (cb_size as usize) < WAVEFORMATEXTENSIBLE_EXTRA_BYTES {
             return Err(WasapiLoopbackError::UnsupportedFormat(format!(
                 "WAVE_FORMAT_EXTENSIBLE cbSize={} is smaller than {}",
-                base.cbSize, WAVEFORMATEXTENSIBLE_EXTRA_BYTES
+                cb_size, WAVEFORMATEXTENSIBLE_EXTRA_BYTES
             )));
         }
-        let total = WAVEFORMATEX_BASE_BYTES + base.cbSize as usize;
+        let total = WAVEFORMATEX_BASE_BYTES + cb_size as usize;
         let raw = std::slice::from_raw_parts(format as *const u8, total);
         if raw.len() < WAVEFORMATEX_BASE_BYTES + WAVEFORMATEXTENSIBLE_EXTRA_BYTES {
             return Err(WasapiLoopbackError::UnsupportedFormat(

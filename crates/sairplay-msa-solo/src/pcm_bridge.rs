@@ -412,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn 48k_to_44k1_resampling_changes_frame_count_not_playback_pitch() {
+    fn rate_48k_to_44k1_resampling_changes_frame_count_not_playback_pitch() {
         let input = InputPcmFormat {
             sample_rate: 48_000,
             channels: 2,
