@@ -5,8 +5,7 @@
 use crate::{
     ap2::Ap2State,
     native_media::SendResult,
-    native_timeline::ntp_to_frames,
-    ntp_timing::system_time_to_ntp,
+    time_domain::SourceNtp,
     Ap2AudioFormat, NativeSoloEngine, Pcm352Chunker, WasapiLoopbackCapture,
     WasapiLoopbackError,
 };
@@ -277,18 +276,18 @@ impl WindowsSoloAudioWorker {
                                 Ok(v) => v,
                                 Err(_) => return,
                             };
-                            let now_ntp = match system_time_to_ntp(SystemTime::now()) {
+                            let now_ntp = match SourceNtp::from_system_time(SystemTime::now()) {
                                 Ok(v) => v,
                                 Err(e) => {
                                     if let Ok(mut slot) = error_thread.lock() {
-                                        *slot = Some(format!("clock conversion failed: {e:?}"));
+                                        *slot = Some(format!("clock conversion failed: {e}"));
                                     }
                                     running_thread.store(false, Ordering::SeqCst);
                                     return;
                                 }
                             };
                             let now_frame =
-                                ntp_to_frames(now_ntp, guard.runtime.media.timeline.sample_rate);
+                                now_ntp.to_frames(guard.runtime.media.timeline.sample_rate);
                             if guard.runtime.state == Ap2State::Streaming {
                                 guard.runtime.recover_delivery_gap(now_frame);
                             }
@@ -359,14 +358,12 @@ impl WindowsSoloAudioWorker {
                                 if guard.runtime.state != Ap2State::Streaming {
                                     false
                                 } else {
-                                    let now_ntp = match system_time_to_ntp(SystemTime::now()) {
+                                    let now_ntp = match SourceNtp::from_system_time(SystemTime::now()) {
                                         Ok(v) => v,
-                                        Err(_) => 0,
+                                        Err(_) => SourceNtp::ZERO,
                                     };
-                                    let now_frame = ntp_to_frames(
-                                        now_ntp,
-                                        guard.runtime.media.timeline.sample_rate,
-                                    );
+                                    let now_frame =
+                                        now_ntp.to_frames(guard.runtime.media.timeline.sample_rate);
                                     let timing = match guard.ready.timing_owner.sync_timing() {
                                         Ok(v) => v,
                                         Err(_) => {
