@@ -54,7 +54,7 @@ struct MsaSoloGuiSession {
 
 impl MsaSoloGuiSession {
     fn drain_startup_events(&self) -> Vec<String> {
-        let mut out = self
+        let mut out: Vec<String> = self
             .startup_events
             .lock()
             .map(|mut events| events.drain(..).collect())
