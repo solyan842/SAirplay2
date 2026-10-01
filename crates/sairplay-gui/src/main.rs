@@ -2577,7 +2577,7 @@ impl SairplayApp {
                                 .into(),
                         ),
                         Err(error) => self.log.push(format!(
-                            "Playback stopped; MSA SOLO STOP reported {error}; teardown still completed."
+                            "Playback stopped; MSA SOLO STOP reported {error:?}; teardown still completed."
                         )),
                     }
                 }
