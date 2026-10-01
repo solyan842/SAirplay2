@@ -1,3 +1,4 @@
+use crate::time_domain::RfcNtp;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{
@@ -6,8 +7,6 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-const NTP_EPOCH_DELTA: u64 = 2_208_988_800;
 
 #[derive(Debug)]
 pub enum NtpTimingError {
@@ -62,7 +61,7 @@ impl NtpTimingResponder {
                             continue;
                         }
 
-                        let Ok(receive_ntp) = system_time_to_ntp(SystemTime::now()) else {
+                        let Ok(receive_ntp) = system_time_to_rfc_ntp(SystemTime::now()) else {
                             continue;
                         };
 
@@ -72,8 +71,8 @@ impl NtpTimingResponder {
                             continue;
                         };
 
-                        if let Ok(transmit_ntp) = system_time_to_ntp(SystemTime::now()) {
-                            response[24..32].copy_from_slice(&transmit_ntp.to_be_bytes());
+                        if let Ok(transmit_ntp) = system_time_to_rfc_ntp(SystemTime::now()) {
+                            response[24..32].copy_from_slice(&transmit_ntp.raw().to_be_bytes());
                         }
 
                         let _ = socket.send_to(&response, peer);
@@ -118,25 +117,14 @@ impl Drop for NtpTimingResponder {
     }
 }
 
-pub fn system_time_to_ntp(time: SystemTime) -> Result<u64, NtpTimingError> {
-    let since_unix = time
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| NtpTimingError::Time)?;
-
-    let seconds = since_unix
-        .as_secs()
-        .checked_add(NTP_EPOCH_DELTA)
-        .ok_or(NtpTimingError::Time)?;
-
-    let fraction = ((since_unix.subsec_nanos() as u128) << 32) / 1_000_000_000u128;
-
-    Ok((seconds << 32) | fraction as u64)
+pub fn system_time_to_rfc_ntp(time: SystemTime) -> Result<RfcNtp, NtpTimingError> {
+    RfcNtp::from_system_time(time).map_err(|_| NtpTimingError::Time)
 }
 
 pub fn build_timing_response(
     request: &[u8],
-    receive_ntp: u64,
-    transmit_ntp: u64,
+    receive_ntp: RfcNtp,
+    transmit_ntp: RfcNtp,
 ) -> Option<[u8; 32]> {
     if request.len() != 32 || request[0] != 0x80 || request[1] != 0xD2 {
         return None;
@@ -151,8 +139,8 @@ pub fn build_timing_response(
     response[8..16].copy_from_slice(&request[24..32]);
 
     // Receive and transmit timestamps are NTP fixed-point, big endian.
-    response[16..24].copy_from_slice(&receive_ntp.to_be_bytes());
-    response[24..32].copy_from_slice(&transmit_ntp.to_be_bytes());
+    response[16..24].copy_from_slice(&receive_ntp.raw().to_be_bytes());
+    response[24..32].copy_from_slice(&transmit_ntp.raw().to_be_bytes());
 
     Some(response)
 }
@@ -172,8 +160,8 @@ mod tests {
 
         let response = build_timing_response(
             &request,
-            0x1112131415161718,
-            0x2122232425262728,
+            RfcNtp::from_raw(0x1112131415161718),
+            RfcNtp::from_raw(0x2122232425262728),
         )
         .unwrap();
 
@@ -193,19 +181,19 @@ mod tests {
 
     #[test]
     fn malformed_or_wrong_timing_request_is_ignored() {
-        assert!(build_timing_response(&[0u8; 31], 1, 2).is_none());
+        assert!(build_timing_response(&[0u8; 31], RfcNtp::from_raw(1), RfcNtp::from_raw(2)).is_none());
 
         let mut wrong = [0u8; 32];
         wrong[0] = 0x80;
         wrong[1] = 0xD3;
-        assert!(build_timing_response(&wrong, 1, 2).is_none());
+        assert!(build_timing_response(&wrong, RfcNtp::from_raw(1), RfcNtp::from_raw(2)).is_none());
     }
 
     #[test]
-    fn unix_epoch_converts_to_ntp_epoch_delta() {
-        let ntp = system_time_to_ntp(UNIX_EPOCH).unwrap();
-        assert_eq!(ntp >> 32, NTP_EPOCH_DELTA);
-        assert_eq!(ntp as u32, 0);
+    fn unix_epoch_converts_to_rfc_ntp_epoch_delta() {
+        let ntp = system_time_to_rfc_ntp(UNIX_EPOCH).unwrap();
+        assert_eq!(ntp.raw() >> 32, crate::time_domain::RFC_NTP_UNIX_EPOCH_DELTA_SECS);
+        assert_eq!(ntp.raw() as u32, 0);
     }
 
     #[test]

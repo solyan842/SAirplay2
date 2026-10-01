@@ -6,7 +6,7 @@ use crate::clock::ProbeStreak;
 use crate::native_control::LiveTiming;
 use crate::native_runtime::SyncTiming;
 use crate::ntp_timing::NtpTimingResponder;
-use crate::native_timeline::system_time_to_source_ntp;
+use crate::time_domain::SourceNtp;
 use crate::ptp_engine::{PtpClock, PtpEngine};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -104,8 +104,8 @@ impl NativeTimingOwner {
         let now = SystemTime::now();
         // ap2_send_sync_packet_ptp in pinned MSA uses raopcl_get_ntp(NULL):
         // Unix-epoch fixed point. The NTP responder below remains RFC/NTP-epoch.
-        let ntp = system_time_to_source_ntp(now)
-            .ok_or_else(|| "system clock before UNIX epoch".to_string())?;
+        let source_ntp = SourceNtp::from_system_time(now)
+            .map_err(|e| e.to_string())?;
         let local_ns = now.duration_since(UNIX_EPOCH)
             .map_err(|_| "system clock before UNIX epoch".to_string())?
             .as_nanos()
@@ -113,13 +113,13 @@ impl NativeTimingOwner {
 
         match self {
             Self::Ntp { .. } => Ok(SyncTiming {
-                ntp,
+                source_ntp,
                 master_now_ns: local_ns,
                 local_ptp_now_ns: local_ns,
                 master_clock_id: 0,
             }),
             Self::Ptp { clock, .. } => Ok(SyncTiming {
-                ntp,
+                source_ntp,
                 master_now_ns: clock.master_now_ns(),
                 local_ptp_now_ns: local_ns,
                 master_clock_id: clock.master_clock_id(),
@@ -172,6 +172,6 @@ mod tests {
         let (n, _) = client.recv_from(&mut response).unwrap();
         assert_eq!(n, 32);
         let snapshot = owner.sync_timing().unwrap();
-        assert!(snapshot.ntp != 0);
+        assert!(snapshot.source_ntp.raw() != 0);
     }
 }

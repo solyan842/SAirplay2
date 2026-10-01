@@ -2,7 +2,7 @@
 
 use crate::{EncryptedRtspChannel, EncryptedRtspError, RtspRequest};
 use crate::ptp_engine::PtpClock;
-use crate::native_timeline::system_time_to_source_ntp;
+use crate::time_domain::SourceNtp;
 use plist::{Dictionary, Value};
 use std::io::Cursor;
 use std::time::{Duration, SystemTime};
@@ -159,9 +159,9 @@ pub fn send_setrateanchortime(
     Ok(())
 }
 
-fn remaining_lead_ns(commanded_start_ntp: u64, now_ntp: u64) -> u64 {
+fn remaining_lead_ns(commanded_start_ntp: SourceNtp, now_ntp: SourceNtp) -> u64 {
     if commanded_start_ntp <= now_ntp { return 0; }
-    let d = commanded_start_ntp - now_ntp;
+    let d = commanded_start_ntp.raw() - now_ntp.raw();
     (d >> 32).saturating_mul(1_000_000_000)
         .saturating_add((((d & 0xffff_ffff) as u128 * 1_000_000_000u128) >> 32) as u64)
 }
@@ -174,11 +174,11 @@ pub fn buffered_anchor_start(
     active_remote: &str,
     clock: &PtpClock,
     rtp_time: u32,
-    commanded_start_ntp: u64,
+    commanded_start_ntp: SourceNtp,
 ) -> Result<u64, NativeCommandError> {
     for attempt in 0..12 {
         if attempt != 0 { thread::sleep(Duration::from_millis(500)); }
-        let now_ntp = system_time_to_source_ntp(SystemTime::now()).ok_or(NativeCommandError::Time)?;
+        let now_ntp = SourceNtp::from_system_time(SystemTime::now()).map_err(|_| NativeCommandError::Time)?;
         let lead_ns = remaining_lead_ns(commanded_start_ntp, now_ntp);
         let anchor_ns = clock.master_now_ns().saturating_add(lead_ns);
         let cseq = next_cseq.fetch_add(1, Ordering::SeqCst);

@@ -2,6 +2,7 @@
 //! Pinned to music-assistant/airplay-cli @ 431c5c582eef9307c4e39c50a0ea65e970bc1128.
 
 use crate::native_media::{MediaHealth, SendResult};
+use crate::time_domain::SourceNtp;
 
 pub const PTP_FRAME_1_OFFSET: u32 = 11_035;
 pub const PTP_FRAME_2_OFFSET: u32 = 77_175;
@@ -39,7 +40,7 @@ pub fn build_ntp_sync(
     rtp_timestamp: u32,
     lead_ms: u64,
     sample_rate: u32,
-    ntp: u64,
+    ntp: SourceNtp,
 ) -> [u8; 20] {
     let mut pkt = [0u8; 20];
     pkt[0] = if first { 0x90 } else { 0x80 };
@@ -54,8 +55,9 @@ pub fn build_ntp_sync(
         0
     };
     pkt[4..8].copy_from_slice(&rendering.to_be_bytes());
-    pkt[8..12].copy_from_slice(&((ntp >> 32) as u32).to_be_bytes());
-    pkt[12..16].copy_from_slice(&(ntp as u32).to_be_bytes());
+    let raw = ntp.raw();
+    pkt[8..12].copy_from_slice(&((raw >> 32) as u32).to_be_bytes());
+    pkt[12..16].copy_from_slice(&(raw as u32).to_be_bytes());
     pkt[16..20].copy_from_slice(&rtp_timestamp.to_be_bytes());
     pkt
 }
@@ -67,18 +69,12 @@ pub struct PtpAnchor {
     pub pos0: u32,
 }
 
-fn ntp_to_unix_ns(ntp: u64) -> u64 {
-    (ntp >> 32)
-        .saturating_mul(1_000_000_000)
-        .saturating_add((((ntp & 0xffff_ffff) as u128 * 1_000_000_000u128) >> 32) as u64)
-}
-
 impl PtpAnchor {
     pub fn freeze_if_needed(
         &mut self,
         master_now_ns: u64,
         local_ptp_now_ns: u64,
-        start_ntp: u64,
+        start_ntp: SourceNtp,
         lead_ms: u64,
         sample_rate: u32,
         rtp_offset: u32,
@@ -87,12 +83,12 @@ impl PtpAnchor {
         if self.valid {
             return;
         }
-        if start_ntp != 0 {
-            let unix_ns = ntp_to_unix_ns(start_ntp);
+        if start_ntp != SourceNtp::ZERO {
+            let unix_ns = start_ntp.to_unix_ns();
             let master_shift = master_now_ns as i128 - local_ptp_now_ns as i128;
             let shifted = (unix_ns as i128 + master_shift) as u64;
             self.wall0_ns = shifted.wrapping_sub(lead_ms.saturating_mul(1_000_000));
-            self.pos0 = (crate::native_timeline::ntp_to_frames(start_ntp, sample_rate) as u32)
+            self.pos0 = (start_ntp.to_frames(sample_rate) as u32)
                 .wrapping_add(rtp_offset);
         } else {
             self.wall0_ns = master_now_ns;
@@ -143,7 +139,7 @@ mod tests {
 
     #[test]
     fn ntp_sync_matches_msa_wire_layout() {
-        let ntp = (123u64 << 32) | 0x1122_3344;
+        let ntp = SourceNtp::from_raw((123u64 << 32) | 0x1122_3344);
         let pkt = build_ntp_sync(true, 100_000, 250, 48_000, ntp);
         assert_eq!(&pkt[0..4], &[0x90, 0xd4, 0x00, 0x07]);
         assert_eq!(u32::from_be_bytes(pkt[4..8].try_into().unwrap()), 88_000);
@@ -154,7 +150,7 @@ mod tests {
 
     #[test]
     fn ptp_anchor_freezes_once_and_packet_matches_msa_shape() {
-        let start_ntp = crate::native_timeline::unix_ms_to_ntp(10_000);
+        let start_ntp = SourceNtp::from_unix_ms(10_000);
         let mut anchor = PtpAnchor::default();
         anchor.freeze_if_needed(
             20_000_000_000,

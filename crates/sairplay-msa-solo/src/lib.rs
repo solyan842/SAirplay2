@@ -2,6 +2,7 @@
 //! Source: music-assistant/airplay-cli @ 431c5c582eef9307c4e39c50a0ea65e970bc1128
 //! Legacy SAirplay Solo/MultiRoom remain frozen.
 
+pub mod time_domain;
 pub mod native_timeline;
 pub mod native_media;
 pub mod native_sync;
@@ -292,7 +293,11 @@ pub use native_control::{
     NativeControlErrorClass, NativeControlReady,
 };
 
-pub use ntp_timing::{build_timing_response, system_time_to_ntp, NtpTimingError, NtpTimingResponder};
+pub use ntp_timing::{build_timing_response, system_time_to_rfc_ntp, NtpTimingError, NtpTimingResponder};
+pub use time_domain::{
+    validate_immediate_start, ImmediateStartViolation, RfcNtp, SourceNtp,
+    TimeDomainError, RFC_NTP_UNIX_EPOCH_DELTA_SECS,
+};
 pub use ptp_engine::{PtpClock, PtpEngine, PtpEngineError, PtpExchange};
 pub use native_timing_owner::NativeTimingOwner;
 

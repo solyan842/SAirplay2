@@ -17,9 +17,8 @@ use crate::native_sync::{PtpAnchor, SyncCounters};
 use crate::native_rtx::{RtxCounters, RtxRing};
 use crate::feedback::FeedbackWorker;
 use crate::native_rtx_worker::RtxWorker;
-use crate::native_timeline::{
-    frames_for_ms, ms_for_frames, ntp_to_frames, system_time_to_source_ntp, unix_ms_to_ntp, Timeline,
-};
+use crate::native_timeline::{frames_for_ms, ms_for_frames, Timeline};
+use crate::time_domain::SourceNtp;
 use crate::{
     send_native_artwork, send_native_metadata, send_native_progress, send_teardown,
     set_native_volume, write_farewell_teardown_locked, Ap2AudioFormat,
@@ -204,7 +203,7 @@ impl NativeSoloEngine {
             splice_depth_ms: config.splice_depth_ms.clamp(1, MSA_SPLICE_DEPTH_MAX_MS),
             splice_depth_explicit: config.splice_depth_explicit,
             ssrc,
-            start_ntp: 0,
+            start_ntp: SourceNtp::ZERO,
             media: NativeMediaState {
                 timeline: Timeline {
                     sample_rate,
@@ -756,9 +755,9 @@ impl NativeSoloEngine {
             return Ok(ParameterResult { status: 200, bytes: 0 });
         }
 
-        let now_ntp = system_time_to_ntp(SystemTime::now())
-            .map_err(|e| NativeSoloError::Timing(format!("{e:?}")))?;
-        let wall = ntp_to_frames(now_ntp, self.runtime.media.timeline.sample_rate) as u32;
+        let now_ntp = SourceNtp::now()
+            .map_err(|e| NativeSoloError::Timing(e.to_string()))?;
+        let wall = now_ntp.to_frames(self.runtime.media.timeline.sample_rate) as u32;
         let now_wire_rtp = wall.wrapping_add(self.runtime.media.timeline.rtp_offset);
         match send_native_progress(
             &self.ready.control,
@@ -823,12 +822,11 @@ impl NativeSoloEngine {
     pub fn play_content(&mut self) -> Result<(), NativeSoloError> {
         self.content_paused = false;
         self.content_stopped = false;
-        let now_ntp = system_time_to_ntp(SystemTime::now())
-            .map_err(|e| NativeSoloError::Timing(format!("{e:?}")))?;
+        let now_ntp = SourceNtp::now()
+            .map_err(|e| NativeSoloError::Timing(e.to_string()))?;
         let sample_rate = self.runtime.media.timeline.sample_rate;
-        let now_frame = ntp_to_frames(now_ntp, sample_rate);
+        let now_frame = now_ntp.to_frames(sample_rate);
         let warm = frames_for_ms(crate::timing::AP2_MIN_WARM_LEAD_MS, sample_rate);
-        let warm_ntp = unix_ms_to_ntp(crate::timing::AP2_MIN_WARM_LEAD_MS);
 
         if self.runtime.splice_timeline && self.runtime.ptp_anchor.valid {
             let target = now_frame.saturating_add(warm);
@@ -842,8 +840,8 @@ impl NativeSoloEngine {
                 // milliseconds, do not reset sequence/reanchor diagnostics,
                 // and do mark the first packet on the fresh realtime line.
                 self.runtime.splice_pad_frames = 0;
-                let start_ntp = now_ntp.saturating_add(warm_ntp);
-                let head = ntp_to_frames(start_ntp, sample_rate);
+                let start_ntp = now_ntp.add_ms(crate::timing::AP2_MIN_WARM_LEAD_MS);
+                let head = start_ntp.to_frames(sample_rate);
                 self.runtime.start_ntp = start_ntp;
                 self.runtime.media.timeline.reanchor_after_drain(head);
                 self.runtime.ptp_anchor = PtpAnchor::default();
@@ -854,8 +852,8 @@ impl NativeSoloEngine {
 
         if self.runtime.lane == NativeLane::Realtime && self.runtime.state == Ap2State::Paused {
             if self.runtime.media.timeline.head_frame <= now_frame {
-                let start_ntp = now_ntp.saturating_add(warm_ntp);
-                let head = ntp_to_frames(start_ntp, sample_rate);
+                let start_ntp = now_ntp.add_ms(crate::timing::AP2_MIN_WARM_LEAD_MS);
+                let head = start_ntp.to_frames(sample_rate);
                 self.runtime.start_ntp = start_ntp;
                 self.runtime.media.timeline.reanchor_after_drain(head);
                 self.runtime.ptp_anchor = PtpAnchor::default();
@@ -868,8 +866,8 @@ impl NativeSoloEngine {
             // Pinned ap2cl_play keeps seq and first_packet untouched on a
             // buffered un-pause. It only rebases head/RTP continuity and then
             // establishes rate=1; state becomes STREAMING only after success.
-            let resume_ntp = now_ntp.saturating_add(warm_ntp);
-            let head = ntp_to_frames(resume_ntp, sample_rate);
+            let resume_ntp = now_ntp.add_ms(crate::timing::AP2_MIN_WARM_LEAD_MS);
+            let head = resume_ntp.to_frames(sample_rate);
             let sent = self.runtime.media.counters.sent;
             self.runtime.media.timeline.rebase_buffered_play(head, sent);
             if let Err(err) = self.buffered_anchor_at_ntp(resume_ntp) {
@@ -942,9 +940,9 @@ impl NativeSoloEngine {
     pub fn accept_frames_now(&mut self) -> Result<bool, NativeSoloError> {
         self.refresh_control_health();
         if self.rtsp_dead { return Ok(false); }
-        let ntp = system_time_to_ntp(SystemTime::now())
-            .map_err(|e| NativeSoloError::Timing(format!("{e:?}")))?;
-        let now_frame = ntp_to_frames(ntp, self.runtime.media.timeline.sample_rate);
+        let ntp = SourceNtp::now()
+            .map_err(|e| NativeSoloError::Timing(e.to_string()))?;
+        let now_frame = ntp.to_frames(self.runtime.media.timeline.sample_rate);
         let now_us = self.monotonic_zero.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         Ok(self.runtime.accept_frames(now_frame, now_us, &mut self.ready.media.io))
     }
@@ -1169,8 +1167,8 @@ impl NativeSoloEngine {
     pub fn consume_content_skip_bytes(&mut self, _bytes: u32) {}
 
     pub fn diagnostics(&self) -> NativeDiagnostics {
-        let now_frame = system_time_to_ntp(SystemTime::now())
-            .map(|ntp| ntp_to_frames(ntp, self.runtime.media.timeline.sample_rate))
+        let now_frame = SourceNtp::now()
+            .map(|ntp| ntp.to_frames(self.runtime.media.timeline.sample_rate))
             .unwrap_or(0);
         let head = self.runtime.media.timeline.head_frame;
         let pacing_ahead_frames = if head >= now_frame {
@@ -1273,7 +1271,7 @@ impl NativeSoloEngine {
         }
     }
 
-    fn buffered_anchor_at_ntp(&mut self, ntp: u64) -> Result<(), NativeSoloError> {
+    fn buffered_anchor_at_ntp(&mut self, ntp: SourceNtp) -> Result<(), NativeSoloError> {
         let Some(clock) = self.ready.timing_owner.ptp_clock().cloned() else {
             return Err(NativeSoloError::Command("buffered anchor without PTP".into()));
         };
@@ -1329,7 +1327,7 @@ impl NativeAp2Transport for NativeSoloEngine {
     fn start_floor(&self) -> ClockFloor {
         // Pinned MSA compares against raopcl_get_ntp(NULL), whose fixed-point
         // epoch is Unix, not RFC/NTP 1900. Mixing epochs moves START ~70 years.
-        let now_ntp = system_time_to_source_ntp(SystemTime::now()).unwrap_or(0);
+        let now_ntp = SourceNtp::now().unwrap_or(SourceNtp::ZERO);
         clock_floor(
             now_ntp,
             true,
@@ -1457,10 +1455,8 @@ impl NativeAp2Transport for NativeSoloEngine {
     }
 
     fn reanchor_stock_timeline(&mut self, at_unix_ms: u64, buffered: bool) {
-        let head = ntp_to_frames(
-            unix_ms_to_ntp(at_unix_ms),
-            self.runtime.media.timeline.sample_rate,
-        );
+        let start_ntp = SourceNtp::from_unix_ms(at_unix_ms);
+        let head = start_ntp.to_frames(self.runtime.media.timeline.sample_rate);
         if !self.timeline_initialized {
             let (offset, seq) = Self::process_seed();
             self.runtime.media.timeline.rtp_offset = offset;
@@ -1475,7 +1471,7 @@ impl NativeAp2Transport for NativeSoloEngine {
     }
 
     fn anchor_start(&mut self, at_unix_ms: u64) -> Result<(), Self::Error> {
-        self.runtime.start_ntp = unix_ms_to_ntp(at_unix_ms);
+        self.runtime.start_ntp = SourceNtp::from_unix_ms(at_unix_ms);
         Ok(())
     }
 

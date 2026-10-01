@@ -1,8 +1,6 @@
 //! Native AP2 SOLO timeline math from pinned MSA ap2_client.c.
 //! Frame-domain decisions are retained until the final wall-clock projection.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 pub const BUFFERED_RTP_GAP_MS:u64=100;
 pub const MIN_WARM_LEAD_MS:u64=250;
 
@@ -44,15 +42,6 @@ pub fn plan_stock_recovery(head_frame:u64,wire_rtp:u32,rtp_offset:u32,now_frame:
 }
 
 const NTP_FRAC_SCALE:u128=1u128<<32;
-
-/// Exact time domain used by pinned MSA's raopcl_get_ntp(NULL): fixed-point
-/// seconds since the Unix epoch. This is intentionally NOT RFC/NTP epoch 1900.
-/// AP2 scheduling, pacing and sync packets must stay in this one domain.
-pub fn system_time_to_source_ntp(time:SystemTime)->Option<u64>{
- let d=time.duration_since(UNIX_EPOCH).ok()?;
- let frac=((u128::from(d.subsec_nanos())<<32)/1_000_000_000u128) as u64;
- Some((d.as_secs()<<32)|frac)
-}
 
 pub fn unix_ms_to_ntp(ms:u64)->u64{(((u128::from(ms/1000))<<32)+((u128::from(ms%1000)<<32)/1000)) as u64}
 pub fn ntp_to_unix_ms(ntp:u64)->u64{((u128::from(ntp>>32)*1000)+((u128::from(ntp&0xffff_ffff)*1000)>>32)) as u64}
@@ -147,15 +136,6 @@ impl Timeline{
 #[cfg(test)]
 mod tests{
  use super::*;
- use std::time::Duration;
- #[test]fn source_ntp_uses_unix_epoch_not_rfc_ntp_epoch(){
-  assert_eq!(system_time_to_source_ntp(UNIX_EPOCH),Some(0));
-  assert_eq!(system_time_to_source_ntp(UNIX_EPOCH+Duration::from_secs(1)),Some(1u64<<32));
-  let t=UNIX_EPOCH+Duration::from_millis(1_234);
-  assert_eq!(ntp_to_unix_ms(system_time_to_source_ntp(t).unwrap()),1_233);
-  // Integer fixed-point truncation may lose <1 ms, but can never add the
-  // 2,208,988,800-second RFC/NTP epoch offset.
- }
  #[test]fn reanchor_after_drain_preserves_seq_offset_and_sets_marker(){
   let mut t=Timeline{sample_rate:44100,head_frame:100,wire_rtp:5100,rtp_offset:5000,seq:77,first_packet:false};
   t.reanchor_after_drain(22050);

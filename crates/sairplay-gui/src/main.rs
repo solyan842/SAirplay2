@@ -10,7 +10,8 @@ use sairplay_engine::{
     ALAC_48000_24_2,
 };
 use sairplay_msa_solo::{
-    Ap2AudioFormat as MsaAp2AudioFormat, WindowsMsaSoloClient, WindowsMsaSoloConfig,
+    validate_immediate_start, Ap2AudioFormat as MsaAp2AudioFormat,
+    WindowsMsaSoloClient, WindowsMsaSoloConfig,
 };
 use sairplay_msa_solo::route::ProtocolPreference as MsaProtocolPreference;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -2180,10 +2181,36 @@ impl SairplayApp {
                                     .set_volume(volume)
                                     .map_err(|error| format!("MSA SOLO volume: {error:?}"))?;
                             }
+                            let requested_start_unix_ms = unix_ms_now();
                             let start = client
-                                .commit_start(unix_ms_now())
+                                .commit_start(requested_start_unix_ms)
                                 .map_err(|error| format!("MSA SOLO START: {error:?}"))?;
+                            validate_immediate_start(
+                                requested_start_unix_ms,
+                                start.at_unix_ms,
+                                10_000,
+                            )
+                            .map_err(|error| {
+                                format!("MSA SOLO TIME-DOMAIN invariant failed: {error}")
+                            })?;
+                            startup_events.push(format!(
+                                "MSA SOLO TIME requested={} accepted={} delta={}ms.",
+                                requested_start_unix_ms,
+                                start.at_unix_ms,
+                                requested_start_unix_ms.abs_diff(start.at_unix_ms),
+                            ));
                             startup_events.push(format!("MSA SOLO START {start:?}."));
+                            if let Some(diag) = client.diagnostics() {
+                                startup_events.push(format!(
+                                    "MSA SOLO TIMELINE head_frame={} pacing_ahead_frames={} audio_sent={} audio_dropped={} sync_sent={} sync_dropped={}.",
+                                    diag.head_frame,
+                                    diag.pacing_ahead_frames,
+                                    diag.audio_sent,
+                                    diag.audio_dropped,
+                                    diag.sync_sent,
+                                    diag.sync_dropped,
+                                ));
+                            }
                             Ok(ActiveSession::MsaSolo(MsaSoloGuiSession {
                                 client,
                                 format,

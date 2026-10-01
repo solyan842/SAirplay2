@@ -1,6 +1,7 @@
 //! Receiver clock readiness for native AP2 SOLO, ported from pinned MSA.
 //! Group/join enforcement is deliberately excluded by the architecture lock.
 
+use crate::time_domain::SourceNtp;
 use crate::timing::{AP2_CLOCK_LOCK_MS,AP2_CLOCK_SETTLE_MS,AP2_CLOCK_SEAT_EXCHANGES,AP2_MIN_WARM_LEAD_MS,StartResolution};
 
 pub const AP2_CLOCK_STALL_MS:u64=5000;
@@ -9,12 +10,7 @@ pub const AP2_CLOCK_STALL_MS:u64=5000;
 pub struct ProbeStreak{pub first_age_ms:u64,pub third_age_ms:u64,pub exchanges:u32}
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
-pub struct ClockFloor{pub floor_ntp:u64,pub cold:bool}
-
-const NTP_SCALE:u128=1u128<<32;
-fn unix_ms_to_ntp(ms:u64)->u64{(((u128::from(ms/1000))<<32)+((u128::from(ms%1000)<<32)/1000)) as u64}
-fn ntp_to_unix_ms(ntp:u64)->u64{((u128::from(ntp>>32)*1000)+((u128::from(ntp&0xffff_ffff)*1000)>>32)) as u64}
-fn ms_to_ntp(ms:u64)->u64{((u128::from(ms)*NTP_SCALE)/1000) as u64}
+pub struct ClockFloor{pub floor_ntp:SourceNtp,pub cold:bool}
 
 pub fn ready_from(now:u64,apple_model:bool,ex:ProbeStreak)->u64{
     // MSA ap2_ptp_exchange reports AGES before now, not absolute timestamps.
@@ -30,23 +26,23 @@ pub fn ready_from(now:u64,apple_model:bool,ex:ProbeStreak)->u64{
 }
 
 /// MSA ap2_clock_floor: compare readiness and feasibility in NTP domain.
-pub fn clock_floor(now_ntp:u64,native:bool,use_ptp:bool,apple_model:bool,exchange:Option<ProbeStreak>)->ClockFloor{
-    let base=now_ntp.saturating_add(ms_to_ntp(AP2_MIN_WARM_LEAD_MS));
+pub fn clock_floor(now_ntp:SourceNtp,native:bool,use_ptp:bool,apple_model:bool,exchange:Option<ProbeStreak>)->ClockFloor{
+    let base=now_ntp.add_ms(AP2_MIN_WARM_LEAD_MS);
     if !native || !use_ptp{return ClockFloor{floor_ntp:base,cold:false}}
     let Some(ex)=exchange else{return ClockFloor{floor_ntp:base,cold:true}};
-    let now_ms=ntp_to_unix_ms(now_ntp);
-    let ready_ntp=unix_ms_to_ntp(ready_from(now_ms,apple_model,ex));
+    let now_ms=now_ntp.to_unix_ms();
+    let ready_ntp=SourceNtp::from_unix_ms(ready_from(now_ms,apple_model,ex));
     ClockFloor{floor_ntp:base.max(ready_ntp),cold:false}
 }
 
 /// Exact MSA resolve shape: zero picks floor; a stale nonzero request gets one
 /// extra warm-lead beyond the moving floor so a corrective retry converges.
-pub fn resolve_at_floor(requested:u64,floor_ntp:u64)->StartResolution{
-    let requested_ntp=if requested==0{0}else{unix_ms_to_ntp(requested)};
-    if requested_ntp>=floor_ntp{return StartResolution{requested_unix_ms:requested,at_unix_ms:requested,corrected_forward:false}}
-    if requested==0{return StartResolution{requested_unix_ms:0,at_unix_ms:ntp_to_unix_ms(floor_ntp),corrected_forward:false}}
-    let at=floor_ntp.saturating_add(ms_to_ntp(AP2_MIN_WARM_LEAD_MS));
-    StartResolution{requested_unix_ms:requested,at_unix_ms:ntp_to_unix_ms(at),corrected_forward:true}
+pub fn resolve_at_floor(requested:u64,floor_ntp:SourceNtp)->StartResolution{
+    let requested_ntp=SourceNtp::from_unix_ms(requested);
+    if requested!=0 && requested_ntp>=floor_ntp{return StartResolution{requested_unix_ms:requested,at_unix_ms:requested,corrected_forward:false}}
+    if requested==0{return StartResolution{requested_unix_ms:0,at_unix_ms:floor_ntp.to_unix_ms(),corrected_forward:false}}
+    let at=floor_ntp.add_ms(AP2_MIN_WARM_LEAD_MS);
+    StartResolution{requested_unix_ms:requested,at_unix_ms:at.to_unix_ms(),corrected_forward:true}
 }
 
 #[cfg(test)]
@@ -61,9 +57,9 @@ mod tests{
   assert_eq!(ready_from(1500,true,ex),350);
  }
  #[test] fn cold_ptp_keeps_warm_floor_and_marks_cold(){
-  assert_eq!(clock_floor(unix_ms_to_ntp(1000),true,true,false,None),ClockFloor{floor_ntp:unix_ms_to_ntp(1250),cold:true});
+  assert_eq!(clock_floor(SourceNtp::from_unix_ms(1000),true,true,false,None),ClockFloor{floor_ntp:SourceNtp::from_unix_ms(1250),cold:true});
  }
  #[test] fn stale_request_gets_retry_slack_beyond_clock_floor(){
-  let s=resolve_at_floor(1500,unix_ms_to_ntp(2000));assert_eq!(s.at_unix_ms,2250);assert!(s.corrected_forward);
+  let s=resolve_at_floor(1500,SourceNtp::from_unix_ms(2000));assert_eq!(s.at_unix_ms,2250);assert!(s.corrected_forward);
  }
 }

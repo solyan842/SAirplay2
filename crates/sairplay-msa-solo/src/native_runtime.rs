@@ -13,11 +13,12 @@ use crate::native_sync::{
     build_ntp_sync, build_ptp_sync, execute_sync, PtpAnchor, SyncCounters, SyncIo,
 };
 use crate::native_timeline::{frames_for_ms, MIN_WARM_LEAD_MS};
+use crate::time_domain::SourceNtp;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncTiming {
-    pub ntp: u64,
+    pub source_ntp: SourceNtp,
     pub master_now_ns: u64,
     pub local_ptp_now_ns: u64,
     pub master_clock_id: u64,
@@ -35,7 +36,7 @@ pub struct NativeRuntime {
     pub splice_depth_ms: u64,
     pub splice_depth_explicit: bool,
     pub ssrc: u32,
-    pub start_ntp: u64,
+    pub start_ntp: SourceNtp,
     pub media: NativeMediaState,
     pub health: MediaHealth,
     pub pending: BufferedPending,
@@ -120,7 +121,7 @@ impl NativeRuntime {
                 self.media.timeline.wire_rtp,
                 self.lead_ms,
                 self.media.timeline.sample_rate,
-                timing.ntp,
+                timing.source_ntp,
             );
             execute_sync(io, &mut self.health, &mut self.sync_counters, &pkt)
         }
@@ -333,7 +334,7 @@ impl NativeRuntime {
                     self.media.timeline.wire_rtp,
                     self.lead_ms,
                     self.media.timeline.sample_rate,
-                    timing.ntp,
+                    timing.source_ntp,
                 );
                 execute_sync(io, &mut self.health, &mut self.sync_counters, &pkt)
             };
@@ -410,7 +411,7 @@ mod tests {
             splice_depth_ms: 600,
             splice_depth_explicit: false,
             ssrc: 0x0506_0708,
-            start_ntp: 0,
+            start_ntp: SourceNtp::ZERO,
             media: NativeMediaState {
                 timeline: Timeline {
                     sample_rate: 48_000,
@@ -487,7 +488,7 @@ mod tests {
 
     fn timing() -> SyncTiming {
         SyncTiming {
-            ntp: crate::native_timeline::unix_ms_to_ntp(1_000),
+            source_ntp: SourceNtp::from_unix_ms(1_000),
             master_now_ns: 1_000_000_000,
             local_ptp_now_ns: 1_000_000_000,
             master_clock_id: 7,

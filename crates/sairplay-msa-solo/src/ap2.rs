@@ -158,7 +158,7 @@ mod tests {
  impl Default for Ap2State{fn default()->Self{Self::Connected}}
  impl Default for NativeLane{fn default()->Self{Self::Realtime}}
  impl NativeAp2Transport for Mock{
-  type Error=();fn state(&self)->Ap2State{self.state}fn now_unix_ms(&self)->u64{1000}fn start_floor(&self)->ClockFloor{ClockFloor{floor_ntp:(2u64)<<32,cold:self.cold}}
+  type Error=();fn state(&self)->Ap2State{self.state}fn now_unix_ms(&self)->u64{1000}fn start_floor(&self)->ClockFloor{ClockFloor{floor_ntp:crate::time_domain::SourceNtp::from_raw((2u64)<<32),cold:self.cold}}
   fn splice_timeline(&self)->bool{false}fn clock_verify_applicable(&self,_:u64)->bool{self.cold}fn anchor_valid(&self)->bool{self.anchor}fn audible_head_unix_ms(&self)->u64{0}fn lane(&self)->NativeLane{self.lane}fn rtsp_alive(&self)->bool{true}
   fn keep_splice_queue(&mut self){}fn flush_realtime(&mut self)->Result<(),Self::Error>{self.log.push("flush_rt");Ok(())}fn flush_buffered(&mut self)->Result<(),Self::Error>{self.log.push("flush_buf");Ok(())}
   fn park_buffered(&mut self)->Result<(),Self::Error>{Ok(())}fn set_connected(&mut self){self.state=Ap2State::Connected}fn set_streaming(&mut self){self.state=Ap2State::Streaming;self.log.push("streaming")}
