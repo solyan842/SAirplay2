@@ -102,10 +102,17 @@ Locked rules:
 
 Physical testing on 2026-10-01 showed this receiver can ACK native AP2/PTP
 control and volume while rendering no audible media. The temporary
-`AirPort10,115 -> RAOP` patch in
-`59bff8cb19d95d136525266edf902d9360d5cfe9` exists only to validate the
-RAOP lane. It must be replaced by the general per-device `streaming_mode`
-architecture; do not copy this pattern to additional models.
+`AirPort10,115 -> RAOP` model pin in
+`59bff8cb19d95d136525266edf902d9360d5cfe9` is superseded by the general
+per-device `streaming_mode` architecture. AirPlay 1 / RAOP is now a stored
+user choice for this receiver, not a source-code model exception.
+
+The first RAOP run also proved a Windows adapter issue: pinned libraop's
+Windows `gettime_us()` is FILETIME-derived, so its raw transport clock must
+not be compared numerically with Unix milliseconds. The Windows helper bridges
+Unix commands to libraop's local clock by relative delta and converts reported
+heads back to Unix time. This is a Windows-only adapter boundary, not a change
+to MSA's public scheduling semantics.
 
 ## Evidence discipline
 

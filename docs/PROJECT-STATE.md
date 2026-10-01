@@ -94,11 +94,19 @@ pops/dropouts. Diagnostic work must stay source-aligned and must not retune
 352-frame packetization, PTP or ALAC without evidence.
 
 AirPort Express `AirPort10,115` is a separate 16/44.1 hardware gate. Its
-2026-10-01 test showed native AP2/PTP control and volume ACKs but no audible
-media. Commit `59bff8cb19d95d136525266edf902d9360d5cfe9` pins that model to
-RAOP only as a **temporary hardware-validation patch**. It is not the final
-routing architecture and must be superseded by the MSA-style per-device
-`streaming_mode` mechanism before the routing design is considered complete.
+2026-10-01 native AP2/PTP test ACKed control/volume but rendered no audible
+media. The temporary model pin in
+`59bff8cb19d95d136525266edf902d9360d5cfe9` is superseded: routing now uses
+MSA-style per-device `streaming_mode`, default Automatic, with explicit
+AirPlay 1 / RAOP available as the hardware-test override.
+
+The first RAOP hardware run then exposed a Windows-only clock-domain mismatch:
+the exact pinned libraop crosstools implementation derives `gettime_us()` from
+Windows FILETIME, so its raw `raopcl_get_ntp(NULL)` value is not numerically
+the Unix 32.32 value assumed by MSA's POSIX `raop_session.c`. The Windows
+helper must bridge by relative wall-clock delta at its adapter boundary while
+keeping public START/HEAD acknowledgements in Unix milliseconds. Do not push
+that Windows transport clock into the rest of the MSA contract.
 
 Do not move to Stereo Pair, MultiRoom or unrelated transport tuning before the
 active SOLO hardware gates are evaluated.
@@ -273,10 +281,14 @@ Upstream's current measured-hostile prefix table is empty. SAirplay2's
 MSA stable's automatic per-model buffer-depth default table is also empty.
 Do not add a Naim-specific deeper queue without new hardware evidence.
 
-## 9. Legacy RAOP
+## 9. RAOP / AirPlay 1
 
-Legacy RAOP is a separate transport class using the source-built pinned libraop
-helper.
+Single-device MSA SOLO can select RAOP through the same per-device
+`streaming_mode` architecture as MSA. The older LegacyGroup transport remains
+a separate group/fallback class; do not confuse the two.
+
+The MSA SOLO RAOP lane uses the exact pinned libraop helper and keeps its
+Windows clock-domain bridge local to that helper.
 
 Current behavior includes:
 

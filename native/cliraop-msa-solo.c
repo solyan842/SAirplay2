@@ -49,18 +49,68 @@ static int truncate_32to24(const uint8_t *in, int in_bytes, uint8_t *out) {
     return samples * 3;
 }
 
-static uint64_t unix_ms_to_ntp(uint64_t ms) {
+/*
+ * Pinned MSA raop_session.c treats raopcl_get_ntp(NULL) as Unix-epoch 32.32.
+ * That is true on its normal POSIX deployment, but the exact pinned libraop
+ * crosstools Windows implementation derives gettime_us() from FILETIME and
+ * therefore produces a different raw 32.32 wall-clock domain. Never compare a
+ * Unix-ms command directly with that raw Windows transport clock.
+ *
+ * Bridge only at this Windows adapter boundary: schedule in libraop's own clock
+ * using a relative delta from the current Unix wall clock, while all public
+ * START/HEAD acknowledgements remain Unix milliseconds like MSA's contract.
+ */
+static uint64_t unix_now_ms(void) {
+#if WIN
+    FILETIME ft;
+    ULARGE_INTEGER ticks;
+    const uint64_t unix_epoch_filetime = 116444736000000000ULL;
+    GetSystemTimeAsFileTime(&ft);
+    ticks.LowPart = ft.dwLowDateTime;
+    ticks.HighPart = ft.dwHighDateTime;
+    if (ticks.QuadPart <= unix_epoch_filetime) return 0;
+    return (ticks.QuadPart - unix_epoch_filetime) / 10000ULL;
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)tv.tv_usec / 1000ULL;
+#endif
+}
+
+static uint64_t ms_to_source_delta(uint64_t ms) {
     return ((ms / 1000ULL) << 32) | (((ms % 1000ULL) << 32) / 1000ULL);
 }
-static uint64_t ntp_to_unix_ms(uint64_t ntp) {
-    return (ntp >> 32) * 1000ULL + (((ntp & 0xffffffffULL) * 1000ULL) >> 32);
+
+static uint64_t source_delta_to_ms(uint64_t delta) {
+    return (delta >> 32) * 1000ULL
+        + (((delta & 0xffffffffULL) * 1000ULL) >> 32);
 }
-static uint64_t resolve_start(uint64_t requested_ms) {
-    uint64_t lead = MS2NTP(START_LEAD_MS);
-    uint64_t floor = raopcl_get_ntp(NULL) + lead;
-    uint64_t requested = requested_ms ? unix_ms_to_ntp(requested_ms) : 0;
-    if (requested_ms && requested >= floor) return requested;
-    return requested_ms ? floor + lead : floor;
+
+static uint64_t source_ntp_to_unix_ms(uint64_t source_ntp) {
+    uint64_t source_now = raopcl_get_ntp(NULL);
+    uint64_t unix_now = unix_now_ms();
+    if (source_ntp >= source_now) {
+        return unix_now + source_delta_to_ms(source_ntp - source_now);
+    }
+    uint64_t back = source_delta_to_ms(source_now - source_ntp);
+    return unix_now > back ? unix_now - back : 0;
+}
+
+static uint64_t resolve_start(uint64_t requested_ms, uint64_t *at_ms) {
+    uint64_t source_now = raopcl_get_ntp(NULL);
+    uint64_t unix_now = unix_now_ms();
+    uint64_t lead_ms = START_LEAD_MS;
+
+    if (requested_ms && requested_ms >= unix_now + lead_ms) {
+        *at_ms = requested_ms;
+        return source_now + ms_to_source_delta(requested_ms - unix_now);
+    }
+
+    /* Match MSA's correction semantics: a stale explicit request gets one
+     * extra lead of slack; an implicit START(0) takes the minimum floor. */
+    uint64_t corrected_ms = requested_ms ? lead_ms * 2ULL : lead_ms;
+    *at_ms = unix_now + corrected_ms;
+    return source_now + ms_to_source_delta(corrected_ms);
 }
 
 static void ack_write(const char *path, uint64_t seq, bool ok, uint64_t at_ms, const char *detail) {
@@ -82,8 +132,7 @@ static void ack_write(const char *path, uint64_t seq, bool ok, uint64_t at_ms, c
 static bool session_commit(struct raopcl_s *p, uint64_t requested_ms, uint64_t *at_ms) {
     raop_state_t state = raopcl_state(p);
     if (state != RAOP_STREAMING && state != RAOP_FLUSHED) return false;
-    uint64_t audible = resolve_start(requested_ms);
-    *at_ms = ntp_to_unix_ms(audible);
+    uint64_t audible = resolve_start(requested_ms, at_ms);
     raopcl_stop(p);
     if (state == RAOP_STREAMING && !raopcl_flush(p)) return false;
     uint64_t latency = TS2NTP(raopcl_latency(p), raopcl_sample_rate(p));
@@ -92,8 +141,7 @@ static bool session_commit(struct raopcl_s *p, uint64_t requested_ms, uint64_t *
 
 static bool session_start_after_flush(struct raopcl_s *p, uint64_t requested_ms, uint64_t *at_ms) {
     if (raopcl_state(p) != RAOP_FLUSHED) return false;
-    uint64_t audible = resolve_start(requested_ms);
-    *at_ms = ntp_to_unix_ms(audible);
+    uint64_t audible = resolve_start(requested_ms, at_ms);
     uint64_t latency = TS2NTP(raopcl_latency(p), raopcl_sample_rate(p));
     return raopcl_start_at(p, audible - latency);
 }
@@ -331,6 +379,9 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "MSA-RAOP READY latency=%u sample_rate=%u bit_depth=%d channels=%d\n",
             raopcl_latency(p), raopcl_sample_rate(p), bit_depth, channels);
+    fprintf(stderr, "MSA-RAOP CLOCK unix_ms=%llu source_ms=%llu bridge=relative\n",
+            (unsigned long long)unix_now_ms(),
+            (unsigned long long)source_delta_to_ms(raopcl_get_ntp(NULL)));
     fflush(stderr);
 
     int input_bpf = (bit_depth <= 16 ? 2 : 4) * channels;
@@ -390,7 +441,7 @@ int main(int argc, char **argv) {
                 }
                 uint64_t head = playtime + TS2NTP(FRAMES_PER_CHUNK, raopcl_sample_rate(p));
                 fprintf(stderr, "MSA-RAOP HEAD audible_ms=%llu\n",
-                        (unsigned long long)ntp_to_unix_ms(head));
+                        (unsigned long long)source_ntp_to_unix_ms(head));
                 fflush(stderr);
                 pcm_len = 0;
             }

@@ -343,6 +343,38 @@ enum UiLanguage {
     En,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamingMode {
+    Auto,
+    AirPlay2Ptp,
+    AirPlay2Ntp,
+    AirPlay2Compat,
+    AirPlay1Raop,
+}
+
+impl StreamingMode {
+    fn storage_key(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::AirPlay2Ptp => "ap2_ptp",
+            Self::AirPlay2Ntp => "ap2_ntp",
+            Self::AirPlay2Compat => "ap2_compat",
+            Self::AirPlay1Raop => "raop",
+        }
+    }
+
+    fn from_storage_key(value: &str) -> Option<Self> {
+        match value.trim() {
+            "auto" => Some(Self::Auto),
+            "ap2_ptp" => Some(Self::AirPlay2Ptp),
+            "ap2_ntp" => Some(Self::AirPlay2Ntp),
+            "ap2_compat" => Some(Self::AirPlay2Compat),
+            "raop" => Some(Self::AirPlay1Raop),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum DeviceArtwork {
     HomePodMiniWhite,
@@ -452,6 +484,7 @@ struct SairplayApp {
     mute_restore_volume: u8,
     legacy_secrets: BTreeMap<String, String>,
     native_credentials: BTreeMap<String, String>,
+    streaming_modes: BTreeMap<String, StreamingMode>,
     hires_overrides: BTreeMap<String, bool>,
     hires_capabilities: BTreeMap<String, bool>,
     buffered_hires_capabilities: BTreeMap<String, bool>,
@@ -542,6 +575,7 @@ impl Default for SairplayApp {
             mute_restore_volume,
             legacy_secrets: BTreeMap::new(),
             native_credentials: load_native_credentials(),
+            streaming_modes: load_streaming_modes(),
             hires_overrides: BTreeMap::new(),
             hires_capabilities: BTreeMap::new(),
             buffered_hires_capabilities: BTreeMap::new(),
@@ -808,6 +842,13 @@ impl SairplayApp {
         // Capability controls whether the switch is offered; capability alone
         // never enables the high-resolution path.
         self.hires_overrides.get(fullname).copied().unwrap_or(false)
+    }
+
+    fn streaming_mode_for_fullname(&self, fullname: &str) -> StreamingMode {
+        self.streaming_modes
+            .get(fullname)
+            .copied()
+            .unwrap_or(StreamingMode::Auto)
     }
 
     fn pump_connect_result(&mut self) {
@@ -2099,7 +2140,7 @@ impl SairplayApp {
 
         if self.selected_fullnames.is_empty() {
             self.playback =
-                PlaybackUiState::Error("Select at least one AirPlay 2 receiver first".into());
+                PlaybackUiState::Error("Select at least one AirPlay receiver first".into());
             return;
         }
 
@@ -2138,7 +2179,12 @@ impl SairplayApp {
         // Apple TV to AirPlay2Compat and launches legacy cliraop pairing.
         if let Some((_, device)) = selected_devices
             .iter()
-            .find(|(_, device)| self.native_pairing_required(device))
+            .find(|(fullname, device)| {
+                matches!(
+                    self.streaming_mode_for_fullname(fullname),
+                    StreamingMode::Auto | StreamingMode::AirPlay2Ptp | StreamingMode::AirPlay2Ntp
+                ) && self.native_pairing_required(device)
+            })
         {
             self.begin_native_pairing(device);
             return;
@@ -2147,7 +2193,11 @@ impl SairplayApp {
         let routes = selected_devices
             .iter()
             .map(|(fullname, device)| {
-                device.route(self.native_credentials.contains_key(fullname), false)
+                route_for_streaming_mode(
+                    device,
+                    self.native_credentials.contains_key(fullname),
+                    self.streaming_mode_for_fullname(fullname),
+                )
             })
             .collect::<Vec<_>>();
         let all_native = routes
@@ -2236,19 +2286,30 @@ impl SairplayApp {
         self.active_fullnames.clear();
         self.last_feedback_error = None;
 
-        if all_native {
-            if requested_mode == PlaybackMode::Single && member_count == 1 {
+        let msa_solo_single =
+            requested_mode == PlaybackMode::Single
+                && member_count == 1
+                && selected_devices[0].1.airplay.is_some();
+
+        if msa_solo_single {
                 let (fullname, device) = &selected_devices[0];
+                let streaming_mode = self.streaming_mode_for_fullname(fullname);
                 let hires_enabled = self
                     .hires_overrides
                     .get(fullname)
                     .copied()
                     .unwrap_or(false);
                 let credentials = self.native_credentials.get(fullname).cloned();
+                let raop_secret = Self::legacy_pairing_key(device)
+                    .as_ref()
+                    .and_then(|key| self.legacy_secrets.get(key))
+                    .cloned();
                 let (config, format, connect_summary) = match msa_solo_config_for_device(
                     device,
                     credentials.clone(),
+                    raop_secret,
                     hires_enabled,
+                    streaming_mode,
                 ) {
                     Ok(value) => value,
                     Err(message) => {
@@ -2335,7 +2396,7 @@ impl SairplayApp {
                         let _ = tx.send(result);
                     })
                     .expect("failed to spawn MSA SOLO connect worker");
-            } else {
+        } else if all_native {
                 let mut configs = Vec::<NativeGroupMemberConfig>::with_capacity(member_count);
                 for (fullname, device) in &selected_devices {
                     let hires_override = self.hires_overrides.get(fullname).copied();
@@ -2390,7 +2451,6 @@ impl SairplayApp {
                         let _ = tx.send(result);
                     })
                     .expect("failed to spawn native connect worker");
-            }
         } else {
             let mut configs = Vec::<LegacyMemberConfig>::with_capacity(member_count);
             for (_, device) in &selected_devices {
@@ -2627,7 +2687,7 @@ impl SairplayApp {
         device: &DeviceRecord,
         stereo_pair: bool,
     ) {
-        const ROW_H: f32 = 72.0;
+        const ROW_H: f32 = 76.0;
         const SELECTOR_W: f32 = 24.0;
         const ART_W: f32 = 70.0;
         const STATUS_W: f32 = 166.0;
@@ -2759,6 +2819,10 @@ impl SairplayApp {
             && !members.is_empty()
             && members.iter().all(|fullname| {
                 self.hires_capabilities.get(fullname).copied() == Some(true)
+                    && !matches!(
+                        self.streaming_mode_for_fullname(fullname),
+                        StreamingMode::AirPlay1Raop | StreamingMode::AirPlay2Compat
+                    )
             });
         let mut hires_enabled = hires_available
             && members
@@ -2777,8 +2841,12 @@ impl SairplayApp {
         ).to_owned();
 
         let badge_rect = egui::Rect::from_min_size(
-            egui::pos2(status_rect.left(), row_y - 13.0),
-            egui::vec2(110.0, 26.0),
+            egui::pos2(status_rect.left(), row_y - 22.0),
+            egui::vec2(110.0, 21.0),
+        );
+        let protocol_rect = egui::Rect::from_min_size(
+            egui::pos2(status_rect.left(), row_y + 2.0),
+            egui::vec2(110.0, 22.0),
         );
         let bit_rect = egui::Rect::from_min_size(
             egui::pos2(status_rect.right() - 44.0, row_y - 19.0),
@@ -2788,6 +2856,55 @@ impl SairplayApp {
         ui.allocate_ui_at_rect(badge_rect, |ui| {
             draw_status_badge(ui, status, status_tone);
         });
+
+        let mut protocol_interacted = false;
+        let protocol_editable = !stereo_pair
+            && members.len() == 1
+            && !matches!(
+                self.playback,
+                PlaybackUiState::Connecting(_) | PlaybackUiState::Playing(_)
+            );
+        if !stereo_pair && members.len() == 1 {
+            let fullname = &members[0];
+            let current_mode = self.streaming_mode_for_fullname(fullname);
+            let mut selected_mode = current_mode;
+            ui.allocate_ui_at_rect(protocol_rect, |ui| {
+                ui.add_enabled_ui(protocol_editable, |ui| {
+                    let combo = egui::ComboBox::from_id_salt(format!("streaming-mode-{fullname}"))
+                        .width(106.0)
+                        .selected_text(streaming_mode_label(selected_mode, self.language))
+                        .show_ui(ui, |ui| {
+                            for option in streaming_mode_options(device) {
+                                ui.selectable_value(
+                                    &mut selected_mode,
+                                    option,
+                                    streaming_mode_label(option, self.language),
+                                );
+                            }
+                        });
+                    protocol_interacted = combo.response.hovered() || combo.response.clicked();
+                });
+            });
+            if protocol_editable && selected_mode != current_mode {
+                if selected_mode == StreamingMode::Auto {
+                    self.streaming_modes.remove(fullname);
+                } else {
+                    self.streaming_modes.insert(fullname.clone(), selected_mode);
+                }
+                if matches!(
+                    selected_mode,
+                    StreamingMode::AirPlay1Raop | StreamingMode::AirPlay2Compat
+                ) {
+                    self.hires_overrides.insert(fullname.clone(), false);
+                }
+                save_streaming_modes(&self.streaming_modes);
+                self.log.push(format!(
+                    "{}: streaming mode -> {}.",
+                    device.display_name,
+                    selected_mode.storage_key()
+                ));
+            }
+        }
 
         ui.allocate_ui_at_rect(bit_rect, |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
@@ -2836,7 +2953,7 @@ impl SairplayApp {
             ));
         }
 
-        if response.clicked() && selectable && !hires_clicked {
+        if response.clicked() && selectable && !hires_clicked && !protocol_interacted {
             let all_selected = members
                 .iter()
                 .all(|fullname| self.selected_fullnames.contains(fullname));
@@ -3130,8 +3247,8 @@ impl SairplayApp {
     fn render_controls(&mut self, ui: &mut egui::Ui) {
         const CARD_OUTER_H: f32 = 58.0;
         const CARD_INNER_H: f32 = 42.0;
-        const CARD_GAP: f32 = 7.0;
-        const CARD_HORIZONTAL_MARGIN: f32 = 20.0;
+        const CARD_GAP: f32 = 8.0;
+        const CARD_HORIZONTAL_MARGIN: f32 = 16.0;
 
         // Own one exact full-width row and split it geometrically into three
         // cards. Do not use horizontal() here: egui adds item_spacing between
@@ -3208,11 +3325,11 @@ impl SairplayApp {
                             // volume slider outside its card.
                             let mut mute_clicked = false;
                             ui.allocate_ui_with_layout(
-                                egui::vec2(64.0, CARD_INNER_H),
+                                egui::vec2(54.0, CARD_INNER_H),
                                 egui::Layout::top_down(egui::Align::Center),
                                 |ui| {
-                                    ui.set_min_width(64.0);
-                                    ui.set_max_width(64.0);
+                                    ui.set_min_width(54.0);
+                                    ui.set_max_width(54.0);
                                     let response = draw_speaker_mute_button(
                                         ui,
                                         egui::vec2(31.0, 27.0),
@@ -3237,7 +3354,7 @@ impl SairplayApp {
                             }
                             ui.add_space(4.0);
 
-                            let volume_controls_w = (card_inner_w - 68.0).max(110.0);
+                            let volume_controls_w = (card_inner_w - 58.0).max(100.0);
                             ui.allocate_ui_with_layout(
                                 egui::vec2(volume_controls_w, CARD_INNER_H),
                                 egui::Layout::top_down(egui::Align::Min),
@@ -3360,14 +3477,26 @@ impl SairplayApp {
                             draw_airplay_wave_icon(ui, egui::vec2(34.0, 34.0));
                             ui.add_space(9.0);
                             ui.vertical(|ui| {
-                                ui.label(
-                                    egui::RichText::new(self.t(
+                                let transport_title = match self
+                                    .session
+                                    .as_ref()
+                                    .map(ActiveSession::transport_label)
+                                {
+                                    Some("AirPlay 1") => self.t(
+                                        "Kết nối qua AirPlay 1",
+                                        "Connect via AirPlay 1",
+                                    ),
+                                    Some("AirPlay 2") => self.t(
                                         "Kết nối qua AirPlay 2",
                                         "Connect via AirPlay 2",
-                                    ))
-                                    .size(12.0)
-                                    .strong()
-                                    .color(UiTheme::text()),
+                                    ),
+                                    _ => self.t("Kết nối AirPlay", "AirPlay Connection"),
+                                };
+                                ui.label(
+                                    egui::RichText::new(transport_title)
+                                        .size(12.0)
+                                        .strong()
+                                        .color(UiTheme::text()),
                                 );
 
                                 let display_mode = self.active_mode.unwrap_or_else(|| {
@@ -3418,20 +3547,34 @@ impl SairplayApp {
     fn render_trial_row(&mut self, ui: &mut egui::Ui) {
         let text = self.t("Dùng thử · còn 3 ngày", "Trial · 3 days left");
         let activate = self.t("Nhấn để kích hoạt", "Click to activate");
+        let hint = self.t(
+            "Khi gặp lỗi khi phát âm thanh, vui lòng nhấn Dừng rồi Bắt đầu lại.",
+            "If audio playback issues occur, please press Stop, then Start again.",
+        );
 
-        let (rect, response) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), 34.0),
+        let (row_rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 30.0),
+            egui::Sense::hover(),
+        );
+        let trial_w = row_rect.width().min(300.0);
+        let trial_rect = egui::Rect::from_min_size(
+            row_rect.min,
+            egui::vec2(trial_w, row_rect.height()),
+        );
+        let response = ui.interact(
+            trial_rect,
+            ui.make_persistent_id("trial-activation"),
             egui::Sense::click(),
         );
         let fill = if response.hovered() {
-            egui::Color32::from_rgb(244, 250, 255)
+            egui::Color32::from_rgb(238, 247, 255)
         } else {
             egui::Color32::from_rgb(249, 252, 255)
         };
-        ui.painter().rect_filled(rect, egui::CornerRadius::same(11), fill);
+        ui.painter().rect_filled(trial_rect, egui::CornerRadius::same(10), fill);
         ui.painter().rect_stroke(
-            rect,
-            egui::CornerRadius::same(11),
+            trial_rect,
+            egui::CornerRadius::same(10),
             egui::Stroke::new(
                 1.0,
                 if response.hovered() { UiTheme::border_hover() } else { UiTheme::border() },
@@ -3439,36 +3582,54 @@ impl SairplayApp {
             egui::StrokeKind::Inside,
         );
 
-        draw_key_icon_at(ui, egui::pos2(rect.left() + 20.0, rect.center().y));
-
+        draw_key_icon_at(ui, egui::pos2(trial_rect.left() + 18.0, trial_rect.center().y));
         ui.painter().text(
-            egui::pos2(rect.left() + 40.0, rect.center().y),
+            egui::pos2(trial_rect.left() + 37.0, trial_rect.center().y),
             egui::Align2::LEFT_CENTER,
             text,
-            egui::FontId::proportional(12.3),
+            egui::FontId::proportional(11.6),
             UiTheme::text(),
         );
         ui.painter().line_segment(
             [
-                egui::pos2(rect.left() + 164.0, rect.center().y - 7.0),
-                egui::pos2(rect.left() + 164.0, rect.center().y + 7.0),
+                egui::pos2(trial_rect.left() + 154.0, trial_rect.center().y - 6.0),
+                egui::pos2(trial_rect.left() + 154.0, trial_rect.center().y + 6.0),
             ],
             egui::Stroke::new(1.0, UiTheme::border()),
         );
         ui.painter().text(
-            egui::pos2(rect.left() + 177.0, rect.center().y),
+            egui::pos2(trial_rect.left() + 166.0, trial_rect.center().y),
             egui::Align2::LEFT_CENTER,
             activate,
-            egui::FontId::proportional(11.8),
+            egui::FontId::proportional(11.2),
             if response.hovered() { UiTheme::blue() } else { UiTheme::text_soft() },
         );
         ui.painter().text(
-            egui::pos2(rect.right() - 16.0, rect.center().y),
+            egui::pos2(trial_rect.right() - 13.0, trial_rect.center().y),
             egui::Align2::CENTER_CENTER,
             "›",
-            egui::FontId::proportional(21.0),
+            egui::FontId::proportional(19.0),
             if response.hovered() { UiTheme::blue() } else { UiTheme::text_soft() },
         );
+
+        if row_rect.width() > trial_w + 120.0 {
+            let hint_rect = egui::Rect::from_min_max(
+                egui::pos2(trial_rect.right() + 14.0, row_rect.top()),
+                row_rect.max,
+            );
+            ui.allocate_ui_at_rect(hint_rect, |ui| {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(hint)
+                                .size(10.4)
+                                .color(UiTheme::text_soft()),
+                        )
+                        .truncate(),
+                    );
+                });
+            });
+        }
 
         if response.clicked() {
             self.activation_open = true;
@@ -4001,20 +4162,30 @@ fn draw_speaker_mute_button(
     enabled: bool,
     tooltip: &str,
 ) -> egui::Response {
-    // Use a real egui button hit target instead of painting an Image over a
-    // separately allocated response. This guarantees hover/click ownership.
-    let image = egui::Image::new(
-        egui::include_image!("../assets/fluent_speaker_2_24_filled.svg"),
-    )
-    .fit_to_exact_size(egui::vec2(23.0, 23.0))
-    .tint(color);
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    let fill = if response.hovered() {
+        egui::Color32::from_rgb(215, 235, 255)
+    } else {
+        egui::Color32::from_rgb(232, 244, 255)
+    };
+    ui.painter().rect_filled(rect, egui::CornerRadius::same(8), fill);
 
-    #[allow(deprecated)]
-    let button = egui::ImageButton::new(image)
-        .frame(true)
-        .corner_radius(egui::CornerRadius::same(7));
-    #[allow(deprecated)]
-    let mut response = ui.add_sized(size, button);
+    let icon_size = if response.hovered() { 23.5 } else { 22.0 };
+    let icon_rect = egui::Rect::from_center_size(
+        rect.center(),
+        egui::vec2(icon_size, icon_size),
+    );
+    ui.put(
+        icon_rect,
+        egui::Image::new(egui::include_image!("../assets/fluent_speaker_2_24_filled.svg"))
+            .fit_to_exact_size(icon_rect.size())
+            .tint(color),
+    );
 
     if response.hovered() {
         ui.ctx().set_cursor_icon(if enabled {
@@ -4023,14 +4194,7 @@ fn draw_speaker_mute_button(
             egui::CursorIcon::Default
         });
     }
-
-    response = response.on_hover_text(tooltip);
-    if !enabled {
-        // Keep hover/tooltip active while idle, but never allow an idle click
-        // to mutate receiver volume state.
-        response = response.interact(egui::Sense::hover());
-    }
-    response
+    response.on_hover_text(tooltip)
 }
 
 fn homepod_tsid(device: &DeviceRecord) -> Option<&str> {
@@ -4893,59 +5057,95 @@ fn msa_solo_route_txt(service: &DiscoveredService) -> Result<String, String> {
     Ok(parts.join(" "))
 }
 
-fn msa_solo_airport_raop_pinned(device: &DeviceRecord) -> bool {
-    // Pinned MSA documents AirPort Express as a RAOP-class receiver and keeps
-    // an AirPlay-1 escape lane. This exact AirPort10,115 was hardware-validated
-    // on 2026-10-01: AUTO/native AP2 + PTP accepted RTSP/control and volume
-    // commands but rendered silence. Keep the exception model-scoped rather
-    // than changing generic MSA route policy.
-    let model = device
-        .airplay
-        .as_ref()
-        .and_then(|service| {
-            service
+fn route_for_streaming_mode(
+    device: &DeviceRecord,
+    has_native_credentials: bool,
+    mode: StreamingMode,
+) -> Route {
+    match mode {
+        StreamingMode::Auto => device.route(has_native_credentials, false),
+        StreamingMode::AirPlay2Ptp | StreamingMode::AirPlay2Ntp => Route::AirPlay2Native,
+        StreamingMode::AirPlay2Compat => Route::AirPlay2Compat,
+        StreamingMode::AirPlay1Raop => Route::Raop,
+    }
+}
+
+fn streaming_mode_label(mode: StreamingMode, language: UiLanguage) -> &'static str {
+    match (mode, language) {
+        (StreamingMode::Auto, UiLanguage::Vi) => "Tự động",
+        (StreamingMode::Auto, UiLanguage::En) => "Auto",
+        (StreamingMode::AirPlay2Ptp, _) => "AirPlay 2 · PTP",
+        (StreamingMode::AirPlay2Ntp, _) => "AirPlay 2 · NTP",
+        (StreamingMode::AirPlay2Compat, UiLanguage::Vi) => "AP2 tương thích",
+        (StreamingMode::AirPlay2Compat, UiLanguage::En) => "AP2 Compat",
+        (StreamingMode::AirPlay1Raop, _) => "AirPlay 1",
+    }
+}
+
+fn streaming_mode_options(device: &DeviceRecord) -> Vec<StreamingMode> {
+    let mut options = vec![StreamingMode::Auto];
+    if let Some(service) = device.airplay.as_ref() {
+        if service.txt.supports_airplay2() {
+            if service.txt.supports_ptp() {
+                options.push(StreamingMode::AirPlay2Ptp);
+            }
+            let model = service
                 .txt
                 .fields
                 .get("model")
                 .or_else(|| service.txt.fields.get("am"))
-        })
-        .or_else(|| {
-            device.raop.as_ref().and_then(|service| {
-                service
-                    .txt
-                    .fields
-                    .get("am")
-                    .or_else(|| service.txt.fields.get("model"))
-            })
-        })
-        .map(String::as_str)
-        .unwrap_or("");
-    model.eq_ignore_ascii_case("AirPort10,115") && device.raop.is_some()
+                .map(String::as_str)
+                .unwrap_or("");
+            // Mirrors MSA server's Apple no-NTP family: HomePod and Apple TV.
+            // AirPort/Mac and third-party AP2 receivers retain the NTP escape.
+            if !model.starts_with("AudioAccessory") && !model.starts_with("AppleTV") {
+                options.push(StreamingMode::AirPlay2Ntp);
+            }
+            options.push(StreamingMode::AirPlay2Compat);
+        }
+    }
+    if device.raop.is_some() {
+        options.push(StreamingMode::AirPlay1Raop);
+    }
+    options
 }
 
 fn msa_solo_config_for_device(
     device: &DeviceRecord,
     credentials: Option<String>,
+    raop_secret: Option<String>,
     hires_enabled: bool,
+    streaming_mode: StreamingMode,
 ) -> Result<(WindowsMsaSoloConfig, sairplay_engine::Ap2AudioFormat, String), String> {
     let service = device
         .airplay
         .as_ref()
         .ok_or_else(|| format!("{} has no AirPlay service", device.display_name))?;
     let raop_service = device.raop.as_ref().unwrap_or(service);
-    let airport_raop = msa_solo_airport_raop_pinned(device);
-    let host = if airport_raop {
+    let use_raop_endpoint = streaming_mode == StreamingMode::AirPlay1Raop;
+    let host = if use_raop_endpoint {
         preferred_service_address(raop_service)
     } else {
         preferred_service_address(service)
     };
     let txt = msa_solo_route_txt(service)?;
 
-    // MSA server normally invokes cliairplay with --protocol auto whenever a
-    // receiver exposes both _airplay and _raop. Preserve that default. The
-    // hardware-proven AirPort10,115 exception above is pinned to the RAOP
-    // escape lane and therefore remains 16/44.1.
-    let effective_hires = hires_enabled && !airport_raop;
+    // Pinned MSA server defaults to --protocol auto whenever a receiver has a
+    // normal fallback lane. Explicit per-device streaming_mode is the only
+    // persistent override; transport failures never rewrite it automatically.
+    let (protocol, ptp_override) = match streaming_mode {
+        StreamingMode::Auto => (MsaProtocolPreference::Auto, None),
+        StreamingMode::AirPlay2Ptp => (MsaProtocolPreference::AirPlay2, Some(true)),
+        StreamingMode::AirPlay2Ntp => (MsaProtocolPreference::AirPlay2, Some(false)),
+        StreamingMode::AirPlay2Compat => (MsaProtocolPreference::AirPlay2Compat, None),
+        StreamingMode::AirPlay1Raop => (MsaProtocolPreference::Raop, None),
+    };
+
+    let effective_hires = hires_enabled
+        && !matches!(
+            streaming_mode,
+            StreamingMode::AirPlay1Raop | StreamingMode::AirPlay2Compat
+        );
     let (sample_rate, bit_depth) = if effective_hires {
         (48_000, 24)
     } else {
@@ -4953,11 +5153,8 @@ fn msa_solo_config_for_device(
     };
 
     let mut config = WindowsMsaSoloConfig::new(host.clone(), service.port, raop_service.port);
-    config.protocol = if airport_raop {
-        MsaProtocolPreference::Raop
-    } else {
-        MsaProtocolPreference::Auto
-    };
+    config.protocol = protocol;
+    config.ptp_override = ptp_override;
     config.txt = Some(txt.clone());
     config.am = service
         .txt
@@ -4968,6 +5165,7 @@ fn msa_solo_config_for_device(
     config.pw_txt = service.txt.fields.get("pw").cloned();
     config.raop_cn = raop_service.txt.fields.get("cn").cloned();
     config.raop_pk = raop_service.txt.fields.get("pk").cloned();
+    config.raop.secret = raop_secret;
     if let Some(et) = raop_service.txt.fields.get("et") {
         config.raop.et = et.clone();
     }
@@ -4986,14 +5184,19 @@ fn msa_solo_config_for_device(
     };
     let features = sairplay_msa_solo::route::txt_features(Some(&txt));
     let flags = sairplay_msa_solo::route::txt_flags(Some(&txt));
-    let endpoint_port = if airport_raop { raop_service.port } else { service.port };
+    let endpoint_port = if use_raop_endpoint {
+        raop_service.port
+    } else {
+        service.port
+    };
     let summary = format!(
-        "MSA SOLO CONNECT target={} endpoint={}:{} requested={}/{} protocol={:?} features={:#018x} flags={:#x}; credentials are never printed.",
+        "MSA SOLO CONNECT target={} endpoint={}:{} requested={}/{} streaming_mode={} protocol={:?} features={:#018x} flags={:#x}; credentials are never printed.",
         device.display_name,
         host,
         endpoint_port,
         sample_rate,
         bit_depth,
+        streaming_mode.storage_key(),
         config.protocol,
         features,
         flags,
@@ -5102,6 +5305,57 @@ fn save_native_credentials(credentials: &BTreeMap<String, String>) {
             text.push_str(value);
             text.push('\n');
         }
+    }
+    let _ = std::fs::write(path, text);
+}
+
+fn streaming_modes_path() -> Option<PathBuf> {
+    let base = std::env::var_os("APPDATA")?;
+    Some(
+        PathBuf::from(base)
+            .join("SolYan")
+            .join("SAirplay2")
+            .join("streaming_modes.txt"),
+    )
+}
+
+fn load_streaming_modes() -> BTreeMap<String, StreamingMode> {
+    let Some(path) = streaming_modes_path() else {
+        return BTreeMap::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('\t')?;
+            let mode = StreamingMode::from_storage_key(value)?;
+            (!key.trim().is_empty() && mode != StreamingMode::Auto)
+                .then(|| (key.to_owned(), mode))
+        })
+        .collect()
+}
+
+fn save_streaming_modes(modes: &BTreeMap<String, StreamingMode>) {
+    let Some(path) = streaming_modes_path() else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let mut text = String::new();
+    for (key, mode) in modes {
+        if *mode == StreamingMode::Auto {
+            continue;
+        }
+        let clean_key = key.replace(['\t', '\r', '\n'], "");
+        text.push_str(&clean_key);
+        text.push('\t');
+        text.push_str(mode.storage_key());
+        text.push('\n');
     }
     let _ = std::fs::write(path, text);
 }
@@ -5342,7 +5596,7 @@ mod gui_tests {
     }
 
     #[test]
-    fn airport10_115_is_pinned_to_msa_raop_16_44100() {
+    fn airport10_115_uses_general_streaming_mode_override_not_model_pin() {
         let airplay = DiscoveredService {
             kind: ServiceKind::AirPlay,
             fullname: "AirPort._airplay._tcp.local.".into(),
@@ -5375,9 +5629,23 @@ mod gui_tests {
             raop: Some(raop),
         };
 
-        assert!(msa_solo_airport_raop_pinned(&device));
-        let (config, format, _) = msa_solo_config_for_device(&device, None, true).unwrap();
-        assert_eq!(config.protocol, MsaProtocolPreference::Raop);
+        let (auto_cfg, _, _) = msa_solo_config_for_device(
+            &device,
+            None,
+            None,
+            false,
+            StreamingMode::Auto,
+        ).unwrap();
+        assert_eq!(auto_cfg.protocol, MsaProtocolPreference::Auto);
+
+        let (raop_cfg, format, _) = msa_solo_config_for_device(
+            &device,
+            None,
+            None,
+            true,
+            StreamingMode::AirPlay1Raop,
+        ).unwrap();
+        assert_eq!(raop_cfg.protocol, MsaProtocolPreference::Raop);
         assert_eq!(format.sample_rate, 44_100);
         assert_eq!(format.bit_depth, 16);
     }

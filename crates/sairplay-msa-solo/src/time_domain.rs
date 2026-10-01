@@ -4,10 +4,14 @@
 //! - music-assistant/airplay-cli @ 431c5c582eef9307c4e39c50a0ea65e970bc1128
 //! - its libraop submodule @ 81c2182649da8645ac2a58b78e9f370c79a4165b
 //!
-//! IMPORTANT: pinned libraop raopcl_get_ntp(NULL) is NOT RFC/NTP epoch 1900.
-//! It packs gettime_us() directly as seconds<<32 | fraction. MSA AP2 scheduling
-//! therefore uses a Unix/system-wall fixed-point domain. The AirPlay NTP timing
-//! responder is a different protocol domain and uses RFC/NTP epoch 1900.
+//! IMPORTANT: pinned libraop raopcl_get_ntp(NULL) is NOT the AirPlay RFC/NTP
+//! responder clock. On POSIX, pinned crosstools gettime_us() is Unix wall time,
+//! which is the domain assumed by MSA raop_session.c. On Windows, however, that
+//! exact crosstools implementation derives gettime_us() from FILETIME and its raw
+//! 32.32 value is numerically different from Unix 32.32. The Windows RAOP helper
+//! therefore bridges by relative wall-clock delta at its adapter boundary.
+//! SourceNtp here remains the MSA/public Unix-wall scheduling domain; raw Windows
+//! libraop clock values must never enter this type.
 
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,8 +34,10 @@ impl fmt::Display for TimeDomainError {
     }
 }
 
-/// MSA/libraop scheduling time: 32.32 fixed point, seconds in the Unix/system
-/// wall-clock domain used by pinned raopcl_get_ntp(NULL).
+/// MSA/public scheduling time: 32.32 fixed point in the Unix/system wall-clock
+/// domain. Pinned libraop matches this numerically on POSIX. Its Windows raw
+/// clock is bridged separately inside cliraop-msa-solo and must not be wrapped
+/// in SourceNtp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct SourceNtp(u64);
 
