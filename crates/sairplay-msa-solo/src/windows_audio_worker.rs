@@ -19,6 +19,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const AIRPLAY_CLOCK_READY_TIMEOUT: Duration = Duration::from_millis(2500);
 pub const STARVATION_RECOVERY_INTERVAL: Duration = Duration::from_millis(250);
+/// Passive Windows loopback has no explicit player pause command. Require two
+/// MSA starvation intervals without a non-SILENT source packet before mapping
+/// source disappearance to Buffered STANDBY.
+pub const BUFFERED_SOURCE_IDLE_PARK_INTERVAL: Duration = Duration::from_millis(500);
 pub const FLUSH_DRAIN_TIMEOUT: Duration = Duration::from_millis(2000);
 const DEFERRED_START_LEAD_MS: u64 = 400;
 const DEFERRED_CLOCK_READY_LEAD_MS: u64 = 500;
@@ -124,6 +128,7 @@ impl WindowsSoloAudioWorker {
                 let mut starvation_started: Option<Instant> = None;
                 let mut last_starvation_recovery: Option<Instant> = None;
                 let mut deferred_audio_seen: Option<Instant> = None;
+                let mut buffered_source_idle_since: Option<Instant> = None;
 
                 while running_thread.load(Ordering::SeqCst) {
                     // Exact cliairplay outer-loop health gate: MediaRemote
@@ -157,6 +162,7 @@ impl WindowsSoloAudioWorker {
                         local_flush_generation = generation;
                         starvation_started = None;
                         last_starvation_recovery = None;
+                        buffered_source_idle_since = None;
                         audio_ready_thread.store(false, Ordering::SeqCst);
                         flush_ack_thread.store(generation, Ordering::SeqCst);
                     }
@@ -404,6 +410,103 @@ impl WindowsSoloAudioWorker {
                         }
                     } else if !deferred_start_thread.load(Ordering::SeqCst) {
                         deferred_audio_seen = None;
+                    }
+
+                    // Buffered type-103 has no realtime starvation re-anchor in
+                    // pinned MSA. MSA parks it explicitly (rate=0 +
+                    // FLUSHBUFFERED -> CONNECTED) when the source is stopped,
+                    // then resumes on a fresh rate=1 anchor. Windows loopback
+                    // has no explicit source STOP event, so adapt only the
+                    // engine's source-presence signal: two starvation windows
+                    // with no non-SILENT WASAPI packet means the passive source
+                    // has gone idle. Digital-zero content remains source-present
+                    // because it arrives in a non-SILENT WASAPI packet.
+                    let source_packet_present =
+                        report.first_non_silent_frame_offset.is_some();
+                    if source_packet_present {
+                        buffered_source_idle_since = None;
+                    } else {
+                        let buffered_streaming = engine_thread
+                            .lock()
+                            .map(|guard| {
+                                guard.is_buffered()
+                                    && guard.runtime.state == Ap2State::Streaming
+                                    && !guard.content_paused()
+                                    && !guard.content_stopped()
+                            })
+                            .unwrap_or(false);
+                        if buffered_streaming {
+                            let idle_since =
+                                buffered_source_idle_since.get_or_insert_with(Instant::now);
+                            if idle_since.elapsed() >= BUFFERED_SOURCE_IDLE_PARK_INTERVAL {
+                                let park_result = {
+                                    let mut guard = match engine_thread.lock() {
+                                        Ok(v) => v,
+                                        Err(_) => {
+                                            if let Ok(mut slot) = error_thread.lock() {
+                                                *slot = Some(
+                                                    "native SOLO engine mutex poisoned".into(),
+                                                );
+                                            }
+                                            running_thread.store(false, Ordering::SeqCst);
+                                            return;
+                                        }
+                                    };
+                                    if guard.is_buffered()
+                                        && guard.runtime.state == Ap2State::Streaming
+                                    {
+                                        let result = guard.standby();
+                                        let mrp = guard.mrp_controller();
+                                        Some((result, mrp))
+                                    } else {
+                                        None
+                                    }
+                                };
+
+                                if let Some((result, mrp)) = park_result {
+                                    if let Err(e) = result {
+                                        if let Ok(mut slot) = error_thread.lock() {
+                                            *slot = Some(format!(
+                                                "Buffered source-idle STANDBY failed: {e:?}"
+                                            ));
+                                        }
+                                        running_thread.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+
+                                    // Drop any engine-generated silence or
+                                    // pre-park tail. MSA standby discards the
+                                    // parked receiver queue before the next
+                                    // source is admitted.
+                                    chunker.clear();
+                                    capture.reset_conversion();
+                                    source_present = false;
+                                    audio_ready_thread.store(false, Ordering::SeqCst);
+                                    deferred_audio_seen = None;
+                                    buffered_source_idle_since = None;
+                                    starvation_started = None;
+                                    last_starvation_recovery = None;
+                                    deferred_start_thread.store(true, Ordering::SeqCst);
+
+                                    if let Ok(mut events) = events_thread.lock() {
+                                        events.push(format!(
+                                            "MSA SOLO BUFFERED source idle for >= {}ms; rate-0 STANDBY + FLUSHBUFFERED completed, waiting for source resume.",
+                                            BUFFERED_SOURCE_IDLE_PARK_INTERVAL.as_millis(),
+                                        ));
+                                    }
+                                    if let Some(mrp) = mrp {
+                                        let _ = mrp.publish_playback_state(
+                                            crate::MrpPlaybackState::Paused,
+                                            true,
+                                        );
+                                    }
+                                    thread::sleep(Duration::from_millis(1));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            buffered_source_idle_since = None;
+                        }
                     }
 
                     let content_paused_or_stopped = engine_thread
@@ -857,5 +960,18 @@ impl WindowsSoloAudioWorker {
 impl Drop for WindowsSoloAudioWorker {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod source_idle_tests {
+    use super::*;
+
+    #[test]
+    fn buffered_idle_park_requires_two_starvation_intervals() {
+        assert_eq!(
+            BUFFERED_SOURCE_IDLE_PARK_INTERVAL,
+            STARVATION_RECOVERY_INTERVAL + STARVATION_RECOVERY_INTERVAL
+        );
     }
 }
