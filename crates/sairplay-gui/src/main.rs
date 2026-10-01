@@ -2902,7 +2902,7 @@ impl SairplayApp {
                             device.display_name,
                             option.storage_key()
                         ));
-                        ui.close();
+                        ui.close_menu();
                     }
                 }
             });
