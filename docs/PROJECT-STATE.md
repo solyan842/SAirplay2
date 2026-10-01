@@ -1,42 +1,82 @@
 # SAirplay2 — Project State
 
-Last updated: 2026-09-27  
-Working branch: `dev/hires-source-port`
+Last updated: 2026-10-01  
+Working branch: `dev/msa-solo-rebuild`
 
 ## 1. Protected stable
 
 Repository: `solyan842/SAirplay2`
 
-Locked stable commit:
+Locked stable commits:
 
 ```
-a7cb24b1faa6b54abf7d24812b732ed08eb72524
+stable1: a7cb24b1faa6b54abf7d24812b732ed08eb72524
+stable2: 83286f7597690297faf7f998f5beaa16a061434b
 ```
 
-**Do not modify or move this stable checkpoint.**
+**Do not modify, move, rebase onto, or force-update either stable checkpoint.**
 
 The active development branch contains later native AirPlay 2, hi-res, group,
 late-join and recovery work. Stable history is intentionally separate.
 
-## 2. Source references
+## 2. Source references — MSA architecture lock
 
-Pinned references:
+Pinned source of truth for the independent MSA SOLO path:
 
 - `music-assistant/airplay-cli@431c5c582eef9307c4e39c50a0ea65e970bc1128`
-- `music-assistant/server@9e311eb84aba0a940bdfbf7433d5a29c07bab1b6`
-- `philippe44/libraop@dadcfcaa26d988cdd3e3501ddf8286c224f1b494`
+- `music-assistant/server@f09136859e240fc7859160e186c2e2186e917715`
+- exact MSA libraop submodule:
+  `81c2182649da8645ac2a58b78e9f370c79a4165b`
+- legacy/current comparison pin only:
+  `philippe44/libraop@dadcfcaa26d988cdd3e3501ddf8286c224f1b494`
 
-2026-09-27 recheck:
+### Mandatory lock
 
-- `music-assistant/airplay-cli` main still points to the pinned commit.
-- Music Assistant server stable was cross-checked at
-  `e30a4974ba951f38e21bea8d502af3b903df992c`.
-- Current MSA stable still uses the same core START constants relied on here:
-  400 ms solo base, 2500 ms clock-readiness wait, +500 ms readiness margin and
-  2500 ms cold-group floor.
+**MSA is the Source of Truth for SOLO/AirPlay 2.**
 
-Source-first rules and current parity status live in
-`DEVELOPMENT-RULES.md` and `SOURCE-AUDIT.md`.
+Before changing transport behavior, answer first: **“How does pinned MSA do this?”**
+
+Rules:
+
+1. Do not invent or independently retune timing, buffering, pacing, START/FLUSH,
+   route selection, PCM handoff, ALAC framing, volume semantics or recovery when
+   pinned MSA already defines the behavior.
+2. Windows-specific code may only adapt Windows to the MSA contract. It must not
+   redefine the contract.
+3. MSA server architecture is:
+   source audio -> conversion/resampling -> exact player PCM -> cliairplay/AP2
+   transport. Windows WASAPI capture must therefore stay in the endpoint mix
+   format and convert privately to the requested MSA PCM; it must not force the
+   Windows endpoint itself into the AirPlay transport format.
+4. Every protocol/audio change requires source evidence or a hardware/log failure
+   that identifies the affected layer. Do not patch symptoms speculatively.
+5. Keep Single MSA SOLO isolated from Stereo Pair, MultiRoom and legacy RAOP
+   until the current hardware gate is passed.
+6. CI PASS proves build/tests only. Hardware/audible PASS must be recorded
+   separately.
+7. Do not alter either protected stable checkpoint while developing this path.
+
+The detailed lock is duplicated intentionally in
+`docs/MSA-SOLO-SOURCE-LOCK.md` so a future handoff cannot silently drift from
+the pinned architecture.
+
+### Current MSA SOLO hardware gate
+
+Black HomePod, native AP2, 16-bit / 44.1 kHz is **audibly PASS** as of
+2026-10-01:
+
+- Windows local audio remains normal while SAirplay2 is running;
+- Black plays at correct speed/pitch;
+- no observed previous pop/drop/missing-audio symptom across the tested tracks;
+- live receiver volume works, including mute, with RTSP 200 responses;
+- START time-domain delta is in the expected immediate range.
+
+Commit `a85beb5fded804bdff45987d39ab0e2fafc76318` additionally surfaces the
+Windows input-format diagnostic to the GUI log. Windows Action #1303 passed.
+
+The next hardware gate is **Black SOLO 24-bit / 48 kHz**. Do not move to
+Stereo Pair, MultiRoom or unrelated transport tuning before that gate is
+evaluated.
 
 ## 3. Last fully validated transport checkpoint
 
