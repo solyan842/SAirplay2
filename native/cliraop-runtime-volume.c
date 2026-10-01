@@ -75,8 +75,9 @@ static int print_usage(char *argv[])
 			   "\t[-V <runtime volume file>]\n"
 			   "\t[-l <latency> (frames]\n"
 			   "\t[-w <wait>]  (start after <wait> milliseconds)\n"
-			   "\t[-n <start>] (start at NTP <start> + <wait>)\n"
-			   "\t[-nf <start>] (start at NTP in <file> + <wait>)\n"
+			   "\t[-n <start>] (start at libraop clock <start> + <wait>)\n"
+			   "\t[-U <unix_ms>] (audible start at Unix milliseconds; bridged to libraop clock)\n"
+			   "\t[-nf <start>] (start at libraop clock in <file> + <wait>)\n"
 			   "\t[-e] audio payload encryption\n"
 			   "\t[-u] for authentication (only if crypto present in TXT record)\n"
    			   "\t[-a] send ALAC compressed audio\n"
@@ -155,6 +156,37 @@ static void close_platform(bool interactive) {
 	cross_ssl_free();
 }
 
+
+/* SAirplay2 Windows boundary:
+ * libraop's pinned crosstools gettime_us() is FILETIME-derived on Windows,
+ * while the app/MSA scheduling contract is Unix wall time. Keep the raw
+ * libraop clock private to this helper and map absolute Unix-ms commands by
+ * relative delta after raopcl_connect().
+ */
+static uint64_t unix_now_ms(void) {
+#if WIN
+	FILETIME ft;
+	ULARGE_INTEGER ticks;
+	const uint64_t unix_epoch_filetime = 116444736000000000ULL;
+	GetSystemTimeAsFileTime(&ft);
+	ticks.LowPart = ft.dwLowDateTime;
+	ticks.HighPart = ft.dwHighDateTime;
+	if (ticks.QuadPart <= unix_epoch_filetime) return 0;
+	return (ticks.QuadPart - unix_epoch_filetime) / 10000ULL;
+#else
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)tv.tv_usec / 1000ULL;
+#endif
+}
+
+static uint64_t source_from_unix_ms(uint64_t target_unix_ms) {
+	uint64_t source_now = raopcl_get_ntp(NULL);
+	uint64_t wall_now = unix_now_ms();
+	if (target_unix_ms <= wall_now) return source_now;
+	return source_now + MS2NTP(target_unix_ms - wall_now);
+}
+
 /*----------------------------------------------------------------------------*/
 /*																			  */
 /*----------------------------------------------------------------------------*/
@@ -174,7 +206,7 @@ int main(int argc, char *argv[]) {
 	int i, n = -1, level = 2;
 	enum {STOPPED, PAUSED, PLAYING } status;
 	raop_crypto_t crypto = RAOP_CLEAR;
-	uint64_t start = 0, start_at = 0, last = 0, frames = 0, last_volume_check = 0;
+	uint64_t start = 0, start_unix_ms = 0, start_at = 0, last = 0, frames = 0, last_volume_check = 0;
 	bool interactive = false, alac = false, pairing = false;
 	char *secret = NULL, *md = NULL, *et = NULL, *volume_file = NULL;
 	bool auth = false;
@@ -216,6 +248,8 @@ int main(int argc, char *argv[]) {
 			pairing = true;
 		} else if(!strcmp(argv[i],"-n")) {
 			sscanf(argv[++i], "%" PRIu64, &start);
+		} else if(!strcmp(argv[i],"-U")) {
+			sscanf(argv[++i], "%" PRIu64, &start_unix_ms);
 		} else if (!strcmp(argv[i],"-nf")) {
 			FILE *in;
 
@@ -299,6 +333,12 @@ int main(int argc, char *argv[]) {
 
 	LOG_INFO("connected to %s on port %d, player latency is %d ms", inet_ntoa(player.addr),
 			 port, (int) TS2MS(latency, raopcl_sample_rate(raopcl)));
+
+	if (start_unix_ms) {
+		start = source_from_unix_ms(start_unix_ms);
+		LOG_INFO("Unix-ms audible start %" PRIu64 " bridged to local libraop clock %u.%u",
+				 start_unix_ms, RAOP_SECNTP(start));
+	}
 
 	if (start || wait) {
 		uint64_t now = raopcl_get_ntp(NULL);

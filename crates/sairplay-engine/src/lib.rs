@@ -77,7 +77,10 @@ pub use session::{EngineCommand, EngineEvent, EngineState, SessionCore};
 pub use timeline::{Boundary, SplicePlan, Timeline, TimelineError};
 
 pub use timing_policy::{TimingDecision, TimingMode, TimingPreference, TimingReadiness, TimingStartResult};
-pub use ntp_timing::{build_timing_response, system_time_to_ntp, NtpTimingError, NtpTimingResponder};
+pub use ntp_timing::{
+    build_timing_response, system_time_to_rfc_ntp, system_time_to_source_ntp,
+    NtpTimingError, NtpTimingResponder, RFC_NTP_UNIX_EPOCH_DELTA_SECS,
+};
 pub use native_timing::{start_ntp_timing_gate, NativeTimingGateError};
 pub use ntp_session_setup::{build_ntp_session_plist, parse_event_port, setup_ntp_session, NtpSessionSetupConfig, NtpSessionSetupError, NtpSessionSetupResult};
 pub use event_channel::{derive_event_keys, open_event_channel, EventChannel, EventChannelError};

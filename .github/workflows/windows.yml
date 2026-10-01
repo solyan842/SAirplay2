@@ -119,6 +119,9 @@ jobs:
           if ($help -notmatch '\[-V <runtime volume file>\]') {
             throw "Source-built cliraop.exe is missing runtime-volume support"
           }
+          if ($help -notmatch '\[-U <unix_ms>\]') {
+            throw "Source-built cliraop.exe is missing Unix-ms clock bridge support"
+          }
           # Upstream cliraop returns -1 after printing usage. The binary has
           # already been source-built successfully; normalize this documented
           # help exit so it cannot fail the packaging job.

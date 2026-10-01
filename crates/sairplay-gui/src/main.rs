@@ -2687,7 +2687,7 @@ impl SairplayApp {
         device: &DeviceRecord,
         stereo_pair: bool,
     ) {
-        const ROW_H: f32 = 76.0;
+        const ROW_H: f32 = 72.0;
         const SELECTOR_W: f32 = 24.0;
         const ART_W: f32 = 70.0;
         const STATUS_W: f32 = 166.0;
@@ -2841,12 +2841,8 @@ impl SairplayApp {
         ).to_owned();
 
         let badge_rect = egui::Rect::from_min_size(
-            egui::pos2(status_rect.left(), row_y - 22.0),
-            egui::vec2(110.0, 21.0),
-        );
-        let protocol_rect = egui::Rect::from_min_size(
-            egui::pos2(status_rect.left(), row_y + 2.0),
-            egui::vec2(110.0, 22.0),
+            egui::pos2(status_rect.left(), row_y - 13.0),
+            egui::vec2(110.0, 26.0),
         );
         let bit_rect = egui::Rect::from_min_size(
             egui::pos2(status_rect.right() - 44.0, row_y - 19.0),
@@ -2857,53 +2853,59 @@ impl SairplayApp {
             draw_status_badge(ui, status, status_tone);
         });
 
-        let mut protocol_interacted = false;
-        let protocol_editable = !stereo_pair
-            && members.len() == 1
-            && !matches!(
+        // Keep the receiver list clean: MSA's streaming_mode is an advanced
+        // per-device escape hatch, not a primary playback control. Automatic
+        // remains the default. Right-click a single receiver only when a
+        // hardware-specific override is actually needed.
+        if !stereo_pair && members.len() == 1 {
+            let fullname = members[0].clone();
+            let protocol_editable = !matches!(
                 self.playback,
                 PlaybackUiState::Connecting(_) | PlaybackUiState::Playing(_)
             );
-        if !stereo_pair && members.len() == 1 {
-            let fullname = &members[0];
-            let current_mode = self.streaming_mode_for_fullname(fullname);
-            let mut selected_mode = current_mode;
-            ui.allocate_ui_at_rect(protocol_rect, |ui| {
-                ui.add_enabled_ui(protocol_editable, |ui| {
-                    let combo = egui::ComboBox::from_id_salt(format!("streaming-mode-{fullname}"))
-                        .width(106.0)
-                        .selected_text(streaming_mode_label(selected_mode, self.language))
-                        .show_ui(ui, |ui| {
-                            for option in streaming_mode_options(device) {
-                                ui.selectable_value(
-                                    &mut selected_mode,
-                                    option,
-                                    streaming_mode_label(option, self.language),
-                                );
-                            }
-                        });
-                    protocol_interacted = combo.response.hovered() || combo.response.clicked();
-                });
+            response.context_menu(|ui| {
+                ui.label(
+                    egui::RichText::new(self.t(
+                        "Nâng cao · Chế độ truyền",
+                        "Advanced · Streaming Mode",
+                    ))
+                    .strong()
+                    .color(UiTheme::text()),
+                );
+                ui.add_space(4.0);
+                let current_mode = self.streaming_mode_for_fullname(&fullname);
+                for option in streaming_mode_options(device) {
+                    let selected = current_mode == option;
+                    let button = ui
+                        .add_enabled_ui(protocol_editable, |ui| {
+                            ui.selectable_label(
+                                selected,
+                                streaming_mode_label(option, self.language),
+                            )
+                        })
+                        .inner;
+                    if button.clicked() && option != current_mode {
+                        if option == StreamingMode::Auto {
+                            self.streaming_modes.remove(&fullname);
+                        } else {
+                            self.streaming_modes.insert(fullname.clone(), option);
+                        }
+                        if matches!(
+                            option,
+                            StreamingMode::AirPlay1Raop | StreamingMode::AirPlay2Compat
+                        ) {
+                            self.hires_overrides.insert(fullname.clone(), false);
+                        }
+                        save_streaming_modes(&self.streaming_modes);
+                        self.log.push(format!(
+                            "{}: streaming mode -> {}.",
+                            device.display_name,
+                            option.storage_key()
+                        ));
+                        ui.close();
+                    }
+                }
             });
-            if protocol_editable && selected_mode != current_mode {
-                if selected_mode == StreamingMode::Auto {
-                    self.streaming_modes.remove(fullname);
-                } else {
-                    self.streaming_modes.insert(fullname.clone(), selected_mode);
-                }
-                if matches!(
-                    selected_mode,
-                    StreamingMode::AirPlay1Raop | StreamingMode::AirPlay2Compat
-                ) {
-                    self.hires_overrides.insert(fullname.clone(), false);
-                }
-                save_streaming_modes(&self.streaming_modes);
-                self.log.push(format!(
-                    "{}: streaming mode -> {}.",
-                    device.display_name,
-                    selected_mode.storage_key()
-                ));
-            }
         }
 
         ui.allocate_ui_at_rect(bit_rect, |ui| {
@@ -2953,7 +2955,7 @@ impl SairplayApp {
             ));
         }
 
-        if response.clicked() && selectable && !hires_clicked && !protocol_interacted {
+        if response.clicked() && selectable && !hires_clicked {
             let all_selected = members
                 .iter()
                 .all(|fullname| self.selected_fullnames.contains(fullname));

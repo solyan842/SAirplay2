@@ -104,15 +104,38 @@ Physical testing on 2026-10-01 showed this receiver can ACK native AP2/PTP
 control and volume while rendering no audible media. The temporary
 `AirPort10,115 -> RAOP` model pin in
 `59bff8cb19d95d136525266edf902d9360d5cfe9` is superseded by the general
-per-device `streaming_mode` architecture. AirPlay 1 / RAOP is now a stored
-user choice for this receiver, not a source-code model exception.
+per-device `streaming_mode` architecture.
 
-The first RAOP run also proved a Windows adapter issue: pinned libraop's
-Windows `gettime_us()` is FILETIME-derived, so its raw transport clock must
-not be compared numerically with Unix milliseconds. The Windows helper bridges
-Unix commands to libraop's local clock by relative delta and converts reported
-heads back to Unix time. This is a Windows-only adapter boundary, not a change
-to MSA's public scheduling semantics.
+A subsequent run with `streaming_mode=auto` again resolved to native AP2/PTP
+and again rendered silence. That is not evidence that the GUI should hard-code
+AirPort: pinned MSA's Automatic mode is TXT-driven and deliberately does not
+persist an automatic protocol fallback. Therefore the normal device row stays
+clean/default-Automatic and the explicit AirPlay 1 / RAOP choice lives only in
+an advanced per-device control.
+
+The first explicit RAOP run also proved a Windows adapter issue: pinned
+libraop's Windows `gettime_us()` is FILETIME-derived, so its raw transport
+clock must not be compared numerically with Unix milliseconds. The Windows
+helper bridges Unix commands to libraop's local clock by relative delta and
+converts reported heads back to Unix time. This is a Windows-only adapter
+boundary, not a change to MSA's public scheduling semantics.
+
+### Whole-engine time-domain lock
+
+The older Pair/MultiRoom/Legacy engine follows the same domain separation:
+
+- **Source clock**: Unix wall time packed as 32.32 for media START, D4 sync,
+  buffered anchors, pacing and group scheduling.
+- **RFC NTP clock**: epoch-1900 32.32 only for the AirPlay D2/D3 timing
+  responder.
+- **PTP clock**: Unix/master nanoseconds; monotonic `Instant` remains for
+  local timeout/age measurements.
+- **Windows libraop clock**: private helper-local FILETIME-derived 32.32. The
+  parent process passes Unix milliseconds; the helper converts by relative
+  delta after connect.
+
+There is no generic exported `system_time_to_ntp` helper. Callers must name
+the domain explicitly.
 
 ## Evidence discipline
 

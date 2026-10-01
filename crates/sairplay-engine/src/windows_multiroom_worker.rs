@@ -1,5 +1,5 @@
 use crate::{
-    buffered_anchor_start, system_time_to_ntp, Ap2AudioFormat, BufferedAnchorStartConfig,
+    buffered_anchor_start, system_time_to_source_ntp, Ap2AudioFormat, BufferedAnchorStartConfig,
     BufferedMediaSender, BufferedWriteOutcome, NativeMetadataControl, Pcm352Chunker, PtpClock,
     RealtimeMediaSender, RtpState, SharedCseq, SharedRtspControl, WasapiLoopbackCapture,
     WasapiLoopbackError,
@@ -191,7 +191,7 @@ impl WindowsGroupMediaSender {
                 // Type103 uses the same START feasibility contract, but its
                 // timeline is committed with SETRATEANCHORTIME instead of a
                 // realtime sync packet.
-                let now_ntp = system_time_to_ntp(SystemTime::now())
+                let now_ntp = system_time_to_source_ntp(SystemTime::now())
                     .map_err(|error| format!("{error:?}"))?;
                 let mut floor_ntp = now_ntp.saturating_add(ms_to_ntp(250));
                 if let Some(exchange) = clock.exchange() {
@@ -582,7 +582,7 @@ impl WindowsMultiroomAudioWorker {
                             }
                             continue;
                         }
-                        let now_ntp = match system_time_to_ntp(SystemTime::now()) {
+                        let now_ntp = match system_time_to_source_ntp(SystemTime::now()) {
                             Ok(value) => value,
                             Err(error) => {
                                 if let Ok(mut slot) = last_error_thread.lock() {
@@ -746,7 +746,7 @@ impl WindowsMultiroomAudioWorker {
                         }
                     }
 
-                    let now_ntp = match system_time_to_ntp(SystemTime::now()) {
+                    let now_ntp = match system_time_to_source_ntp(SystemTime::now()) {
                         Ok(value) => value,
                         Err(error) => {
                             if let Ok(mut slot) = last_error_thread.lock() {
@@ -813,7 +813,7 @@ impl WindowsMultiroomAudioWorker {
                             break;
                         }
 
-                        let ntp = match system_time_to_ntp(SystemTime::now()) {
+                        let ntp = match system_time_to_source_ntp(SystemTime::now()) {
                             Ok(value) => value,
                             Err(error) => {
                                 if let Ok(mut slot) = last_error_thread.lock() {
@@ -939,7 +939,7 @@ impl WindowsMultiroomAudioWorker {
                                 .queued_packets
                                 .push_back(packet.clone());
 
-                            let now_ntp = match system_time_to_ntp(SystemTime::now()) {
+                            let now_ntp = match system_time_to_source_ntp(SystemTime::now()) {
                                 Ok(value) => value,
                                 Err(_) => {
                                     join_index += 1;
@@ -1373,7 +1373,7 @@ fn prepare_pending_joins(
             }
         }
 
-        let now_ntp = match system_time_to_ntp(SystemTime::now()) {
+        let now_ntp = match system_time_to_source_ntp(SystemTime::now()) {
             Ok(value) => value,
             Err(error) => {
                 let pending = pending_joins.remove(index);
@@ -1589,7 +1589,7 @@ fn trim_late_join_ring(
 
     let mut required_seconds = AIRPLAY_LATE_JOIN_RING_MIN_SECONDS;
     if let (Some(base_start), Ok(now_ntp)) =
-        (group_start_ntp, system_time_to_ntp(SystemTime::now()))
+        (group_start_ntp, system_time_to_source_ntp(SystemTime::now()))
     {
         let effective_start =
             base_start.saturating_add(frames_to_ntp(reanchor_shift_frames, source_format.sample_rate));

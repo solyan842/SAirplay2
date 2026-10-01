@@ -230,7 +230,7 @@ impl RealtimeMediaSender {
             let lead_ns = frames_to_ns(lead_frames, self.audio_format.sample_rate as u64);
             let local_now = system_unix_ns();
             let master_now = clock.master_now_ns();
-            let start_local = ntp_fixed_to_unix_ns(start_ntp) as i128;
+            let start_local = source_ntp_to_unix_ns(start_ntp) as i128;
             let master_shift = master_now as i128 - local_now as i128;
             let wall0 = start_local + master_shift - lead_ns as i128;
             self.ptp_anchor_wall0 = Some(wall0.max(0) as u64);
@@ -286,7 +286,7 @@ impl RealtimeMediaSender {
         // actually committed, never merely the caller's request. This is what
         // lets Music Assistant converge every member of a group on one shared
         // audible instant.
-        let now_ntp = crate::system_time_to_ntp(SystemTime::now())
+        let now_ntp = crate::system_time_to_source_ntp(SystemTime::now())
             .unwrap_or(requested_start_ntp);
         let mut floor_ntp = now_ntp.saturating_add(ms_to_ntp(250));
         if let Some(exchange) = self.ptp_probe_exchange() {
@@ -690,13 +690,10 @@ fn ntp_to_frames(ntp: u64, sample_rate: u64) -> u64 {
         .saturating_add(((frac as u128 * sample_rate as u128) >> 32) as u64)
 }
 
-fn ntp_fixed_to_unix_ns(ntp: u64) -> u64 {
-    const NTP_UNIX_EPOCH_DELTA: u64 = 2_208_988_800;
+fn source_ntp_to_unix_ns(ntp: u64) -> u64 {
     let sec = ntp >> 32;
     let frac = ntp & 0xFFFF_FFFF;
-    let unix_sec = sec.saturating_sub(NTP_UNIX_EPOCH_DELTA);
-    unix_sec
-        .saturating_mul(1_000_000_000)
+    sec.saturating_mul(1_000_000_000)
         .saturating_add((frac.saturating_mul(1_000_000_000)) >> 32)
 }
 
@@ -717,6 +714,15 @@ mod tests {
             },
         );
         transport
+    }
+
+    #[test]
+    fn source_ntp_to_unix_ns_has_no_rfc_epoch_subtraction() {
+        let source = (1_700_000_000u64 << 32) | 0x8000_0000;
+        assert_eq!(
+            source_ntp_to_unix_ns(source),
+            1_700_000_000_500_000_000u64
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 use crate::{
-    system_time_to_ntp, volume_percent_to_db, Pcm352Chunker, VolumeSetResult,
+    volume_percent_to_db, Pcm352Chunker, VolumeSetResult,
     WasapiLoopbackCapture, WasapiLoopbackError, PCM352_PACKET_BYTES,
 };
 use std::fmt;
@@ -15,7 +15,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const LIBRAOP_PINNED_COMMIT: &str = "dadcfcaa26d988cdd3e3501ddf8286c224f1b494";
 const RAOP_CONFIGURED_LATENCY_FRAMES: u32 = 44_100;
@@ -152,11 +152,10 @@ impl LegacyGroupSession {
         let member_count = configs.len();
         let scheduled_group_start = member_count > 1;
         let helper = helper_path()?;
-        let now_ntp = system_time_to_ntp(SystemTime::now())
-            .map_err(|error| LegacyGroupError::Time(format!(
-                "NTP clock conversion failed: {error:?}"
-            )))?;
-        let start_ntp = now_ntp.saturating_add(ms_to_ntp(RAOP_GROUP_START_LEAD_MS));
+        let now_unix_ms = system_time_to_unix_ms(SystemTime::now())
+            .map_err(LegacyGroupError::Time)?;
+        let start_unix_ms =
+            now_unix_ms.saturating_add(RAOP_GROUP_START_LEAD_MS);
 
         let running = Arc::new(AtomicBool::new(true));
         let last_error = Arc::new(Mutex::new(None));
@@ -170,7 +169,7 @@ impl LegacyGroupSession {
             spawned.push(spawn_member(
                 &helper,
                 config,
-                scheduled_group_start.then_some(start_ntp),
+                scheduled_group_start.then_some(start_unix_ms),
                 Arc::clone(&running),
                 Arc::clone(&last_error),
                 Arc::clone(&startup_events),
@@ -238,11 +237,17 @@ impl LegacyGroupSession {
         // cliraop enters PLAYING after connect and raopcl_accept_frames() owns
         // all pacing. Do not impose our shared NTP anchor on that path.
         //
-        // Only a real legacy group needs -n and a common audible anchor.
-        let feed_ntp = if scheduled_group_start {
+        // Only a real legacy group needs an absolute shared audible anchor.
+        // The parent process keeps that contract in Unix milliseconds. The
+        // Windows helper maps it to libraop's private FILETIME-derived 32.32
+        // clock at its own process boundary.
+        let feed_unix_ms = if scheduled_group_start {
             let total_latency_frames =
                 RAOP_CONFIGURED_LATENCY_FRAMES + RAOP_FIXED_LATENCY_FRAMES;
-            Some(start_ntp.saturating_sub(frames_to_ntp(total_latency_frames)))
+            Some(
+                start_unix_ms
+                    .saturating_sub(frames_to_ms_ceil(total_latency_frames)),
+            )
         } else {
             None
         };
@@ -250,24 +255,24 @@ impl LegacyGroupSession {
         let worker = thread::Builder::new()
             .name("sairplay-legacy-audio".into())
             .spawn(move || {
-                if let Some(feed_ntp) = feed_ntp {
+                if let Some(feed_unix_ms) = feed_unix_ms {
                     while running_thread.load(Ordering::SeqCst) {
-                        let now_ntp = match system_time_to_ntp(SystemTime::now()) {
+                        let now_unix_ms = match system_time_to_unix_ms(SystemTime::now()) {
                             Ok(value) => value,
                             Err(error) => {
                                 if let Ok(mut slot) = error_thread.lock() {
                                     *slot = Some(format!(
-                                        "legacy feed clock conversion failed: {error:?}"
+                                        "legacy feed wall-clock conversion failed: {error}"
                                     ));
                                 }
                                 running_thread.store(false, Ordering::SeqCst);
                                 break;
                             }
                         };
-                        if now_ntp >= feed_ntp {
+                        if now_unix_ms >= feed_unix_ms {
                             break;
                         }
-                        let remaining_ms = ntp_delta_to_ms(feed_ntp - now_ntp);
+                        let remaining_ms = feed_unix_ms.saturating_sub(now_unix_ms);
                         thread::sleep(Duration::from_millis(remaining_ms.clamp(1, 10)));
                     }
                 }
@@ -484,7 +489,7 @@ impl Drop for LegacyGroupSession {
 fn spawn_member(
     helper: &Path,
     config: LegacyMemberConfig,
-    start_ntp: Option<u64>,
+    start_unix_ms: Option<u64>,
     running: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
     startup_events: Arc<Mutex<Vec<String>>>,
@@ -518,8 +523,8 @@ fn spawn_member(
         .arg("-d")
         .arg("3");
 
-    if let Some(start_ntp) = start_ntp {
-        command.arg("-n").arg(start_ntp.to_string());
+    if let Some(start_unix_ms) = start_unix_ms {
+        command.arg("-U").arg(start_unix_ms.to_string());
     }
 
     if config.compressed_alac {
@@ -740,14 +745,31 @@ fn helper_path() -> Result<PathBuf, LegacyGroupError> {
     }
 }
 
-fn ms_to_ntp(ms: u64) -> u64 {
-    ((ms as u128) << 32).div_ceil(1000) as u64
+fn system_time_to_unix_ms(time: SystemTime) -> Result<u64, String> {
+    time.duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .map_err(|_| "system wall clock predates Unix epoch".to_owned())
 }
 
-fn frames_to_ntp(frames: u32) -> u64 {
-    ((frames as u128) << 32).div_ceil(44_100) as u64
+fn frames_to_ms_ceil(frames: u32) -> u64 {
+    ((frames as u128 * 1_000u128).div_ceil(44_100u128)) as u64
 }
 
-fn ntp_delta_to_ms(delta: u64) -> u64 {
-    (((delta as u128) * 1000) >> 32) as u64
+#[cfg(test)]
+mod time_domain_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_group_anchor_is_unix_ms_not_fixed_point_ntp() {
+        let t = UNIX_EPOCH + Duration::from_millis(12_345);
+        assert_eq!(system_time_to_unix_ms(t).unwrap(), 12_345);
+    }
+
+    #[test]
+    fn configured_plus_fixed_latency_is_exactly_1250ms() {
+        assert_eq!(
+            frames_to_ms_ceil(RAOP_CONFIGURED_LATENCY_FRAMES + RAOP_FIXED_LATENCY_FRAMES),
+            1_250
+        );
+    }
 }

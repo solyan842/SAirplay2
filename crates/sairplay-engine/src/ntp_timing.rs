@@ -7,7 +7,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const NTP_EPOCH_DELTA: u64 = 2_208_988_800;
+pub const RFC_NTP_UNIX_EPOCH_DELTA_SECS: u64 = 2_208_988_800;
 
 #[derive(Debug)]
 pub enum NtpTimingError {
@@ -62,7 +62,7 @@ impl NtpTimingResponder {
                             continue;
                         }
 
-                        let Ok(receive_ntp) = system_time_to_ntp(SystemTime::now()) else {
+                        let Ok(receive_ntp) = system_time_to_rfc_ntp(SystemTime::now()) else {
                             continue;
                         };
 
@@ -72,7 +72,7 @@ impl NtpTimingResponder {
                             continue;
                         };
 
-                        if let Ok(transmit_ntp) = system_time_to_ntp(SystemTime::now()) {
+                        if let Ok(transmit_ntp) = system_time_to_rfc_ntp(SystemTime::now()) {
                             response[24..32].copy_from_slice(&transmit_ntp.to_be_bytes());
                         }
 
@@ -118,19 +118,29 @@ impl Drop for NtpTimingResponder {
     }
 }
 
-pub fn system_time_to_ntp(time: SystemTime) -> Result<u64, NtpTimingError> {
+/// MSA media/scheduling clock: Unix wall time packed as unsigned 32.32.
+///
+/// This is deliberately different from the RFC/NTP-1900 timing responder
+/// domain below. Native media START/D4 scheduling must use this source domain.
+pub fn system_time_to_source_ntp(time: SystemTime) -> Result<u64, NtpTimingError> {
     let since_unix = time
         .duration_since(UNIX_EPOCH)
         .map_err(|_| NtpTimingError::Time)?;
 
-    let seconds = since_unix
-        .as_secs()
-        .checked_add(NTP_EPOCH_DELTA)
-        .ok_or(NtpTimingError::Time)?;
-
     let fraction = ((since_unix.subsec_nanos() as u128) << 32) / 1_000_000_000u128;
+    Ok((since_unix.as_secs() << 32) | fraction as u64)
+}
 
-    Ok((seconds << 32) | fraction as u64)
+/// AirPlay timing-responder D2/D3 clock: RFC/NTP epoch 1900 packed as 32.32.
+///
+/// Keep this function confined to the NTP timing responder. Media scheduling
+/// must never consume this value.
+pub fn system_time_to_rfc_ntp(time: SystemTime) -> Result<u64, NtpTimingError> {
+    let source = system_time_to_source_ntp(time)?;
+    let seconds = (source >> 32)
+        .checked_add(RFC_NTP_UNIX_EPOCH_DELTA_SECS)
+        .ok_or(NtpTimingError::Time)?;
+    Ok((seconds << 32) | (source & 0xffff_ffff))
 }
 
 pub fn build_timing_response(
@@ -202,10 +212,23 @@ mod tests {
     }
 
     #[test]
-    fn unix_epoch_converts_to_ntp_epoch_delta() {
-        let ntp = system_time_to_ntp(UNIX_EPOCH).unwrap();
-        assert_eq!(ntp >> 32, NTP_EPOCH_DELTA);
-        assert_eq!(ntp as u32, 0);
+    fn unix_epoch_keeps_source_and_rfc_domains_distinct() {
+        let source = system_time_to_source_ntp(UNIX_EPOCH).unwrap();
+        let rfc = system_time_to_rfc_ntp(UNIX_EPOCH).unwrap();
+        assert_eq!(source, 0);
+        assert_eq!(rfc >> 32, RFC_NTP_UNIX_EPOCH_DELTA_SECS);
+        assert_eq!(rfc as u32, 0);
+    }
+
+    #[test]
+    fn source_and_rfc_differ_by_exact_epoch_delta() {
+        let t = UNIX_EPOCH + Duration::from_millis(1_234);
+        let source = system_time_to_source_ntp(t).unwrap();
+        let rfc = system_time_to_rfc_ntp(t).unwrap();
+        assert_eq!(
+            rfc.wrapping_sub(source),
+            RFC_NTP_UNIX_EPOCH_DELTA_SECS << 32
+        );
     }
 
     #[test]

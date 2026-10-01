@@ -96,17 +96,35 @@ pops/dropouts. Diagnostic work must stay source-aligned and must not retune
 AirPort Express `AirPort10,115` is a separate 16/44.1 hardware gate. Its
 2026-10-01 native AP2/PTP test ACKed control/volume but rendered no audible
 media. The temporary model pin in
-`59bff8cb19d95d136525266edf902d9360d5cfe9` is superseded: routing now uses
+`59bff8cb19d95d136525266edf902d9360d5cfe9` is superseded: routing uses
 MSA-style per-device `streaming_mode`, default Automatic, with explicit
 AirPlay 1 / RAOP available as the hardware-test override.
 
-The first RAOP hardware run then exposed a Windows-only clock-domain mismatch:
-the exact pinned libraop crosstools implementation derives `gettime_us()` from
-Windows FILETIME, so its raw `raopcl_get_ntp(NULL)` value is not numerically
-the Unix 32.32 value assumed by MSA's POSIX `raop_session.c`. The Windows
-helper must bridge by relative wall-clock delta at its adapter boundary while
-keeping public START/HEAD acknowledgements in Unix milliseconds. Do not push
-that Windows transport clock into the rest of the MSA contract.
+A later Automatic-mode hardware run again resolved to
+`AirPlay2Native + PTP` from the AirPort TXT feature bits and again rendered
+silence. This is expected from pinned MSA's Automatic resolver: Automatic is a
+TXT-driven choice, not a self-healing protocol fallback. Keep the main receiver
+list visually clean and on Automatic by default; expose the MSA override only
+as an advanced per-device control (hidden from the normal row). Do not silently
+persist a new mode after a playback failure.
+
+The first explicit RAOP hardware run exposed a Windows-only clock-domain
+mismatch: the exact pinned libraop crosstools implementation derives
+`gettime_us()` from Windows FILETIME, so its raw `raopcl_get_ntp(NULL)`
+value is not numerically the Unix 32.32 value assumed by MSA's POSIX
+`raop_session.c`. The Windows helper bridges by relative wall-clock delta at
+its adapter boundary while public START/HEAD acknowledgements stay in Unix
+milliseconds. Do not push that Windows transport clock into the rest of the MSA
+contract.
+
+The same audit found two old-engine leaks and they must remain fixed before
+Pair/MultiRoom work resumes:
+
+- native old-engine media/group scheduling uses **Source/Unix 32.32** only;
+- D2/D3 timing responder uses **RFC/NTP-1900 32.32** only;
+- legacy RAOP group scheduling crosses process boundaries as **Unix ms**, then
+  the Windows helper maps that instant to its private libraop clock locally.
+  Raw FILETIME-derived fixed-point values must never leave the helper.
 
 Do not move to Stereo Pair, MultiRoom or unrelated transport tuning before the
 active SOLO hardware gates are evaluated.

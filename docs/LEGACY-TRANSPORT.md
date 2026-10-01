@@ -16,9 +16,16 @@ legacy helper processes over stdin. Libraop remains responsible for the legacy
 RAOP ANNOUNCE / SETUP / RECORD, auth setup, ALAC packetization, NTP timing,
 resend handling and RTSP lifecycle.
 
-SAirplay2's checked-in helper overlay adds runtime volume control. CI rebuilds
-the helper from the pinned source, verifies the runtime-volume option, and
-packages that exact built binary.
+SAirplay2's checked-in helper overlay adds runtime volume control and an
+explicit Unix-millisecond scheduled-start boundary (`-U <unix_ms>`). CI
+rebuilds the helper from the pinned source, verifies both options, and packages
+that exact built binary.
+
+The Unix-ms boundary is required on Windows because the pinned crosstools
+`gettime_us()` implementation is FILETIME-derived. The parent process must not
+pass raw fixed-point clock values into the helper. The helper converts the
+absolute Unix wall-clock command to its private libraop clock by relative delta
+after `raopcl_connect()`.
 
 Legacy RAOP remains a separate transport class. Native AirPlay 2 PTP/RTP or
 buffered-media logic must not be patched into the legacy helper path.
