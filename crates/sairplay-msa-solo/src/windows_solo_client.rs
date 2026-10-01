@@ -8,6 +8,7 @@ use crate::{
     ap2::Ap2State,
     MsaRaopConfig, NativeControlErrorClass, NativeDiagnostics, NativeFormatCapabilities,
     NativeLatencyInfo, NativeSoloConfig, NativeSoloEngine, NativeSoloError,
+    NativeVolumeControl, SharedMsaRaopSession, VolumeSetResult, volume_percent_to_db,
     SoloClockReadiness, SoloClockReadinessState, SoloClockVerifyOutcome,
     MrpPushResult, MrpRemoteCommand, MrpRemoteCommandCallback,
     WindowsSoloAudioWorker,
@@ -136,6 +137,35 @@ enum Transport {
 pub struct WindowsMsaSoloClient {
     route: RouteDecision,
     transport: Transport,
+}
+
+#[derive(Clone)]
+pub enum WindowsMsaSoloVolumeControl {
+    Native(NativeVolumeControl),
+    Raop(SharedMsaRaopSession),
+}
+
+impl WindowsMsaSoloVolumeControl {
+    pub fn set(&self, percent: u8) -> Result<VolumeSetResult, WindowsMsaSoloError> {
+        match self {
+            Self::Native(control) => control
+                .set(percent)
+                .map_err(|e| WindowsMsaSoloError::Native(format!("volume: {e:?}"))),
+            Self::Raop(session) => {
+                let percent = percent.min(100);
+                session
+                    .lock()
+                    .map_err(|_| WindowsMsaSoloError::Raop("RAOP session mutex poisoned".into()))?
+                    .set_volume(percent)
+                    .map_err(|e| WindowsMsaSoloError::Raop(e.to_string()))?;
+                Ok(VolumeSetResult {
+                    percent,
+                    db: volume_percent_to_db(percent),
+                    status: 200,
+                })
+            }
+        }
+    }
 }
 
 impl WindowsMsaSoloClient {
@@ -286,6 +316,18 @@ impl WindowsMsaSoloClient {
                 .map_err(|e| WindowsMsaSoloError::Native(e.to_string())),
             Transport::Raop { worker } => worker.stop_content()
                 .map_err(|e| WindowsMsaSoloError::Raop(e.to_string())),
+        }
+    }
+
+    pub fn volume_control(&self) -> Result<WindowsMsaSoloVolumeControl, WindowsMsaSoloError> {
+        match &self.transport {
+            Transport::Native { engine, .. } => Ok(WindowsMsaSoloVolumeControl::Native(
+                engine
+                    .lock()
+                    .map_err(|_| WindowsMsaSoloError::Native("native engine mutex poisoned".into()))?
+                    .volume_control(),
+            )),
+            Transport::Raop { worker } => Ok(WindowsMsaSoloVolumeControl::Raop(worker.session())),
         }
     }
 

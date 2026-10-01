@@ -23,7 +23,7 @@ use crate::{
     send_native_artwork, send_native_metadata, send_native_progress, send_teardown,
     set_native_volume, write_farewell_teardown_locked, Ap2AudioFormat,
     EncryptedRtspError, MetadataError, MetadataSetResult, ParameterError,
-    ParameterResult, VolumeError, VolumeSetResult, mrp_post_command, MrpError,
+    ParameterResult, NativeVolumeControl, VolumeError, VolumeSetResult, mrp_post_command, MrpError,
     MrpArtworkInfo, MrpArtworkResult, MrpController, MrpDataStream, MrpDataStreamWorker, MrpEventWorker,
     MrpPlaybackState, MrpPushResult, MrpRemoteCommand, MrpState,
 };
@@ -495,6 +495,16 @@ impl NativeSoloEngine {
         self.runtime.splice_timeline
             && self.runtime.state == Ap2State::Streaming
             && !self.rtsp_dead
+    }
+
+    pub fn volume_control(&self) -> NativeVolumeControl {
+        NativeVolumeControl::new(
+            Arc::clone(&self.ready.control),
+            Arc::clone(&self.ready.next_cseq),
+            self.ready.session_uri.clone(),
+            self.config.control.dacp_id.clone(),
+            self.config.control.active_remote.clone(),
+        )
     }
 
     pub fn set_volume(&mut self, percent: u8) -> Result<VolumeSetResult, NativeSoloError> {

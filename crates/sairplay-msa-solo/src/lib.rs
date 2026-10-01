@@ -355,6 +355,7 @@ pub use windows_raop_worker::{
 pub use windows_solo_client::{
     SoloConnectError, SoloConnectErrorClass, SoloFlushAck, WindowsMsaSoloClient,
     WindowsMsaSoloConfig, WindowsMsaSoloError, WindowsMsaSoloState,
+    WindowsMsaSoloVolumeControl,
 };
 
 pub use owned_session::{OwnedError, OwnedSoloSession, OwnedTransport, SessionEvent, SESSION_IDLE_TIMEOUT_MS};

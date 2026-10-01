@@ -11,7 +11,7 @@ use sairplay_engine::{
 };
 use sairplay_msa_solo::{
     validate_immediate_start, Ap2AudioFormat as MsaAp2AudioFormat,
-    WindowsMsaSoloClient, WindowsMsaSoloConfig,
+    WindowsMsaSoloClient, WindowsMsaSoloConfig, WindowsMsaSoloVolumeControl,
 };
 use sairplay_msa_solo::route::ProtocolPreference as MsaProtocolPreference;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -67,6 +67,7 @@ enum ActiveSession {
 
 #[derive(Clone)]
 enum ActiveVolumeControl {
+    MsaSolo(WindowsMsaSoloVolumeControl),
     Native(sairplay_engine::NativeVolumeControl),
     Legacy(sairplay_engine::LegacyVolumeControl),
 }
@@ -74,6 +75,14 @@ enum ActiveVolumeControl {
 impl ActiveVolumeControl {
     fn set(&self, percent: u8) -> Result<VolumeSetResult, String> {
         match self {
+            Self::MsaSolo(control) => control
+                .set(percent)
+                .map(|result| VolumeSetResult {
+                    percent: result.percent,
+                    db: result.db,
+                    status: result.status,
+                })
+                .map_err(|e| e.to_string()),
             Self::Native(control) => control.set(percent).map_err(|e| format!("{e:?}")),
             Self::Legacy(control) => control.set(percent).map_err(|e| e.to_string()),
         }
@@ -164,7 +173,13 @@ impl ActiveSession {
 
     fn volume_controls(&self) -> Vec<ActiveVolumeControl> {
         match self {
-            Self::MsaSolo(_) => Vec::new(),
+            Self::MsaSolo(session) => session
+                .client
+                .volume_control()
+                .ok()
+                .map(ActiveVolumeControl::MsaSolo)
+                .into_iter()
+                .collect(),
             Self::Single(session) => vec![ActiveVolumeControl::Native(session.volume_control())],
             Self::StereoPair(session) => session
                 .volume_controls()
@@ -1288,13 +1303,6 @@ impl SairplayApp {
         let Some(session) = self.session.as_ref() else {
             return;
         };
-        if matches!(session, ActiveSession::MsaSolo(_)) {
-            // The slider value is already persisted by the UI. During the
-            // first SOLO hardware gate, defer live RTSP volume mutation until
-            // the next Start without flooding the diagnostic log every frame.
-            return;
-        }
-
         let controls = session.volume_controls();
         let (tx, rx) = mpsc::sync_channel(1);
         self.volume_rx = Some(rx);
