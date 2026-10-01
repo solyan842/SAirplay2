@@ -3,7 +3,13 @@ name: Windows
 on:
   push:
     branches: [main, "dev/**", "rewrite/**"]
+    paths-ignore:
+      - "docs/PROJECT-STATE.md"
+      - "docs/MSA-SOLO-SOURCE-LOCK.md"
   pull_request:
+    paths-ignore:
+      - "docs/PROJECT-STATE.md"
+      - "docs/MSA-SOLO-SOURCE-LOCK.md"
 
 concurrency:
   group: sairplay2-${{ github.ref }}
