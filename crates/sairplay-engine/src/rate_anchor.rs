@@ -1,4 +1,4 @@
-use crate::{system_time_to_ntp, EncryptedRtspChannel, EncryptedRtspError, PtpClock, RtspRequest};
+use crate::{system_time_to_source_ntp, EncryptedRtspChannel, EncryptedRtspError, PtpClock, RtspRequest};
 use plist::{Dictionary, Value};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
@@ -136,7 +136,7 @@ pub fn buffered_anchor_start(
             thread::sleep(BUFFERED_ANCHOR_RETRY_DELAY);
         }
 
-        let now_ntp = system_time_to_ntp(SystemTime::now())
+        let now_ntp = system_time_to_source_ntp(SystemTime::now())
             .map_err(|_| RateAnchorError::Time)?;
         let lead_ns = remaining_lead_ns(config.commanded_start_ntp, now_ntp);
         let anchor_ns = clock.master_now_ns().saturating_add(lead_ns);

@@ -1,5 +1,5 @@
 use crate::{
-    buffered_anchor_start, system_time_to_ntp, BufferedAnchorStartConfig,
+    buffered_anchor_start, system_time_to_source_ntp, BufferedAnchorStartConfig,
     BufferedMediaSender, BufferedWriteOutcome, Pcm352Chunker, PtpClock,
     RealtimeMediaSender, SharedCseq, SharedRtspControl, WasapiLoopbackCapture,
     WasapiLoopbackError,
@@ -152,7 +152,7 @@ impl WindowsAudioWorker {
                             let effective_start_delay_ms =
                                 cold_start_delay_ms.max(readiness_lead_ms);
 
-                            let now_ntp = match system_time_to_ntp(SystemTime::now()) {
+                            let now_ntp = match system_time_to_source_ntp(SystemTime::now()) {
                                 Ok(value) => value,
                                 Err(error) => {
                                     if let Ok(mut slot) = last_error_thread.lock() {
@@ -250,7 +250,7 @@ impl WindowsAudioWorker {
                             if !chunker.has_packet() {
                                 break;
                             }
-                            let now_ntp = match system_time_to_ntp(SystemTime::now()) {
+                            let now_ntp = match system_time_to_source_ntp(SystemTime::now()) {
                                 Ok(value) => value,
                                 Err(error) => {
                                     if let Ok(mut slot) = last_error_thread.lock() {
@@ -492,7 +492,7 @@ impl WindowsAudioWorker {
                             let effective_start_delay_ms =
                                 cold_start_delay_ms.max(readiness_lead_ms);
 
-                            let now_ntp = match system_time_to_ntp(SystemTime::now()) {
+                            let now_ntp = match system_time_to_source_ntp(SystemTime::now()) {
                                 Ok(value) => value,
                                 Err(error) => {
                                     if let Ok(mut slot) = last_error_thread.lock() {
@@ -561,7 +561,7 @@ impl WindowsAudioWorker {
                             }
                         }
 
-                        let recovery_ntp = match system_time_to_ntp(SystemTime::now()) {
+                        let recovery_ntp = match system_time_to_source_ntp(SystemTime::now()) {
                             Ok(value) => value,
                             Err(error) => {
                                 if let Ok(mut slot) = last_error_thread.lock() {
@@ -661,7 +661,7 @@ impl WindowsAudioWorker {
                                 break;
                             }
 
-                            let ntp = match system_time_to_ntp(SystemTime::now()) {
+                            let ntp = match system_time_to_source_ntp(SystemTime::now()) {
                                 Ok(value) => value,
                                 Err(error) => {
                                     if let Ok(mut slot) = last_error_thread.lock() {
