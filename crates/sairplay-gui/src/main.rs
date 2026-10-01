@@ -11,7 +11,8 @@ use sairplay_engine::{
 };
 use sairplay_msa_solo::{
     validate_immediate_start, Ap2AudioFormat as MsaAp2AudioFormat,
-    WindowsMsaSoloClient, WindowsMsaSoloConfig, WindowsMsaSoloVolumeControl,
+    SoloClockReadinessState, WindowsMsaSoloClient, WindowsMsaSoloConfig,
+    WindowsMsaSoloVolumeControl, AIRPLAY_CLOCK_READY_TIMEOUT,
 };
 use sairplay_msa_solo::route::{Flow as MsaFlow, ProtocolPreference as MsaProtocolPreference};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -24,7 +25,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const MSA_SOLO_AUDIO_PRESENT_TIMEOUT: Duration = Duration::from_secs(5);
+const MSA_SOLO_START_LEAD_MS: u64 = 400;
+const MSA_SOLO_CLOCK_READY_LEAD_MS: u64 = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PlaybackUiState {
@@ -2403,7 +2408,19 @@ impl SairplayApp {
                                     .set_volume(volume)
                                     .map_err(|error| format!("MSA SOLO volume: {error:?}"))?;
                             }
-                            let requested_start_unix_ms = unix_ms_now();
+
+                            // Match pinned Music Assistant startup ownership:
+                            // audio must already be present before START, then PTP
+                            // receivers get up to 2.5s to publish their clock
+                            // projection. The audible anchor is now+400ms, never
+                            // earlier than ready_at+500ms when a projection exists.
+                            wait_msa_solo_audio_present(&client)?;
+                            startup_events.push("MSA SOLO AUDIO ready before START.".into());
+                            let (ready_at_unix_ms, clock_event) =
+                                wait_msa_solo_clock_projection(&client);
+                            startup_events.push(clock_event);
+                            let requested_start_unix_ms =
+                                msa_solo_start_anchor(unix_ms_now(), ready_at_unix_ms);
                             let start = client
                                 .commit_start(requested_start_unix_ms)
                                 .map_err(|error| format!("MSA SOLO START: {error:?}"))?;
@@ -2422,6 +2439,9 @@ impl SairplayApp {
                                 requested_start_unix_ms.abs_diff(start.at_unix_ms),
                             ));
                             startup_events.push(format!("MSA SOLO START {start:?}."));
+                            if client.route().flow == MsaFlow::AirPlay2Native {
+                                wait_msa_solo_audio_delivery(&client)?;
+                            }
                             if let Some(diag) = client.diagnostics() {
                                 startup_events.push(format!(
                                     "MSA SOLO TIMELINE head_frame={} pacing_ahead_frames={} audio_sent={} audio_dropped={} sync_sent={} sync_dropped={}.",
@@ -4422,7 +4442,7 @@ fn device_model(device: &DeviceRecord) -> String {
         .to_ascii_lowercase()
 }
 
-fn is_unsupported_living_tv(device: &DeviceRecord) -> bool {
+fn is_mitv_clone(device: &DeviceRecord) -> bool {
     let model = device_model(device);
     if !model.starts_with("appletv3,") {
         return false;
@@ -4438,8 +4458,15 @@ fn is_unsupported_living_tv(device: &DeviceRecord) -> bool {
     mitv_host || name.contains("mi project")
 }
 
+fn is_unsupported_living_tv(_device: &DeviceRecord) -> bool {
+    // MiTV is intentionally selectable again for MSA SOLO validation.
+    // Clone identity is still preserved below so it is not mistaken for a
+    // genuine Apple TV and forced through Apple's PIN-pairing path.
+    false
+}
+
 fn is_genuine_appletv_candidate(device: &DeviceRecord) -> bool {
-    device_model(device).starts_with("appletv") && !is_unsupported_living_tv(device)
+    device_model(device).starts_with("appletv") && !is_mitv_clone(device)
 }
 
 fn device_color_is_dark(device: &DeviceRecord) -> bool {
@@ -5282,6 +5309,93 @@ fn redact_msa_detail(detail: &str, credentials: Option<&str>) -> String {
     match credentials {
         Some(secret) if !secret.is_empty() => detail.replace(secret, "<redacted>"),
         _ => detail.to_owned(),
+    }
+}
+
+fn wait_msa_solo_audio_present(client: &WindowsMsaSoloClient) -> Result<(), String> {
+    let deadline = Instant::now() + MSA_SOLO_AUDIO_PRESENT_TIMEOUT;
+    loop {
+        if client.audio_ready() {
+            return Ok(());
+        }
+        if !client.is_connected() {
+            return Err("MSA SOLO audio source stopped before START".into());
+        }
+        if Instant::now() >= deadline {
+            return Err("MSA SOLO audio feed was not confirmed within 5 seconds".into());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn wait_msa_solo_clock_projection(client: &WindowsMsaSoloClient) -> (u64, String) {
+    if !client.uses_ptp() {
+        return (
+            0,
+            "MSA SOLO CLOCK not applicable: receiver uses NTP timing.".into(),
+        );
+    }
+
+    let deadline = Instant::now() + AIRPLAY_CLOCK_READY_TIMEOUT;
+    loop {
+        let readiness = client.clock_readiness();
+        if matches!(
+            readiness.state,
+            SoloClockReadinessState::Probing | SoloClockReadinessState::Ready
+        ) && readiness.ready_at_unix_ms != 0
+        {
+            return (
+                readiness.ready_at_unix_ms,
+                format!(
+                    "MSA SOLO CLOCK state={:?} exchanges={} streak_age={}ms ready_at={} ready_in={}ms.",
+                    readiness.state,
+                    readiness.exchanges,
+                    readiness.streak_age_ms,
+                    readiness.ready_at_unix_ms,
+                    readiness.ready_in_ms,
+                ),
+            );
+        }
+        if Instant::now() >= deadline {
+            return (
+                0,
+                format!(
+                    "MSA SOLO CLOCK projection unreported within {}ms; state={:?} exchanges={}; anchoring on the source lead.",
+                    AIRPLAY_CLOCK_READY_TIMEOUT.as_millis(),
+                    readiness.state,
+                    readiness.exchanges,
+                ),
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn msa_solo_start_anchor(now_unix_ms: u64, ready_at_unix_ms: u64) -> u64 {
+    let mut anchor = now_unix_ms.saturating_add(MSA_SOLO_START_LEAD_MS);
+    if ready_at_unix_ms != 0 {
+        anchor = anchor.max(
+            ready_at_unix_ms.saturating_add(MSA_SOLO_CLOCK_READY_LEAD_MS),
+        );
+    }
+    anchor
+}
+
+fn wait_msa_solo_audio_delivery(client: &WindowsMsaSoloClient) -> Result<(), String> {
+    let deadline = Instant::now() + MSA_SOLO_AUDIO_PRESENT_TIMEOUT;
+    loop {
+        if let Some(diag) = client.diagnostics() {
+            if diag.audio_sent != 0 {
+                return Ok(());
+            }
+        }
+        if !client.is_connected() {
+            return Err("MSA SOLO transport stopped before the first audio packet was sent".into());
+        }
+        if Instant::now() >= deadline {
+            return Err("MSA SOLO START completed but no audio packet was sent within 5 seconds".into());
+        }
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
