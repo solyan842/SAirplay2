@@ -40,8 +40,8 @@ impl SourceNtp {
 
     /// Explicit raw constructor. Keep raw ingress visually obvious at protocol
     /// boundaries; never use this to convert RFC-NTP.
-    pub const fn from_raw(raw: u64) -> Self { Self(raw) }
-    pub const fn raw(self) -> u64 { self.0 }
+    pub(crate) const fn from_raw(raw: u64) -> Self { Self(raw) }
+    pub(crate) const fn raw(self) -> u64 { self.0 }
 
     pub fn from_system_time(time: SystemTime) -> Result<Self, TimeDomainError> {
         let d = time.duration_since(UNIX_EPOCH).map_err(|_| TimeDomainError::BeforeUnixEpoch)?;
@@ -103,8 +103,8 @@ impl SourceNtp {
 pub struct RfcNtp(u64);
 
 impl RfcNtp {
-    pub const fn from_raw(raw: u64) -> Self { Self(raw) }
-    pub const fn raw(self) -> u64 { self.0 }
+    pub(crate) const fn from_raw(raw: u64) -> Self { Self(raw) }
+    pub(crate) const fn raw(self) -> u64 { self.0 }
 
     pub fn from_system_time(time: SystemTime) -> Result<Self, TimeDomainError> {
         let d = time.duration_since(UNIX_EPOCH).map_err(|_| TimeDomainError::BeforeUnixEpoch)?;

@@ -43,12 +43,12 @@ pub fn plan_stock_recovery(head_frame:u64,wire_rtp:u32,rtp_offset:u32,now_frame:
 
 const NTP_FRAC_SCALE:u128=1u128<<32;
 
-pub fn unix_ms_to_ntp(ms:u64)->u64{(((u128::from(ms/1000))<<32)+((u128::from(ms%1000)<<32)/1000)) as u64}
-pub fn ntp_to_unix_ms(ntp:u64)->u64{((u128::from(ntp>>32)*1000)+((u128::from(ntp&0xffff_ffff)*1000)>>32)) as u64}
-pub fn frames_to_ntp(frames:u64,sample_rate:u32)->u64{
+fn unix_ms_to_ntp(ms:u64)->u64{(((u128::from(ms/1000))<<32)+((u128::from(ms%1000)<<32)/1000)) as u64}
+fn ntp_to_unix_ms(ntp:u64)->u64{((u128::from(ntp>>32)*1000)+((u128::from(ntp&0xffff_ffff)*1000)>>32)) as u64}
+fn frames_to_ntp(frames:u64,sample_rate:u32)->u64{
  if sample_rate==0{0}else{((u128::from(frames)*NTP_FRAC_SCALE)/u128::from(sample_rate)) as u64}
 }
-pub fn ntp_to_frames(ntp:u64,sample_rate:u32)->u64{
+fn ntp_to_frames(ntp:u64,sample_rate:u32)->u64{
  if sample_rate==0{0}else{((u128::from(ntp)*u128::from(sample_rate))>>32) as u64}
 }
 

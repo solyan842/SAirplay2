@@ -48,3 +48,13 @@ Before 24/48, Stereo Pair or MultiRoom work continues:
 4. Timeline diagnostic has a plausible pacing-ahead value.
 5. Audio counters advance and sound is audibly present.
 6. STOP/START once more, then retain the GUI log.
+
+
+## Hardening against recurrence
+
+- Raw fixed-point constructors/accessors are crate-private escape hatches.
+- The raw fixed-point helpers in `native_timeline.rs` are private to that module.
+- The RAOP lane also carries absolute scheduling instants as `SourceNtp`, so
+  native AP2 and RAOP cannot silently diverge on epoch semantics.
+- Any future code that needs RFC/NTP must explicitly use `RfcNtp`; scheduling
+  APIs do not accept it.
