@@ -5,7 +5,8 @@
 use crate::clock::ProbeStreak;
 use crate::native_control::LiveTiming;
 use crate::native_runtime::SyncTiming;
-use crate::ntp_timing::{system_time_to_ntp, NtpTimingResponder};
+use crate::ntp_timing::NtpTimingResponder;
+use crate::native_timeline::system_time_to_source_ntp;
 use crate::ptp_engine::{PtpClock, PtpEngine};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -101,7 +102,10 @@ impl NativeTimingOwner {
 
     pub fn sync_timing(&self) -> Result<SyncTiming, String> {
         let now = SystemTime::now();
-        let ntp = system_time_to_ntp(now).map_err(|e| format!("clock NTP: {e:?}"))?;
+        // ap2_send_sync_packet_ptp in pinned MSA uses raopcl_get_ntp(NULL):
+        // Unix-epoch fixed point. The NTP responder below remains RFC/NTP-epoch.
+        let ntp = system_time_to_source_ntp(now)
+            .ok_or_else(|| "system clock before UNIX epoch".to_string())?;
         let local_ns = now.duration_since(UNIX_EPOCH)
             .map_err(|_| "system clock before UNIX epoch".to_string())?
             .as_nanos()

@@ -2,7 +2,7 @@
 
 use crate::{EncryptedRtspChannel, EncryptedRtspError, RtspRequest};
 use crate::ptp_engine::PtpClock;
-use crate::ntp_timing::system_time_to_ntp;
+use crate::native_timeline::system_time_to_source_ntp;
 use plist::{Dictionary, Value};
 use std::io::Cursor;
 use std::time::{Duration, SystemTime};
@@ -178,7 +178,7 @@ pub fn buffered_anchor_start(
 ) -> Result<u64, NativeCommandError> {
     for attempt in 0..12 {
         if attempt != 0 { thread::sleep(Duration::from_millis(500)); }
-        let now_ntp = system_time_to_ntp(SystemTime::now()).map_err(|_| NativeCommandError::Time)?;
+        let now_ntp = system_time_to_source_ntp(SystemTime::now()).ok_or(NativeCommandError::Time)?;
         let lead_ns = remaining_lead_ns(commanded_start_ntp, now_ntp);
         let anchor_ns = clock.master_now_ns().saturating_add(lead_ns);
         let cseq = next_cseq.fetch_add(1, Ordering::SeqCst);

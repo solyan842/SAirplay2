@@ -18,7 +18,7 @@ use crate::native_rtx::{RtxCounters, RtxRing};
 use crate::feedback::FeedbackWorker;
 use crate::native_rtx_worker::RtxWorker;
 use crate::native_timeline::{
-    frames_for_ms, ms_for_frames, ntp_to_frames, unix_ms_to_ntp, Timeline,
+    frames_for_ms, ms_for_frames, ntp_to_frames, system_time_to_source_ntp, unix_ms_to_ntp, Timeline,
 };
 use crate::{
     send_native_artwork, send_native_metadata, send_native_progress, send_teardown,
@@ -28,7 +28,6 @@ use crate::{
     MrpArtworkInfo, MrpArtworkResult, MrpController, MrpDataStream, MrpDataStreamWorker, MrpEventWorker,
     MrpPlaybackState, MrpPushResult, MrpRemoteCommand, MrpState,
 };
-use crate::ntp_timing::system_time_to_ntp;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::sync::{Arc, Mutex, atomic::Ordering};
@@ -1328,7 +1327,9 @@ impl NativeAp2Transport for NativeSoloEngine {
     }
 
     fn start_floor(&self) -> ClockFloor {
-        let now_ntp = system_time_to_ntp(SystemTime::now()).unwrap_or(0);
+        // Pinned MSA compares against raopcl_get_ntp(NULL), whose fixed-point
+        // epoch is Unix, not RFC/NTP 1900. Mixing epochs moves START ~70 years.
+        let now_ntp = system_time_to_source_ntp(SystemTime::now()).unwrap_or(0);
         clock_floor(
             now_ntp,
             true,

@@ -1288,10 +1288,9 @@ impl SairplayApp {
             return;
         };
         if matches!(session, ActiveSession::MsaSolo(_)) {
-            self.log.push(
-                "MSA SOLO hardware-test path: volume change saved and will apply on next Start."
-                    .into(),
-            );
+            // The slider value is already persisted by the UI. During the
+            // first SOLO hardware gate, defer live RTSP volume mutation until
+            // the next Start without flooding the diagnostic log every frame.
             return;
         }
 
