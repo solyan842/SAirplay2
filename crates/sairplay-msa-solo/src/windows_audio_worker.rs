@@ -265,6 +265,27 @@ impl WindowsSoloAudioWorker {
                                     .unwrap_or_default()
                                     .as_millis()
                                     .min(u128::from(u64::MAX)) as u64;
+
+                                // Cold Buffered media activation is source-gated:
+                                // RECORD -> type103 SETUP -> SETPEERS -> data TCP.
+                                // SETPEERS must happen before clock readiness is
+                                // evaluated, otherwise a long pre-source wait
+                                // would consume the readiness timeout before the
+                                // receiver is even invited onto the media peer set.
+                                let buffered_connected_now =
+                                    match guard.ensure_buffered_media_connected() {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            if let Ok(mut slot) = error_thread.lock() {
+                                                *slot = Some(format!(
+                                                    "deferred native SOLO media activation failed: {e:?}"
+                                                ));
+                                            }
+                                            running_thread.store(false, Ordering::SeqCst);
+                                            return;
+                                        }
+                                    };
+
                                 let uses_ptp = guard.uses_ptp();
                                 let readiness = guard.clock_readiness();
                                 let have_projection = uses_ptp
@@ -285,20 +306,6 @@ impl WindowsSoloAudioWorker {
                                     } else {
                                         0
                                     };
-                                    let buffered_connected_now =
-                                        match guard.ensure_buffered_media_connected() {
-                                            Ok(v) => v,
-                                            Err(e) => {
-                                                if let Ok(mut slot) = error_thread.lock() {
-                                                    *slot = Some(format!(
-                                                        "deferred native SOLO media connect failed: {e:?}"
-                                                    ));
-                                                }
-                                                running_thread.store(false, Ordering::SeqCst);
-                                                return;
-                                            }
-                                        };
-
                                     let mut requested =
                                         now_unix_ms.saturating_add(DEFERRED_START_LEAD_MS);
                                     if ready_at != 0 {
@@ -380,7 +387,7 @@ impl WindowsSoloAudioWorker {
                                 );
                                 if buffered_connected_now {
                                     events.push(
-                                        "MSA SOLO BUFFERED data TCP connected at source-present START boundary."
+                                        "MSA SOLO BUFFERED media leg activated and data TCP connected at source-present START boundary."
                                             .into(),
                                     );
                                 }

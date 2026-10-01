@@ -8,7 +8,10 @@ use crate::native_commands::{
     buffered_anchor_start, send_flushbuffered, send_realtime_flush,
     send_setrateanchortime, NativeCommandError,
 };
-use crate::native_control::{open_native_control, NativeControlConfig, NativeControlError, NativeControlReady};
+use crate::native_control::{
+    activate_buffered_media, open_native_control, NativeControlConfig,
+    NativeControlError, NativeControlReady,
+};
 use crate::native_media::{
     drain_buffered_pending, pacing_window_frames, BufferedPending, MediaCounters, MediaHealth, MediaIo, NativeMediaState, SendResult,
 };
@@ -1183,8 +1186,12 @@ impl NativeSoloEngine {
         if self.runtime.lane != NativeLane::Buffered {
             return Ok(false);
         }
+
+        let activated = activate_buffered_media(&mut self.ready, &self.config.control)
+            .map_err(NativeSoloError::Control)?;
+
         if self.ready.media.io.buffered_connected() {
-            return Ok(false);
+            return Ok(activated);
         }
         self.ready
             .media

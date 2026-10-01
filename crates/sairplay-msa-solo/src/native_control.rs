@@ -133,6 +133,10 @@ pub struct NativeControlReady {
     pub timing: LiveTiming,
     pub timing_owner: NativeTimingOwner,
     pub buffered: bool,
+    /// True once RECORD + type-103 Stream SETUP + SETPEERS have completed.
+    /// Realtime is activated eagerly; Buffered cold-start is source-gated.
+    pub buffered_media_active: bool,
+    buffered_media_flow: Option<NativeConnectFlow>,
     pub latency_min: Option<u32>,
     pub latency_max: Option<u32>,
     pub arrival_to_render_latency_ms: Option<u32>,
@@ -295,8 +299,11 @@ pub fn open_native_control(
         Duration::from_secs(3),
     ).map_err(|e| NativeControlError::Event(format!("{e:?}")))?;
 
-    // MSA opens/binds RTP data+control sockets after session SETUP/event and
-    // before RECORD/stream SETUP.
+    // Bind local media resources now, but do not create a never-started
+    // Buffered type-103 stream while Windows audio may remain idle indefinitely.
+    // Pinned MSA's connect->audio interval is short: it feeds source immediately
+    // after connection, waits for audio_present, then STARTs. Windows loopback
+    // needs an adapter boundary that preserves that media lifecycle.
     let mut media = NativeMediaOwner::prepare(
         bind_ip,
         config.audio_format.sample_rate,
@@ -304,41 +311,36 @@ pub fn open_native_control(
         config.audio_format.channels,
         &pairing,
     ).map_err(|e| NativeControlError::Media(format!("{e:?}")))?;
-    let local_ports = media.local_ports()
-        .map_err(|e| NativeControlError::Media(format!("{e:?}")))?;
-
-    send_record(
-        &mut flow,
-        &mut control,
-        &RecordConfig {
-            cseq: 2,
-            session_uri: session_uri.clone(),
-            dacp_id: config.dacp_id.clone(),
-            active_remote: config.active_remote.clone(),
-        },
-    ).map_err(|e| NativeControlError::Record(format!("{e:?}")))?;
 
     let mut latency_min = None;
     let mut latency_max = None;
     let mut arrival_to_render_latency_ms = None;
+    let buffered_media_active;
+    let buffered_media_flow;
+    let next_cseq_value;
+
     if buffered {
-        let result = setup_buffered_stream(
+        // Keep the encrypted control/PTP/event session alive and stop at
+        // EventChannelOpen. RECORD -> type103 SETUP -> SETPEERS are activated
+        // only when WASAPI reports the first source-present packet.
+        buffered_media_active = false;
+        buffered_media_flow = Some(flow);
+        next_cseq_value = 2;
+    } else {
+        let local_ports = media.local_ports()
+            .map_err(|e| NativeControlError::Media(format!("{e:?}")))?;
+
+        send_record(
             &mut flow,
             &mut control,
-            &BufferedStreamSetupConfig {
-                cseq: 3,
+            &RecordConfig {
+                cseq: 2,
                 session_uri: session_uri.clone(),
                 dacp_id: config.dacp_id.clone(),
                 active_remote: config.active_remote.clone(),
-                local_control_port: local_ports.control,
-                audio_secret: pairing.audio_secret,
-                stream_connection_id: session_id,
-                audio_format: config.audio_format,
             },
-        ).map_err(|e| NativeControlError::Media(format!("{e:?}")))?;
-        media.attach_buffered(receiver.ip(), result.data_port, result.control_port)
-            .map_err(|e| NativeControlError::Media(format!("{e:?}")))?;
-    } else {
+        ).map_err(|e| NativeControlError::Record(format!("{e:?}")))?;
+
         let result = setup_realtime_stream(
             &mut flow,
             &mut control,
@@ -362,34 +364,36 @@ pub fn open_native_control(
         latency_min = result.latency_min;
         latency_max = result.latency_max;
         arrival_to_render_latency_ms = result.arrival_to_render_latency_ms;
+
+        next_cseq_value = if matches!(timing, LiveTiming::Ptp { .. }) {
+            send_setpeers(
+                &mut control,
+                &SetPeersConfig {
+                    cseq: 4,
+                    session_uri: session_uri.clone(),
+                    receiver_address: receiver.ip().to_string(),
+                    local_address: publish_ip.to_string(),
+                    dacp_id: config.dacp_id.clone(),
+                    active_remote: config.active_remote.clone(),
+                },
+            ).map_err(|e| NativeControlError::SetPeers(format!("{e:?}")))?;
+            timing_owner.set_session_peers(receiver.ip(), publish_ip);
+            5
+        } else {
+            4
+        };
+
+        flow.ready()
+            .map_err(|e| NativeControlError::Flow(format!("{e:?}")))?;
+        buffered_media_active = true;
+        buffered_media_flow = None;
     }
-
-    let next_cseq = if matches!(timing, LiveTiming::Ptp { .. }) {
-        send_setpeers(
-            &mut control,
-            &SetPeersConfig {
-                cseq: 4,
-                session_uri: session_uri.clone(),
-                receiver_address: receiver.ip().to_string(),
-                local_address: publish_ip.to_string(),
-                dacp_id: config.dacp_id.clone(),
-                active_remote: config.active_remote.clone(),
-            },
-        ).map_err(|e| NativeControlError::SetPeers(format!("{e:?}")))?;
-        timing_owner.set_session_peers(receiver.ip(), publish_ip);
-        5
-    } else {
-        4
-    };
-
-    flow.ready()
-        .map_err(|e| NativeControlError::Flow(format!("{e:?}")))?;
 
     // Pinned MSA: NTP SSRC == streamConnectionID; PTP SSRC == 0.
     let ssrc = if matches!(timing, LiveTiming::Ptp { .. }) { 0 } else { session_id };
 
     let control = Arc::new(Mutex::new(control));
-    let next_cseq = Arc::new(AtomicU32::new(next_cseq));
+    let next_cseq = Arc::new(AtomicU32::new(next_cseq_value));
 
     Ok(NativeControlReady {
         control,
@@ -412,11 +416,90 @@ pub fn open_native_control(
         timing,
         timing_owner,
         buffered,
+        buffered_media_active,
+        buffered_media_flow,
         latency_min,
         latency_max,
         arrival_to_render_latency_ms,
         next_cseq,
     })
+}
+
+/// Complete the never-started Buffered media leg only when source-present
+/// audio exists. The shared control mutex is held while CSeq values are
+/// allocated so /feedback cannot overtake RECORD/SETUP/SETPEERS on the wire.
+pub fn activate_buffered_media(
+    ready: &mut NativeControlReady,
+    config: &NativeControlConfig,
+) -> Result<bool, NativeControlError> {
+    if !ready.buffered || ready.buffered_media_active {
+        return Ok(false);
+    }
+
+    let mut flow = ready.buffered_media_flow.take().ok_or_else(|| {
+        NativeControlError::Flow("buffered media activation flow is missing".into())
+    })?;
+    let local_ports = ready.media.local_ports()
+        .map_err(|e| NativeControlError::Media(format!("{e:?}")))?;
+    let control_arc = Arc::clone(&ready.control);
+    let mut control = control_arc.lock()
+        .map_err(|_| NativeControlError::Media("RTSP control mutex poisoned".into()))?;
+
+    let record_cseq = ready.next_cseq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    send_record(
+        &mut flow,
+        &mut control,
+        &RecordConfig {
+            cseq: record_cseq,
+            session_uri: ready.session_uri.clone(),
+            dacp_id: config.dacp_id.clone(),
+            active_remote: config.active_remote.clone(),
+        },
+    ).map_err(|e| NativeControlError::Record(format!("{e:?}")))?;
+
+    let setup_cseq = ready.next_cseq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let result = setup_buffered_stream(
+        &mut flow,
+        &mut control,
+        &BufferedStreamSetupConfig {
+            cseq: setup_cseq,
+            session_uri: ready.session_uri.clone(),
+            dacp_id: config.dacp_id.clone(),
+            active_remote: config.active_remote.clone(),
+            local_control_port: local_ports.control,
+            audio_secret: ready.hap_shared_secret,
+            stream_connection_id: ready.session_id,
+            audio_format: config.audio_format,
+        },
+    ).map_err(|e| NativeControlError::Media(format!("{e:?}")))?;
+
+    ready.media
+        .attach_buffered(ready.receiver.ip(), result.data_port, result.control_port)
+        .map_err(|e| NativeControlError::Media(format!("{e:?}")))?;
+
+    if matches!(ready.timing, LiveTiming::Ptp { .. }) {
+        let peers_cseq = ready.next_cseq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        send_setpeers(
+            &mut control,
+            &SetPeersConfig {
+                cseq: peers_cseq,
+                session_uri: ready.session_uri.clone(),
+                receiver_address: ready.receiver.ip().to_string(),
+                local_address: ready.publish_ip.to_string(),
+                dacp_id: config.dacp_id.clone(),
+                active_remote: config.active_remote.clone(),
+            },
+        ).map_err(|e| NativeControlError::SetPeers(format!("{e:?}")))?;
+        ready.timing_owner
+            .set_session_peers(ready.receiver.ip(), ready.publish_ip);
+    }
+
+    flow.ready()
+        .map_err(|e| NativeControlError::Flow(format!("{e:?}")))?;
+    drop(control);
+    ready.buffered_media_flow = None;
+    ready.buffered_media_active = true;
+    Ok(true)
 }
 
 fn pairing_error_is_transport(error: &crate::PairingError) -> bool {
