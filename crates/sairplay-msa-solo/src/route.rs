@@ -203,9 +203,17 @@ pub fn supports_buffered_audio(features: u64) -> bool { feature(features, FEAT_B
 /// Pinned source currently has an empty realtime-splice deny-list.
 pub fn splice_timeline_allowed(_txt: Option<&str>, _am: Option<&str>) -> bool { true }
 
-/// Exact MSA type-103 selection policy. Buffered is eligible only for native
-/// PTP, CLIAIRPLAY_BUFFERED outranks all other decisions, and Apple models are
-/// excluded from automatic type-103 selection by measured behavior.
+/// Local measured-hostile type-103 exceptions. Keep this narrowly scoped:
+/// the receiver remains native AirPlay 2/PTP and only Automatic buffered
+/// selection is denied. Explicit/diagnostic forcing still wins.
+fn buffered_denied(txt: Option<&str>, am: Option<&str>) -> bool {
+    model_prefix(txt, am, "Mu-so Qb")
+}
+
+/// MSA type-103 selection policy plus documented local hardware exceptions.
+/// Buffered is eligible only for native PTP, CLIAIRPLAY_BUFFERED outranks all
+/// other decisions, Apple models are excluded by upstream behavior, and the
+/// local measured-hostile deny set affects Automatic selection only.
 pub fn buffered_route(
     route: &RouteDecision,
     txt: Option<&str>,
@@ -219,8 +227,9 @@ pub fn buffered_route(
         return env_enabled("CLIAIRPLAY_BUFFERED", false);
     }
     if forced { return true; }
-    supports_buffered_audio(txt_features(txt)) && !apple_model(txt, am)
-    // Pinned buffered deny-list is intentionally empty.
+    supports_buffered_audio(txt_features(txt))
+        && !apple_model(txt, am)
+        && !buffered_denied(txt, am)
 }
 
 #[cfg(test)]
@@ -256,6 +265,13 @@ mod tests {
     #[test] fn auto_buffered_excludes_apple_but_forced_allows_it() {
         let route=RouteDecision{flow:Flow::AirPlay2Native,timing:Timing::Ptp,transient_pairing:false,features:1u64<<FEAT_BUFFERED,flags:0,reason:""};
         let txt=Some("features=0x0,0x100 model=AppleTV14,1");
+        assert!(!buffered_route(&route,txt,None,false));
+        assert!(buffered_route(&route,txt,None,true));
+    }
+
+    #[test] fn auto_buffered_denies_measured_hostile_muso_qb_but_forced_allows_it() {
+        let route=RouteDecision{flow:Flow::AirPlay2Native,timing:Timing::Ptp,transient_pairing:false,features:1u64<<FEAT_BUFFERED,flags:0,reason:""};
+        let txt=Some("features=0x0,0x100 model=Mu-so Qb");
         assert!(!buffered_route(&route,txt,None,false));
         assert!(buffered_route(&route,txt,None,true));
     }
