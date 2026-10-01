@@ -61,8 +61,18 @@ impl NativeMediaIo {
         self.attach_control_remote(receiver_ip, control_port);
     }
 
+    pub fn buffered_connected(&self) -> bool {
+        self.buffered.is_some()
+    }
+
     pub fn connect_buffered(&mut self) -> io::Result<()> {
-        let remote = self.remote_data.ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "remote data endpoint not attached"))?;
+        if self.buffered.is_some() {
+            return Ok(());
+        }
+        let remote = self.remote_data.ok_or_else(|| io::Error::new(
+            io::ErrorKind::NotConnected,
+            "remote data endpoint not attached",
+        ))?;
         let stream = TcpStream::connect_timeout(&remote, BUFFERED_WRITE_TIMEOUT)?;
         stream.set_nodelay(true)?;
         stream.set_write_timeout(Some(BUFFERED_WRITE_TIMEOUT))?;

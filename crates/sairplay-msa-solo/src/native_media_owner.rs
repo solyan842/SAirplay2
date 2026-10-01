@@ -70,6 +70,11 @@ impl NativeMediaOwner {
 
     /// Type-103 has a receiver-owned TCP data listener. Its SETUP response may
     /// omit a remote control port; buffered media itself does not use RTX/sync.
+    ///
+    /// Windows system audio may stay idle indefinitely after the AirPlay control
+    /// session is Ready. Unlike MSA's media-source path, do not leave the type-103
+    /// data TCP connected and empty for that whole interval. Record the endpoint
+    /// here and connect it only at the source-present START boundary.
     pub fn attach_buffered(
         &mut self,
         receiver_ip: IpAddr,
@@ -80,6 +85,10 @@ impl NativeMediaOwner {
         if let Some(port) = control_port {
             self.io.attach_control_remote(receiver_ip, port);
         }
+        Ok(())
+    }
+
+    pub fn connect_buffered(&mut self) -> Result<(), NativeMediaOwnerError> {
         self.io.connect_buffered()?;
         Ok(())
     }
@@ -118,8 +127,9 @@ mod tests {
     }
 
     #[test]
-    fn buffered_attach_connects_receiver_owned_tcp_listener() {
+    fn buffered_attach_defers_tcp_until_explicit_source_boundary_connect() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
         let p = pairing();
         let mut owner = NativeMediaOwner::prepare(
@@ -129,7 +139,21 @@ mod tests {
             2,
             &p,
         ).unwrap();
+
         owner.attach_buffered(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port(), None).unwrap();
-        let (_sock, _) = listener.accept().unwrap();
+        assert!(!owner.io.buffered_connected());
+        assert_eq!(listener.accept().unwrap_err().kind(), io::ErrorKind::WouldBlock);
+
+        owner.connect_buffered().unwrap();
+        assert!(owner.io.buffered_connected());
+        let (_sock, _) = loop {
+            match listener.accept() {
+                Ok(v) => break v,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::yield_now();
+                }
+                Err(e) => panic!("accept failed: {e}"),
+            }
+        };
     }
 }

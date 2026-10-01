@@ -279,6 +279,20 @@ impl WindowsSoloAudioWorker {
                                     } else {
                                         0
                                     };
+                                    let buffered_connected_now =
+                                        match guard.ensure_buffered_media_connected() {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                if let Ok(mut slot) = error_thread.lock() {
+                                                    *slot = Some(format!(
+                                                        "deferred native SOLO media connect failed: {e:?}"
+                                                    ));
+                                                }
+                                                running_thread.store(false, Ordering::SeqCst);
+                                                return;
+                                            }
+                                        };
+
                                     let mut requested =
                                         now_unix_ms.saturating_add(DEFERRED_START_LEAD_MS);
                                     if ready_at != 0 {
@@ -332,18 +346,38 @@ impl WindowsSoloAudioWorker {
                                             readiness.exchanges,
                                         )
                                     };
-                                    Some((requested, started, diag, mrp, clock_event))
+                                    Some((
+                                        requested,
+                                        started,
+                                        diag,
+                                        mrp,
+                                        clock_event,
+                                        buffered_connected_now,
+                                    ))
                                 }
                             }
                         };
 
-                        if let Some((requested, started, diag, mrp, clock_event)) = start_attempt {
+                        if let Some((
+                            requested,
+                            started,
+                            diag,
+                            mrp,
+                            clock_event,
+                            buffered_connected_now,
+                        )) = start_attempt {
                             deferred_start_thread.store(false, Ordering::SeqCst);
                             if let Ok(mut events) = events_thread.lock() {
                                 events.push(
                                     "MSA SOLO AUDIO first packet present; committing deferred Buffered START."
                                         .into(),
                                 );
+                                if buffered_connected_now {
+                                    events.push(
+                                        "MSA SOLO BUFFERED data TCP connected at source-present START boundary."
+                                            .into(),
+                                    );
+                                }
                                 events.push(clock_event);
                                 events.push(format!(
                                     "MSA SOLO TIME requested={} accepted={} delta={}ms.",

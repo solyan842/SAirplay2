@@ -1175,6 +1175,26 @@ impl NativeSoloEngine {
 
     pub fn is_buffered(&self) -> bool { self.runtime.lane == NativeLane::Buffered }
 
+    /// Windows adaptation of MSA's short connect->audio interval: Stream SETUP
+    /// may be Ready long before system audio exists, so establish type-103's
+    /// receiver-owned data TCP only when the first source packet is about to
+    /// receive a START anchor. Returns true when this call opened the socket.
+    pub fn ensure_buffered_media_connected(&mut self) -> Result<bool, NativeSoloError> {
+        if self.runtime.lane != NativeLane::Buffered {
+            return Ok(false);
+        }
+        if self.ready.media.io.buffered_connected() {
+            return Ok(false);
+        }
+        self.ready
+            .media
+            .connect_buffered()
+            .map_err(|e| NativeSoloError::Command(format!(
+                "buffered data TCP connect at START boundary: {e:?}"
+            )))?;
+        Ok(true)
+    }
+
     pub fn splice_pad_frames(&self) -> u64 { self.runtime.splice_pad_frames }
 
     pub fn consume_splice_pad_frames(&mut self, frames: u32) -> u32 {
