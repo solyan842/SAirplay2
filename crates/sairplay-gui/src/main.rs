@@ -427,6 +427,8 @@ struct SairplayApp {
     initial_volume_text: String,
     volume_rx: Option<Receiver<Result<Vec<VolumeSetResult>, String>>>,
     pending_volume: Option<u8>,
+    muted: bool,
+    mute_restore_volume: u8,
     legacy_secrets: BTreeMap<String, String>,
     native_credentials: BTreeMap<String, String>,
     hires_overrides: BTreeMap<String, bool>,
@@ -484,6 +486,8 @@ impl Default for SairplayApp {
         let initial_volume_text = load_saved_volume()
             .map(|volume| volume.to_string())
             .unwrap_or_else(|| "50".to_owned());
+        let initial_volume = initial_volume_text.parse::<u8>().unwrap_or(50).min(100);
+        let mute_restore_volume = if initial_volume == 0 { 50 } else { initial_volume };
 
         Self {
             log: {
@@ -511,6 +515,8 @@ impl Default for SairplayApp {
             initial_volume_text,
             volume_rx: None,
             pending_volume: None,
+            muted: initial_volume == 0,
+            mute_restore_volume,
             legacy_secrets: BTreeMap::new(),
             native_credentials: load_native_credentials(),
             hires_overrides: BTreeMap::new(),
@@ -828,6 +834,14 @@ impl SairplayApp {
                     self.active_mode = Some(success.mode);
                     self.playback = PlaybackUiState::Playing(success.label);
                     self.session = Some(success.session);
+                    let current_volume = parse_volume_text(&self.initial_volume_text)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(self.mute_restore_volume);
+                    self.muted = current_volume == 0;
+                    if current_volume > 0 {
+                        self.mute_restore_volume = current_volume;
+                    }
                 } else {
                     let message =
                         "native transport returned without a running Windows audio path".to_owned();
@@ -1316,6 +1330,39 @@ impl SairplayApp {
                 let _ = tx.send(result);
             })
             .expect("failed to spawn volume worker");
+    }
+
+    fn toggle_mute(&mut self) {
+        if self.session.is_none() || !matches!(self.playback, PlaybackUiState::Playing(_)) {
+            return;
+        }
+
+        if self.muted {
+            let desired = parse_volume_text(&self.initial_volume_text)
+                .ok()
+                .flatten()
+                .unwrap_or(self.mute_restore_volume);
+            let restore = if desired == 0 {
+                self.mute_restore_volume.max(1)
+            } else {
+                desired
+            };
+            self.initial_volume_text = restore.to_string();
+            self.mute_restore_volume = restore;
+            save_volume(restore);
+            self.muted = false;
+            self.apply_volume_value(restore);
+        } else {
+            let current = parse_volume_text(&self.initial_volume_text)
+                .ok()
+                .flatten()
+                .unwrap_or(self.mute_restore_volume);
+            if current > 0 {
+                self.mute_restore_volume = current;
+            }
+            self.muted = true;
+            self.apply_volume_value(0);
+        }
     }
 
     fn legacy_pairing_key(device: &DeviceRecord) -> Option<String> {
@@ -2135,6 +2182,7 @@ impl SairplayApp {
         self.connect_rx = Some(rx);
         self.playback = PlaybackUiState::Connecting(label.clone());
         self.session = None;
+        self.muted = false;
         self.active_fullnames.clear();
         self.last_feedback_error = None;
 
@@ -2366,6 +2414,7 @@ impl SairplayApp {
         self.membership_pending.clear();
         self.membership_rx = None;
         self.playback = PlaybackUiState::Idle;
+        self.muted = false;
         self.last_retransmit_stats = RetransmitStats::default();
         self.last_member_retransmit_stats.clear();
     }
@@ -3075,7 +3124,46 @@ impl SairplayApp {
                         egui::vec2(card_inner_w, CARD_INNER_H),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
-                            draw_speaker_icon(ui, egui::vec2(25.0, 25.0));
+                            let audio_active = self.session.is_some()
+                                && matches!(self.playback, PlaybackUiState::Playing(_));
+                            let icon_color = if audio_active {
+                                if self.muted { UiTheme::red() } else { UiTheme::blue() }
+                            } else {
+                                UiTheme::text_soft()
+                            };
+                            let status_text = if !audio_active {
+                                self.t("Chưa phát", "Idle")
+                            } else if self.muted {
+                                self.t("Đã tắt âm", "Muted")
+                            } else {
+                                self.t("Đang bật âm", "Audio On")
+                            };
+                            let tooltip = if self.muted {
+                                self.t("Bật âm", "Unmute")
+                            } else {
+                                self.t("Tắt âm", "Mute")
+                            };
+
+                            let mut mute_clicked = false;
+                            ui.vertical_centered(|ui| {
+                                let response = draw_speaker_mute_button(
+                                    ui,
+                                    egui::vec2(29.0, 27.0),
+                                    icon_color,
+                                    audio_active,
+                                    tooltip,
+                                );
+                                mute_clicked = response.clicked();
+                                ui.label(
+                                    egui::RichText::new(status_text)
+                                        .size(9.0)
+                                        .strong()
+                                        .color(icon_color),
+                                );
+                            });
+                            if mute_clicked {
+                                self.toggle_mute();
+                            }
                             ui.add_space(6.0);
 
                             ui.vertical(|ui| {
@@ -3098,7 +3186,14 @@ impl SairplayApp {
                                     if response.changed() {
                                         self.initial_volume_text = volume.to_string();
                                         save_volume(volume);
-                                        self.apply_volume_value(volume);
+                                        if volume == 0 {
+                                            self.muted = true;
+                                            self.apply_volume_value(0);
+                                        } else {
+                                            self.mute_restore_volume = volume;
+                                            self.muted = false;
+                                            self.apply_volume_value(volume);
+                                        }
                                     }
 
                                     let (badge_rect, _) = ui.allocate_exact_size(
@@ -3817,14 +3912,33 @@ fn draw_action_button(
     response
 }
 
-fn draw_speaker_icon(ui: &mut egui::Ui, size: egui::Vec2) {
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+fn draw_speaker_mute_button(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    color: egui::Color32,
+    enabled: bool,
+    tooltip: &str,
+) -> egui::Response {
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    let shrink = if enabled && response.hovered() { 1.5 } else { 3.0 };
+    let icon_rect = rect.shrink(shrink);
     ui.put(
-        rect.shrink(3.0),
+        icon_rect,
         egui::Image::new(egui::include_image!("../assets/fluent_speaker_2_24_filled.svg"))
-            .fit_to_exact_size(rect.shrink(3.0).size())
-            .tint(UiTheme::text_soft()),
+            .fit_to_exact_size(icon_rect.size())
+            .tint(color),
     );
+
+    if enabled {
+        response.on_hover_text(tooltip)
+    } else {
+        response
+    }
 }
 
 fn homepod_tsid(device: &DeviceRecord) -> Option<&str> {
