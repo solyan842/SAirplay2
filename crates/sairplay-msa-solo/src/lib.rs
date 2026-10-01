@@ -15,6 +15,8 @@ pub mod native_control;
 pub mod native_solo;
 pub mod pcm_chunker;
 #[cfg(windows)]
+mod pcm_bridge;
+#[cfg(windows)]
 pub mod wasapi_loopback;
 #[cfg(windows)]
 pub mod windows_audio_worker;

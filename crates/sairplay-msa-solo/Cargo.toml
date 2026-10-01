@@ -23,3 +23,4 @@ chacha20poly1305 = "0.10.1"
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_System_Com"] }
 libloading = "0.8"
+rubato = "=0.16.2"

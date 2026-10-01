@@ -131,7 +131,7 @@ impl WindowsRaopAudioWorker {
         let error_c=Arc::clone(&last_error);
         let (ready_tx,ready_rx)=mpsc::sync_channel::<Result<(),String>>(1);
         let capture_worker=thread::Builder::new().name("msa-raop-wasapi".into()).spawn(move||{
-            let capture=match WasapiLoopbackCapture::open_default_for_format(audio_format){
+            let mut capture=match WasapiLoopbackCapture::open_default_for_format(audio_format){
                 Ok(v)=>{let _=ready_tx.send(Ok(()));v}
                 Err(e)=>{
                     let msg=e.to_string();let _=ready_tx.send(Err(msg.clone()));
@@ -146,11 +146,11 @@ impl WindowsRaopAudioWorker {
             while running_c.load(Ordering::SeqCst) {
                 let generation=flush_c.load(Ordering::SeqCst);
                 if generation!=local_flush {
-                    // The transport FLUSH has already completed while control
-                    // held its own serialization. Reset only bytes retained
-                    // before that boundary; subsequent WASAPI data becomes the
-                    // next persistent-session content.
+                    // MSA replaces the per-seek FFmpeg at this boundary. Clear
+                    // both packetized PCM and the Windows private converter
+                    // history so no pre-FLUSH samples bleed into the new source.
                     chunker.clear();
+                    capture.reset_conversion();
                     pending_packet=None;
                     local_flush=generation;
                     audio_ready_c.store(false,Ordering::SeqCst);

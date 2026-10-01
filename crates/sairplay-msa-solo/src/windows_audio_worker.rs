@@ -91,8 +91,11 @@ impl WindowsSoloAudioWorker {
         let worker = thread::Builder::new()
             .name("sairplay-msa-wasapi".into())
             .spawn(move || {
-                let capture = match WasapiLoopbackCapture::open_default_for_format(audio_format) {
+                let mut capture = match WasapiLoopbackCapture::open_default_for_format(audio_format) {
                     Ok(v) => {
+                        if let Ok(mut events) = events_thread.lock() {
+                            events.push(format!("MSA INPUT {}.", v.format_summary()));
+                        }
                         let _ = ready_tx.send(Ok(()));
                         v
                     }
@@ -140,6 +143,7 @@ impl WindowsSoloAudioWorker {
                     let generation = flush_thread.load(Ordering::SeqCst);
                     if generation != local_flush_generation {
                         chunker.clear();
+                        capture.reset_conversion();
                         local_flush_generation = generation;
                         starvation_started = None;
                         last_starvation_recovery = None;
