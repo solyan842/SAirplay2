@@ -86,6 +86,14 @@ pub struct WasapiDrainReport {
     pub silent_frames: usize,
     pub discontinuities: u64,
     pub discontinuity_frame_offset: Option<u64>,
+    /// First source frame belonging to a WASAPI packet that is not marked
+    /// AUDCLNT_BUFFERFLAGS_SILENT. This is a source-presence signal, not an
+    /// amplitude test: a real packet containing digital zero remains valid PCM.
+    pub first_non_silent_frame_offset: Option<u64>,
+}
+
+fn packet_is_source_present(flags: u32) -> bool {
+    (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) == 0
 }
 
 pub struct WasapiLoopbackCapture {
@@ -281,7 +289,10 @@ impl WasapiLoopbackCapture {
                 }
 
                 let source_frames = frames as usize;
-                let silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0;
+                let silent = !packet_is_source_present(flags);
+                if !silent && report.first_non_silent_frame_offset.is_none() {
+                    report.first_non_silent_frame_offset = Some(drained_before);
+                }
                 let byte_len = source_frames.saturating_mul(self.input_bytes_per_frame);
 
                 let produced = if silent {
@@ -440,6 +451,25 @@ mod tests {
         assert_eq!(parsed.sample_rate, 48_000);
         assert_eq!(parsed.channels, 2);
         assert_eq!(parsed.kind, InputSampleKind::I16);
+    }
+
+    #[test]
+    fn wasapi_engine_silent_packet_is_not_source_present() {
+        assert!(!packet_is_source_present(
+            AUDCLNT_BUFFERFLAGS_SILENT.0 as u32
+        ));
+        assert!(!packet_is_source_present(
+            AUDCLNT_BUFFERFLAGS_SILENT.0 as u32
+                | AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32
+        ));
+    }
+
+    #[test]
+    fn non_silent_packet_is_source_present_even_without_amplitude_probe() {
+        assert!(packet_is_source_present(0));
+        assert!(packet_is_source_present(
+            AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32
+        ));
     }
 
     #[test]

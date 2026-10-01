@@ -116,6 +116,10 @@ impl WindowsSoloAudioWorker {
                 let mut chunker =
                     Pcm352Chunker::new_with_bytes_per_frame(audio_format.input_bytes_per_frame());
                 let mut captured_frames_total = 0u64;
+                // Cold-start adapter invariant: WASAPI engine-silent packets are
+                // not equivalent to MSA stdin audio_present. Latch only after
+                // the first packet not marked AUDCLNT_BUFFERFLAGS_SILENT.
+                let mut source_present = false;
                 let mut local_flush_generation = flush_thread.load(Ordering::SeqCst);
                 let mut starvation_started: Option<Instant> = None;
                 let mut last_starvation_recovery: Option<Instant> = None;
@@ -182,6 +186,36 @@ impl WindowsSoloAudioWorker {
                     }
                     captured_frames_total =
                         captured_frames_total.saturating_add(report.frames as u64);
+
+                    // Pinned MSA waits for actual source bytes before START.
+                    // Windows shared-loopback can emit engine-generated SILENT
+                    // packets while no application is playing; those packets
+                    // must not satisfy audio_present. Preserve stable's adapter
+                    // boundary: drop pre-source engine silence, reset conversion
+                    // history, and wait indefinitely for the first non-SILENT
+                    // WASAPI packet. This deliberately does not inspect sample
+                    // amplitude, so a real digital-zero source remains valid.
+                    if !source_present {
+                        if report.first_non_silent_frame_offset.is_some() {
+                            source_present = true;
+                            if let Ok(mut events) = events_thread.lock() {
+                                events.push(
+                                    "MSA INPUT source-present: first non-SILENT WASAPI packet."
+                                        .into(),
+                                );
+                            }
+                        } else {
+                            chunker.clear();
+                            capture.reset_conversion();
+                            audio_ready_thread.store(false, Ordering::SeqCst);
+                            deferred_audio_seen = None;
+                            if report.frames == 0 {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            continue;
+                        }
+                    }
+
                     // MSA's persistent input ring is max(4 seconds, 1 MiB).
                     // WASAPI cannot backpressure the system mixer, so preserve
                     // the oldest resident bytes and discard only new excess.
@@ -195,11 +229,10 @@ impl WindowsSoloAudioWorker {
 
                     // Windows loopback differs from MSA's ffmpeg/stdin source:
                     // a Buffered type-103 receiver must not be anchored before
-                    // the first real PCM packet exists. Otherwise a user who
-                    // starts playback a few seconds later feeds an already
-                    // expired buffered timeline, and Buffered deliberately has
-                    // no starvation re-anchor. Keep the first PCM resident in
-                    // the chunker while the receiver clock projection settles.
+                    // source-present PCM exists and a complete packet is retained.
+                    // Engine-silent WASAPI buffers were rejected above. Keep the
+                    // first source packet resident in the chunker while the
+                    // receiver clock projection settles.
                     if deferred_start_thread.load(Ordering::SeqCst) && chunker.has_packet() {
                         let first_audio_at =
                             *deferred_audio_seen.get_or_insert_with(Instant::now);
