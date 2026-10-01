@@ -27,7 +27,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const MSA_SOLO_AUDIO_PRESENT_TIMEOUT: Duration = Duration::from_secs(5);
 const MSA_SOLO_START_LEAD_MS: u64 = 400;
 const MSA_SOLO_CLOCK_READY_LEAD_MS: u64 = 500;
 
@@ -2409,13 +2408,10 @@ impl SairplayApp {
                                     .map_err(|error| format!("MSA SOLO volume: {error:?}"))?;
                             }
 
-                            // Match pinned Music Assistant startup ownership:
-                            // audio must already be present before START, then PTP
-                            // receivers get up to 2.5s to publish their clock
-                            // projection. The audible anchor is now+400ms, never
-                            // earlier than ready_at+500ms when a projection exists.
-                            wait_msa_solo_audio_present(&client)?;
-                            startup_events.push("MSA SOLO AUDIO ready before START.".into());
+                            // Windows loopback is not MSA's ffmpeg/stdin source:
+                            // it may legitimately have no PCM before START. Keep
+                            // the source-faithful receiver-clock planning, but do
+                            // not turn pre-START WASAPI silence into connect failure.
                             let (ready_at_unix_ms, clock_event) =
                                 wait_msa_solo_clock_projection(&client);
                             startup_events.push(clock_event);
@@ -2439,9 +2435,6 @@ impl SairplayApp {
                                 requested_start_unix_ms.abs_diff(start.at_unix_ms),
                             ));
                             startup_events.push(format!("MSA SOLO START {start:?}."));
-                            if client.route().flow == MsaFlow::AirPlay2Native {
-                                wait_msa_solo_audio_delivery(&client)?;
-                            }
                             if let Some(diag) = client.diagnostics() {
                                 startup_events.push(format!(
                                     "MSA SOLO TIMELINE head_frame={} pacing_ahead_frames={} audio_sent={} audio_dropped={} sync_sent={} sync_dropped={}.",
@@ -5312,22 +5305,6 @@ fn redact_msa_detail(detail: &str, credentials: Option<&str>) -> String {
     }
 }
 
-fn wait_msa_solo_audio_present(client: &WindowsMsaSoloClient) -> Result<(), String> {
-    let deadline = Instant::now() + MSA_SOLO_AUDIO_PRESENT_TIMEOUT;
-    loop {
-        if client.audio_ready() {
-            return Ok(());
-        }
-        if !client.is_connected() {
-            return Err("MSA SOLO audio source stopped before START".into());
-        }
-        if Instant::now() >= deadline {
-            return Err("MSA SOLO audio feed was not confirmed within 5 seconds".into());
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-}
-
 fn wait_msa_solo_clock_projection(client: &WindowsMsaSoloClient) -> (u64, String) {
     if !client.uses_ptp() {
         return (
@@ -5379,24 +5356,6 @@ fn msa_solo_start_anchor(now_unix_ms: u64, ready_at_unix_ms: u64) -> u64 {
         );
     }
     anchor
-}
-
-fn wait_msa_solo_audio_delivery(client: &WindowsMsaSoloClient) -> Result<(), String> {
-    let deadline = Instant::now() + MSA_SOLO_AUDIO_PRESENT_TIMEOUT;
-    loop {
-        if let Some(diag) = client.diagnostics() {
-            if diag.audio_sent != 0 {
-                return Ok(());
-            }
-        }
-        if !client.is_connected() {
-            return Err("MSA SOLO transport stopped before the first audio packet was sent".into());
-        }
-        if Instant::now() >= deadline {
-            return Err("MSA SOLO START completed but no audio packet was sent within 5 seconds".into());
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
 }
 
 fn unix_ms_now() -> u64 {

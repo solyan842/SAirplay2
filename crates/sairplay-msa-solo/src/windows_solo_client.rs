@@ -262,13 +262,6 @@ impl WindowsMsaSoloClient {
 
     pub fn route(&self) -> RouteDecision { self.route }
 
-    pub fn audio_ready(&self) -> bool {
-        match &self.transport {
-            Transport::Native { worker, .. } => worker.audio_ready(),
-            Transport::Raop { worker } => worker.audio_ready(),
-        }
-    }
-
     pub fn commit_start(&self, requested_unix_ms: u64) -> Result<StartResolution, WindowsMsaSoloError> {
         match &self.transport {
             Transport::Native { worker, .. } => worker.commit_start(requested_unix_ms)
