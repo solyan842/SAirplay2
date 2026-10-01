@@ -5133,11 +5133,11 @@ fn msa_solo_route_txt(service: &DiscoveredService) -> Result<String, String> {
     let mut parts = Vec::new();
     for key in ROUTE_KEYS {
         if let Some(value) = service.txt.fields.get(*key) {
+            // Pinned Music Assistant serialize_txt_records(): cliairplay parses
+            // this blob on spaces, so a whole key=value pair containing
+            // whitespace is skipped rather than rejecting the receiver.
             if value.chars().any(char::is_whitespace) {
-                return Err(format!(
-                    "{}: mDNS TXT field {key} contains whitespace; refusing an ambiguous MSA SOLO route input.",
-                    service.display_name
-                ));
+                continue;
             }
             parts.push(format!("{key}={value}"));
         }
@@ -5795,6 +5795,27 @@ mod gui_tests {
         assert_eq!(raop_cfg.protocol, MsaProtocolPreference::Raop);
         assert_eq!(format.sample_rate, 44_100);
         assert_eq!(format.bit_depth, 16);
+    }
+
+    #[test]
+    fn msa_route_txt_skips_whitespace_value_without_rejecting_receiver() {
+        let service = DiscoveredService {
+            kind: ServiceKind::AirPlay,
+            fullname: "Naim._airplay._tcp.local.".into(),
+            display_name: "Naim Muso QB".into(),
+            host: "naim.local.".into(),
+            port: 7000,
+            addresses: vec!["192.168.1.20".into()],
+            txt: AirPlayTxt::parse([
+                ("model", "Mu-so Qb"),
+                ("features", "0x0001c340445d0a00"),
+                ("flags", "0x4"),
+            ]).unwrap(),
+        };
+        let txt = msa_solo_route_txt(&service).unwrap();
+        assert!(txt.contains("features=0x0001c340445d0a00"));
+        assert!(txt.contains("flags=0x4"));
+        assert!(!txt.contains("model="));
     }
 
     #[test]
