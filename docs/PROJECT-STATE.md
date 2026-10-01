@@ -176,16 +176,59 @@ Supported native target formats:
 
 No 96/192 target is in scope.
 
-### Solo START
+### Solo START — Windows/WASAPI cold-start invariant (LOCKED 2026-10-01)
 
-Solo PTP cold START now follows MSA planning:
+**Do not regress this ordering while re-aligning code to pinned MSA.** Pinned MSA
+does not cold-START an empty source: the server starts feeding the cli, waits for
+the binary's one-shot `audio_present`, then waits for receiver-clock readiness,
+then commands START. Windows loopback must preserve that contract even though its
+source can remain idle indefinitely.
 
-- wait for receiver clock readiness up to 2500 ms;
-- base lead 400 ms;
-- projection margin +500 ms;
-- PCM continues to accumulate during readiness wait;
-- use verified committed START;
-- one receiver adopts a forward correction without a second START.
+The required SAirplay2 native cold-start ordering is therefore:
+
+1. connect the receiver and bring the Windows/WASAPI capture path Ready;
+2. remain **Ready / Waiting for audio** for as long as the Windows source is idle;
+   no fixed idle timeout may turn this state into a connection failure;
+3. do **not** treat WASAPI engine-silent buffers or an empty capture poll by
+   themselves as source-present audio;
+4. once source-present PCM exists and at least one complete 352-frame transport
+   packet is retained, keep that first packet queued while START is planned;
+5. for PTP, obtain/use receiver clock readiness (up to the pinned 2500 ms
+   projection wait), then choose the anchor as the MSA lead floor:
+   `max(now + 400 ms, ready_at + 500 ms)`;
+6. commit one verified START and only then release media to the transport.
+
+This is a **Windows source adapter requirement for MSA semantics**, not an
+AirPort/Naim model workaround. Do not later simplify the Windows path back to
+`CONNECT -> CLOCK -> START` merely because low-level `ap2cl_start()` permits
+it: MSA's server-level ordering is `feed audio -> wait_audio_present -> clock
+ready -> START`.
+
+After START, lane behavior remains separate and source-aligned:
+
+- realtime type 96 keeps MSA starvation recovery / timeline recovery / sync;
+- buffered type 103 keeps MSA buffered semantics and does **not** gain a
+  realtime-style starvation re-anchor;
+- digital-zero PCM remains valid PCM after the source has become present; do not
+  restore amplitude-based transition heuristics as general media semantics.
+
+Historical confirmation: protected stable `a7cb24b1...` already deferred cold
+START until Windows capture had source-present PCM and a complete 352-frame
+packet. That behavior is evidence for the Windows adapter boundary, not a reason
+to restore the old transport engine.
+
+Implementation status:
+
+- `83cb2f4fb096b894c96bd2c07d00cd5d65360f27` introduced deferred first-audio
+  START for native Buffered SOLO;
+- `b8d282848cc0de4bdfedf066d4adc3675e9bf247` is its compile-only fix and
+  Windows Action #1321 PASS;
+- hardware PASS for the deferred Buffered behavior is still required on AirPort
+  Express and Naim Mu-so Qb;
+- **after that hardware test**, the intended cleanup is to make this one
+  cold-start invariant common to native SOLO realtime and buffered paths, while
+  preserving their different post-START recovery semantics.
+
 
 ### Naim Mu-so Qb
 
