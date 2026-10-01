@@ -262,6 +262,33 @@ impl WindowsMsaSoloClient {
 
     pub fn route(&self) -> RouteDecision { self.route }
 
+    pub fn uses_buffered(&self) -> bool {
+        match &self.transport {
+            Transport::Native { engine, .. } => {
+                engine.lock().map(|v| v.is_buffered()).unwrap_or(false)
+            }
+            Transport::Raop { .. } => false,
+        }
+    }
+
+    pub fn arm_start_on_audio(&self) -> Result<(), WindowsMsaSoloError> {
+        match &self.transport {
+            Transport::Native { worker, .. } => worker
+                .arm_start_on_audio()
+                .map_err(|e| WindowsMsaSoloError::Native(e.to_string())),
+            Transport::Raop { .. } => Err(WindowsMsaSoloError::InvalidState(
+                "deferred START is not used by RAOP",
+            )),
+        }
+    }
+
+    pub fn start_pending(&self) -> bool {
+        match &self.transport {
+            Transport::Native { worker, .. } => worker.start_pending(),
+            Transport::Raop { .. } => false,
+        }
+    }
+
     pub fn commit_start(&self, requested_unix_ms: u64) -> Result<StartResolution, WindowsMsaSoloError> {
         match &self.transport {
             Transport::Native { worker, .. } => worker.commit_start(requested_unix_ms)
@@ -544,6 +571,13 @@ impl WindowsMsaSoloClient {
     pub fn startup_events(&self) -> Vec<String> {
         match &self.transport {
             Transport::Native { worker, .. } => worker.startup_events(),
+            Transport::Raop { .. } => Vec::new(),
+        }
+    }
+
+    pub fn drain_startup_events(&self) -> Vec<String> {
+        match &self.transport {
+            Transport::Native { worker, .. } => worker.drain_startup_events(),
             Transport::Raop { .. } => Vec::new(),
         }
     }

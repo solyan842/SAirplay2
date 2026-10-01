@@ -54,10 +54,13 @@ struct MsaSoloGuiSession {
 
 impl MsaSoloGuiSession {
     fn drain_startup_events(&self) -> Vec<String> {
-        self.startup_events
+        let mut out = self
+            .startup_events
             .lock()
             .map(|mut events| events.drain(..).collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        out.extend(self.client.drain_startup_events());
+        out
     }
 }
 
@@ -96,12 +99,18 @@ impl ActiveVolumeControl {
 impl ActiveSession {
     fn audio_running(&self) -> bool {
         match self {
-            Self::MsaSolo(session) => session.client.is_playing(),
+            Self::MsaSolo(session) => {
+                session.client.is_playing() || session.client.start_pending()
+            },
             Self::Single(session) => session.audio_running(),
             Self::StereoPair(session) => session.audio_running(),
             Self::MultiRoom(session) => session.audio_running(),
             Self::Legacy(session) => session.is_running(),
         }
+    }
+
+    fn waiting_for_audio(&self) -> bool {
+        matches!(self, Self::MsaSolo(session) if session.client.start_pending())
     }
 
     fn audio_error(&self) -> Option<String> {
@@ -905,11 +914,18 @@ impl SairplayApp {
                             rate
                         ));
                     }
-                    self.log.push(format!(
-                        "{}: transport Ready, Windows audio running on {} receiver(s).",
-                        success.label,
-                        success.active_fullnames.len()
-                    ));
+                    if success.session.waiting_for_audio() {
+                        self.log.push(format!(
+                            "{}: transport Ready; waiting for Windows audio before Buffered START.",
+                            success.label
+                        ));
+                    } else {
+                        self.log.push(format!(
+                            "{}: transport Ready, Windows audio running on {} receiver(s).",
+                            success.label,
+                            success.active_fullnames.len()
+                        ));
+                    }
                     self.last_retransmit_stats = success.session.retransmit_stats();
                     self.last_member_retransmit_stats = success
                         .session
@@ -2401,50 +2417,61 @@ impl SairplayApp {
                                 client.latency_info(),
                                 client.uses_ptp(),
                             ));
-                            startup_events.extend(client.startup_events());
+                            startup_events.extend(client.drain_startup_events());
                             if let Some(volume) = initial_volume {
                                 client
                                     .set_volume(volume)
                                     .map_err(|error| format!("MSA SOLO volume: {error:?}"))?;
                             }
 
-                            // Windows loopback is not MSA's ffmpeg/stdin source:
-                            // it may legitimately have no PCM before START. Keep
-                            // the source-faithful receiver-clock planning, but do
-                            // not turn pre-START WASAPI silence into connect failure.
-                            let (ready_at_unix_ms, clock_event) =
-                                wait_msa_solo_clock_projection(&client);
-                            startup_events.push(clock_event);
-                            let requested_start_unix_ms =
-                                msa_solo_start_anchor(unix_ms_now(), ready_at_unix_ms);
-                            let start = client
-                                .commit_start(requested_start_unix_ms)
-                                .map_err(|error| format!("MSA SOLO START: {error:?}"))?;
-                            validate_immediate_start(
-                                requested_start_unix_ms,
-                                start.at_unix_ms,
-                                10_000,
-                            )
-                            .map_err(|error| {
-                                format!("MSA SOLO TIME-DOMAIN invariant failed: {error}")
-                            })?;
-                            startup_events.push(format!(
-                                "MSA SOLO TIME requested={} accepted={} delta={}ms.",
-                                requested_start_unix_ms,
-                                start.at_unix_ms,
-                                requested_start_unix_ms.abs_diff(start.at_unix_ms),
-                            ));
-                            startup_events.push(format!("MSA SOLO START {start:?}."));
-                            if let Some(diag) = client.diagnostics() {
+                            if client.uses_buffered() {
+                                // MSA's ffmpeg/stdin source already has content
+                                // when START is committed. Windows loopback may
+                                // stay silent indefinitely, so Buffered type 103
+                                // must remain Connected/Ready until the first PCM
+                                // packet exists. The audio worker owns the packet
+                                // and commits the anchor without losing song head.
+                                client
+                                    .arm_start_on_audio()
+                                    .map_err(|error| format!("MSA SOLO START arm: {error:?}"))?;
+                            } else {
+                                // Realtime/RAOP keep the existing source-faithful
+                                // immediate-start behavior, including receiver
+                                // clock projection planning.
+                                let (ready_at_unix_ms, clock_event) =
+                                    wait_msa_solo_clock_projection(&client);
+                                startup_events.push(clock_event);
+                                let requested_start_unix_ms =
+                                    msa_solo_start_anchor(unix_ms_now(), ready_at_unix_ms);
+                                let start = client
+                                    .commit_start(requested_start_unix_ms)
+                                    .map_err(|error| format!("MSA SOLO START: {error:?}"))?;
+                                validate_immediate_start(
+                                    requested_start_unix_ms,
+                                    start.at_unix_ms,
+                                    10_000,
+                                )
+                                .map_err(|error| {
+                                    format!("MSA SOLO TIME-DOMAIN invariant failed: {error}")
+                                })?;
                                 startup_events.push(format!(
-                                    "MSA SOLO TIMELINE head_frame={} pacing_ahead_frames={} audio_sent={} audio_dropped={} sync_sent={} sync_dropped={}.",
-                                    diag.head_frame,
-                                    diag.pacing_ahead_frames,
-                                    diag.audio_sent,
-                                    diag.audio_dropped,
-                                    diag.sync_sent,
-                                    diag.sync_dropped,
+                                    "MSA SOLO TIME requested={} accepted={} delta={}ms.",
+                                    requested_start_unix_ms,
+                                    start.at_unix_ms,
+                                    requested_start_unix_ms.abs_diff(start.at_unix_ms),
                                 ));
+                                startup_events.push(format!("MSA SOLO START {start:?}."));
+                                if let Some(diag) = client.diagnostics() {
+                                    startup_events.push(format!(
+                                        "MSA SOLO TIMELINE head_frame={} pacing_ahead_frames={} audio_sent={} audio_dropped={} sync_sent={} sync_dropped={}.",
+                                        diag.head_frame,
+                                        diag.pacing_ahead_frames,
+                                        diag.audio_sent,
+                                        diag.audio_dropped,
+                                        diag.sync_sent,
+                                        diag.sync_dropped,
+                                    ));
+                                }
                             }
                             Ok(ActiveSession::MsaSolo(MsaSoloGuiSession {
                                 client,
@@ -2628,6 +2655,18 @@ impl SairplayApp {
                 self.t("Đang chuẩn bị thiết bị...", "Preparing receiver...").to_owned(),
                 UiTheme::amber(),
             ),
+            PlaybackUiState::Playing(_) if self
+                .session
+                .as_ref()
+                .is_some_and(ActiveSession::waiting_for_audio) => (
+                    self.t("Sẵn sàng", "Ready"),
+                    self.t(
+                        "Đang chờ âm thanh Windows để bắt đầu AirPlay...",
+                        "Waiting for Windows audio to start AirPlay...",
+                    )
+                    .to_owned(),
+                    UiTheme::green(),
+                ),
             PlaybackUiState::Playing(_) => {
                 let detail = match self.session.as_ref().and_then(ActiveSession::audio_format) {
                     Some(format) => format!(
@@ -2746,6 +2785,15 @@ impl SairplayApp {
             PlaybackUiState::Connecting(_) if selected => (
                 self.t("Đang kết nối", "Connecting"),
                 StatusTone::Orange,
+            ),
+            PlaybackUiState::Playing(_)
+                if active
+                    && self
+                        .session
+                        .as_ref()
+                        .is_some_and(ActiveSession::waiting_for_audio) => (
+                self.t("Sẵn sàng", "Ready"),
+                StatusTone::Green,
             ),
             PlaybackUiState::Playing(_) if active => (
                 self.t("Đang chạy", "Running"),
@@ -3385,7 +3433,11 @@ impl SairplayApp {
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             let audio_active = self.session.is_some()
-                                && matches!(self.playback, PlaybackUiState::Playing(_));
+                                && matches!(self.playback, PlaybackUiState::Playing(_))
+                                && !self
+                                    .session
+                                    .as_ref()
+                                    .is_some_and(ActiveSession::waiting_for_audio);
                             let icon_color = if audio_active {
                                 if self.muted { UiTheme::red() } else { UiTheme::blue() }
                             } else {

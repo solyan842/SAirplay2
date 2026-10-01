@@ -6,8 +6,8 @@ use crate::{
     ap2::Ap2State,
     native_media::SendResult,
     time_domain::SourceNtp,
-    Ap2AudioFormat, NativeSoloEngine, Pcm352Chunker, WasapiLoopbackCapture,
-    WasapiLoopbackError,
+    Ap2AudioFormat, NativeSoloEngine, Pcm352Chunker, SoloClockReadinessState,
+    WasapiLoopbackCapture, WasapiLoopbackError,
 };
 use std::fmt;
 use std::sync::{
@@ -15,11 +15,13 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const AIRPLAY_CLOCK_READY_TIMEOUT: Duration = Duration::from_millis(2500);
 pub const STARVATION_RECOVERY_INTERVAL: Duration = Duration::from_millis(250);
 pub const FLUSH_DRAIN_TIMEOUT: Duration = Duration::from_millis(2000);
+const DEFERRED_START_LEAD_MS: u64 = 400;
+const DEFERRED_CLOCK_READY_LEAD_MS: u64 = 500;
 
 pub type SharedNativeSoloEngine = Arc<Mutex<NativeSoloEngine>>;
 
@@ -48,6 +50,7 @@ pub struct WindowsSoloAudioWorker {
     flush_generation: Arc<AtomicU64>,
     flush_ack_generation: Arc<AtomicU64>,
     audio_ready: Arc<AtomicBool>,
+    deferred_start_armed: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     last_error: Arc<Mutex<Option<String>>>,
     discontinuities: Arc<AtomicU64>,
@@ -72,6 +75,7 @@ impl WindowsSoloAudioWorker {
         let flush_generation = Arc::new(AtomicU64::new(0));
         let flush_ack_generation = Arc::new(AtomicU64::new(0));
         let audio_ready = Arc::new(AtomicBool::new(false));
+        let deferred_start_armed = Arc::new(AtomicBool::new(false));
         let last_error = Arc::new(Mutex::new(None));
         let discontinuities = Arc::new(AtomicU64::new(0));
         let last_discontinuity_frame = Arc::new(AtomicU64::new(u64::MAX));
@@ -81,6 +85,7 @@ impl WindowsSoloAudioWorker {
         let flush_thread = Arc::clone(&flush_generation);
         let flush_ack_thread = Arc::clone(&flush_ack_generation);
         let audio_ready_thread = Arc::clone(&audio_ready);
+        let deferred_start_thread = Arc::clone(&deferred_start_armed);
         let error_thread = Arc::clone(&last_error);
         let discontinuities_thread = Arc::clone(&discontinuities);
         let last_discontinuity_thread = Arc::clone(&last_discontinuity_frame);
@@ -114,6 +119,7 @@ impl WindowsSoloAudioWorker {
                 let mut local_flush_generation = flush_thread.load(Ordering::SeqCst);
                 let mut starvation_started: Option<Instant> = None;
                 let mut last_starvation_recovery: Option<Instant> = None;
+                let mut deferred_audio_seen: Option<Instant> = None;
 
                 while running_thread.load(Ordering::SeqCst) {
                     // Exact cliairplay outer-loop health gate: MediaRemote
@@ -185,6 +191,152 @@ impl WindowsSoloAudioWorker {
                     let _ = chunker.truncate_pending(ring_capacity);
                     if chunker.has_packet() {
                         audio_ready_thread.store(true, Ordering::SeqCst);
+                    }
+
+                    // Windows loopback differs from MSA's ffmpeg/stdin source:
+                    // a Buffered type-103 receiver must not be anchored before
+                    // the first real PCM packet exists. Otherwise a user who
+                    // starts playback a few seconds later feeds an already
+                    // expired buffered timeline, and Buffered deliberately has
+                    // no starvation re-anchor. Keep the first PCM resident in
+                    // the chunker while the receiver clock projection settles.
+                    if deferred_start_thread.load(Ordering::SeqCst) && chunker.has_packet() {
+                        let first_audio_at =
+                            *deferred_audio_seen.get_or_insert_with(Instant::now);
+                        let start_attempt = {
+                            let mut guard = match engine_thread.lock() {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    if let Ok(mut slot) = error_thread.lock() {
+                                        *slot = Some("native SOLO engine mutex poisoned".into());
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            };
+
+                            if guard.runtime.state == Ap2State::Streaming {
+                                deferred_start_thread.store(false, Ordering::SeqCst);
+                                None
+                            } else if guard.runtime.state != Ap2State::Connected {
+                                None
+                            } else {
+                                let now_unix_ms = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis()
+                                    .min(u128::from(u64::MAX)) as u64;
+                                let uses_ptp = guard.uses_ptp();
+                                let readiness = guard.clock_readiness();
+                                let have_projection = uses_ptp
+                                    && matches!(
+                                        readiness.state,
+                                        SoloClockReadinessState::Probing
+                                            | SoloClockReadinessState::Ready
+                                    )
+                                    && readiness.ready_at_unix_ms != 0;
+                                let projection_timeout =
+                                    first_audio_at.elapsed() >= AIRPLAY_CLOCK_READY_TIMEOUT;
+
+                                if uses_ptp && !have_projection && !projection_timeout {
+                                    None
+                                } else {
+                                    let ready_at = if have_projection {
+                                        readiness.ready_at_unix_ms
+                                    } else {
+                                        0
+                                    };
+                                    let mut requested =
+                                        now_unix_ms.saturating_add(DEFERRED_START_LEAD_MS);
+                                    if ready_at != 0 {
+                                        requested = requested.max(
+                                            ready_at
+                                                .saturating_add(DEFERRED_CLOCK_READY_LEAD_MS),
+                                        );
+                                    }
+
+                                    let started = match guard.start(requested) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            if let Ok(mut slot) = error_thread.lock() {
+                                                *slot = Some(format!(
+                                                    "deferred native SOLO START failed: {e:?}"
+                                                ));
+                                            }
+                                            running_thread.store(false, Ordering::SeqCst);
+                                            return;
+                                        }
+                                    };
+                                    if requested.abs_diff(started.at_unix_ms) > 10_000 {
+                                        if let Ok(mut slot) = error_thread.lock() {
+                                            *slot = Some(format!(
+                                                "MSA SOLO TIME-DOMAIN invariant failed: requested={} accepted={}",
+                                                requested, started.at_unix_ms
+                                            ));
+                                        }
+                                        running_thread.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+                                    let diag = guard.diagnostics();
+                                    let mrp = guard.mrp_controller();
+                                    let clock_event = if !uses_ptp {
+                                        "MSA SOLO CLOCK not applicable: receiver uses NTP timing."
+                                            .to_owned()
+                                    } else if have_projection {
+                                        format!(
+                                            "MSA SOLO CLOCK state={:?} exchanges={} streak_age={}ms ready_at={} ready_in={}ms.",
+                                            readiness.state,
+                                            readiness.exchanges,
+                                            readiness.streak_age_ms,
+                                            readiness.ready_at_unix_ms,
+                                            readiness.ready_in_ms,
+                                        )
+                                    } else {
+                                        format!(
+                                            "MSA SOLO CLOCK projection unreported within {}ms; state={:?} exchanges={}; anchoring on the source lead.",
+                                            AIRPLAY_CLOCK_READY_TIMEOUT.as_millis(),
+                                            readiness.state,
+                                            readiness.exchanges,
+                                        )
+                                    };
+                                    Some((requested, started, diag, mrp, clock_event))
+                                }
+                            }
+                        };
+
+                        if let Some((requested, started, diag, mrp, clock_event)) = start_attempt {
+                            deferred_start_thread.store(false, Ordering::SeqCst);
+                            if let Ok(mut events) = events_thread.lock() {
+                                events.push(
+                                    "MSA SOLO AUDIO first packet present; committing deferred Buffered START."
+                                        .into(),
+                                );
+                                events.push(clock_event);
+                                events.push(format!(
+                                    "MSA SOLO TIME requested={} accepted={} delta={}ms.",
+                                    requested,
+                                    started.at_unix_ms,
+                                    requested.abs_diff(started.at_unix_ms),
+                                ));
+                                events.push(format!("MSA SOLO START {started:?}."));
+                                events.push(format!(
+                                    "MSA SOLO TIMELINE head_frame={} pacing_ahead_frames={} audio_sent={} audio_dropped={} sync_sent={} sync_dropped={}.",
+                                    diag.head_frame,
+                                    diag.pacing_ahead_frames,
+                                    diag.audio_sent,
+                                    diag.audio_dropped,
+                                    diag.sync_sent,
+                                    diag.sync_dropped,
+                                ));
+                            }
+                            if let Some(mrp) = mrp {
+                                let _ = mrp.publish_playback_state_on_transition(
+                                    crate::MrpPlaybackState::Playing,
+                                );
+                            }
+                        }
+                    } else if !deferred_start_thread.load(Ordering::SeqCst) {
+                        deferred_audio_seen = None;
                     }
 
                     let content_paused_or_stopped = engine_thread
@@ -409,6 +561,7 @@ impl WindowsSoloAudioWorker {
                 flush_generation,
                 flush_ack_generation,
                 audio_ready,
+                deferred_start_armed,
                 worker: Some(worker),
                 last_error,
                 discontinuities,
@@ -478,6 +631,41 @@ impl WindowsSoloAudioWorker {
         self.audio_ready.load(Ordering::SeqCst)
     }
 
+    pub fn arm_start_on_audio(&self) -> Result<(), WindowsSoloAudioWorkerError> {
+        if !self.is_running() {
+            return Err(WindowsSoloAudioWorkerError::Engine(
+                "WASAPI worker is not running".into(),
+            ));
+        }
+        {
+            let guard = self.engine.lock().map_err(|_| {
+                WindowsSoloAudioWorkerError::Engine("native SOLO engine mutex poisoned".into())
+            })?;
+            if !guard.is_buffered() {
+                return Err(WindowsSoloAudioWorkerError::Engine(
+                    "deferred START is only valid for native Buffered type 103".into(),
+                ));
+            }
+            if guard.runtime.state != Ap2State::Connected {
+                return Err(WindowsSoloAudioWorkerError::Engine(
+                    "deferred START requires a connected, not-yet-streaming session".into(),
+                ));
+            }
+        }
+        self.deferred_start_armed.store(true, Ordering::SeqCst);
+        if let Ok(mut events) = self.startup_events.lock() {
+            events.push(
+                "MSA SOLO START armed; Buffered type 103 is Ready and waiting for first WASAPI audio packet."
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn start_pending(&self) -> bool {
+        self.deferred_start_armed.load(Ordering::SeqCst)
+    }
+
     pub fn commit_start(
         &self,
         requested_unix_ms: u64,
@@ -540,6 +728,7 @@ impl WindowsSoloAudioWorker {
     }
 
     pub fn stop_content(&self) -> Result<(), WindowsSoloAudioWorkerError> {
+        self.deferred_start_armed.store(false, Ordering::SeqCst);
         let mrp = {
             let mut engine = self.engine.lock().map_err(|_| {
                 WindowsSoloAudioWorkerError::Engine("native SOLO engine mutex poisoned".into())
@@ -582,7 +771,15 @@ impl WindowsSoloAudioWorker {
         self.startup_events.lock().map(|v| v.clone()).unwrap_or_default()
     }
 
+    pub fn drain_startup_events(&self) -> Vec<String> {
+        self.startup_events
+            .lock()
+            .map(|mut events| events.drain(..).collect())
+            .unwrap_or_default()
+    }
+
     pub fn stop(&mut self) {
+        self.deferred_start_armed.store(false, Ordering::SeqCst);
         self.running.store(false, Ordering::SeqCst);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();

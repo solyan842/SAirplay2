@@ -1173,6 +1173,8 @@ impl NativeSoloEngine {
 
     pub fn uses_ptp(&self) -> bool { self.runtime.use_ptp }
 
+    pub fn is_buffered(&self) -> bool { self.runtime.lane == NativeLane::Buffered }
+
     pub fn splice_pad_frames(&self) -> u64 { self.runtime.splice_pad_frames }
 
     pub fn consume_splice_pad_frames(&mut self, frames: u32) -> u32 {
