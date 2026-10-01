@@ -557,6 +557,30 @@ impl WindowsMsaSoloClient {
         }
     }
 
+    /// Diagnostic-only detail for a transport that has already gone unhealthy.
+    /// This does not change MSA health policy; it only preserves the concrete
+    /// worker/feedback reason for the GUI log.
+    pub fn transport_error_detail(&self) -> Option<String> {
+        match &self.transport {
+            Transport::Native { engine, worker } => {
+                if let Some(error) = worker.last_error() {
+                    return Some(format!("native audio worker: {error}"));
+                }
+                let mut guard = engine.lock().ok()?;
+                if guard.control_healthy() {
+                    return None;
+                }
+                if let Some(error) = guard.feedback_error() {
+                    return Some(format!("native /feedback: {error}"));
+                }
+                Some("native control/media health failed without a detailed worker error".into())
+            }
+            Transport::Raop { worker } => worker
+                .last_error()
+                .map(|error| format!("RAOP worker: {error}")),
+        }
+    }
+
     pub fn splice_pad_frames(&self) -> u64 {
         match &self.transport {
             Transport::Native { engine, .. } => engine.lock()

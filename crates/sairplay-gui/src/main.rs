@@ -102,8 +102,18 @@ impl ActiveSession {
 
     fn audio_error(&self) -> Option<String> {
         match self {
-            Self::MsaSolo(session) => (!session.client.is_connected())
-                .then(|| "MSA SOLO transport disconnected".to_owned()),
+            Self::MsaSolo(session) => {
+                if session.client.is_connected() {
+                    None
+                } else {
+                    Some(
+                        session
+                            .client
+                            .transport_error_detail()
+                            .unwrap_or_else(|| "MSA SOLO transport disconnected".to_owned()),
+                    )
+                }
+            },
             Self::Single(session) => session.audio_error(),
             Self::StereoPair(session) => session.audio_error(),
             Self::MultiRoom(session) => session.audio_error(),
@@ -183,8 +193,18 @@ impl ActiveSession {
 
     fn feedback_error(&self) -> Option<String> {
         match self {
-            Self::MsaSolo(session) => (!session.client.control_healthy())
-                .then(|| "MSA SOLO control channel unhealthy".to_owned()),
+            Self::MsaSolo(session) => {
+                if session.client.control_healthy() {
+                    None
+                } else {
+                    Some(
+                        session
+                            .client
+                            .transport_error_detail()
+                            .unwrap_or_else(|| "MSA SOLO control channel unhealthy".to_owned()),
+                    )
+                }
+            },
             Self::Single(session) => session.feedback_error(),
             Self::StereoPair(session) => session.feedback_error(),
             Self::MultiRoom(session) => session.feedback_error(),
@@ -2002,17 +2022,51 @@ impl SairplayApp {
             let answered_delta = rtx.answered.saturating_sub(prev.answered);
             let expired_delta = rtx.expired.saturating_sub(prev.expired);
             if requested_delta != 0 || expired_delta != 0 {
-                self.log.push(format!(
-                    "Diagnostic: retransmit activity · requested +{} (total {}) · answered +{} (total {}) · expired +{} (total {}) · requested_wire>1472={} · max_requested_wire={} B.",
-                    requested_delta,
-                    rtx.requested,
-                    answered_delta,
-                    rtx.answered,
-                    expired_delta,
-                    rtx.expired,
-                    rtx.requested_over_1472,
-                    rtx.max_requested_wire_len
-                ));
+                if let ActiveSession::MsaSolo(msa) = session {
+                    if let Some(diag) = msa.client.diagnostics() {
+                        self.log.push(format!(
+                            "Diagnostic: retransmit activity · requested +{} (total {}) · answered +{} (total {}) · expired +{} (total {}) · requested_wire>1472={} · max_requested_wire={} B · audio_sent={} dropped={} · pacing_ahead={}f · reanchors={} · splice_pad={}f · input_discontinuities={}.",
+                            requested_delta,
+                            rtx.requested,
+                            answered_delta,
+                            rtx.answered,
+                            expired_delta,
+                            rtx.expired,
+                            rtx.requested_over_1472,
+                            rtx.max_requested_wire_len,
+                            diag.audio_sent,
+                            diag.audio_dropped,
+                            diag.pacing_ahead_frames,
+                            diag.reanchors,
+                            diag.splice_pad_frames,
+                            msa.client.input_discontinuities()
+                        ));
+                    } else {
+                        self.log.push(format!(
+                            "Diagnostic: retransmit activity · requested +{} (total {}) · answered +{} (total {}) · expired +{} (total {}) · requested_wire>1472={} · max_requested_wire={} B.",
+                            requested_delta,
+                            rtx.requested,
+                            answered_delta,
+                            rtx.answered,
+                            expired_delta,
+                            rtx.expired,
+                            rtx.requested_over_1472,
+                            rtx.max_requested_wire_len
+                        ));
+                    }
+                } else {
+                    self.log.push(format!(
+                        "Diagnostic: retransmit activity · requested +{} (total {}) · answered +{} (total {}) · expired +{} (total {}) · requested_wire>1472={} · max_requested_wire={} B.",
+                        requested_delta,
+                        rtx.requested,
+                        answered_delta,
+                        rtx.answered,
+                        expired_delta,
+                        rtx.expired,
+                        rtx.requested_over_1472,
+                        rtx.max_requested_wire_len
+                    ));
+                }
             }
 
             // Runtime HomePod evidence showed audible crackle with a burst of

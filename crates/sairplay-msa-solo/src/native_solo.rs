@@ -1222,6 +1222,10 @@ impl NativeSoloEngine {
     pub fn effective_lead_ms(&self) -> u64 { self.runtime.lead_ms }
     pub fn clock_verify_armed(&self) -> bool { self.clock_verify_armed }
 
+    pub fn feedback_error(&self) -> Option<String> {
+        self.feedback.last_error()
+    }
+
     pub fn control_healthy(&mut self) -> bool {
         self.refresh_control_health();
         if self.rtsp_dead || !self.runtime.health.healthy {
