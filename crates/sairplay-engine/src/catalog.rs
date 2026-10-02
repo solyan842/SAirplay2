@@ -120,17 +120,64 @@ impl DeviceCatalog {
 }
 
 fn same_device(device: &DeviceRecord, service: &DiscoveredService) -> bool {
-    if device
-        .display_name
-        .eq_ignore_ascii_case(&service.display_name)
-    {
+    // An mDNS refresh of the exact same service must always update its own
+    // record, even if a receiver changed its display name.
+    let same_fullname = match service.kind {
+        ServiceKind::AirPlay => device
+            .airplay
+            .as_ref()
+            .is_some_and(|existing| existing.fullname == service.fullname),
+        ServiceKind::Raop => device
+            .raop
+            .as_ref()
+            .is_some_and(|existing| existing.fullname == service.fullname),
+    };
+    if same_fullname {
         return true;
     }
 
-    let existing_addresses = device.addresses();
-    existing_addresses
-        .iter()
-        .any(|address| service.addresses.iter().any(|other| other == address))
+    // Follow Music Assistant's AirPlay discovery identity:
+    // - RAOP: raw id before '@'
+    // - AirPlay: TXT deviceid
+    //
+    // A shared IP is NOT device identity. TVs / meeting boxes can advertise
+    // multiple independent AirPlay/RAOP endpoints on one address.
+    let incoming_id = stable_service_id(service);
+    let existing_ids = [device.airplay.as_ref(), device.raop.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter_map(stable_service_id)
+        .collect::<Vec<_>>();
+
+    if let Some(incoming_id) = incoming_id.as_deref() {
+        if !existing_ids.is_empty() {
+            return existing_ids.iter().any(|id| id == incoming_id);
+        }
+    }
+
+    // Some third-party receivers omit deviceid. MSA pairs related AirPlay/RAOP
+    // discovery by display name in that case; keep the same conservative
+    // fallback rather than merging unrelated services by network address.
+    device
+        .display_name
+        .eq_ignore_ascii_case(&service.display_name)
+}
+
+fn stable_service_id(service: &DiscoveredService) -> Option<String> {
+    let raw = match service.kind {
+        ServiceKind::AirPlay => service.txt.fields.get("deviceid")?.as_str(),
+        ServiceKind::Raop => {
+            let instance = service.fullname.split('.').next().unwrap_or(&service.fullname);
+            instance.split_once('@')?.0
+        }
+    };
+
+    let normalized = raw
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 #[cfg(test)]
@@ -181,6 +228,92 @@ mod tests {
         let device = &catalog.devices()[0];
         assert!(device.airplay.is_some());
         assert!(device.raop.is_some());
+    }
+
+    #[test]
+    fn shared_ip_does_not_merge_distinct_airplay_receivers() {
+        let mut catalog = DeviceCatalog::default();
+        catalog.upsert(service(
+            ServiceKind::AirPlay,
+            "EShare-1965._airplay._tcp.local.",
+            "EShare-1965",
+            "192.168.31.139",
+            51010,
+            AirPlayTxt::parse([
+                ("deviceid", "AA:BB:CC:DD:EE:01"),
+                ("model", "AppleTV3,2"),
+            ])
+            .unwrap(),
+        ));
+        catalog.upsert(service(
+            ServiceKind::Raop,
+            "AABBCCDDEE01@EShare-1965._raop._tcp.local.",
+            "EShare-1965",
+            "192.168.31.139",
+            51040,
+            AirPlayTxt::default(),
+        ));
+        catalog.upsert(service(
+            ServiceKind::AirPlay,
+            "LiOA_Meeting._airplay._tcp.local.",
+            "LiOA_Meeting",
+            "192.168.31.139",
+            7000,
+            AirPlayTxt::parse([
+                ("deviceid", "AA:BB:CC:DD:EE:02"),
+                ("model", "AppleTV3,2"),
+            ])
+            .unwrap(),
+        ));
+        catalog.upsert(service(
+            ServiceKind::Raop,
+            "AABBCCDDEE02@LiOA_Meeting._raop._tcp.local.",
+            "LiOA_Meeting",
+            "192.168.31.139",
+            7102,
+            AirPlayTxt::default(),
+        ));
+
+        assert_eq!(catalog.devices().len(), 2);
+
+        let eshare = catalog
+            .devices()
+            .iter()
+            .find(|device| device.display_name == "EShare-1965")
+            .unwrap();
+        assert_eq!(eshare.airplay.as_ref().unwrap().port, 51010);
+        assert_eq!(eshare.raop.as_ref().unwrap().port, 51040);
+
+        let lioa = catalog
+            .devices()
+            .iter()
+            .find(|device| device.display_name == "LiOA_Meeting")
+            .unwrap();
+        assert_eq!(lioa.airplay.as_ref().unwrap().port, 7000);
+        assert_eq!(lioa.raop.as_ref().unwrap().port, 7102);
+    }
+
+    #[test]
+    fn stable_device_id_wins_over_same_display_name() {
+        let mut catalog = DeviceCatalog::default();
+        catalog.upsert(service(
+            ServiceKind::AirPlay,
+            "Room._airplay._tcp.local.",
+            "Room",
+            "192.168.1.50",
+            7000,
+            AirPlayTxt::parse([("deviceid", "AA:BB:CC:DD:EE:01")]).unwrap(),
+        ));
+        catalog.upsert(service(
+            ServiceKind::Raop,
+            "AABBCCDDEE02@Room._raop._tcp.local.",
+            "Room",
+            "192.168.1.51",
+            5000,
+            AirPlayTxt::default(),
+        ));
+
+        assert_eq!(catalog.devices().len(), 2);
     }
 
     #[test]
