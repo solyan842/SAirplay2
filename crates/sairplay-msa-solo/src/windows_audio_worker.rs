@@ -519,7 +519,6 @@ impl WindowsSoloAudioWorker {
                             .unwrap_or(false);
                         pcm_hub_thread.set_audio_ready(
                             pcm_hub_thread.source_present() && has_packet,
-                            Ordering::SeqCst,
                         );
 
                         if deferred_start_thread.load(Ordering::SeqCst) && has_packet {
