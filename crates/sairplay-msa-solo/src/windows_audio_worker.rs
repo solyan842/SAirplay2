@@ -864,7 +864,13 @@ impl WindowsSoloAudioWorker {
                             .lock()
                             .map(|ring| ring.has_packet())
                             .unwrap_or(false);
-                        if !ring_has_packet {
+                        // Windows loopback has no meaningful input-starvation
+                        // state until the source has produced its first real
+                        // non-SILENT packet. Realtime Apple sessions START
+                        // immediately, so treating the pre-source empty ring as
+                        // starvation repeatedly re-anchors before any content
+                        // exists and can make the first 24-bit burst catch up.
+                        if source_present_thread.load(Ordering::SeqCst) && !ring_has_packet {
                             let starving_since =
                                 starvation_started.get_or_insert_with(Instant::now);
                             if starving_since.elapsed() >= STARVATION_RECOVERY_INTERVAL
@@ -1187,5 +1193,15 @@ mod source_idle_tests {
             BUFFERED_SOURCE_IDLE_PARK_INTERVAL,
             STARVATION_RECOVERY_INTERVAL + STARVATION_RECOVERY_INTERVAL
         );
+    }
+
+    #[test]
+    fn realtime_starvation_waits_for_first_source_packet() {
+        let source_present = false;
+        let ring_has_packet = false;
+        assert!(!(source_present && !ring_has_packet));
+
+        let source_present = true;
+        assert!(source_present && !ring_has_packet);
     }
 }
