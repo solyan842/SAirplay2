@@ -142,7 +142,7 @@ impl WindowsSoloAudioWorker {
                             if let Ok(mut slot) = error_thread.lock() {
                                 *slot = Some(message);
                             }
-                            running_thread.store(false);
+                            running_thread.store(false, Ordering::SeqCst);
                             return;
                         }
                     };
@@ -186,7 +186,7 @@ impl WindowsSoloAudioWorker {
                                     if let Ok(mut slot) = error_thread.lock() {
                                         *slot = Some("PCM ring mutex poisoned".into());
                                     }
-                                    running_thread.store(false);
+                                    running_thread.store(false, Ordering::SeqCst);
                                     return;
                                 }
                             };
@@ -197,7 +197,7 @@ impl WindowsSoloAudioWorker {
                                     if let Ok(mut slot) = error_thread.lock() {
                                         *slot = Some(format!("WASAPI capture failed: {e}"));
                                     }
-                                    running_thread.store(false);
+                                    running_thread.store(false, Ordering::SeqCst);
                                     return;
                                 }
                             };
@@ -227,7 +227,7 @@ impl WindowsSoloAudioWorker {
                                 captured_frames_total.saturating_add(offset)
                             });
                             if let Some(frame) = absolute_frame {
-                                last_discontinuity_thread.store(frame);
+                                last_discontinuity_thread.store(frame, Ordering::SeqCst);
                             }
 
                             let bytes_per_frame = audio_format.input_bytes_per_frame().max(1);
@@ -299,7 +299,7 @@ impl WindowsSoloAudioWorker {
                                     if let Ok(mut slot) = error_thread.lock() {
                                         *slot = Some("PCM ring mutex poisoned".into());
                                     }
-                                    running_thread.store(false);
+                                    running_thread.store(false, Ordering::SeqCst);
                                     return;
                                 }
                             };
@@ -358,7 +358,7 @@ impl WindowsSoloAudioWorker {
                                     if let Ok(mut slot) = error_thread.lock() {
                                         *slot = Some("native SOLO engine mutex poisoned".into());
                                     }
-                                    running_thread.store(false);
+                                    running_thread.store(false, Ordering::SeqCst);
                                     return;
                                 }
                             };
@@ -368,7 +368,7 @@ impl WindowsSoloAudioWorker {
                             if let Ok(mut slot) = error_thread.lock() {
                                 *slot = Some("AirPlay 2 control channel failed".into());
                             }
-                            running_thread.store(false);
+                            running_thread.store(false, Ordering::SeqCst);
                             return;
                         }
 
@@ -413,7 +413,7 @@ impl WindowsSoloAudioWorker {
                                         if let Ok(mut slot) = error_thread.lock() {
                                             *slot = Some("native SOLO engine mutex poisoned".into());
                                         }
-                                        running_thread.store(false);
+                                        running_thread.store(false, Ordering::SeqCst);
                                         return;
                                     }
                                 };
@@ -448,7 +448,7 @@ impl WindowsSoloAudioWorker {
                                             "Buffered capture-idle resume failed: {e:?}"
                                         ));
                                     }
-                                    running_thread.store(false);
+                                    running_thread.store(false, Ordering::SeqCst);
                                     return;
                                 }
                             }
@@ -469,7 +469,7 @@ impl WindowsSoloAudioWorker {
                                         if let Ok(mut slot) = error_thread.lock() {
                                             *slot = Some("native SOLO engine mutex poisoned".into());
                                         }
-                                        running_thread.store(false);
+                                        running_thread.store(false, Ordering::SeqCst);
                                         return;
                                     }
                                 };
@@ -507,7 +507,7 @@ impl WindowsSoloAudioWorker {
                                             "Buffered capture-idle pause failed: {e:?}"
                                         ));
                                     }
-                                    running_thread.store(false);
+                                    running_thread.store(false, Ordering::SeqCst);
                                     return;
                                 }
                             }
@@ -532,13 +532,13 @@ impl WindowsSoloAudioWorker {
                                         if let Ok(mut slot) = error_thread.lock() {
                                             *slot = Some("native SOLO engine mutex poisoned".into());
                                         }
-                                        running_thread.store(false);
+                                        running_thread.store(false, Ordering::SeqCst);
                                         return;
                                     }
                                 };
 
                                 if guard.runtime.state == Ap2State::Streaming {
-                                    deferred_start_thread.store(false);
+                                    deferred_start_thread.store(false, Ordering::SeqCst);
                                     None
                                 } else if guard.runtime.state != Ap2State::Connected {
                                     None
@@ -558,7 +558,7 @@ impl WindowsSoloAudioWorker {
                                                         "deferred native SOLO media activation failed: {e:?}"
                                                     ));
                                                 }
-                                                running_thread.store(false);
+                                                running_thread.store(false, Ordering::SeqCst);
                                                 return;
                                             }
                                         };
@@ -612,7 +612,7 @@ impl WindowsSoloAudioWorker {
                                                         "deferred native SOLO START failed: {e:?}"
                                                     ));
                                                 }
-                                                running_thread.store(false);
+                                                running_thread.store(false, Ordering::SeqCst);
                                                 return;
                                             }
                                         };
@@ -623,7 +623,7 @@ impl WindowsSoloAudioWorker {
                                                     requested, started.at_unix_ms
                                                 ));
                                             }
-                                            running_thread.store(false);
+                                            running_thread.store(false, Ordering::SeqCst);
                                             return;
                                         }
                                         let diag = guard.diagnostics();
@@ -669,7 +669,7 @@ impl WindowsSoloAudioWorker {
                                 buffered_connected_now,
                             )) = start_attempt
                             {
-                                deferred_start_thread.store(false);
+                                deferred_start_thread.store(false, Ordering::SeqCst);
                                 if let Ok(mut events) = events_thread.lock() {
                                     events.push(
                                         "MSA SOLO AUDIO first packet present; committing deferred Buffered START."
@@ -729,7 +729,7 @@ impl WindowsSoloAudioWorker {
                                         if let Ok(mut slot) = error_thread.lock() {
                                             *slot = Some("native SOLO engine mutex poisoned".into());
                                         }
-                                        running_thread.store(false);
+                                        running_thread.store(false, Ordering::SeqCst);
                                         return;
                                     }
                                 };
@@ -755,7 +755,7 @@ impl WindowsSoloAudioWorker {
                                 if let Ok(mut slot) = error_thread.lock() {
                                     *slot = Some(format!("splice silence send failed: {e:?}"));
                                 }
-                                running_thread.store(false);
+                                running_thread.store(false, Ordering::SeqCst);
                                 return;
                             }
                             thread::sleep(Duration::from_millis(1));
@@ -779,7 +779,7 @@ impl WindowsSoloAudioWorker {
                                         if let Ok(mut slot) = error_thread.lock() {
                                             *slot = Some("native SOLO engine mutex poisoned".into());
                                         }
-                                        running_thread.store(false);
+                                        running_thread.store(false, Ordering::SeqCst);
                                         return;
                                     }
                                 };
@@ -791,7 +791,7 @@ impl WindowsSoloAudioWorker {
                                                 "native SOLO pacing failed: {e:?}"
                                             ));
                                         }
-                                        running_thread.store(false);
+                                        running_thread.store(false, Ordering::SeqCst);
                                         return;
                                     }
                                 }
@@ -814,7 +814,7 @@ impl WindowsSoloAudioWorker {
                                                     "clock conversion failed: {e}"
                                                 ));
                                             }
-                                            running_thread.store(false);
+                                            running_thread.store(false, Ordering::SeqCst);
                                             return;
                                         }
                                     };
@@ -834,7 +834,7 @@ impl WindowsSoloAudioWorker {
                                         if let Ok(mut slot) = error_thread.lock() {
                                             *slot = Some("PCM ring mutex poisoned".into());
                                         }
-                                        running_thread.store(false);
+                                        running_thread.store(false, Ordering::SeqCst);
                                         return;
                                     }
                                 };
@@ -888,7 +888,7 @@ impl WindowsSoloAudioWorker {
                                         *slot =
                                             Some("native SOLO media send returned fatal".into());
                                     }
-                                    running_thread.store(false);
+                                    running_thread.store(false, Ordering::SeqCst);
                                     return;
                                 }
                                 Some(Err(e)) => {
@@ -896,7 +896,7 @@ impl WindowsSoloAudioWorker {
                                         *slot =
                                             Some(format!("native SOLO media send failed: {e:?}"));
                                     }
-                                    running_thread.store(false);
+                                    running_thread.store(false, Ordering::SeqCst);
                                     return;
                                 }
                             }
@@ -994,13 +994,13 @@ impl WindowsSoloAudioWorker {
                 startup_events,
             }),
             Ok(Err(message)) => {
-                running.store(false);
+                running.store(false, Ordering::SeqCst);
                 let _ = capture_worker.join();
                 let _ = media_worker.join();
                 Err(WindowsSoloAudioWorkerError::Engine(message))
             }
             Err(_) => {
-                running.store(false);
+                running.store(false, Ordering::SeqCst);
                 let _ = capture_worker.join();
                 let _ = media_worker.join();
                 Err(WindowsSoloAudioWorkerError::Engine(
@@ -1079,7 +1079,7 @@ impl WindowsSoloAudioWorker {
                 ));
             }
         }
-        self.deferred_start_armed.store(true);
+        self.deferred_start_armed.store(true, Ordering::SeqCst);
         if let Ok(mut events) = self.startup_events.lock() {
             events.push(
                 "MSA SOLO START armed; Buffered type 103 is Ready and waiting for first WASAPI audio packet."
@@ -1155,7 +1155,7 @@ impl WindowsSoloAudioWorker {
     }
 
     pub fn stop_content(&self) -> Result<(), WindowsSoloAudioWorkerError> {
-        self.deferred_start_armed.store(false);
+        self.deferred_start_armed.store(false, Ordering::SeqCst);
         let mrp = {
             let mut engine = self.engine.lock().map_err(|_| {
                 WindowsSoloAudioWorkerError::Engine("native SOLO engine mutex poisoned".into())
@@ -1174,7 +1174,7 @@ impl WindowsSoloAudioWorker {
     /// Clears capture bytes without changing the AP2 wire timeline. Session
     /// FLUSH/RESUME commands remain the transport owner's responsibility.
     pub fn discard_captured_pcm(&self) {
-        self.flush_generation.fetch_add(1);
+        self.pcm_hub.request_flush();
     }
 
     pub fn is_running(&self) -> bool {
@@ -1206,8 +1206,8 @@ impl WindowsSoloAudioWorker {
     }
 
     pub fn stop(&mut self) {
-        self.deferred_start_armed.store(false);
-        self.running.store(false);
+        self.deferred_start_armed.store(false, Ordering::SeqCst);
+        self.running.store(false, Ordering::SeqCst);
         if let Some(worker) = self.media_worker.take() {
             let _ = worker.join();
         }
