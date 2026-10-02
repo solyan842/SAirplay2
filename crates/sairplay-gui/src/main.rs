@@ -15,6 +15,7 @@ use sairplay_msa_solo::{
     WindowsMsaSoloVolumeControl, AIRPLAY_CLOCK_READY_TIMEOUT,
 };
 use sairplay_msa_solo::route::{Flow as MsaFlow, ProtocolPreference as MsaProtocolPreference};
+use sairplay_helper_process::ManagedChild;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::IpAddr;
@@ -1608,7 +1609,7 @@ impl SairplayApp {
                     .stderr(Stdio::piped())
                     .creation_flags(0x08000000);
 
-                let mut child = match command.spawn() {
+                let mut child = match ManagedChild::spawn(&mut command) {
                     Ok(child) => child,
                     Err(error) => {
                         let _ = result_tx.send(LegacyPairingResult::Failed {
@@ -1619,21 +1620,21 @@ impl SairplayApp {
                     }
                 };
 
-                let Some(mut stdin) = child.stdin.take() else {
-                    let _ = child.kill();
+                let Some(mut stdin) = child.take_stdin() else {
+                    let _ = child.terminate_and_wait();
                     let _ = result_tx.send(LegacyPairingResult::Failed {
                         device_name: name,
                         error: "pairing helper stdin was not created".into(),
                     });
                     return;
                 };
-                let stdout = child.stdout.take();
-                let stderr = child.stderr.take();
+                let stdout = child.take_stdout();
+                let stderr = child.take_stderr();
 
                 // AppleTVpairing() performs a 5 s mDNS scan and then scanf()s
                 // the selected IP. Feeding it now is safe; the pipe buffers it.
                 if writeln!(stdin, "{host}").is_err() || stdin.flush().is_err() {
-                    let _ = child.kill();
+                    let _ = child.terminate_and_wait();
                     let _ = result_tx.send(LegacyPairingResult::Failed {
                         device_name: name,
                         error: "cannot send receiver address to pairing helper".into(),
@@ -1644,12 +1645,12 @@ impl SairplayApp {
                 let pin = match pin_rx.recv() {
                     Ok(pin) => pin,
                     Err(_) => {
-                        let _ = child.kill();
+                        let _ = child.terminate_and_wait();
                         return;
                     }
                 };
                 if writeln!(stdin, "{pin}").is_err() || stdin.flush().is_err() {
-                    let _ = child.kill();
+                    let _ = child.terminate_and_wait();
                     let _ = result_tx.send(LegacyPairingResult::Failed {
                         device_name: name,
                         error: "cannot send PIN to pairing helper".into(),

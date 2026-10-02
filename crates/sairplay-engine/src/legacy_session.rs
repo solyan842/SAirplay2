@@ -4,11 +4,12 @@ use crate::{
     volume_percent_to_db, Pcm352Chunker, VolumeSetResult,
     WasapiLoopbackCapture, WasapiLoopbackError, PCM352_PACKET_BYTES,
 };
+use sairplay_helper_process::{ManagedChild, ManagedChildKiller};
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{self, Receiver, SyncSender, TrySendError},
@@ -124,7 +125,7 @@ impl LegacyVolumeControl {
 
 struct SpawnedMember {
     name: String,
-    pid: u32,
+    killer: ManagedChildKiller,
     pcm_tx: SyncSender<[u8; PCM352_PACKET_BYTES]>,
     connected_rx: Receiver<Result<(), String>>,
     writer: JoinHandle<()>,
@@ -133,7 +134,7 @@ struct SpawnedMember {
 
 pub struct LegacyGroupSession {
     running: Arc<AtomicBool>,
-    helper_pids: Vec<u32>,
+    helper_killers: Vec<ManagedChildKiller>,
     worker: Option<JoinHandle<()>>,
     last_error: Arc<Mutex<Option<String>>>,
     discontinuities: Arc<AtomicU64>,
@@ -203,7 +204,7 @@ impl LegacyGroupSession {
         if let Some((name, error)) = readiness_error {
             running.store(false, Ordering::SeqCst);
             for member in &spawned {
-                kill_helper_tree(member.pid);
+                let _ = member.killer.terminate();
             }
             for member in spawned {
                 drop(member.pcm_tx);
@@ -219,7 +220,10 @@ impl LegacyGroupSession {
         let events_thread = Arc::clone(&startup_events);
         let active_thread = Arc::clone(&active_members);
 
-        let helper_pids = spawned.iter().map(|member| member.pid).collect::<Vec<_>>();
+        let helper_killers = spawned
+            .iter()
+            .map(|member| member.killer.clone())
+            .collect::<Vec<_>>();
         let volume_controls = spawned
             .iter()
             .map(|member| member.volume_control.clone())
@@ -406,7 +410,7 @@ impl LegacyGroupSession {
 
         Ok(Self {
             running,
-            helper_pids,
+            helper_killers,
             worker: Some(worker),
             last_error,
             discontinuities,
@@ -459,14 +463,14 @@ impl LegacyGroupSession {
         // Keep the #594 anti-hang guarantee with a delayed watchdog: if a
         // helper is still blocked in stdin/RTSP after two seconds, terminate
         // that local process tree to unblock the Rust writer.
-        let helper_pids = std::mem::take(&mut self.helper_pids);
-        let watchdog = if helper_pids.is_empty() {
+        let helper_killers = std::mem::take(&mut self.helper_killers);
+        let watchdog = if helper_killers.is_empty() {
             None
         } else {
             Some(thread::spawn(move || {
                 thread::sleep(Duration::from_secs(2));
-                for pid in helper_pids {
-                    kill_helper_tree(pid);
+                for killer in helper_killers {
+                    let _ = killer.terminate();
                 }
             }))
         };
@@ -547,17 +551,17 @@ fn spawn_member(
         .stderr(Stdio::piped())
         .creation_flags(0x08000000);
 
-    let mut child = command.spawn().map_err(|error| LegacyGroupError::Spawn {
+    let mut child = ManagedChild::spawn(&mut command).map_err(|error| LegacyGroupError::Spawn {
         name: config.name.clone(),
         error: error.to_string(),
     })?;
-    let child_pid = child.id();
+    let killer = child.killer();
 
-    let stdin = child.stdin.take().ok_or_else(|| LegacyGroupError::Spawn {
+    let stdin = child.take_stdin().ok_or_else(|| LegacyGroupError::Spawn {
         name: config.name.clone(),
         error: "helper stdin pipe was not created".into(),
     })?;
-    let stderr = child.stderr.take().ok_or_else(|| LegacyGroupError::Spawn {
+    let stderr = child.take_stderr().ok_or_else(|| LegacyGroupError::Spawn {
         name: config.name.clone(),
         error: "helper stderr pipe was not created".into(),
     })?;
@@ -623,7 +627,7 @@ fn spawn_member(
         .spawn(move || {
             legacy_writer_loop(
                 writer_name,
-                &mut child,
+                child,
                 stdin,
                 pcm_rx,
                 writer_running,
@@ -639,7 +643,7 @@ fn spawn_member(
 
     Ok(SpawnedMember {
         name: config.name,
-        pid: child_pid,
+        killer,
         pcm_tx,
         connected_rx,
         writer,
@@ -649,7 +653,7 @@ fn spawn_member(
 
 fn legacy_writer_loop(
     name: String,
-    child: &mut Child,
+    mut child: ManagedChild,
     mut stdin: ChildStdin,
     pcm_rx: Receiver<[u8; PCM352_PACKET_BYTES]>,
     running: Arc<AtomicBool>,
@@ -694,20 +698,7 @@ fn legacy_writer_loop(
     // drains, then calls raopcl_disconnect()/raopcl_destroy(). Give that path
     // time to complete so receivers see a normal FLUSH/TEARDOWN. The session
     // watchdog above still guarantees a stuck helper cannot hang the app.
-    let graceful_deadline = std::time::Instant::now() + Duration::from_millis(1500);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if std::time::Instant::now() < graceful_deadline => {
-                thread::sleep(Duration::from_millis(20));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
-            }
-        }
-    }
+    let _ = child.wait_or_terminate(Duration::from_millis(1500));
 
     let previous = active_members.fetch_sub(1, Ordering::SeqCst);
     if previous <= 1 {
@@ -718,17 +709,6 @@ fn legacy_writer_loop(
         }
         running.store(false, Ordering::SeqCst);
     }
-}
-
-fn kill_helper_tree(pid: u32) {
-    // /T also terminates descendants created by the helper, /F guarantees a
-    // blocked RTSP/stdin helper cannot keep SAirplay2 alive after Stop/Exit.
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(0x08000000)
-        .status();
 }
 
 fn helper_path() -> Result<PathBuf, LegacyGroupError> {

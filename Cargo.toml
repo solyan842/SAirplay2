@@ -3,6 +3,7 @@ members = [
   "crates/sairplay-engine",
   "crates/sairplay-msa-solo",
   "crates/sairplay-gui",
+  "crates/sairplay-helper-process",
 ]
 resolver = "2"
 

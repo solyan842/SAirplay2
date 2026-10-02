@@ -6,20 +6,13 @@
 //! helpers are not touched or reused.
 
 use crate::timing::StartResolution;
+use sairplay_helper_process::ManagedChild;
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::net::IpAddr;
-use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject,
-    JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     mpsc,
@@ -40,57 +33,6 @@ const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const DISCONNECT_GRACE: Duration = Duration::from_secs(2);
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 static SESSION_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Owns one Windows Job Object with KILL_ON_JOB_CLOSE. The raw handle is stored
-/// as usize so the session stays Send when moved between GUI/worker threads.
-/// Closing SAirplay2 (even while a connect thread is still blocked) closes the
-/// job handle at process teardown, and Windows terminates the helper instead of
-/// leaving cliraop-msa-solo.exe orphaned and locking the install directory.
-struct KillOnCloseJob {
-    handle: usize,
-}
-
-impl KillOnCloseJob {
-    fn attach(child: &Child) -> Result<Self, MsaRaopError> {
-        let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
-            .map_err(|e| MsaRaopError::Job(e.to_string()))?;
-
-        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let set_result = unsafe {
-            SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &info as *const _ as *const core::ffi::c_void,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        };
-        if let Err(error) = set_result {
-            let _ = unsafe { CloseHandle(job) };
-            return Err(MsaRaopError::Job(error.to_string()));
-        }
-
-        let process = HANDLE(child.as_raw_handle());
-        if let Err(error) = unsafe { AssignProcessToJobObject(job, process) } {
-            let _ = unsafe { CloseHandle(job) };
-            return Err(MsaRaopError::Job(error.to_string()));
-        }
-
-        Ok(Self { handle: job.0 as usize })
-    }
-
-    fn terminate(&self) {
-        let handle = HANDLE(self.handle as *mut core::ffi::c_void);
-        let _ = unsafe { TerminateJobObject(handle, 1) };
-    }
-}
-
-impl Drop for KillOnCloseJob {
-    fn drop(&mut self) {
-        let handle = HANDLE(self.handle as *mut core::ffi::c_void);
-        let _ = unsafe { CloseHandle(handle) };
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct MsaRaopConfig {
@@ -143,7 +85,6 @@ pub enum MsaRaopState { Connected, Streaming, Flushed, Paused, Stopped, Down }
 pub enum MsaRaopError {
     HelperMissing(PathBuf),
     Spawn(std::io::Error),
-    Job(String),
     Pipe,
     ReadinessTimeout,
     Connect(String),
@@ -157,7 +98,6 @@ impl fmt::Display for MsaRaopError {
         match self {
             Self::HelperMissing(p) => write!(f, "MSA RAOP helper missing: {}", p.display()),
             Self::Spawn(e) => write!(f, "MSA RAOP helper spawn failed: {e}"),
-            Self::Job(e) => write!(f, "MSA RAOP helper job setup failed: {e}"),
             Self::Pipe => write!(f, "MSA RAOP helper pipe missing"),
             Self::ReadinessTimeout => write!(f, "MSA RAOP helper readiness timed out"),
             Self::Connect(s) => write!(f, "MSA RAOP connect failed: {s}"),
@@ -198,8 +138,7 @@ impl MsaRaopPcmWriter {
 }
 
 pub struct MsaRaopSession {
-    child: Child,
-    job: KillOnCloseJob,
+    child: ManagedChild,
     stdin: Arc<Mutex<ChildStdin>>,
     control_path: PathBuf,
     ack_path: PathBuf,
@@ -265,32 +204,15 @@ impl MsaRaopSession {
             .stderr(Stdio::piped())
             .creation_flags(CREATE_NO_WINDOW);
 
-        let mut child = cmd.spawn().map_err(MsaRaopError::Spawn)?;
-        let job = match KillOnCloseJob::attach(&child) {
-            Ok(job) => job,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
-        };
-        let stdin = match child.stdin.take() {
+        let mut child = ManagedChild::spawn(&mut cmd).map_err(MsaRaopError::Spawn)?;
+        let stdin = match child.take_stdin() {
             Some(stdin) => Arc::new(Mutex::new(stdin)),
-            None => {
-                job.terminate();
-                let _ = child.wait();
-                return Err(MsaRaopError::Pipe);
-            }
+            None => return Err(MsaRaopError::Pipe),
         };
-        let stderr = match child.stderr.take() {
+        let stderr = match child.take_stderr() {
             Some(stderr) => stderr,
-            None => {
-                job.terminate();
-                let _ = child.wait();
-                return Err(MsaRaopError::Pipe);
-            }
+            None => return Err(MsaRaopError::Pipe),
         };
-
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<MsaRaopReady, String>>(1);
         let log = Arc::new(Mutex::new(Vec::<String>::new()));
         let head_audible_ms = Arc::new(AtomicU64::new(0));
@@ -346,27 +268,17 @@ impl MsaRaopSession {
             }
         });
         if let Err(error) = log_thread {
-            job.terminate();
-            let _ = child.wait();
             return Err(MsaRaopError::Spawn(error));
         }
 
         let ready = match ready_rx.recv_timeout(READY_TIMEOUT) {
             Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                job.terminate();
-                let _ = child.wait();
-                return Err(MsaRaopError::Connect(e));
-            }
-            Err(_) => {
-                job.terminate();
-                let _ = child.wait();
-                return Err(MsaRaopError::ReadinessTimeout);
-            }
+            Ok(Err(e)) => return Err(MsaRaopError::Connect(e)),
+            Err(_) => return Err(MsaRaopError::ReadinessTimeout),
         };
 
         Ok(Self {
-            child, job, stdin, control_path, ack_path, metadata_path, artwork_path,
+            child, stdin, control_path, ack_path, metadata_path, artwork_path,
             head_audible_ms,
             meta_delivered: false,
             meta_title: String::new(),
@@ -558,25 +470,9 @@ impl MsaRaopSession {
         // helper still held the application directory. Queue QUIT once, allow
         // one bounded graceful teardown window, then terminate the whole job.
         let _ = self.enqueue_command("QUIT", 0, 0);
-        let deadline = Instant::now() + DISCONNECT_GRACE;
-        let mut exited = false;
-        while Instant::now() < deadline {
-            match self.child.try_wait() {
-                Ok(Some(_)) => {
-                    exited = true;
-                    break;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(10)),
-                Err(_) => break,
-            }
-        }
-        if !exited {
-            self.job.terminate();
-        }
-        // Reap the process handle before Drop returns so cliraop-msa-solo.exe
-        // cannot keep its executable/directory locked after the GUI is gone.
-        let _ = self.child.wait();
-
+        // Shared name-independent helper guard owns graceful timeout,
+        // whole-job termination and mandatory process reaping.
+        let _ = self.child.wait_or_terminate(DISCONNECT_GRACE);
         self.state = MsaRaopState::Down;
         let _ = std::fs::remove_file(&self.control_path);
         let _ = std::fs::remove_file(&self.ack_path);
