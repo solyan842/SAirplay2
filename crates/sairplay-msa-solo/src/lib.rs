@@ -21,6 +21,8 @@ pub mod wasapi_loopback;
 #[cfg(windows)]
 pub mod windows_audio_worker;
 #[cfg(windows)]
+pub mod windows_pcm_hub;
+#[cfg(windows)]
 pub mod windows_raop_session;
 #[cfg(windows)]
 pub mod windows_raop_worker;
@@ -328,6 +330,8 @@ pub use windows_audio_worker::{
     SharedNativeSoloEngine, WindowsSoloAudioWorker, WindowsSoloAudioWorkerError,
     AIRPLAY_CLOCK_READY_TIMEOUT, FLUSH_DRAIN_TIMEOUT, STARVATION_RECOVERY_INTERVAL,
 };
+#[cfg(windows)]
+pub use windows_pcm_hub::WindowsPcmHub;
 
 pub use volume::{set_native_volume, volume_percent_to_db, NativeVolumeControl, VolumeError, VolumeSetResult};
 pub use native_metadata::{build_dmap_metadata, send_native_metadata, MetadataError, MetadataSetResult, NativeMetadataControl};
