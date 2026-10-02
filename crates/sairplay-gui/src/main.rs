@@ -1439,24 +1439,28 @@ impl SairplayApp {
             .map(|service| service.fullname.clone())
     }
 
+    fn pairing_flags_required(device: &DeviceRecord) -> bool {
+        // Pinned MSA ORs sf/flags from both discovery records. LEGACY_PAIRING
+        // (0x200) is often RAOP-only while PIN_REQUIRED (0x8) may be AirPlay-only.
+        // An AppleTV model string by itself is never evidence that pairing is needed.
+        [device.airplay.as_ref(), device.raop.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|service| service.txt.pin_required() || service.txt.legacy_pairing())
+    }
+
     fn legacy_pairing_required(&self, device: &DeviceRecord) -> bool {
-        // Genuine Apple TV uses native HAP PIN pair-setup + stored pair-verify.
-        // Legacy PIN pairing remains only for receivers whose selected route is
-        // actually RAOP/AirPlay2Compat (and excludes the MiTV AppleTV clone via
-        // is_genuine_appletv_candidate()).
-        if is_genuine_appletv_candidate(device) {
+        if !Self::pairing_flags_required(device) {
             return false;
         }
-        let Some(service) = device.airplay.as_ref().or(device.raop.as_ref()) else {
-            return false;
-        };
 
-        // Follow the source route semantics: full legacy PIN pairing is only
-        // demanded when the receiver's status flags explicitly advertise
-        // PIN-required (0x8) or legacy-pairing (0x200). A pk field by itself
-        // is not sufficient evidence; many TV/projector AirPlay clones expose
-        // AppleTV-like model/pk TXT records without any on-screen pairing UI.
-        if !(service.txt.pin_required() || service.txt.legacy_pairing()) {
+        // If AirPlay 2 is actually advertised, MSA pairs the streaming protocol
+        // on the AirPlay endpoint. Otherwise legacy RAOP pairing owns the PIN.
+        if device
+            .airplay
+            .as_ref()
+            .is_some_and(|service| service.txt.supports_airplay2())
+        {
             return false;
         }
 
@@ -1471,7 +1475,10 @@ impl SairplayApp {
     }
 
     fn native_pairing_required(&self, device: &DeviceRecord) -> bool {
-        if !is_genuine_appletv_candidate(device) {
+        let Some(service) = device.airplay.as_ref() else {
+            return false;
+        };
+        if !service.txt.supports_airplay2() || !Self::pairing_flags_required(device) {
             return false;
         }
         let Some(key) = Self::native_pairing_key(device) else {
@@ -2207,10 +2214,10 @@ impl SairplayApp {
             return;
         }
 
-        // MSA pairs genuine Apple TV on the native AirPlay endpoint first.
-        // Route resolution only becomes native after those credentials exist,
-        // so doing route(false, false) first incorrectly demotes a PIN-required
-        // Apple TV to AirPlay2Compat and launches legacy cliraop pairing.
+        // MSA pairing is driven by discovery flags, not the advertised model.
+        // AirPlay 2 receivers that explicitly require pairing obtain native
+        // credentials first; AppleTV-model clones without pairing flags simply
+        // continue into Auto route resolution.
         if let Some((_, device)) = selected_devices
             .iter()
             .find(|(_, device)| self.native_pairing_required(device))
@@ -5555,6 +5562,70 @@ mod gui_tests {
         );
 
         assert_eq!(build_homepod_stereo_pairs(&[one, two]).len(), 0);
+    }
+
+    #[test]
+    fn appletv_model_without_pairing_flags_is_not_forced_to_pair() {
+        let device = DeviceRecord {
+            display_name: "EShare-1965".into(),
+            airplay: Some(DiscoveredService {
+                kind: ServiceKind::AirPlay,
+                fullname: "EShare-1965._airplay._tcp.local.".into(),
+                display_name: "EShare-1965".into(),
+                host: "es.local.".into(),
+                port: 51010,
+                addresses: vec!["192.168.31.139".into()],
+                txt: AirPlayTxt::parse([
+                    ("model", "AppleTV3,2"),
+                    ("features", "274877906944"),
+                    ("flags", "0x4"),
+                ])
+                .unwrap(),
+            }),
+            raop: Some(DiscoveredService {
+                kind: ServiceKind::Raop,
+                fullname: "112233445566@EShare-1965._raop._tcp.local.".into(),
+                display_name: "EShare-1965".into(),
+                host: "es.local.".into(),
+                port: 51040,
+                addresses: vec!["192.168.31.139".into()],
+                txt: AirPlayTxt::parse([("sf", "0x4")]).unwrap(),
+            }),
+        };
+
+        assert!(!SairplayApp::pairing_flags_required(&device));
+    }
+
+    #[test]
+    fn pairing_flags_are_combined_across_airplay_and_raop() {
+        let device = DeviceRecord {
+            display_name: "Apple TV".into(),
+            airplay: Some(DiscoveredService {
+                kind: ServiceKind::AirPlay,
+                fullname: "Apple TV._airplay._tcp.local.".into(),
+                display_name: "Apple TV".into(),
+                host: "appletv.local.".into(),
+                port: 7000,
+                addresses: vec!["192.168.1.80".into()],
+                txt: AirPlayTxt::parse([
+                    ("model", "AppleTV14,1"),
+                    ("features", "274877906944"),
+                    ("flags", "0x4"),
+                ])
+                .unwrap(),
+            }),
+            raop: Some(DiscoveredService {
+                kind: ServiceKind::Raop,
+                fullname: "AABBCCDDEEFF@Apple TV._raop._tcp.local.".into(),
+                display_name: "Apple TV".into(),
+                host: "appletv.local.".into(),
+                port: 5000,
+                addresses: vec!["192.168.1.80".into()],
+                txt: AirPlayTxt::parse([("sf", "0x200")]).unwrap(),
+            }),
+        };
+
+        assert!(SairplayApp::pairing_flags_required(&device));
     }
 
     #[test]
