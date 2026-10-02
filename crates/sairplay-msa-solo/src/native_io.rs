@@ -4,6 +4,7 @@
 use crate::native_media::{MediaIo, SendResult, StreamWrite};
 use crate::native_rtx::RtxIo;
 use crate::native_sync::SyncIo;
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::io::{self, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, UdpSocket};
 use std::thread;
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant};
 
 pub const UDP_SEND_TIMEOUT: Duration = Duration::from_millis(20);
 pub const BUFFERED_WRITE_TIMEOUT: Duration = Duration::from_millis(2000);
+pub const BUFFERED_SEND_BUFFER_BYTES: usize = 64 << 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalMediaPorts {
@@ -19,6 +21,7 @@ pub struct LocalMediaPorts {
 }
 
 pub struct NativeMediaIo {
+    bind_ip: IpAddr,
     data_socket: UdpSocket,
     control_socket: UdpSocket,
     remote_data: Option<SocketAddr>,
@@ -33,6 +36,7 @@ impl NativeMediaIo {
         data_socket.set_nonblocking(true)?;
         control_socket.set_nonblocking(true)?;
         Ok(Self {
+            bind_ip,
             data_socket,
             control_socket,
             remote_data: None,
@@ -73,9 +77,29 @@ impl NativeMediaIo {
             io::ErrorKind::NotConnected,
             "remote data endpoint not attached",
         ))?;
-        let stream = TcpStream::connect_timeout(&remote, BUFFERED_WRITE_TIMEOUT)?;
-        stream.set_nodelay(true)?;
-        stream.set_write_timeout(Some(BUFFERED_WRITE_TIMEOUT))?;
+
+        // Match pinned MSA's type-103 socket contract. In particular keep the
+        // kernel send queue small: bytes already accepted by the kernel are
+        // the only old audio FLUSHBUFFERED cannot recall on platforms (such
+        // as Windows) where we cannot inspect/drain SIOCOUTQ/SO_NWRITE.
+        let domain = match remote {
+            SocketAddr::V4(_) => Domain::IPV4,
+            SocketAddr::V6(_) => Domain::IPV6,
+        };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        if !self.bind_ip.is_unspecified() {
+            // Pinned MSA treats an explicit-interface bind failure as a
+            // warning and still lets routing attempt the connection.
+            let _ = socket.bind(&SockAddr::from(SocketAddr::new(self.bind_ip, 0)));
+        }
+        socket.set_nodelay(true)?;
+        // MSA's setsockopt is best-effort; do not turn a platform refusal of
+        // the queue hint into a session-connect failure.
+        let _ = socket.set_send_buffer_size(BUFFERED_SEND_BUFFER_BYTES);
+        socket.set_write_timeout(Some(BUFFERED_WRITE_TIMEOUT))?;
+        socket.set_read_timeout(Some(BUFFERED_WRITE_TIMEOUT))?;
+        socket.connect_timeout(&SockAddr::from(remote), BUFFERED_WRITE_TIMEOUT)?;
+        let stream: TcpStream = socket.into();
         self.buffered = Some(stream);
         Ok(())
     }
@@ -234,6 +258,12 @@ mod tests {
         assert_eq!(&buf[..n], b"audio");
         let (n, _) = ctrl_rx.recv_from(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"sync");
+    }
+
+    #[test]
+    fn buffered_contract_matches_pinned_msa() {
+        assert_eq!(BUFFERED_WRITE_TIMEOUT, Duration::from_millis(2000));
+        assert_eq!(BUFFERED_SEND_BUFFER_BYTES, 64 * 1024);
     }
 
     #[test]

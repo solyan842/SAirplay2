@@ -1,6 +1,9 @@
 //! Windows WASAPI -> native AP2 SOLO media worker.
-//! The worker owns the COM/WASAPI capture apartment; the engine stays behind
-//! a shared mutex so lifecycle commands can serialize with media sends.
+//! The adapter deliberately splits capture from transport: one COM/WASAPI
+//! producer continuously drains the Windows engine into the same bounded PCM
+//! ring shape used by MSA, while a separate media consumer owns pacing/ALAC/
+//! network sends. Slow type-103 TCP or RTSP work therefore cannot starve the
+//! 100 ms WASAPI capture buffer.
 
 use crate::{
     ap2::Ap2State,
@@ -55,7 +58,8 @@ pub struct WindowsSoloAudioWorker {
     flush_ack_generation: Arc<AtomicU64>,
     audio_ready: Arc<AtomicBool>,
     deferred_start_armed: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
+    capture_worker: Option<JoinHandle<()>>,
+    media_worker: Option<JoinHandle<()>>,
     last_error: Arc<Mutex<Option<String>>>,
     discontinuities: Arc<AtomicU64>,
     last_discontinuity_frame: Arc<AtomicU64>,
@@ -85,235 +89,268 @@ impl WindowsSoloAudioWorker {
         let last_discontinuity_frame = Arc::new(AtomicU64::new(u64::MAX));
         let startup_events = Arc::new(Mutex::new(Vec::<String>::new()));
 
-        let running_thread = Arc::clone(&running);
-        let flush_thread = Arc::clone(&flush_generation);
-        let flush_ack_thread = Arc::clone(&flush_ack_generation);
-        let audio_ready_thread = Arc::clone(&audio_ready);
-        let deferred_start_thread = Arc::clone(&deferred_start_armed);
-        let error_thread = Arc::clone(&last_error);
-        let discontinuities_thread = Arc::clone(&discontinuities);
-        let last_discontinuity_thread = Arc::clone(&last_discontinuity_frame);
-        let events_thread = Arc::clone(&startup_events);
-        let engine_thread = Arc::clone(&engine);
+        // MSA keeps input acquisition independent from the media sender.  The
+        // Windows equivalent is a shared bounded PCM ring with exactly one
+        // producer (WASAPI) and one consumer (AirPlay media).
+        let pcm_ring = Arc::new(Mutex::new(
+            Pcm352Chunker::new_with_bytes_per_frame(audio_format.input_bytes_per_frame()),
+        ));
+        let source_present = Arc::new(AtomicBool::new(false));
+        let source_activity_generation = Arc::new(AtomicU64::new(0));
 
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-        let worker = thread::Builder::new()
-            .name("sairplay-msa-wasapi".into())
-            .spawn(move || {
-                let mut capture = match WasapiLoopbackCapture::open_default_for_format(audio_format) {
-                    Ok(v) => {
-                        if let Ok(mut events) = events_thread.lock() {
-                            events.push(format!("MSA INPUT {}.", v.format_summary()));
-                        }
-                        let _ = ready_tx.send(Ok(()));
-                        v
-                    }
-                    Err(e) => {
-                        let message = e.to_string();
-                        let _ = ready_tx.send(Err(message.clone()));
-                        if let Ok(mut slot) = error_thread.lock() { *slot = Some(message); }
-                        running_thread.store(false, Ordering::SeqCst);
-                        return;
-                    }
-                };
 
-                let mut chunker =
-                    Pcm352Chunker::new_with_bytes_per_frame(audio_format.input_bytes_per_frame());
-                let mut captured_frames_total = 0u64;
-                // Cold-start adapter invariant: WASAPI engine-silent packets are
-                // not equivalent to MSA stdin audio_present. Latch only after
-                // the first packet not marked AUDCLNT_BUFFERFLAGS_SILENT.
-                let mut source_present = false;
-                let mut local_flush_generation = flush_thread.load(Ordering::SeqCst);
-                let mut starvation_started: Option<Instant> = None;
-                let mut last_starvation_recovery: Option<Instant> = None;
-                let mut deferred_audio_seen: Option<Instant> = None;
-                let mut buffered_source_idle_since: Option<Instant> = None;
-                // Diagnostic only: measure how long the single Windows worker
-                // goes between WASAPI drains. A large gap alongside
-                // AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY would prove that
-                // capture is being starved by work done later in this same loop.
-                let mut last_capture_drain = Instant::now();
+        // Producer: this thread does no RTSP, ALAC or media socket I/O.  Its
+        // only blocking dependency is the short PCM-ring mutex, which the
+        // consumer never holds while it touches the network.
+        let capture_worker = {
+            let running_thread = Arc::clone(&running);
+            let flush_thread = Arc::clone(&flush_generation);
+            let flush_ack_thread = Arc::clone(&flush_ack_generation);
+            let audio_ready_thread = Arc::clone(&audio_ready);
+            let error_thread = Arc::clone(&last_error);
+            let discontinuities_thread = Arc::clone(&discontinuities);
+            let last_discontinuity_thread = Arc::clone(&last_discontinuity_frame);
+            let events_thread = Arc::clone(&startup_events);
+            let ring_thread = Arc::clone(&pcm_ring);
+            let source_present_thread = Arc::clone(&source_present);
+            let source_activity_thread = Arc::clone(&source_activity_generation);
+            let engine_diag = Arc::clone(&engine);
 
-                while running_thread.load(Ordering::SeqCst) {
-                    // Exact cliairplay outer-loop health gate: MediaRemote
-                    // reverse-event health is part of the control verdict,
-                    // even when RTSP/media sockets themselves are still alive.
-                    let control_ok = {
-                        let mut guard = match engine_thread.lock() {
-                            Ok(v) => v,
-                            Err(_) => {
-                                if let Ok(mut slot) = error_thread.lock() {
-                                    *slot = Some("native SOLO engine mutex poisoned".into());
-                                }
-                                running_thread.store(false, Ordering::SeqCst);
-                                return;
+            thread::Builder::new()
+                .name("sairplay-msa-wasapi".into())
+                .spawn(move || {
+                    let mut capture = match WasapiLoopbackCapture::open_default_for_format(audio_format) {
+                        Ok(v) => {
+                            if let Ok(mut events) = events_thread.lock() {
+                                events.push(format!("MSA INPUT {}.", v.format_summary()));
+                                events.push(
+                                    "MSA INPUT capture/media split active: WASAPI producer cannot be blocked by type103 sender."
+                                        .into(),
+                                );
                             }
-                        };
-                        guard.state() != Ap2State::Down && guard.control_healthy()
-                    };
-                    if !control_ok {
-                        if let Ok(mut slot) = error_thread.lock() {
-                            *slot = Some("AirPlay 2 control channel failed".into());
+                            let _ = ready_tx.send(Ok(()));
+                            v
                         }
-                        running_thread.store(false, Ordering::SeqCst);
-                        return;
-                    }
-
-                    let generation = flush_thread.load(Ordering::SeqCst);
-                    if generation != local_flush_generation {
-                        chunker.clear();
-                        capture.reset_conversion();
-                        local_flush_generation = generation;
-                        starvation_started = None;
-                        last_starvation_recovery = None;
-                        buffered_source_idle_since = None;
-                        audio_ready_thread.store(false, Ordering::SeqCst);
-                        flush_ack_thread.store(generation, Ordering::SeqCst);
-                    }
-
-                    let pending_before_drain = chunker.pending_bytes();
-                    let capture_gap_ms = last_capture_drain.elapsed().as_millis();
-                    let report = match capture.drain_into(&mut chunker) {
-                        Ok(v) => v,
                         Err(e) => {
+                            let message = e.to_string();
+                            let _ = ready_tx.send(Err(message.clone()));
                             if let Ok(mut slot) = error_thread.lock() {
-                                *slot = Some(format!("WASAPI capture failed: {e}"));
+                                *slot = Some(message);
                             }
                             running_thread.store(false, Ordering::SeqCst);
                             return;
                         }
                     };
-                    last_capture_drain = Instant::now();
 
-                    if report.discontinuities != 0 {
-                        let total = discontinuities_thread
-                            .fetch_add(report.discontinuities, Ordering::SeqCst)
-                            .saturating_add(report.discontinuities);
-                        let absolute_frame = report.discontinuity_frame_offset.map(|offset| {
-                            captured_frames_total.saturating_add(offset)
-                        });
-                        if let Some(frame) = absolute_frame {
-                            last_discontinuity_thread.store(frame, Ordering::SeqCst);
-                        }
-
-                        // Telemetry only. Do not clear PCM, reset conversion,
-                        // re-anchor, or otherwise alter the MSA media path here.
-                        // We need evidence first that a discontinuity coincides
-                        // with a delayed WASAPI drain and accumulated PCM.
-                        let pending_after_drain = chunker.pending_bytes();
-                        let bytes_per_frame = chunker.bytes_per_frame().max(1);
-                        let pending_before_frames =
-                            pending_before_drain / bytes_per_frame;
-                        let pending_after_frames =
-                            pending_after_drain / bytes_per_frame;
-                        let byte_rate = audio_format.sample_rate as usize
-                            * audio_format.input_bytes_per_frame();
-                        let ring_capacity =
-                            (byte_rate.saturating_mul(4)).max(1 << 20);
-                        let pending_excess_bytes =
-                            pending_after_drain.saturating_sub(ring_capacity);
-                        let diag = engine_thread
-                            .lock()
-                            .ok()
-                            .map(|guard| guard.diagnostics());
-
-                        if let Ok(mut events) = events_thread.lock() {
-                            if let Some(diag) = diag {
-                                events.push(format!(
-                                    "MSA INPUT DISCONTINUITY diag total={} batch={} capture_gap={}ms drained_frames={} output_frames={} silent_frames={} pending_before={}f/{}B pending_after={}f/{}B excess={}B discontinuity_frame={:?} state={:?} head_frame={} pacing_ahead_frames={} audio_sent={} audio_dropped={} sync_sent={} sync_dropped={}.",
-                                    total,
-                                    report.discontinuities,
-                                    capture_gap_ms,
-                                    report.frames,
-                                    report.output_frames,
-                                    report.silent_frames,
-                                    pending_before_frames,
-                                    pending_before_drain,
-                                    pending_after_frames,
-                                    pending_after_drain,
-                                    pending_excess_bytes,
-                                    absolute_frame,
-                                    diag.state,
-                                    diag.head_frame,
-                                    diag.pacing_ahead_frames,
-                                    diag.audio_sent,
-                                    diag.audio_dropped,
-                                    diag.sync_sent,
-                                    diag.sync_dropped,
-                                ));
-                            } else {
-                                events.push(format!(
-                                    "MSA INPUT DISCONTINUITY diag total={} batch={} capture_gap={}ms drained_frames={} output_frames={} silent_frames={} pending_before={}f/{}B pending_after={}f/{}B excess={}B discontinuity_frame={:?}; engine diagnostics unavailable.",
-                                    total,
-                                    report.discontinuities,
-                                    capture_gap_ms,
-                                    report.frames,
-                                    report.output_frames,
-                                    report.silent_frames,
-                                    pending_before_frames,
-                                    pending_before_drain,
-                                    pending_after_frames,
-                                    pending_after_drain,
-                                    pending_excess_bytes,
-                                    absolute_frame,
-                                ));
-                            }
-                        }
-                    }
-                    captured_frames_total =
-                        captured_frames_total.saturating_add(report.frames as u64);
-
-                    // Pinned MSA waits for actual source bytes before START.
-                    // Windows shared-loopback can emit engine-generated SILENT
-                    // packets while no application is playing; those packets
-                    // must not satisfy audio_present. Preserve stable's adapter
-                    // boundary: drop pre-source engine silence, reset conversion
-                    // history, and wait indefinitely for the first non-SILENT
-                    // WASAPI packet. This deliberately does not inspect sample
-                    // amplitude, so a real digital-zero source remains valid.
-                    if !source_present {
-                        if report.first_non_silent_frame_offset.is_some() {
-                            source_present = true;
-                            if let Ok(mut events) = events_thread.lock() {
-                                events.push(
-                                    "MSA INPUT source-present: first non-SILENT WASAPI packet."
-                                        .into(),
-                                );
-                            }
-                        } else {
-                            chunker.clear();
-                            capture.reset_conversion();
-                            audio_ready_thread.store(false, Ordering::SeqCst);
-                            deferred_audio_seen = None;
-                            if report.frames == 0 {
-                                thread::sleep(Duration::from_millis(1));
-                            }
-                            continue;
-                        }
-                    }
-
-                    // MSA's persistent input ring is max(4 seconds, 1 MiB).
-                    // WASAPI cannot backpressure the system mixer, so preserve
-                    // the oldest resident bytes and discard only new excess.
                     let byte_rate = audio_format.sample_rate as usize
                         * audio_format.input_bytes_per_frame();
                     let ring_capacity = (byte_rate.saturating_mul(4)).max(1 << 20);
-                    let _ = chunker.truncate_pending(ring_capacity);
-                    if chunker.has_packet() {
-                        audio_ready_thread.store(true, Ordering::SeqCst);
-                    }
+                    let mut local_flush_generation = flush_thread.load(Ordering::SeqCst);
+                    let mut captured_frames_total = 0u64;
+                    let mut last_capture_drain = Instant::now();
 
-                    // Windows loopback differs from MSA's ffmpeg/stdin source:
-                    // a Buffered type-103 receiver must not be anchored before
-                    // source-present PCM exists and a complete packet is retained.
-                    // Engine-silent WASAPI buffers were rejected above. Keep the
-                    // first source packet resident in the chunker while the
-                    // receiver clock projection settles.
-                    if deferred_start_thread.load(Ordering::SeqCst) && chunker.has_packet() {
-                        let first_audio_at =
-                            *deferred_audio_seen.get_or_insert_with(Instant::now);
-                        let start_attempt = {
+                    while running_thread.load(Ordering::SeqCst) {
+                        let generation = flush_thread.load(Ordering::SeqCst);
+                        if generation != local_flush_generation {
+                            let cleared = ring_thread
+                                .lock()
+                                .map(|mut ring| {
+                                    let bytes = ring.pending_bytes();
+                                    ring.clear();
+                                    bytes
+                                })
+                                .unwrap_or(0);
+                            capture.reset_conversion();
+                            source_present_thread.store(false, Ordering::SeqCst);
+                            audio_ready_thread.store(false, Ordering::SeqCst);
+                            local_flush_generation = generation;
+                            flush_ack_thread.store(generation, Ordering::SeqCst);
+                            if cleared != 0 {
+                                if let Ok(mut events) = events_thread.lock() {
+                                    events.push(format!(
+                                        "MSA INPUT flush reset: discarded {} queued PCM bytes.",
+                                        cleared
+                                    ));
+                                }
+                            }
+                        }
+
+                        let capture_gap_ms = last_capture_drain.elapsed().as_millis();
+                        let (pending_before_drain, report, pending_after_drain) = {
+                            let mut ring = match ring_thread.lock() {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    if let Ok(mut slot) = error_thread.lock() {
+                                        *slot = Some("PCM ring mutex poisoned".into());
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            };
+                            let before = ring.pending_bytes();
+                            let report = match capture.drain_into(&mut ring) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    if let Ok(mut slot) = error_thread.lock() {
+                                        *slot = Some(format!("WASAPI capture failed: {e}"));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            };
+                            let after = ring.pending_bytes();
+                            (before, report, after)
+                        };
+                        last_capture_drain = Instant::now();
+
+                        if report.first_non_silent_frame_offset.is_some() {
+                            if !source_present_thread.swap(true, Ordering::SeqCst) {
+                                if let Ok(mut events) = events_thread.lock() {
+                                    events.push(
+                                        "MSA INPUT source-present: first non-SILENT WASAPI packet."
+                                            .into(),
+                                    );
+                                }
+                            }
+                            source_activity_thread.fetch_add(1, Ordering::SeqCst);
+                        }
+
+                        if report.discontinuities != 0 {
+                            let total = discontinuities_thread
+                                .fetch_add(report.discontinuities, Ordering::SeqCst)
+                                .saturating_add(report.discontinuities);
+                            let absolute_frame = report.discontinuity_frame_offset.map(|offset| {
+                                captured_frames_total.saturating_add(offset)
+                            });
+                            if let Some(frame) = absolute_frame {
+                                last_discontinuity_thread.store(frame, Ordering::SeqCst);
+                            }
+
+                            let bytes_per_frame = audio_format.input_bytes_per_frame().max(1);
+                            let pending_before_frames = pending_before_drain / bytes_per_frame;
+                            let pending_after_frames = pending_after_drain / bytes_per_frame;
+                            let pending_excess_bytes =
+                                pending_after_drain.saturating_sub(ring_capacity);
+                            let diag = engine_diag.try_lock().ok().map(|guard| guard.diagnostics());
+
+                            if let Ok(mut events) = events_thread.lock() {
+                                if let Some(diag) = diag {
+                                    events.push(format!(
+                                        "MSA INPUT DISCONTINUITY diag total={} batch={} capture_gap={}ms drained_frames={} output_frames={} silent_frames={} pending_before={}f/{}B pending_after={}f/{}B excess={}B discontinuity_frame={:?} state={:?} head_frame={} pacing_ahead_frames={} audio_sent={} audio_dropped={} sync_sent={} sync_dropped={}.",
+                                        total,
+                                        report.discontinuities,
+                                        capture_gap_ms,
+                                        report.frames,
+                                        report.output_frames,
+                                        report.silent_frames,
+                                        pending_before_frames,
+                                        pending_before_drain,
+                                        pending_after_frames,
+                                        pending_after_drain,
+                                        pending_excess_bytes,
+                                        absolute_frame,
+                                        diag.state,
+                                        diag.head_frame,
+                                        diag.pacing_ahead_frames,
+                                        diag.audio_sent,
+                                        diag.audio_dropped,
+                                        diag.sync_sent,
+                                        diag.sync_dropped,
+                                    ));
+                                } else {
+                                    events.push(format!(
+                                        "MSA INPUT DISCONTINUITY diag total={} batch={} capture_gap={}ms drained_frames={} output_frames={} silent_frames={} pending_before={}f/{}B pending_after={}f/{}B excess={}B discontinuity_frame={:?}; engine diagnostics busy/unavailable.",
+                                        total,
+                                        report.discontinuities,
+                                        capture_gap_ms,
+                                        report.frames,
+                                        report.output_frames,
+                                        report.silent_frames,
+                                        pending_before_frames,
+                                        pending_before_drain,
+                                        pending_after_frames,
+                                        pending_after_drain,
+                                        pending_excess_bytes,
+                                        absolute_frame,
+                                    ));
+                                }
+                            }
+                        }
+                        captured_frames_total =
+                            captured_frames_total.saturating_add(report.frames as u64);
+
+                        if !source_present_thread.load(Ordering::SeqCst) {
+                            if let Ok(mut ring) = ring_thread.lock() {
+                                ring.clear();
+                            }
+                            capture.reset_conversion();
+                            audio_ready_thread.store(false, Ordering::SeqCst);
+                        } else {
+                            let (dropped, has_packet) = match ring_thread.lock() {
+                                Ok(mut ring) => {
+                                    let dropped = ring.truncate_pending(ring_capacity);
+                                    (dropped, ring.has_packet())
+                                }
+                                Err(_) => {
+                                    if let Ok(mut slot) = error_thread.lock() {
+                                        *slot = Some("PCM ring mutex poisoned".into());
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            };
+                            audio_ready_thread.store(has_packet, Ordering::SeqCst);
+                            if dropped != 0 {
+                                if let Ok(mut events) = events_thread.lock() {
+                                    events.push(format!(
+                                        "MSA INPUT bounded ring full: discarded {} newest PCM bytes (capacity={}B).",
+                                        dropped, ring_capacity
+                                    ));
+                                }
+                            }
+                        }
+
+                        if report.frames == 0 {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                })
+                .map_err(|e| WindowsSoloAudioWorkerError::Engine(format!(
+                    "spawn WASAPI producer: {e}"
+                )))?
+        };
+
+        // Consumer: owns the MSA media loop.  It takes PCM from the ring, drops
+        // that mutex immediately, then performs all potentially slow
+        // pacing/ALAC/TCP/RTSP work.
+        let media_worker = {
+            let running_thread = Arc::clone(&running);
+            let flush_thread = Arc::clone(&flush_generation);
+            let flush_ack_thread = Arc::clone(&flush_ack_generation);
+            let audio_ready_thread = Arc::clone(&audio_ready);
+            let deferred_start_thread = Arc::clone(&deferred_start_armed);
+            let error_thread = Arc::clone(&last_error);
+            let events_thread = Arc::clone(&startup_events);
+            let engine_thread = Arc::clone(&engine);
+            let ring_thread = Arc::clone(&pcm_ring);
+            let source_present_thread = Arc::clone(&source_present);
+            let source_activity_thread = Arc::clone(&source_activity_generation);
+
+            thread::Builder::new()
+                .name("sairplay-msa-media".into())
+                .spawn(move || {
+                    let mut starvation_started: Option<Instant> = None;
+                    let mut last_starvation_recovery: Option<Instant> = None;
+                    let mut deferred_audio_seen: Option<Instant> = None;
+                    let mut buffered_source_idle_since: Option<Instant> = None;
+                    let mut local_flush_ack = flush_ack_thread.load(Ordering::SeqCst);
+                    let mut source_activity_seen =
+                        source_activity_thread.load(Ordering::SeqCst);
+                    let mut source_activity_at = Instant::now();
+
+                    while running_thread.load(Ordering::SeqCst) {
+                        let control_ok = {
                             let mut guard = match engine_thread.lock() {
                                 Ok(v) => v,
                                 Err(_) => {
@@ -324,73 +361,82 @@ impl WindowsSoloAudioWorker {
                                     return;
                                 }
                             };
+                            guard.state() != Ap2State::Down && guard.control_healthy()
+                        };
+                        if !control_ok {
+                            if let Ok(mut slot) = error_thread.lock() {
+                                *slot = Some("AirPlay 2 control channel failed".into());
+                            }
+                            running_thread.store(false, Ordering::SeqCst);
+                            return;
+                        }
 
-                            if guard.runtime.state == Ap2State::Streaming {
-                                deferred_start_thread.store(false, Ordering::SeqCst);
-                                None
-                            } else if guard.runtime.state != Ap2State::Connected {
-                                None
-                            } else {
-                                let now_unix_ms = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_millis()
-                                    .min(u128::from(u64::MAX)) as u64;
+                        let ack = flush_ack_thread.load(Ordering::SeqCst);
+                        if ack != local_flush_ack {
+                            local_flush_ack = ack;
+                            starvation_started = None;
+                            last_starvation_recovery = None;
+                            deferred_audio_seen = None;
+                            buffered_source_idle_since = None;
+                        }
 
-                                // Cold Buffered media activation is source-gated:
-                                // RECORD -> type103 SETUP -> SETPEERS -> data TCP.
-                                // SETPEERS must happen before clock readiness is
-                                // evaluated, otherwise a long pre-source wait
-                                // would consume the readiness timeout before the
-                                // receiver is even invited onto the media peer set.
-                                let buffered_connected_now =
-                                    match guard.ensure_buffered_media_connected() {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            if let Ok(mut slot) = error_thread.lock() {
-                                                *slot = Some(format!(
-                                                    "deferred native SOLO media activation failed: {e:?}"
-                                                ));
-                                            }
-                                            running_thread.store(false, Ordering::SeqCst);
-                                            return;
+                        let activity = source_activity_thread.load(Ordering::SeqCst);
+                        if activity != source_activity_seen {
+                            source_activity_seen = activity;
+                            source_activity_at = Instant::now();
+                            buffered_source_idle_since = None;
+                        }
+
+                        let has_packet = ring_thread
+                            .lock()
+                            .map(|ring| ring.has_packet())
+                            .unwrap_or(false);
+                        audio_ready_thread.store(
+                            source_present_thread.load(Ordering::SeqCst) && has_packet,
+                            Ordering::SeqCst,
+                        );
+
+                        if deferred_start_thread.load(Ordering::SeqCst) && has_packet {
+                            let first_audio_at =
+                                *deferred_audio_seen.get_or_insert_with(Instant::now);
+                            let start_attempt = {
+                                let mut guard = match engine_thread.lock() {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        if let Ok(mut slot) = error_thread.lock() {
+                                            *slot = Some("native SOLO engine mutex poisoned".into());
                                         }
-                                    };
-
-                                if buffered_connected_now {
-                                    // Windows live-loopback cannot be backpressured
-                                    // like MSA stdin. RECORD/SETUP/SETPEERS/TCP
-                                    // above may block this capture thread long
-                                    // enough for WASAPI to accumulate stale live
-                                    // audio. Drain that activation interval once
-                                    // and let the next capture pass define the
-                                    // first audible packet.
-                                    chunker.clear();
-                                    capture.reset_conversion();
-                                    let drained = match capture.drain_into(&mut chunker) {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            if let Ok(mut slot) = error_thread.lock() {
-                                                *slot = Some(format!(
-                                                    "WASAPI post-activation reprime failed: {e}"
-                                                ));
-                                            }
-                                            running_thread.store(false, Ordering::SeqCst);
-                                            return;
-                                        }
-                                    };
-                                    chunker.clear();
-                                    capture.reset_conversion();
-                                    audio_ready_thread.store(false, Ordering::SeqCst);
-                                    deferred_audio_seen = Some(Instant::now());
-                                    if let Ok(mut events) = events_thread.lock() {
-                                        events.push(format!(
-                                            "MSA INPUT reprime after Buffered media activation: discarded {} stale live frames.",
-                                            drained.frames,
-                                        ));
+                                        running_thread.store(false, Ordering::SeqCst);
+                                        return;
                                     }
+                                };
+
+                                if guard.runtime.state == Ap2State::Streaming {
+                                    deferred_start_thread.store(false, Ordering::SeqCst);
+                                    None
+                                } else if guard.runtime.state != Ap2State::Connected {
                                     None
                                 } else {
+                                    let now_unix_ms = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis()
+                                        .min(u128::from(u64::MAX)) as u64;
+
+                                    let buffered_connected_now =
+                                        match guard.ensure_buffered_media_connected() {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                if let Ok(mut slot) = error_thread.lock() {
+                                                    *slot = Some(format!(
+                                                        "deferred native SOLO media activation failed: {e:?}"
+                                                    ));
+                                                }
+                                                running_thread.store(false, Ordering::SeqCst);
+                                                return;
+                                            }
+                                        };
+
                                     let uses_ptp = guard.uses_ptp();
                                     let readiness = guard.clock_readiness();
                                     let have_projection = uses_ptp
@@ -406,149 +452,141 @@ impl WindowsSoloAudioWorker {
                                     let projection_timeout =
                                         first_audio_at.elapsed() >= AIRPLAY_CLOCK_READY_TIMEOUT;
 
-                                    // MSA can act on a projected first probe
-                                    // because its stdin reader keeps filling
-                                    // while SETRATEANCHORTIME retries. Here the
-                                    // command path and WASAPI capture share one
-                                    // thread, so keep draining until the receiver
-                                    // is actually Ready; the eventual anchor then
-                                    // avoids 500 ms retry sleeps blocking capture.
-                                    if !clock_ready_now && !projection_timeout {
+                                    // Once capture is independent, match MSA:
+                                    // a valid projected clock floor is enough to
+                                    // commit START while the producer continues
+                                    // filling the input ring in parallel.
+                                    if uses_ptp
+                                        && !have_projection
+                                        && !clock_ready_now
+                                        && !projection_timeout
+                                    {
                                         None
                                     } else {
-                                    let ready_at = if have_projection {
-                                        readiness.ready_at_unix_ms
-                                    } else {
-                                        0
-                                    };
-                                    let mut requested =
-                                        now_unix_ms.saturating_add(DEFERRED_START_LEAD_MS);
-                                    if ready_at != 0 {
-                                        requested = requested.max(
-                                            ready_at
-                                                .saturating_add(DEFERRED_CLOCK_READY_LEAD_MS),
-                                        );
-                                    }
+                                        let ready_at = if have_projection {
+                                            readiness.ready_at_unix_ms
+                                        } else {
+                                            0
+                                        };
+                                        let mut requested =
+                                            now_unix_ms.saturating_add(DEFERRED_START_LEAD_MS);
+                                        if ready_at != 0 {
+                                            requested = requested.max(
+                                                ready_at.saturating_add(
+                                                    DEFERRED_CLOCK_READY_LEAD_MS,
+                                                ),
+                                            );
+                                        }
 
-                                    let started = match guard.start(requested) {
-                                        Ok(v) => v,
-                                        Err(e) => {
+                                        let started = match guard.start(requested) {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                if let Ok(mut slot) = error_thread.lock() {
+                                                    *slot = Some(format!(
+                                                        "deferred native SOLO START failed: {e:?}"
+                                                    ));
+                                                }
+                                                running_thread.store(false, Ordering::SeqCst);
+                                                return;
+                                            }
+                                        };
+                                        if requested.abs_diff(started.at_unix_ms) > 10_000 {
                                             if let Ok(mut slot) = error_thread.lock() {
                                                 *slot = Some(format!(
-                                                    "deferred native SOLO START failed: {e:?}"
+                                                    "MSA SOLO TIME-DOMAIN invariant failed: requested={} accepted={}",
+                                                    requested, started.at_unix_ms
                                                 ));
                                             }
                                             running_thread.store(false, Ordering::SeqCst);
                                             return;
                                         }
-                                    };
-                                    if requested.abs_diff(started.at_unix_ms) > 10_000 {
-                                        if let Ok(mut slot) = error_thread.lock() {
-                                            *slot = Some(format!(
-                                                "MSA SOLO TIME-DOMAIN invariant failed: requested={} accepted={}",
-                                                requested, started.at_unix_ms
-                                            ));
-                                        }
-                                        running_thread.store(false, Ordering::SeqCst);
-                                        return;
-                                    }
-                                    let diag = guard.diagnostics();
-                                    let mrp = guard.mrp_controller();
-                                    let clock_event = if !uses_ptp {
-                                        "MSA SOLO CLOCK not applicable: receiver uses NTP timing."
-                                            .to_owned()
-                                    } else if have_projection {
-                                        format!(
-                                            "MSA SOLO CLOCK state={:?} exchanges={} streak_age={}ms ready_at={} ready_in={}ms.",
-                                            readiness.state,
-                                            readiness.exchanges,
-                                            readiness.streak_age_ms,
-                                            readiness.ready_at_unix_ms,
-                                            readiness.ready_in_ms,
-                                        )
-                                    } else {
-                                        format!(
-                                            "MSA SOLO CLOCK projection unreported within {}ms; state={:?} exchanges={}; anchoring on the source lead.",
-                                            AIRPLAY_CLOCK_READY_TIMEOUT.as_millis(),
-                                            readiness.state,
-                                            readiness.exchanges,
-                                        )
-                                    };
-                                    Some((
-                                        requested,
-                                        started,
-                                        diag,
-                                        mrp,
-                                        clock_event,
-                                        buffered_connected_now,
-                                    ))
+                                        let diag = guard.diagnostics();
+                                        let mrp = guard.mrp_controller();
+                                        let clock_event = if !uses_ptp {
+                                            "MSA SOLO CLOCK not applicable: receiver uses NTP timing."
+                                                .to_owned()
+                                        } else if have_projection {
+                                            format!(
+                                                "MSA SOLO CLOCK state={:?} exchanges={} streak_age={}ms ready_at={} ready_in={}ms.",
+                                                readiness.state,
+                                                readiness.exchanges,
+                                                readiness.streak_age_ms,
+                                                readiness.ready_at_unix_ms,
+                                                readiness.ready_in_ms,
+                                            )
+                                        } else {
+                                            format!(
+                                                "MSA SOLO CLOCK projection unreported within {}ms; state={:?} exchanges={}; anchoring on the source lead.",
+                                                AIRPLAY_CLOCK_READY_TIMEOUT.as_millis(),
+                                                readiness.state,
+                                                readiness.exchanges,
+                                            )
+                                        };
+                                        Some((
+                                            requested,
+                                            started,
+                                            diag,
+                                            mrp,
+                                            clock_event,
+                                            buffered_connected_now,
+                                        ))
                                     }
                                 }
-                            }
-                        };
+                            };
 
-                        if let Some((
-                            requested,
-                            started,
-                            diag,
-                            mrp,
-                            clock_event,
-                            buffered_connected_now,
-                        )) = start_attempt {
-                            deferred_start_thread.store(false, Ordering::SeqCst);
-                            if let Ok(mut events) = events_thread.lock() {
-                                events.push(
-                                    "MSA SOLO AUDIO first packet present; committing deferred Buffered START."
-                                        .into(),
-                                );
-                                if buffered_connected_now {
+                            if let Some((
+                                requested,
+                                started,
+                                diag,
+                                mrp,
+                                clock_event,
+                                buffered_connected_now,
+                            )) = start_attempt
+                            {
+                                deferred_start_thread.store(false, Ordering::SeqCst);
+                                if let Ok(mut events) = events_thread.lock() {
                                     events.push(
-                                        "MSA SOLO BUFFERED data TCP connected at START boundary."
+                                        "MSA SOLO AUDIO first packet present; committing deferred Buffered START."
                                             .into(),
                                     );
+                                    if buffered_connected_now {
+                                        events.push(
+                                            "MSA SOLO BUFFERED data TCP connected at START boundary."
+                                                .into(),
+                                        );
+                                    }
+                                    events.push(clock_event);
+                                    events.push(format!(
+                                        "MSA SOLO TIME requested={} accepted={} delta={}ms.",
+                                        requested,
+                                        started.at_unix_ms,
+                                        requested.abs_diff(started.at_unix_ms),
+                                    ));
+                                    events.push(format!("MSA SOLO START {started:?}."));
+                                    events.push(format!(
+                                        "MSA SOLO TIMELINE head_frame={} pacing_ahead_frames={} audio_sent={} audio_dropped={} sync_sent={} sync_dropped={}.",
+                                        diag.head_frame,
+                                        diag.pacing_ahead_frames,
+                                        diag.audio_sent,
+                                        diag.audio_dropped,
+                                        diag.sync_sent,
+                                        diag.sync_dropped,
+                                    ));
                                 }
-                                events.push(clock_event);
-                                events.push(format!(
-                                    "MSA SOLO TIME requested={} accepted={} delta={}ms.",
-                                    requested,
-                                    started.at_unix_ms,
-                                    requested.abs_diff(started.at_unix_ms),
-                                ));
-                                events.push(format!("MSA SOLO START {started:?}."));
-                                events.push(format!(
-                                    "MSA SOLO TIMELINE head_frame={} pacing_ahead_frames={} audio_sent={} audio_dropped={} sync_sent={} sync_dropped={}.",
-                                    diag.head_frame,
-                                    diag.pacing_ahead_frames,
-                                    diag.audio_sent,
-                                    diag.audio_dropped,
-                                    diag.sync_sent,
-                                    diag.sync_dropped,
-                                ));
+                                if let Some(mrp) = mrp {
+                                    let _ = mrp.publish_playback_state_on_transition(
+                                        crate::MrpPlaybackState::Playing,
+                                    );
+                                }
                             }
-                            if let Some(mrp) = mrp {
-                                let _ = mrp.publish_playback_state_on_transition(
-                                    crate::MrpPlaybackState::Playing,
-                                );
-                            }
+                        } else if !deferred_start_thread.load(Ordering::SeqCst) {
+                            deferred_audio_seen = None;
                         }
-                    } else if !deferred_start_thread.load(Ordering::SeqCst) {
-                        deferred_audio_seen = None;
-                    }
 
-                    // Buffered type-103 has no realtime starvation re-anchor in
-                    // pinned MSA. MSA parks it explicitly (rate=0 +
-                    // FLUSHBUFFERED -> CONNECTED) when the source is stopped,
-                    // then resumes on a fresh rate=1 anchor. Windows loopback
-                    // has no explicit source STOP event, so adapt only the
-                    // engine's source-presence signal: two starvation windows
-                    // with no non-SILENT WASAPI packet means the passive source
-                    // has gone idle. Digital-zero content remains source-present
-                    // because it arrives in a non-SILENT WASAPI packet.
-                    let source_packet_present =
-                        report.first_non_silent_frame_offset.is_some();
-                    if source_packet_present {
-                        buffered_source_idle_since = None;
-                    } else {
+                        // The passive Windows adapter has no explicit source
+                        // STOP event. Preserve the existing measured mapping:
+                        // two starvation intervals without a non-SILENT source
+                        // packet park Buffered in-place, then flush its queue.
                         let buffered_streaming = engine_thread
                             .lock()
                             .map(|guard| {
@@ -558,294 +596,341 @@ impl WindowsSoloAudioWorker {
                                     && !guard.content_stopped()
                             })
                             .unwrap_or(false);
-                        if buffered_streaming {
+                        if buffered_streaming
+                            && source_present_thread.load(Ordering::SeqCst)
+                        {
+                            // Start the idle window at the last observed
+                            // non-SILENT source activity. This preserves the
+                            // established 500 ms park threshold.
                             let idle_since =
-                                buffered_source_idle_since.get_or_insert_with(Instant::now);
-                            if idle_since.elapsed() >= BUFFERED_SOURCE_IDLE_PARK_INTERVAL {
-                                let park_result = {
-                                    let mut guard = match engine_thread.lock() {
-                                        Ok(v) => v,
-                                        Err(_) => {
+                                buffered_source_idle_since.get_or_insert(source_activity_at);
+                            if idle_since.elapsed()
+                                >= BUFFERED_SOURCE_IDLE_PARK_INTERVAL
+                            {
+                                    let park_result = {
+                                        let mut guard = match engine_thread.lock() {
+                                            Ok(v) => v,
+                                            Err(_) => {
+                                                if let Ok(mut slot) = error_thread.lock() {
+                                                    *slot = Some(
+                                                        "native SOLO engine mutex poisoned".into(),
+                                                    );
+                                                }
+                                                running_thread.store(false, Ordering::SeqCst);
+                                                return;
+                                            }
+                                        };
+                                        if guard.is_buffered()
+                                            && guard.runtime.state == Ap2State::Streaming
+                                        {
+                                            let result = guard.standby();
+                                            let mrp = guard.mrp_controller();
+                                            Some((result, mrp))
+                                        } else {
+                                            None
+                                        }
+                                    };
+
+                                    if let Some((result, mrp)) = park_result {
+                                        if let Err(e) = result {
                                             if let Ok(mut slot) = error_thread.lock() {
-                                                *slot = Some(
-                                                    "native SOLO engine mutex poisoned".into(),
-                                                );
+                                                *slot = Some(format!(
+                                                    "Buffered source-idle STANDBY failed: {e:?}"
+                                                ));
                                             }
                                             running_thread.store(false, Ordering::SeqCst);
                                             return;
                                         }
-                                    };
-                                    if guard.is_buffered()
-                                        && guard.runtime.state == Ap2State::Streaming
-                                    {
-                                        let result = guard.standby();
-                                        let mrp = guard.mrp_controller();
-                                        Some((result, mrp))
-                                    } else {
-                                        None
+
+                                        if let Ok(mut ring) = ring_thread.lock() {
+                                            ring.clear();
+                                        }
+                                        source_present_thread.store(false, Ordering::SeqCst);
+                                        audio_ready_thread.store(false, Ordering::SeqCst);
+                                        deferred_audio_seen = None;
+                                        buffered_source_idle_since = None;
+                                        starvation_started = None;
+                                        last_starvation_recovery = None;
+                                        deferred_start_thread.store(true, Ordering::SeqCst);
+                                        flush_thread.fetch_add(1, Ordering::SeqCst);
+
+                                        if let Ok(mut events) = events_thread.lock() {
+                                            events.push(format!(
+                                                "MSA SOLO BUFFERED source idle for >= {}ms; rate-0 STANDBY + FLUSHBUFFERED completed, waiting for source resume.",
+                                                BUFFERED_SOURCE_IDLE_PARK_INTERVAL.as_millis(),
+                                            ));
+                                        }
+                                        if let Some(mrp) = mrp {
+                                            let _ = mrp.publish_playback_state(
+                                                crate::MrpPlaybackState::Paused,
+                                                true,
+                                            );
+                                        }
+                                        thread::sleep(Duration::from_millis(1));
+                                        continue;
+                                    }
+                            }
+                        } else {
+                            buffered_source_idle_since = None;
+                        }
+
+                        let content_paused_or_stopped = engine_thread
+                            .lock()
+                            .map(|guard| guard.content_paused() || guard.content_stopped())
+                            .unwrap_or(true);
+                        if content_paused_or_stopped {
+                            let send_silence = {
+                                let mut guard = match engine_thread.lock() {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        if let Ok(mut slot) = error_thread.lock() {
+                                            *slot = Some("native SOLO engine mutex poisoned".into());
+                                        }
+                                        running_thread.store(false, Ordering::SeqCst);
+                                        return;
                                     }
                                 };
+                                if guard.runtime.state == Ap2State::Streaming
+                                    && guard.runtime.splice_timeline
+                                {
+                                    match guard.accept_frames_now() {
+                                        Ok(true) => {
+                                            let silence = vec![
+                                                0u8;
+                                                352 * audio_format.input_bytes_per_frame()
+                                            ];
+                                            guard.send_pcm_352(&silence).map(|_| true)
+                                        }
+                                        Ok(false) => Ok(false),
+                                        Err(e) => Err(e),
+                                    }
+                                } else {
+                                    Ok(false)
+                                }
+                            };
+                            if let Err(e) = send_silence {
+                                if let Ok(mut slot) = error_thread.lock() {
+                                    *slot = Some(format!("splice silence send failed: {e:?}"));
+                                }
+                                running_thread.store(false, Ordering::SeqCst);
+                                return;
+                            }
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
 
-                                if let Some((result, mrp)) = park_result {
-                                    if let Err(e) = result {
+                        let transport_streaming = engine_thread
+                            .lock()
+                            .map(|guard| guard.runtime.state == Ap2State::Streaming)
+                            .unwrap_or(false);
+                        if !transport_streaming {
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+
+                        loop {
+                            let can_accept = {
+                                let mut guard = match engine_thread.lock() {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        if let Ok(mut slot) = error_thread.lock() {
+                                            *slot = Some("native SOLO engine mutex poisoned".into());
+                                        }
+                                        running_thread.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+                                };
+                                match guard.accept_frames_now() {
+                                    Ok(v) => v,
+                                    Err(e) => {
                                         if let Ok(mut slot) = error_thread.lock() {
                                             *slot = Some(format!(
-                                                "Buffered source-idle STANDBY failed: {e:?}"
+                                                "native SOLO pacing failed: {e:?}"
                                             ));
                                         }
                                         running_thread.store(false, Ordering::SeqCst);
                                         return;
                                     }
-
-                                    // Drop any engine-generated silence or
-                                    // pre-park tail. MSA standby discards the
-                                    // parked receiver queue before the next
-                                    // source is admitted.
-                                    chunker.clear();
-                                    capture.reset_conversion();
-                                    source_present = false;
-                                    audio_ready_thread.store(false, Ordering::SeqCst);
-                                    deferred_audio_seen = None;
-                                    buffered_source_idle_since = None;
-                                    starvation_started = None;
-                                    last_starvation_recovery = None;
-                                    deferred_start_thread.store(true, Ordering::SeqCst);
-
-                                    if let Ok(mut events) = events_thread.lock() {
-                                        events.push(format!(
-                                            "MSA SOLO BUFFERED source idle for >= {}ms; rate-0 STANDBY + FLUSHBUFFERED completed, waiting for source resume.",
-                                            BUFFERED_SOURCE_IDLE_PARK_INTERVAL.as_millis(),
-                                        ));
-                                    }
-                                    if let Some(mrp) = mrp {
-                                        let _ = mrp.publish_playback_state(
-                                            crate::MrpPlaybackState::Paused,
-                                            true,
-                                        );
-                                    }
-                                    thread::sleep(Duration::from_millis(1));
-                                    continue;
-                                }
-                            }
-                        } else {
-                            buffered_source_idle_since = None;
-                        }
-                    }
-
-                    let content_paused_or_stopped = engine_thread
-                        .lock()
-                        .map(|guard| guard.content_paused() || guard.content_stopped())
-                        .unwrap_or(true);
-                    if content_paused_or_stopped {
-                        // The transport may intentionally remain STREAMING on
-                        // the splice path. Feed contiguous silence there, but
-                        // never turn captured system PCM into content while the
-                        // single authoritative engine state says content is paused.
-                        let send_silence = {
-                            let mut guard = match engine_thread.lock() {
-                                Ok(v) => v,
-                                Err(_) => {
-                                    if let Ok(mut slot) = error_thread.lock() {
-                                        *slot = Some("native SOLO engine mutex poisoned".into());
-                                    }
-                                    running_thread.store(false, Ordering::SeqCst);
-                                    return;
                                 }
                             };
-                            if guard.runtime.state == Ap2State::Streaming
-                                && guard.runtime.splice_timeline
-                            {
-                                match guard.accept_frames_now() {
-                                    Ok(true) => {
-                                        let silence =
-                                            vec![0u8; 352 * audio_format.input_bytes_per_frame()];
-                                        guard.send_pcm_352(&silence).map(|_| true)
-                                    }
-                                    Ok(false) => Ok(false),
-                                    Err(e) => Err(e),
-                                }
-                            } else {
-                                Ok(false)
+                            if !can_accept {
+                                break;
                             }
-                        };
-                        if let Err(e) = send_silence {
-                            if let Ok(mut slot) = error_thread.lock() {
-                                *slot = Some(format!("splice silence send failed: {e:?}"));
-                            }
-                            running_thread.store(false, Ordering::SeqCst);
-                            return;
-                        }
-                        thread::sleep(Duration::from_millis(1));
-                        continue;
-                    }
 
-                    // Pinned ap2_session ownership: the reader only announces
-                    // audio readiness. START is committed exclusively by the
-                    // command/session path (commit_start), never by capture.
-                    let transport_streaming = engine_thread
-                        .lock()
-                        .map(|guard| guard.runtime.state == Ap2State::Streaming)
-                        .unwrap_or(false);
-                    if !transport_streaming {
-                        if report.frames == 0 {
-                            thread::sleep(Duration::from_millis(1));
-                        }
-                        continue;
-                    }
-
-                    // Source-order delivery-stall guard: pacing gate first,
-                    // then recovery before consuming real content.
-                    loop {
-                        let can_accept = {
-                            let mut guard = match engine_thread.lock() {
-                                Ok(v) => v,
-                                Err(_) => {
-                                    if let Ok(mut slot) = error_thread.lock() {
-                                        *slot = Some("native SOLO engine mutex poisoned".into());
-                                    }
-                                    running_thread.store(false, Ordering::SeqCst);
-                                    return;
-                                }
-                            };
-                            match guard.accept_frames_now() {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    if let Ok(mut slot) = error_thread.lock() {
-                                        *slot = Some(format!("native SOLO pacing failed: {e:?}"));
-                                    }
-                                    running_thread.store(false, Ordering::SeqCst);
-                                    return;
-                                }
-                            }
-                        };
-                        if !can_accept { break; }
-
-                        let pad_frames = {
-                            let mut guard = match engine_thread.lock() {
-                                Ok(v) => v,
-                                Err(_) => return,
-                            };
-                            let now_ntp = match SourceNtp::from_system_time(SystemTime::now()) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    if let Ok(mut slot) = error_thread.lock() {
-                                        *slot = Some(format!("clock conversion failed: {e}"));
-                                    }
-                                    running_thread.store(false, Ordering::SeqCst);
-                                    return;
-                                }
-                            };
-                            let now_frame =
-                                now_ntp.to_frames(guard.runtime.media.timeline.sample_rate);
-                            if guard.runtime.state == Ap2State::Streaming {
-                                guard.runtime.recover_delivery_gap(now_frame);
-                            }
-                            guard.runtime.splice_pad_frames.min(352) as u32
-                        };
-
-                        let packet = if pad_frames != 0 {
-                            match chunker.pop_packet_with_silence_prefix(pad_frames) {
-                                Some(v) => v,
-                                None => break,
-                            }
-                        } else {
-                            match chunker.pop_packet() {
-                                Some(v) => v,
-                                None => break,
-                            }
-                        };
-
-                        let sent = {
-                            let mut guard = match engine_thread.lock() {
-                                Ok(v) => v,
-                                Err(_) => return,
-                            };
-                            guard.send_pcm_352(&packet)
-                        };
-                        match sent {
-                            Ok(SendResult::Sent | SendResult::Dropped) => {
-                                if pad_frames != 0 {
-                                    if let Ok(mut guard) = engine_thread.lock() {
-                                        guard.runtime.take_splice_pad_frames(pad_frames);
-                                    }
-                                }
-                                starvation_started = None;
-                                last_starvation_recovery = None;
-                            }
-                            Ok(SendResult::Fatal) => {
-                                if let Ok(mut slot) = error_thread.lock() {
-                                    *slot = Some("native SOLO media send returned fatal".into());
-                                }
-                                running_thread.store(false, Ordering::SeqCst);
-                                return;
-                            }
-                            Err(e) => {
-                                if let Ok(mut slot) = error_thread.lock() {
-                                    *slot = Some(format!("native SOLO media send failed: {e:?}"));
-                                }
-                                running_thread.store(false, Ordering::SeqCst);
-                                return;
-                            }
-                        }
-                    }
-
-                    // MSA waits for 250 ms read intervals before declaring
-                    // input starvation. Buffered type-103 intentionally does
-                    // no starvation recovery.
-                    if !chunker.has_packet() {
-                        let starving_since = starvation_started.get_or_insert_with(Instant::now);
-                        if starving_since.elapsed() >= STARVATION_RECOVERY_INTERVAL
-                            && last_starvation_recovery
-                                .map(|t| t.elapsed() >= STARVATION_RECOVERY_INTERVAL)
-                                .unwrap_or(true)
-                        {
-                            let recovered = {
+                            let pad_frames = {
                                 let mut guard = match engine_thread.lock() {
                                     Ok(v) => v,
                                     Err(_) => return,
                                 };
-                                if guard.runtime.state != Ap2State::Streaming {
-                                    false
-                                } else {
-                                    let now_ntp = match SourceNtp::from_system_time(SystemTime::now()) {
+                                let now_ntp =
+                                    match SourceNtp::from_system_time(SystemTime::now()) {
                                         Ok(v) => v,
-                                        Err(_) => SourceNtp::ZERO,
-                                    };
-                                    let now_frame =
-                                        now_ntp.to_frames(guard.runtime.media.timeline.sample_rate);
-                                    let timing = match guard.ready.timing_owner.sync_timing() {
-                                        Ok(v) => v,
-                                        Err(_) => {
-                                            last_starvation_recovery = Some(Instant::now());
-                                            continue;
+                                        Err(e) => {
+                                            if let Ok(mut slot) = error_thread.lock() {
+                                                *slot = Some(format!(
+                                                    "clock conversion failed: {e}"
+                                                ));
+                                            }
+                                            running_thread.store(false, Ordering::SeqCst);
+                                            return;
                                         }
                                     };
-                                    let engine = &mut *guard;
-                                    engine.runtime.recover_input_gap(
-                                        now_frame,
-                                        &mut engine.ready.media.io,
-                                        timing,
-                                    )
+                                let now_frame =
+                                    now_ntp.to_frames(guard.runtime.media.timeline.sample_rate);
+                                if guard.runtime.state == Ap2State::Streaming {
+                                    guard.runtime.recover_delivery_gap(now_frame);
+                                }
+                                guard.runtime.splice_pad_frames.min(352) as u32
+                            };
+
+                            let send_generation = flush_thread.load(Ordering::SeqCst);
+                            let packet = {
+                                let mut ring = match ring_thread.lock() {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        if let Ok(mut slot) = error_thread.lock() {
+                                            *slot = Some("PCM ring mutex poisoned".into());
+                                        }
+                                        running_thread.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+                                };
+                                let packet = if pad_frames != 0 {
+                                    ring.pop_packet_with_silence_prefix(pad_frames)
+                                } else {
+                                    ring.pop_packet()
+                                };
+                                audio_ready_thread.store(
+                                    source_present_thread.load(Ordering::SeqCst)
+                                        && ring.has_packet(),
+                                    Ordering::SeqCst,
+                                );
+                                packet
+                            };
+                            let Some(packet) = packet else {
+                                break;
+                            };
+
+                            let sent = {
+                                let mut guard = match engine_thread.lock() {
+                                    Ok(v) => v,
+                                    Err(_) => return,
+                                };
+                                // A FLUSH/standby/stop that won the engine lock
+                                // after this packet left the ring supersedes it.
+                                // Never let pre-boundary PCM cross that command.
+                                if flush_thread.load(Ordering::SeqCst) != send_generation
+                                    || guard.runtime.state != Ap2State::Streaming
+                                    || guard.content_paused()
+                                    || guard.content_stopped()
+                                {
+                                    None
+                                } else {
+                                    Some(guard.send_pcm_352(&packet))
                                 }
                             };
-                            last_starvation_recovery = Some(Instant::now());
-                            if recovered {
-                                if let Ok(mut events) = events_thread.lock() {
-                                    events.push("WASAPI input starvation recovery queued timeline silence.".into());
+
+                            match sent {
+                                None => {}
+                                Some(Ok(SendResult::Sent | SendResult::Dropped)) => {
+                                    if pad_frames != 0 {
+                                        if let Ok(mut guard) = engine_thread.lock() {
+                                            guard.runtime.take_splice_pad_frames(pad_frames);
+                                        }
+                                    }
+                                    starvation_started = None;
+                                    last_starvation_recovery = None;
+                                }
+                                Some(Ok(SendResult::Fatal)) => {
+                                    if let Ok(mut slot) = error_thread.lock() {
+                                        *slot =
+                                            Some("native SOLO media send returned fatal".into());
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                                Some(Err(e)) => {
+                                    if let Ok(mut slot) = error_thread.lock() {
+                                        *slot =
+                                            Some(format!("native SOLO media send failed: {e:?}"));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
                                 }
                             }
                         }
-                    } else {
-                        starvation_started = None;
-                        last_starvation_recovery = None;
-                    }
 
-                    if report.frames == 0 {
+                        let ring_has_packet = ring_thread
+                            .lock()
+                            .map(|ring| ring.has_packet())
+                            .unwrap_or(false);
+                        if !ring_has_packet {
+                            let starving_since =
+                                starvation_started.get_or_insert_with(Instant::now);
+                            if starving_since.elapsed() >= STARVATION_RECOVERY_INTERVAL
+                                && last_starvation_recovery
+                                    .map(|t| {
+                                        t.elapsed() >= STARVATION_RECOVERY_INTERVAL
+                                    })
+                                    .unwrap_or(true)
+                            {
+                                let recovered = {
+                                    let mut guard = match engine_thread.lock() {
+                                        Ok(v) => v,
+                                        Err(_) => return,
+                                    };
+                                    if guard.runtime.state != Ap2State::Streaming
+                                        || guard.is_buffered()
+                                    {
+                                        false
+                                    } else {
+                                        let now_ntp =
+                                            match SourceNtp::from_system_time(SystemTime::now()) {
+                                                Ok(v) => v,
+                                                Err(_) => SourceNtp::ZERO,
+                                            };
+                                        let now_frame = now_ntp.to_frames(
+                                            guard.runtime.media.timeline.sample_rate,
+                                        );
+                                        let timing =
+                                            match guard.ready.timing_owner.sync_timing() {
+                                                Ok(v) => v,
+                                                Err(_) => {
+                                                    last_starvation_recovery =
+                                                        Some(Instant::now());
+                                                    continue;
+                                                }
+                                            };
+                                        let engine = &mut *guard;
+                                        engine.runtime.recover_input_gap(
+                                            now_frame,
+                                            &mut engine.ready.media.io,
+                                            timing,
+                                        )
+                                    }
+                                };
+                                last_starvation_recovery = Some(Instant::now());
+                                if recovered {
+                                    if let Ok(mut events) = events_thread.lock() {
+                                        events.push(
+                                            "WASAPI input starvation recovery queued timeline silence."
+                                                .into(),
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            starvation_started = None;
+                            last_starvation_recovery = None;
+                        }
+
                         thread::sleep(Duration::from_millis(1));
                     }
-                }
-            })
-            .map_err(|e| WindowsSoloAudioWorkerError::Engine(format!("spawn worker: {e}")))?;
+                })
+                .map_err(|e| WindowsSoloAudioWorkerError::Engine(format!(
+                    "spawn media consumer: {e}"
+                )))?
+        };
 
         match ready_rx.recv_timeout(Duration::from_secs(3)) {
             Ok(Ok(())) => Ok(Self {
@@ -855,7 +940,8 @@ impl WindowsSoloAudioWorker {
                 flush_ack_generation,
                 audio_ready,
                 deferred_start_armed,
-                worker: Some(worker),
+                capture_worker: Some(capture_worker),
+                media_worker: Some(media_worker),
                 last_error,
                 discontinuities,
                 last_discontinuity_frame,
@@ -863,14 +949,16 @@ impl WindowsSoloAudioWorker {
             }),
             Ok(Err(message)) => {
                 running.store(false, Ordering::SeqCst);
-                let _ = worker.join();
+                let _ = capture_worker.join();
+                let _ = media_worker.join();
                 Err(WindowsSoloAudioWorkerError::Engine(message))
             }
             Err(_) => {
                 running.store(false, Ordering::SeqCst);
-                let _ = worker.join();
+                let _ = capture_worker.join();
+                let _ = media_worker.join();
                 Err(WindowsSoloAudioWorkerError::Engine(
-                    "WASAPI worker did not become ready".into(),
+                    "WASAPI producer did not become ready".into(),
                 ))
             }
         }
@@ -1074,7 +1162,10 @@ impl WindowsSoloAudioWorker {
     pub fn stop(&mut self) {
         self.deferred_start_armed.store(false, Ordering::SeqCst);
         self.running.store(false, Ordering::SeqCst);
-        if let Some(worker) = self.worker.take() {
+        if let Some(worker) = self.media_worker.take() {
+            let _ = worker.join();
+        }
+        if let Some(worker) = self.capture_worker.take() {
             let _ = worker.join();
         }
     }
