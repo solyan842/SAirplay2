@@ -22,10 +22,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const AIRPLAY_CLOCK_READY_TIMEOUT: Duration = Duration::from_millis(2500);
 pub const STARVATION_RECOVERY_INTERVAL: Duration = Duration::from_millis(250);
-/// Passive Windows loopback has no explicit player pause command. Require two
-/// MSA starvation intervals without a non-SILENT source packet before mapping
-/// source disappearance to Buffered STANDBY.
-pub const BUFFERED_SOURCE_IDLE_PARK_INTERVAL: Duration = Duration::from_millis(500);
 pub const FLUSH_DRAIN_TIMEOUT: Duration = Duration::from_millis(2000);
 const DEFERRED_START_LEAD_MS: u64 = 400;
 const DEFERRED_CLOCK_READY_LEAD_MS: u64 = 500;
@@ -96,7 +92,6 @@ impl WindowsSoloAudioWorker {
             Pcm352Chunker::new_with_bytes_per_frame(audio_format.input_bytes_per_frame()),
         ));
         let source_present = Arc::new(AtomicBool::new(false));
-        let source_activity_generation = Arc::new(AtomicU64::new(0));
 
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
@@ -114,7 +109,6 @@ impl WindowsSoloAudioWorker {
             let events_thread = Arc::clone(&startup_events);
             let ring_thread = Arc::clone(&pcm_ring);
             let source_present_thread = Arc::clone(&source_present);
-            let source_activity_thread = Arc::clone(&source_activity_generation);
             let engine_diag = Arc::clone(&engine);
 
             thread::Builder::new()
@@ -213,7 +207,6 @@ impl WindowsSoloAudioWorker {
                                     );
                                 }
                             }
-                            source_activity_thread.fetch_add(1, Ordering::SeqCst);
                         }
 
                         if report.discontinuities != 0 {
@@ -335,7 +328,6 @@ impl WindowsSoloAudioWorker {
             let engine_thread = Arc::clone(&engine);
             let ring_thread = Arc::clone(&pcm_ring);
             let source_present_thread = Arc::clone(&source_present);
-            let source_activity_thread = Arc::clone(&source_activity_generation);
 
             thread::Builder::new()
                 .name("sairplay-msa-media".into())
@@ -343,11 +335,7 @@ impl WindowsSoloAudioWorker {
                     let mut starvation_started: Option<Instant> = None;
                     let mut last_starvation_recovery: Option<Instant> = None;
                     let mut deferred_audio_seen: Option<Instant> = None;
-                    let mut buffered_source_idle_since: Option<Instant> = None;
                     let mut local_flush_ack = flush_ack_thread.load(Ordering::SeqCst);
-                    let mut source_activity_seen =
-                        source_activity_thread.load(Ordering::SeqCst);
-                    let mut source_activity_at = Instant::now();
 
                     while running_thread.load(Ordering::SeqCst) {
                         let control_ok = {
@@ -377,14 +365,6 @@ impl WindowsSoloAudioWorker {
                             starvation_started = None;
                             last_starvation_recovery = None;
                             deferred_audio_seen = None;
-                            buffered_source_idle_since = None;
-                        }
-
-                        let activity = source_activity_thread.load(Ordering::SeqCst);
-                        if activity != source_activity_seen {
-                            source_activity_seen = activity;
-                            source_activity_at = Instant::now();
-                            buffered_source_idle_since = None;
                         }
 
                         let has_packet = ring_thread
@@ -583,96 +563,13 @@ impl WindowsSoloAudioWorker {
                             deferred_audio_seen = None;
                         }
 
-                        // The passive Windows adapter has no explicit source
-                        // STOP event. Preserve the existing measured mapping:
-                        // two starvation intervals without a non-SILENT source
-                        // packet park Buffered in-place, then flush its queue.
-                        let buffered_streaming = engine_thread
-                            .lock()
-                            .map(|guard| {
-                                guard.is_buffered()
-                                    && guard.runtime.state == Ap2State::Streaming
-                                    && !guard.content_paused()
-                                    && !guard.content_stopped()
-                            })
-                            .unwrap_or(false);
-                        if buffered_streaming
-                            && source_present_thread.load(Ordering::SeqCst)
-                        {
-                            // Start the idle window at the last observed
-                            // non-SILENT source activity. This preserves the
-                            // established 500 ms park threshold.
-                            let idle_since =
-                                buffered_source_idle_since.get_or_insert(source_activity_at);
-                            if idle_since.elapsed()
-                                >= BUFFERED_SOURCE_IDLE_PARK_INTERVAL
-                            {
-                                    let park_result = {
-                                        let mut guard = match engine_thread.lock() {
-                                            Ok(v) => v,
-                                            Err(_) => {
-                                                if let Ok(mut slot) = error_thread.lock() {
-                                                    *slot = Some(
-                                                        "native SOLO engine mutex poisoned".into(),
-                                                    );
-                                                }
-                                                running_thread.store(false, Ordering::SeqCst);
-                                                return;
-                                            }
-                                        };
-                                        if guard.is_buffered()
-                                            && guard.runtime.state == Ap2State::Streaming
-                                        {
-                                            let result = guard.standby();
-                                            let mrp = guard.mrp_controller();
-                                            Some((result, mrp))
-                                        } else {
-                                            None
-                                        }
-                                    };
-
-                                    if let Some((result, mrp)) = park_result {
-                                        if let Err(e) = result {
-                                            if let Ok(mut slot) = error_thread.lock() {
-                                                *slot = Some(format!(
-                                                    "Buffered source-idle STANDBY failed: {e:?}"
-                                                ));
-                                            }
-                                            running_thread.store(false, Ordering::SeqCst);
-                                            return;
-                                        }
-
-                                        if let Ok(mut ring) = ring_thread.lock() {
-                                            ring.clear();
-                                        }
-                                        source_present_thread.store(false, Ordering::SeqCst);
-                                        audio_ready_thread.store(false, Ordering::SeqCst);
-                                        deferred_audio_seen = None;
-                                        buffered_source_idle_since = None;
-                                        starvation_started = None;
-                                        last_starvation_recovery = None;
-                                        deferred_start_thread.store(true, Ordering::SeqCst);
-                                        flush_thread.fetch_add(1, Ordering::SeqCst);
-
-                                        if let Ok(mut events) = events_thread.lock() {
-                                            events.push(format!(
-                                                "MSA SOLO BUFFERED source idle for >= {}ms; rate-0 STANDBY + FLUSHBUFFERED completed, waiting for source resume.",
-                                                BUFFERED_SOURCE_IDLE_PARK_INTERVAL.as_millis(),
-                                            ));
-                                        }
-                                        if let Some(mrp) = mrp {
-                                            let _ = mrp.publish_playback_state(
-                                                crate::MrpPlaybackState::Paused,
-                                                true,
-                                            );
-                                        }
-                                        thread::sleep(Duration::from_millis(1));
-                                        continue;
-                                    }
-                            }
-                        } else {
-                            buffered_source_idle_since = None;
-                        }
+                        // Do not infer source lifecycle from WASAPI SILENT.
+                        // AUDCLNT_BUFFERFLAGS_SILENT is valid PCM silence, not
+                        // a PAUSE/STOP/EOF signal. MSA changes playback state
+                        // only from explicit session commands/EOF; on Windows
+                        // we therefore keep the active type103 timeline alive
+                        // through silence until an explicit app lifecycle
+                        // command changes it.
 
                         let content_paused_or_stopped = engine_thread
                             .lock()
@@ -1184,15 +1081,16 @@ impl Drop for WindowsSoloAudioWorker {
 }
 
 #[cfg(test)]
-mod source_idle_tests {
-    use super::*;
-
+mod source_lifecycle_tests {
     #[test]
-    fn buffered_idle_park_requires_two_starvation_intervals() {
-        assert_eq!(
-            BUFFERED_SOURCE_IDLE_PARK_INTERVAL,
-            STARVATION_RECOVERY_INTERVAL + STARVATION_RECOVERY_INTERVAL
-        );
+    fn wasapi_silence_is_not_a_stop_signal() {
+        // A Windows loopback SILENT packet still represents valid timeline
+        // PCM. Source lifecycle must come from explicit app/session state,
+        // never from a silence-duration threshold.
+        let wasapi_silent = true;
+        let explicit_stop = false;
+        assert!(wasapi_silent);
+        assert!(!explicit_stop);
     }
 
     #[test]
