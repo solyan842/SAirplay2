@@ -286,21 +286,65 @@ impl WindowsSoloAudioWorker {
                                         }
                                     };
 
-                                let uses_ptp = guard.uses_ptp();
-                                let readiness = guard.clock_readiness();
-                                let have_projection = uses_ptp
-                                    && matches!(
-                                        readiness.state,
-                                        SoloClockReadinessState::Probing
-                                            | SoloClockReadinessState::Ready
-                                    )
-                                    && readiness.ready_at_unix_ms != 0;
-                                let projection_timeout =
-                                    first_audio_at.elapsed() >= AIRPLAY_CLOCK_READY_TIMEOUT;
-
-                                if uses_ptp && !have_projection && !projection_timeout {
+                                if buffered_connected_now {
+                                    // Windows live-loopback cannot be backpressured
+                                    // like MSA stdin. RECORD/SETUP/SETPEERS/TCP
+                                    // above may block this capture thread long
+                                    // enough for WASAPI to accumulate stale live
+                                    // audio. Drain that activation interval once
+                                    // and let the next capture pass define the
+                                    // first audible packet.
+                                    chunker.clear();
+                                    capture.reset_conversion();
+                                    let drained = match capture.drain_into(&mut chunker) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            if let Ok(mut slot) = error_thread.lock() {
+                                                *slot = Some(format!(
+                                                    "WASAPI post-activation reprime failed: {e}"
+                                                ));
+                                            }
+                                            running_thread.store(false, Ordering::SeqCst);
+                                            return;
+                                        }
+                                    };
+                                    chunker.clear();
+                                    capture.reset_conversion();
+                                    audio_ready_thread.store(false, Ordering::SeqCst);
+                                    deferred_audio_seen = Some(Instant::now());
+                                    if let Ok(mut events) = events_thread.lock() {
+                                        events.push(format!(
+                                            "MSA INPUT reprime after Buffered media activation: discarded {} stale live frames.",
+                                            drained.frames,
+                                        ));
+                                    }
                                     None
                                 } else {
+                                    let uses_ptp = guard.uses_ptp();
+                                    let readiness = guard.clock_readiness();
+                                    let have_projection = uses_ptp
+                                        && matches!(
+                                            readiness.state,
+                                            SoloClockReadinessState::Probing
+                                                | SoloClockReadinessState::Ready
+                                        )
+                                        && readiness.ready_at_unix_ms != 0;
+                                    let clock_ready_now =
+                                        !uses_ptp
+                                            || readiness.state == SoloClockReadinessState::Ready;
+                                    let projection_timeout =
+                                        first_audio_at.elapsed() >= AIRPLAY_CLOCK_READY_TIMEOUT;
+
+                                    // MSA can act on a projected first probe
+                                    // because its stdin reader keeps filling
+                                    // while SETRATEANCHORTIME retries. Here the
+                                    // command path and WASAPI capture share one
+                                    // thread, so keep draining until the receiver
+                                    // is actually Ready; the eventual anchor then
+                                    // avoids 500 ms retry sleeps blocking capture.
+                                    if !clock_ready_now && !projection_timeout {
+                                        None
+                                    } else {
                                     let ready_at = if have_projection {
                                         readiness.ready_at_unix_ms
                                     } else {
@@ -367,6 +411,7 @@ impl WindowsSoloAudioWorker {
                                         clock_event,
                                         buffered_connected_now,
                                     ))
+                                    }
                                 }
                             }
                         };
@@ -387,7 +432,7 @@ impl WindowsSoloAudioWorker {
                                 );
                                 if buffered_connected_now {
                                     events.push(
-                                        "MSA SOLO BUFFERED media leg activated and data TCP connected at source-present START boundary."
+                                        "MSA SOLO BUFFERED data TCP connected at START boundary."
                                             .into(),
                                     );
                                 }
