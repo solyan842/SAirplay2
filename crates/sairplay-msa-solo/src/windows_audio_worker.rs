@@ -518,8 +518,10 @@ impl WindowsSoloAudioWorker {
                             match park_result {
                                 Ok(true) => {
                                     buffered_capture_paused = true;
-                                    non_silent_seen =
-                                        non_silent_generation_thread.load(Ordering::SeqCst);
+                                    // Keep the last observed non-silent generation.
+                                    // If source audio returns concurrently with
+                                    // the rate-0 park, the next media-loop turn
+                                    // must still observe that edge and resume.
                                     if let Ok(mut events) = events_thread.lock() {
                                         events.push(format!(
                                             "MSA INPUT Buffered capture idle for >={}ms: rate-0 PAUSE armed; receiver buffer preserved, no FLUSHBUFFERED.",
