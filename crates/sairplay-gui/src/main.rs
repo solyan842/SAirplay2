@@ -11,7 +11,7 @@ use sairplay_engine::{
 };
 use sairplay_msa_solo::{
     validate_immediate_start, Ap2AudioFormat as MsaAp2AudioFormat,
-    SoloClockReadinessState, WindowsMsaSoloClient, WindowsMsaSoloConfig,
+    SoloClockReadinessState, WindowsMsaReceiverSession, WindowsMsaSoloConfig,
     WindowsMsaSoloVolumeControl, AIRPLAY_CLOCK_READY_TIMEOUT,
 };
 use sairplay_msa_solo::route::{Flow as MsaFlow, ProtocolPreference as MsaProtocolPreference};
@@ -46,14 +46,14 @@ enum PlaybackMode {
     StereoPair,
 }
 
-struct MsaSoloGuiSession {
+struct MsaReceiverGuiSession {
     client: WindowsMsaSoloClient,
     format: sairplay_engine::Ap2AudioFormat,
     initial_volume: Option<u8>,
     startup_events: Mutex<Vec<String>>,
 }
 
-impl MsaSoloGuiSession {
+impl MsaReceiverGuiSession {
     fn drain_startup_events(&self) -> Vec<String> {
         let mut out: Vec<String> = self
             .startup_events
@@ -66,7 +66,7 @@ impl MsaSoloGuiSession {
 }
 
 enum ActiveSession {
-    MsaSolo(MsaSoloGuiSession),
+    MsaReceiver(MsaReceiverGuiSession),
     Single(NativeSession),
     StereoPair(NativeGroupSession),
     MultiRoom(NativeGroupSession),
@@ -83,7 +83,7 @@ enum ActiveVolumeControl {
 impl ActiveVolumeControl {
     fn set(&self, percent: u8) -> Result<VolumeSetResult, String> {
         match self {
-            Self::MsaSolo(control) => control
+            Self::MsaReceiver(control) => control
                 .set(percent)
                 .map(|result| VolumeSetResult {
                     percent: result.percent,
@@ -100,7 +100,7 @@ impl ActiveVolumeControl {
 impl ActiveSession {
     fn audio_running(&self) -> bool {
         match self {
-            Self::MsaSolo(session) => {
+            Self::MsaReceiver(session) => {
                 // GUI health must track the live transport/worker, not only
                 // the STREAMING wire state. Buffered type103 intentionally
                 // enters AP2_PAUSED (rate=0) while the Windows source is
@@ -116,12 +116,12 @@ impl ActiveSession {
     }
 
     fn waiting_for_audio(&self) -> bool {
-        matches!(self, Self::MsaSolo(session) if session.client.start_pending())
+        matches!(self, Self::MsaReceiver(session) if session.client.start_pending())
     }
 
     fn audio_error(&self) -> Option<String> {
         match self {
-            Self::MsaSolo(session) => {
+            Self::MsaReceiver(session) => {
                 if session.client.is_connected() {
                     None
                 } else {
@@ -142,7 +142,7 @@ impl ActiveSession {
 
     fn audio_format(&self) -> Option<sairplay_engine::Ap2AudioFormat> {
         match self {
-            Self::MsaSolo(session) => Some(session.format),
+            Self::MsaReceiver(session) => Some(session.format),
             Self::Single(session) => Some(session.audio_format()),
             Self::StereoPair(session) => session.audio_format(),
             Self::MultiRoom(session) => session.audio_format(),
@@ -152,7 +152,7 @@ impl ActiveSession {
 
     fn transport_label(&self) -> &'static str {
         match self {
-            Self::MsaSolo(session) => match session.client.route().flow {
+            Self::MsaReceiver(session) => match session.client.route().flow {
                 MsaFlow::Raop => "AirPlay 1",
                 MsaFlow::AirPlay2Compat | MsaFlow::AirPlay2Native => "AirPlay 2",
             },
@@ -163,7 +163,7 @@ impl ActiveSession {
 
     fn drain_startup_events(&self) -> Vec<String> {
         match self {
-            Self::MsaSolo(session) => session.drain_startup_events(),
+            Self::MsaReceiver(session) => session.drain_startup_events(),
             Self::Single(session) => session.drain_startup_events(),
             Self::StereoPair(session) => session.drain_startup_events(),
             Self::MultiRoom(session) => session.drain_startup_events(),
@@ -173,7 +173,7 @@ impl ActiveSession {
 
     fn retransmit_stats(&self) -> RetransmitStats {
         match self {
-            Self::MsaSolo(session) => session
+            Self::MsaReceiver(session) => session
                 .client
                 .diagnostics()
                 .map(|diag| RetransmitStats {
@@ -196,13 +196,13 @@ impl ActiveSession {
             Self::StereoPair(session) | Self::MultiRoom(session) => {
                 session.member_retransmit_stats()
             }
-            Self::MsaSolo(_) | Self::Single(_) | Self::Legacy(_) => Vec::new(),
+            Self::MsaReceiver(_) | Self::Single(_) | Self::Legacy(_) => Vec::new(),
         }
     }
 
     fn feedback_running(&self) -> bool {
         match self {
-            Self::MsaSolo(session) => session.client.control_healthy(),
+            Self::MsaReceiver(session) => session.client.control_healthy(),
             Self::Single(session) => session.feedback_running(),
             Self::StereoPair(session) => session.feedback_running(),
             Self::MultiRoom(session) => session.feedback_running(),
@@ -212,7 +212,7 @@ impl ActiveSession {
 
     fn feedback_error(&self) -> Option<String> {
         match self {
-            Self::MsaSolo(session) => {
+            Self::MsaReceiver(session) => {
                 if session.client.control_healthy() {
                     None
                 } else {
@@ -233,7 +233,7 @@ impl ActiveSession {
 
     fn volume_controls(&self) -> Vec<ActiveVolumeControl> {
         match self {
-            Self::MsaSolo(session) => session
+            Self::MsaReceiver(session) => session
                 .client
                 .volume_control()
                 .ok()
@@ -261,7 +261,7 @@ impl ActiveSession {
 
     fn initial_volume_results(&self) -> Vec<(String, VolumeSetResult)> {
         match self {
-            Self::MsaSolo(session) => session.initial_volume.map(|percent| vec![(
+            Self::MsaReceiver(session) => session.initial_volume.map(|percent| vec![(
                 "MSA SOLO".to_owned(),
                 VolumeSetResult {
                     percent,
@@ -284,7 +284,7 @@ impl ActiveSession {
             Self::StereoPair(session) | Self::MultiRoom(session) => {
                 session.failed_group_members()
             }
-            Self::MsaSolo(_) | Self::Single(_) | Self::Legacy(_) => Vec::new(),
+            Self::MsaReceiver(_) | Self::Single(_) | Self::Legacy(_) => Vec::new(),
         }
     }
 
@@ -293,7 +293,7 @@ impl ActiveSession {
             Self::StereoPair(session) | Self::MultiRoom(session) => {
                 session.recovery_join_handle()
             }
-            Self::MsaSolo(_) | Self::Single(_) | Self::Legacy(_) => None,
+            Self::MsaReceiver(_) | Self::Single(_) | Self::Legacy(_) => None,
         }
     }
 
@@ -302,7 +302,7 @@ impl ActiveSession {
             Self::StereoPair(session) | Self::MultiRoom(session) => {
                 session.detach_failed_member(name).map_err(|error| error.to_string())
             }
-            Self::MsaSolo(_) | Self::Single(_) | Self::Legacy(_) => Ok(false),
+            Self::MsaReceiver(_) | Self::Single(_) | Self::Legacy(_) => Ok(false),
         }
     }
 
@@ -312,7 +312,7 @@ impl ActiveSession {
                 group.adopt_member(name, session);
                 true
             }
-            Self::MsaSolo(_) | Self::Single(_) | Self::Legacy(_) => false,
+            Self::MsaReceiver(_) | Self::Single(_) | Self::Legacy(_) => false,
         }
     }
 }
@@ -1941,7 +1941,7 @@ impl SairplayApp {
             self.log.push(event);
         }
 
-        if let ActiveSession::MsaSolo(msa) = session {
+        if let ActiveSession::MsaReceiver(msa) = session {
             if let Some(diag) = msa.client.diagnostics() {
                 if self.last_msa_wire_over_1472 == 0 && diag.realtime_wire_over_1472 > 0 {
                     self.log.push(format!(
@@ -2014,7 +2014,7 @@ impl SairplayApp {
             let answered_delta = rtx.answered.saturating_sub(prev.answered);
             let expired_delta = rtx.expired.saturating_sub(prev.expired);
             if requested_delta != 0 || expired_delta != 0 {
-                if let ActiveSession::MsaSolo(msa) = session {
+                if let ActiveSession::MsaReceiver(msa) = session {
                     if let Some(diag) = msa.client.diagnostics() {
                         self.log.push(format!(
                             "Diagnostic: retransmit activity · requested +{} (total {}) · answered +{} (total {}) · expired +{} (total {}) · requested_wire>1472={} · max_requested_wire={} B · audio_sent={} dropped={} · pacing_ahead={}f · reanchors={} · splice_pad={}f · input_discontinuities={}.",
@@ -2131,7 +2131,7 @@ impl SairplayApp {
                             && error.contains("peer/control channel closed");
                         let native_session = matches!(
                             self.session,
-                            Some(ActiveSession::MsaSolo(_))
+                            Some(ActiveSession::MsaReceiver(_))
                                 | Some(ActiveSession::Single(_))
                                 | Some(ActiveSession::StereoPair(_))
                                 | Some(ActiveSession::MultiRoom(_))
@@ -2357,12 +2357,12 @@ impl SairplayApp {
                 let native_configs = BTreeMap::new();
 
                 thread::Builder::new()
-                    .name("sairplay-msa-solo-connect".into())
+                    .name("sairplay-msa-receiver-connect".into())
                     .spawn(move || {
                         let credential_for_redaction = credentials.as_deref();
                         let result = (|| -> Result<ActiveSession, String> {
                             let mut startup_events = vec![connect_summary];
-                            let client = WindowsMsaSoloClient::connect(config).map_err(|error| {
+                            let client = WindowsMsaReceiverSession::connect(config).map_err(|error| {
                                 format!(
                                     "MSA SOLO CONNECT class={:?} status={} route={:?} detail={}",
                                     error.class,
@@ -2434,7 +2434,7 @@ impl SairplayApp {
                                     ));
                                 }
                             }
-                            Ok(ActiveSession::MsaSolo(MsaSoloGuiSession {
+                            Ok(ActiveSession::MsaReceiver(MsaReceiverGuiSession {
                                 client,
                                 format,
                                 initial_volume,
@@ -2569,7 +2569,7 @@ impl SairplayApp {
                 // audio loop exits and normal destroy/disconnect sends TEARDOWN.
                 // WindowsSoloAudioWorker::stop_content() takes the same engine
                 // mutex used by sends, so invoke it before dropping the owner.
-                ActiveSession::MsaSolo(session) => {
+                ActiveSession::MsaReceiver(session) => {
                     let stop_result = session.client.stop_content();
                     drop(session);
                     match stop_result {

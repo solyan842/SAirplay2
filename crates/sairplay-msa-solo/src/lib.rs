@@ -26,6 +26,8 @@ pub mod windows_raop_session;
 pub mod windows_raop_worker;
 #[cfg(windows)]
 pub mod windows_solo_client;
+#[cfg(windows)]
+pub mod receiver_session;
 pub mod native_rtx_worker;
 pub mod feedback;
 pub mod native_commands;
@@ -357,5 +359,7 @@ pub use windows_solo_client::{
     WindowsMsaSoloConfig, WindowsMsaSoloError, WindowsMsaSoloState,
     WindowsMsaSoloVolumeControl,
 };
+#[cfg(windows)]
+pub use receiver_session::WindowsMsaReceiverSession;
 
 pub use owned_session::{OwnedError, OwnedSoloSession, OwnedTransport, SessionEvent, SESSION_IDLE_TIMEOUT_MS};
