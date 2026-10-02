@@ -5129,12 +5129,13 @@ fn msa_solo_config_for_device(
     config.protocol = protocol;
     config.ptp_override = ptp_override;
     config.txt = Some(txt.clone());
-    config.am = service
-        .txt
-        .fields
-        .get("model")
-        .or_else(|| service.txt.fields.get("am"))
-        .cloned();
+    // Match pinned Music Assistant stream.py exactly: RAOP transport
+    // properties (et/md/am/pk/pw/cn) come from the _raop._tcp service.
+    // The full _airplay._tcp TXT remains in config.txt for Auto/AP2 routing.
+    // Do not project AirPlay model=AppleTV... into RAOP am: third-party
+    // receivers often spoof that model and would falsely trigger the legacy
+    // AppleTV secret guard when their RAOP service itself never advertised am.
+    config.am = raop_service.txt.fields.get("am").cloned();
     config.pw_txt = service.txt.fields.get("pw").cloned();
     config.raop_cn = raop_service.txt.fields.get("cn").cloned();
     config.raop_pk = raop_service.txt.fields.get("pk").cloned();
@@ -5594,6 +5595,11 @@ mod gui_tests {
         };
 
         assert!(!SairplayApp::pairing_flags_required(&device));
+
+        let (config, _, _) =
+            msa_solo_config_for_device(&device, None, None, false).unwrap();
+        assert_eq!(config.am, None);
+        assert_eq!(config.raop_pk, None);
     }
 
     #[test]
@@ -5626,6 +5632,46 @@ mod gui_tests {
         };
 
         assert!(SairplayApp::pairing_flags_required(&device));
+    }
+
+    #[test]
+    fn msa_solo_raop_identity_comes_only_from_raop_txt() {
+        let device = DeviceRecord {
+            display_name: "Clone TV".into(),
+            airplay: Some(DiscoveredService {
+                kind: ServiceKind::AirPlay,
+                fullname: "Clone TV._airplay._tcp.local.".into(),
+                display_name: "Clone TV".into(),
+                host: "clone.local.".into(),
+                port: 7000,
+                addresses: vec!["192.168.1.90".into()],
+                txt: AirPlayTxt::parse([
+                    ("model", "AppleTV3,2"),
+                    ("pk", "airplay-public-key"),
+                    ("features", "130233135095"),
+                ])
+                .unwrap(),
+            }),
+            raop: Some(DiscoveredService {
+                kind: ServiceKind::Raop,
+                fullname: "AABBCCDDEEFF@Clone TV._raop._tcp.local.".into(),
+                display_name: "Clone TV".into(),
+                host: "clone.local.".into(),
+                port: 7102,
+                addresses: vec!["192.168.1.90".into()],
+                txt: AirPlayTxt::parse([
+                    ("am", "ThirdPartyRAOP"),
+                    ("pk", "raop-public-key"),
+                    ("cn", "0,1"),
+                ])
+                .unwrap(),
+            }),
+        };
+
+        let (config, _, _) =
+            msa_solo_config_for_device(&device, None, None, false).unwrap();
+        assert_eq!(config.am.as_deref(), Some("ThirdPartyRAOP"));
+        assert_eq!(config.raop_pk.as_deref(), Some("raop-public-key"));
     }
 
     #[test]
