@@ -376,38 +376,6 @@ enum UiLanguage {
     En,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamingMode {
-    Auto,
-    AirPlay2Ptp,
-    AirPlay2Ntp,
-    AirPlay2Compat,
-    AirPlay1Raop,
-}
-
-impl StreamingMode {
-    fn storage_key(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::AirPlay2Ptp => "ap2_ptp",
-            Self::AirPlay2Ntp => "ap2_ntp",
-            Self::AirPlay2Compat => "ap2_compat",
-            Self::AirPlay1Raop => "raop",
-        }
-    }
-
-    fn from_storage_key(value: &str) -> Option<Self> {
-        match value.trim() {
-            "auto" => Some(Self::Auto),
-            "ap2_ptp" => Some(Self::AirPlay2Ptp),
-            "ap2_ntp" => Some(Self::AirPlay2Ntp),
-            "ap2_compat" => Some(Self::AirPlay2Compat),
-            "raop" => Some(Self::AirPlay1Raop),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum DeviceArtwork {
     HomePodMiniWhite,
@@ -517,7 +485,6 @@ struct SairplayApp {
     mute_restore_volume: u8,
     legacy_secrets: BTreeMap<String, String>,
     native_credentials: BTreeMap<String, String>,
-    streaming_modes: BTreeMap<String, StreamingMode>,
     hires_overrides: BTreeMap<String, bool>,
     hires_capabilities: BTreeMap<String, bool>,
     buffered_hires_capabilities: BTreeMap<String, bool>,
@@ -608,7 +575,6 @@ impl Default for SairplayApp {
             mute_restore_volume,
             legacy_secrets: BTreeMap::new(),
             native_credentials: load_native_credentials(),
-            streaming_modes: load_streaming_modes(),
             hires_overrides: BTreeMap::new(),
             hires_capabilities: BTreeMap::new(),
             buffered_hires_capabilities: BTreeMap::new(),
@@ -875,13 +841,6 @@ impl SairplayApp {
         // Capability controls whether the switch is offered; capability alone
         // never enables the high-resolution path.
         self.hires_overrides.get(fullname).copied().unwrap_or(false)
-    }
-
-    fn streaming_mode_for_fullname(&self, fullname: &str) -> StreamingMode {
-        self.streaming_modes
-            .get(fullname)
-            .copied()
-            .unwrap_or(StreamingMode::Auto)
     }
 
     fn pump_connect_result(&mut self) {
@@ -2253,12 +2212,7 @@ impl SairplayApp {
         // Apple TV to AirPlay2Compat and launches legacy cliraop pairing.
         if let Some((_, device)) = selected_devices
             .iter()
-            .find(|(fullname, device)| {
-                matches!(
-                    self.streaming_mode_for_fullname(fullname),
-                    StreamingMode::Auto | StreamingMode::AirPlay2Ptp | StreamingMode::AirPlay2Ntp
-                ) && self.native_pairing_required(device)
-            })
+            .find(|(_, device)| self.native_pairing_required(device))
         {
             self.begin_native_pairing(device);
             return;
@@ -2267,11 +2221,7 @@ impl SairplayApp {
         let routes = selected_devices
             .iter()
             .map(|(fullname, device)| {
-                route_for_streaming_mode(
-                    device,
-                    self.native_credentials.contains_key(fullname),
-                    self.streaming_mode_for_fullname(fullname),
-                )
+                device.route(self.native_credentials.contains_key(fullname), false)
             })
             .collect::<Vec<_>>();
         let all_native = routes
@@ -2367,7 +2317,6 @@ impl SairplayApp {
 
         if msa_solo_single {
                 let (fullname, device) = &selected_devices[0];
-                let streaming_mode = self.streaming_mode_for_fullname(fullname);
                 let hires_enabled = self
                     .hires_overrides
                     .get(fullname)
@@ -2383,7 +2332,6 @@ impl SairplayApp {
                     credentials.clone(),
                     raop_secret,
                     hires_enabled,
-                    streaming_mode,
                 ) {
                     Ok(value) => value,
                     Err(message) => {
@@ -2950,13 +2898,9 @@ impl SairplayApp {
         });
         let hires_available = !unsupported
             && !members.is_empty()
-            && members.iter().all(|fullname| {
-                self.hires_capabilities.get(fullname).copied() == Some(true)
-                    && !matches!(
-                        self.streaming_mode_for_fullname(fullname),
-                        StreamingMode::AirPlay1Raop | StreamingMode::AirPlay2Compat
-                    )
-            });
+            && members
+                .iter()
+                .all(|fullname| self.hires_capabilities.get(fullname).copied() == Some(true));
         let mut hires_enabled = hires_available
             && members
                 .iter()
@@ -2985,61 +2929,6 @@ impl SairplayApp {
         ui.allocate_ui_at_rect(badge_rect, |ui| {
             draw_status_badge(ui, status, status_tone);
         });
-
-        // Keep the receiver list clean: MSA's streaming_mode is an advanced
-        // per-device escape hatch, not a primary playback control. Automatic
-        // remains the default. Right-click a single receiver only when a
-        // hardware-specific override is actually needed.
-        if !stereo_pair && members.len() == 1 {
-            let fullname = members[0].clone();
-            let protocol_editable = !matches!(
-                self.playback,
-                PlaybackUiState::Connecting(_) | PlaybackUiState::Playing(_)
-            );
-            response.context_menu(|ui| {
-                ui.label(
-                    egui::RichText::new(self.t(
-                        "Nâng cao · Chế độ truyền",
-                        "Advanced · Streaming Mode",
-                    ))
-                    .strong()
-                    .color(UiTheme::text()),
-                );
-                ui.add_space(4.0);
-                let current_mode = self.streaming_mode_for_fullname(&fullname);
-                for option in streaming_mode_options(device) {
-                    let selected = current_mode == option;
-                    let button = ui
-                        .add_enabled_ui(protocol_editable, |ui| {
-                            ui.selectable_label(
-                                selected,
-                                streaming_mode_label(option, self.language),
-                            )
-                        })
-                        .inner;
-                    if button.clicked() && option != current_mode {
-                        if option == StreamingMode::Auto {
-                            self.streaming_modes.remove(&fullname);
-                        } else {
-                            self.streaming_modes.insert(fullname.clone(), option);
-                        }
-                        if matches!(
-                            option,
-                            StreamingMode::AirPlay1Raop | StreamingMode::AirPlay2Compat
-                        ) {
-                            self.hires_overrides.insert(fullname.clone(), false);
-                        }
-                        save_streaming_modes(&self.streaming_modes);
-                        self.log.push(format!(
-                            "{}: streaming mode -> {}.",
-                            device.display_name,
-                            option.storage_key()
-                        ));
-                        ui.close_menu();
-                    }
-                }
-            });
-        }
 
         ui.allocate_ui_at_rect(bit_rect, |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
@@ -5203,95 +5092,25 @@ fn msa_solo_route_txt(service: &DiscoveredService) -> Result<String, String> {
     Ok(parts.join(" "))
 }
 
-fn route_for_streaming_mode(
-    device: &DeviceRecord,
-    has_native_credentials: bool,
-    mode: StreamingMode,
-) -> Route {
-    match mode {
-        StreamingMode::Auto => device.route(has_native_credentials, false),
-        StreamingMode::AirPlay2Ptp | StreamingMode::AirPlay2Ntp => Route::AirPlay2Native,
-        StreamingMode::AirPlay2Compat => Route::AirPlay2Compat,
-        StreamingMode::AirPlay1Raop => Route::Raop,
-    }
-}
-
-fn streaming_mode_label(mode: StreamingMode, language: UiLanguage) -> &'static str {
-    match (mode, language) {
-        (StreamingMode::Auto, UiLanguage::Vi) => "Tự động",
-        (StreamingMode::Auto, UiLanguage::En) => "Auto",
-        (StreamingMode::AirPlay2Ptp, _) => "AirPlay 2 · PTP",
-        (StreamingMode::AirPlay2Ntp, _) => "AirPlay 2 · NTP",
-        (StreamingMode::AirPlay2Compat, UiLanguage::Vi) => "AP2 tương thích",
-        (StreamingMode::AirPlay2Compat, UiLanguage::En) => "AP2 Compat",
-        (StreamingMode::AirPlay1Raop, _) => "AirPlay 1",
-    }
-}
-
-fn streaming_mode_options(device: &DeviceRecord) -> Vec<StreamingMode> {
-    let mut options = vec![StreamingMode::Auto];
-    if let Some(service) = device.airplay.as_ref() {
-        if service.txt.supports_airplay2() {
-            if service.txt.supports_ptp() {
-                options.push(StreamingMode::AirPlay2Ptp);
-            }
-            let model = service
-                .txt
-                .fields
-                .get("model")
-                .or_else(|| service.txt.fields.get("am"))
-                .map(String::as_str)
-                .unwrap_or("");
-            // Mirrors MSA server's Apple no-NTP family: HomePod and Apple TV.
-            // AirPort/Mac and third-party AP2 receivers retain the NTP escape.
-            if !model.starts_with("AudioAccessory") && !model.starts_with("AppleTV") {
-                options.push(StreamingMode::AirPlay2Ntp);
-            }
-            options.push(StreamingMode::AirPlay2Compat);
-        }
-    }
-    if device.raop.is_some() {
-        options.push(StreamingMode::AirPlay1Raop);
-    }
-    options
-}
-
 fn msa_solo_config_for_device(
     device: &DeviceRecord,
     credentials: Option<String>,
     raop_secret: Option<String>,
     hires_enabled: bool,
-    streaming_mode: StreamingMode,
 ) -> Result<(WindowsMsaSoloConfig, sairplay_engine::Ap2AudioFormat, String), String> {
     let service = device
         .airplay
         .as_ref()
         .ok_or_else(|| format!("{} has no AirPlay service", device.display_name))?;
     let raop_service = device.raop.as_ref().unwrap_or(service);
-    let use_raop_endpoint = streaming_mode == StreamingMode::AirPlay1Raop;
-    let host = if use_raop_endpoint {
-        preferred_service_address(raop_service)
-    } else {
-        preferred_service_address(service)
-    };
+    let host = preferred_service_address(service);
     let txt = msa_solo_route_txt(service)?;
 
-    // Pinned MSA server defaults to --protocol auto whenever a receiver has a
-    // normal fallback lane. Explicit per-device streaming_mode is the only
-    // persistent override; transport failures never rewrite it automatically.
-    let (protocol, ptp_override) = match streaming_mode {
-        StreamingMode::Auto => (MsaProtocolPreference::Auto, None),
-        StreamingMode::AirPlay2Ptp => (MsaProtocolPreference::AirPlay2, Some(true)),
-        StreamingMode::AirPlay2Ntp => (MsaProtocolPreference::AirPlay2, Some(false)),
-        StreamingMode::AirPlay2Compat => (MsaProtocolPreference::AirPlay2Compat, None),
-        StreamingMode::AirPlay1Raop => (MsaProtocolPreference::Raop, None),
-    };
-
-    let effective_hires = hires_enabled
-        && !matches!(
-            streaming_mode,
-            StreamingMode::AirPlay1Raop | StreamingMode::AirPlay2Compat
-        );
+    // GUI policy: transport is always Automatic. MSA route/fallback remains
+    // inside the engine; there is no user-visible or persisted protocol override.
+    let protocol = MsaProtocolPreference::Auto;
+    let ptp_override = None;
+    let effective_hires = hires_enabled;
     let (sample_rate, bit_depth) = if effective_hires {
         (48_000, 24)
     } else {
@@ -5330,19 +5149,13 @@ fn msa_solo_config_for_device(
     };
     let features = sairplay_msa_solo::route::txt_features(Some(&txt));
     let flags = sairplay_msa_solo::route::txt_flags(Some(&txt));
-    let endpoint_port = if use_raop_endpoint {
-        raop_service.port
-    } else {
-        service.port
-    };
     let summary = format!(
-        "MSA SOLO CONNECT target={} endpoint={}:{} requested={}/{} streaming_mode={} protocol={:?} features={:#018x} flags={:#x}; credentials are never printed.",
+        "MSA SOLO CONNECT target={} endpoint={}:{} requested={}/{} streaming_mode=auto protocol={:?} features={:#018x} flags={:#x}; credentials are never printed.",
         device.display_name,
         host,
-        endpoint_port,
+        service.port,
         sample_rate,
         bit_depth,
-        streaming_mode.storage_key(),
         config.protocol,
         features,
         flags,
@@ -5504,57 +5317,6 @@ fn save_native_credentials(credentials: &BTreeMap<String, String>) {
             text.push_str(value);
             text.push('\n');
         }
-    }
-    let _ = std::fs::write(path, text);
-}
-
-fn streaming_modes_path() -> Option<PathBuf> {
-    let base = std::env::var_os("APPDATA")?;
-    Some(
-        PathBuf::from(base)
-            .join("SolYan")
-            .join("SAirplay2")
-            .join("streaming_modes.txt"),
-    )
-}
-
-fn load_streaming_modes() -> BTreeMap<String, StreamingMode> {
-    let Some(path) = streaming_modes_path() else {
-        return BTreeMap::new();
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return BTreeMap::new();
-    };
-    text.lines()
-        .filter_map(|line| {
-            let (key, value) = line.split_once('\t')?;
-            let mode = StreamingMode::from_storage_key(value)?;
-            (!key.trim().is_empty() && mode != StreamingMode::Auto)
-                .then(|| (key.to_owned(), mode))
-        })
-        .collect()
-}
-
-fn save_streaming_modes(modes: &BTreeMap<String, StreamingMode>) {
-    let Some(path) = streaming_modes_path() else {
-        return;
-    };
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    let mut text = String::new();
-    for (key, mode) in modes {
-        if *mode == StreamingMode::Auto {
-            continue;
-        }
-        let clean_key = key.replace(['\t', '\r', '\n'], "");
-        text.push_str(&clean_key);
-        text.push('\t');
-        text.push_str(mode.storage_key());
-        text.push('\n');
     }
     let _ = std::fs::write(path, text);
 }
@@ -5828,25 +5590,20 @@ mod gui_tests {
             raop: Some(raop),
         };
 
-        let (auto_cfg, _, _) = msa_solo_config_for_device(
-            &device,
-            None,
-            None,
-            false,
-            StreamingMode::Auto,
-        ).unwrap();
+        let (auto_cfg, format16, summary) =
+            msa_solo_config_for_device(&device, None, None, false).unwrap();
         assert_eq!(auto_cfg.protocol, MsaProtocolPreference::Auto);
+        assert!(auto_cfg.ptp_override.is_none());
+        assert_eq!(format16.sample_rate, 44_100);
+        assert_eq!(format16.bit_depth, 16);
+        assert!(summary.contains("streaming_mode=auto"));
 
-        let (raop_cfg, format, _) = msa_solo_config_for_device(
-            &device,
-            None,
-            None,
-            true,
-            StreamingMode::AirPlay1Raop,
-        ).unwrap();
-        assert_eq!(raop_cfg.protocol, MsaProtocolPreference::Raop);
-        assert_eq!(format.sample_rate, 44_100);
-        assert_eq!(format.bit_depth, 16);
+        let (hires_cfg, format24, _) =
+            msa_solo_config_for_device(&device, None, None, true).unwrap();
+        assert_eq!(hires_cfg.protocol, MsaProtocolPreference::Auto);
+        assert!(hires_cfg.ptp_override.is_none());
+        assert_eq!(format24.sample_rate, 48_000);
+        assert_eq!(format24.bit_depth, 24);
     }
 
     #[test]
