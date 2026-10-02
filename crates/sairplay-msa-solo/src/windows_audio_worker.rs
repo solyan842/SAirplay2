@@ -129,6 +129,11 @@ impl WindowsSoloAudioWorker {
                 let mut last_starvation_recovery: Option<Instant> = None;
                 let mut deferred_audio_seen: Option<Instant> = None;
                 let mut buffered_source_idle_since: Option<Instant> = None;
+                // Diagnostic only: measure how long the single Windows worker
+                // goes between WASAPI drains. A large gap alongside
+                // AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY would prove that
+                // capture is being starved by work done later in this same loop.
+                let mut last_capture_drain = Instant::now();
 
                 while running_thread.load(Ordering::SeqCst) {
                     // Exact cliairplay outer-loop health gate: MediaRemote
@@ -167,6 +172,8 @@ impl WindowsSoloAudioWorker {
                         flush_ack_thread.store(generation, Ordering::SeqCst);
                     }
 
+                    let pending_before_drain = chunker.pending_bytes();
+                    let capture_gap_ms = last_capture_drain.elapsed().as_millis();
                     let report = match capture.drain_into(&mut chunker) {
                         Ok(v) => v,
                         Err(e) => {
@@ -177,17 +184,81 @@ impl WindowsSoloAudioWorker {
                             return;
                         }
                     };
+                    last_capture_drain = Instant::now();
 
                     if report.discontinuities != 0 {
-                        discontinuities_thread.fetch_add(
-                            report.discontinuities,
-                            Ordering::SeqCst,
-                        );
-                        if let Some(offset) = report.discontinuity_frame_offset {
-                            last_discontinuity_thread.store(
-                                captured_frames_total.saturating_add(offset),
-                                Ordering::SeqCst,
-                            );
+                        let total = discontinuities_thread
+                            .fetch_add(report.discontinuities, Ordering::SeqCst)
+                            .saturating_add(report.discontinuities);
+                        let absolute_frame = report.discontinuity_frame_offset.map(|offset| {
+                            captured_frames_total.saturating_add(offset)
+                        });
+                        if let Some(frame) = absolute_frame {
+                            last_discontinuity_thread.store(frame, Ordering::SeqCst);
+                        }
+
+                        // Telemetry only. Do not clear PCM, reset conversion,
+                        // re-anchor, or otherwise alter the MSA media path here.
+                        // We need evidence first that a discontinuity coincides
+                        // with a delayed WASAPI drain and accumulated PCM.
+                        let pending_after_drain = chunker.pending_bytes();
+                        let bytes_per_frame = chunker.bytes_per_frame().max(1);
+                        let pending_before_frames =
+                            pending_before_drain / bytes_per_frame;
+                        let pending_after_frames =
+                            pending_after_drain / bytes_per_frame;
+                        let byte_rate = audio_format.sample_rate as usize
+                            * audio_format.input_bytes_per_frame();
+                        let ring_capacity =
+                            (byte_rate.saturating_mul(4)).max(1 << 20);
+                        let pending_excess_bytes =
+                            pending_after_drain.saturating_sub(ring_capacity);
+                        let diag = engine_thread
+                            .lock()
+                            .ok()
+                            .map(|guard| guard.diagnostics());
+
+                        if let Ok(mut events) = events_thread.lock() {
+                            if let Some(diag) = diag {
+                                events.push(format!(
+                                    "MSA INPUT DISCONTINUITY diag total={} batch={} capture_gap={}ms drained_frames={} output_frames={} silent_frames={} pending_before={}f/{}B pending_after={}f/{}B excess={}B discontinuity_frame={:?} state={:?} head_frame={} pacing_ahead_frames={} audio_sent={} audio_dropped={} sync_sent={} sync_dropped={}.",
+                                    total,
+                                    report.discontinuities,
+                                    capture_gap_ms,
+                                    report.frames,
+                                    report.output_frames,
+                                    report.silent_frames,
+                                    pending_before_frames,
+                                    pending_before_drain,
+                                    pending_after_frames,
+                                    pending_after_drain,
+                                    pending_excess_bytes,
+                                    absolute_frame,
+                                    diag.state,
+                                    diag.head_frame,
+                                    diag.pacing_ahead_frames,
+                                    diag.audio_sent,
+                                    diag.audio_dropped,
+                                    diag.sync_sent,
+                                    diag.sync_dropped,
+                                ));
+                            } else {
+                                events.push(format!(
+                                    "MSA INPUT DISCONTINUITY diag total={} batch={} capture_gap={}ms drained_frames={} output_frames={} silent_frames={} pending_before={}f/{}B pending_after={}f/{}B excess={}B discontinuity_frame={:?}; engine diagnostics unavailable.",
+                                    total,
+                                    report.discontinuities,
+                                    capture_gap_ms,
+                                    report.frames,
+                                    report.output_frames,
+                                    report.silent_frames,
+                                    pending_before_frames,
+                                    pending_before_drain,
+                                    pending_after_frames,
+                                    pending_after_drain,
+                                    pending_excess_bytes,
+                                    absolute_frame,
+                                ));
+                            }
                         }
                     }
                     captured_frames_total =
