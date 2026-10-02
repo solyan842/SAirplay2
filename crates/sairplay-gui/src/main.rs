@@ -101,7 +101,12 @@ impl ActiveSession {
     fn audio_running(&self) -> bool {
         match self {
             Self::MsaSolo(session) => {
-                session.client.is_playing() || session.client.start_pending()
+                // GUI health must track the live transport/worker, not only
+                // the STREAMING wire state. Buffered type103 intentionally
+                // enters AP2_PAUSED (rate=0) while the Windows source is
+                // capture-idle and must remain owned by the GUI so the same
+                // session can resume with a fresh rate=1 anchor.
+                session.client.is_connected()
             },
             Self::Single(session) => session.audio_running(),
             Self::StereoPair(session) => session.audio_running(),
