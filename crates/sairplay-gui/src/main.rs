@@ -5138,7 +5138,23 @@ fn msa_solo_config_for_device(
     config.am = raop_service.txt.fields.get("am").cloned();
     config.pw_txt = service.txt.fields.get("pw").cloned();
     config.raop_cn = raop_service.txt.fields.get("cn").cloned();
-    config.raop_pk = raop_service.txt.fields.get("pk").cloned();
+
+    // MSA server treats sf/flags 0x8 (PIN_REQUIRED) and 0x200
+    // (LEGACY_PAIRING) across both discovery services as the authoritative
+    // pairing signal. Keep the pinned airplay-cli AppleTV am+pk secret guard,
+    // but only arm its pk input when that server-side pairing signal exists
+    // (or a stored RAOP secret already exists). This preserves genuine paired
+    // Apple TV behavior while allowing embedded AppleTV-class RAOP clones that
+    // advertise pk with flags=0x4 to reach the normal RAOP handshake.
+    let pairing_required = SairplayApp::pairing_flags_required(device);
+    let have_raop_secret = raop_secret
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    config.raop_pk = if pairing_required || have_raop_secret {
+        raop_service.txt.fields.get("pk").cloned()
+    } else {
+        None
+    };
     config.raop.secret = raop_secret;
     if let Some(et) = raop_service.txt.fields.get("et") {
         config.raop.et = et.clone();
@@ -5159,7 +5175,7 @@ fn msa_solo_config_for_device(
     let features = sairplay_msa_solo::route::txt_features(Some(&txt));
     let flags = sairplay_msa_solo::route::txt_flags(Some(&txt));
     let summary = format!(
-        "MSA SOLO CONNECT target={} endpoint={}:{} requested={}/{} streaming_mode=auto protocol={:?} features={:#018x} flags={:#x}; credentials are never printed.",
+        "MSA SOLO CONNECT target={} endpoint={}:{} requested={}/{} streaming_mode=auto protocol={:?} features={:#018x} flags={:#x} pairing_required={}; credentials are never printed.",
         device.display_name,
         host,
         service.port,
@@ -5168,6 +5184,7 @@ fn msa_solo_config_for_device(
         config.protocol,
         features,
         flags,
+        pairing_required,
     );
     Ok((config, format, summary))
 }
@@ -5649,6 +5666,7 @@ mod gui_tests {
                     ("model", "AppleTV3,2"),
                     ("pk", "airplay-public-key"),
                     ("features", "130233135095"),
+                    ("flags", "0x4"),
                 ])
                 .unwrap(),
             }),
@@ -5660,9 +5678,10 @@ mod gui_tests {
                 port: 7102,
                 addresses: vec!["192.168.1.90".into()],
                 txt: AirPlayTxt::parse([
-                    ("am", "ThirdPartyRAOP"),
+                    ("am", "AppleTV3,1"),
                     ("pk", "raop-public-key"),
                     ("cn", "0,1"),
+                    ("sf", "0x4"),
                 ])
                 .unwrap(),
             }),
@@ -5670,7 +5689,48 @@ mod gui_tests {
 
         let (config, _, _) =
             msa_solo_config_for_device(&device, None, None, false).unwrap();
-        assert_eq!(config.am.as_deref(), Some("ThirdPartyRAOP"));
+        assert_eq!(config.am.as_deref(), Some("AppleTV3,1"));
+        assert_eq!(config.raop_pk, None);
+    }
+
+    #[test]
+    fn msa_solo_keeps_appletv_secret_guard_when_pairing_flags_require_it() {
+        let device = DeviceRecord {
+            display_name: "Apple TV".into(),
+            airplay: Some(DiscoveredService {
+                kind: ServiceKind::AirPlay,
+                fullname: "Apple TV._airplay._tcp.local.".into(),
+                display_name: "Apple TV".into(),
+                host: "appletv.local.".into(),
+                port: 7000,
+                addresses: vec!["192.168.1.91".into()],
+                txt: AirPlayTxt::parse([
+                    ("model", "AppleTV3,1"),
+                    ("features", "130233135095"),
+                    ("flags", "0x4"),
+                ])
+                .unwrap(),
+            }),
+            raop: Some(DiscoveredService {
+                kind: ServiceKind::Raop,
+                fullname: "AABBCCDDEEFF@Apple TV._raop._tcp.local.".into(),
+                display_name: "Apple TV".into(),
+                host: "appletv.local.".into(),
+                port: 5000,
+                addresses: vec!["192.168.1.91".into()],
+                txt: AirPlayTxt::parse([
+                    ("am", "AppleTV3,1"),
+                    ("pk", "raop-public-key"),
+                    ("cn", "0,1"),
+                    ("sf", "0x200"),
+                ])
+                .unwrap(),
+            }),
+        };
+
+        let (config, _, _) =
+            msa_solo_config_for_device(&device, None, None, false).unwrap();
+        assert_eq!(config.am.as_deref(), Some("AppleTV3,1"));
         assert_eq!(config.raop_pk.as_deref(), Some("raop-public-key"));
     }
 
