@@ -22,11 +22,32 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const AIRPLAY_CLOCK_READY_TIMEOUT: Duration = Duration::from_millis(2500);
 pub const STARVATION_RECOVERY_INTERVAL: Duration = Duration::from_millis(250);
+/// Windows loopback adaptation of MSA's explicit PAUSE event for Buffered
+/// type103. This measures absence of *all* captured frames, not audio silence:
+/// AUDCLNT_BUFFERFLAGS_SILENT packets still reset the timer and remain valid PCM.
+pub const BUFFERED_CAPTURE_IDLE_PARK_INTERVAL: Duration = Duration::from_millis(500);
 pub const FLUSH_DRAIN_TIMEOUT: Duration = Duration::from_millis(2000);
 const DEFERRED_START_LEAD_MS: u64 = 400;
 const DEFERRED_CLOCK_READY_LEAD_MS: u64 = 500;
 
 pub type SharedNativeSoloEngine = Arc<Mutex<NativeSoloEngine>>;
+
+fn buffered_capture_idle_should_park(
+    source_present: bool,
+    idle_for: Duration,
+    is_buffered: bool,
+    state: Ap2State,
+    content_paused: bool,
+    content_stopped: bool,
+) -> bool {
+    source_present
+        && is_buffered
+        && state == Ap2State::Streaming
+        && !content_paused
+        && !content_stopped
+        && idle_for >= BUFFERED_CAPTURE_IDLE_PARK_INTERVAL
+}
+
 
 #[derive(Debug)]
 pub enum WindowsSoloAudioWorkerError {
@@ -92,6 +113,12 @@ impl WindowsSoloAudioWorker {
             Pcm352Chunker::new_with_bytes_per_frame(audio_format.input_bytes_per_frame()),
         ));
         let source_present = Arc::new(AtomicBool::new(false));
+        // Any captured frame (including AUDCLNT_BUFFERFLAGS_SILENT) proves the
+        // Windows render timeline is still alive. A separate non-silent
+        // generation is the only safe automatic resume edge after a true
+        // capture-idle park.
+        let capture_frame_generation = Arc::new(AtomicU64::new(0));
+        let non_silent_generation = Arc::new(AtomicU64::new(0));
 
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
@@ -109,6 +136,8 @@ impl WindowsSoloAudioWorker {
             let events_thread = Arc::clone(&startup_events);
             let ring_thread = Arc::clone(&pcm_ring);
             let source_present_thread = Arc::clone(&source_present);
+            let capture_frame_generation_thread = Arc::clone(&capture_frame_generation);
+            let non_silent_generation_thread = Arc::clone(&non_silent_generation);
             let engine_diag = Arc::clone(&engine);
 
             thread::Builder::new()
@@ -198,7 +227,12 @@ impl WindowsSoloAudioWorker {
                         };
                         last_capture_drain = Instant::now();
 
+                        if report.frames != 0 {
+                            capture_frame_generation_thread.fetch_add(1, Ordering::SeqCst);
+                        }
+
                         if report.first_non_silent_frame_offset.is_some() {
+                            non_silent_generation_thread.fetch_add(1, Ordering::SeqCst);
                             if !source_present_thread.swap(true, Ordering::SeqCst) {
                                 if let Ok(mut events) = events_thread.lock() {
                                     events.push(
@@ -328,6 +362,8 @@ impl WindowsSoloAudioWorker {
             let engine_thread = Arc::clone(&engine);
             let ring_thread = Arc::clone(&pcm_ring);
             let source_present_thread = Arc::clone(&source_present);
+            let capture_frame_generation_thread = Arc::clone(&capture_frame_generation);
+            let non_silent_generation_thread = Arc::clone(&non_silent_generation);
 
             thread::Builder::new()
                 .name("sairplay-msa-media".into())
@@ -336,6 +372,12 @@ impl WindowsSoloAudioWorker {
                     let mut last_starvation_recovery: Option<Instant> = None;
                     let mut deferred_audio_seen: Option<Instant> = None;
                     let mut local_flush_ack = flush_ack_thread.load(Ordering::SeqCst);
+                    let mut capture_frame_seen =
+                        capture_frame_generation_thread.load(Ordering::SeqCst);
+                    let mut non_silent_seen =
+                        non_silent_generation_thread.load(Ordering::SeqCst);
+                    let mut last_capture_frame_at = Instant::now();
+                    let mut buffered_capture_paused = false;
 
                     while running_thread.load(Ordering::SeqCst) {
                         let control_ok = {
@@ -365,6 +407,137 @@ impl WindowsSoloAudioWorker {
                             starvation_started = None;
                             last_starvation_recovery = None;
                             deferred_audio_seen = None;
+                            capture_frame_seen =
+                                capture_frame_generation_thread.load(Ordering::SeqCst);
+                            non_silent_seen =
+                                non_silent_generation_thread.load(Ordering::SeqCst);
+                            last_capture_frame_at = Instant::now();
+                            buffered_capture_paused = false;
+                        }
+
+                        let capture_generation =
+                            capture_frame_generation_thread.load(Ordering::SeqCst);
+                        if capture_generation != capture_frame_seen {
+                            capture_frame_seen = capture_generation;
+                            last_capture_frame_at = Instant::now();
+                        }
+
+                        let non_silent_generation =
+                            non_silent_generation_thread.load(Ordering::SeqCst);
+                        let non_silent_edge = non_silent_generation != non_silent_seen;
+                        if non_silent_edge {
+                            non_silent_seen = non_silent_generation;
+                        }
+
+                        // A Buffered session parked by *capture inactivity* is
+                        // resumed only by fresh non-silent source data. The
+                        // producer has already placed those first samples in
+                        // the bounded ring, so play_content() establishes the
+                        // new rate-1 anchor before the consumer releases them.
+                        if buffered_capture_paused && non_silent_edge {
+                            let resume_result = {
+                                let mut guard = match engine_thread.lock() {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        if let Ok(mut slot) = error_thread.lock() {
+                                            *slot = Some("native SOLO engine mutex poisoned".into());
+                                        }
+                                        running_thread.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+                                };
+                                if guard.is_buffered()
+                                    && guard.content_paused()
+                                    && guard.runtime.state == Ap2State::Paused
+                                {
+                                    guard.play_content().map(|_| true)
+                                } else {
+                                    Ok(false)
+                                }
+                            };
+                            match resume_result {
+                                Ok(true) => {
+                                    buffered_capture_paused = false;
+                                    last_capture_frame_at = Instant::now();
+                                    if let Ok(mut events) = events_thread.lock() {
+                                        events.push(
+                                            "MSA INPUT Buffered source resumed: non-SILENT WASAPI returned; rate-1 anchor restored without FLUSHBUFFERED."
+                                                .into(),
+                                        );
+                                    }
+                                }
+                                Ok(false) => {
+                                    // An explicit GUI/session lifecycle command
+                                    // may have superseded the inferred park.
+                                    buffered_capture_paused = false;
+                                }
+                                Err(e) => {
+                                    if let Ok(mut slot) = error_thread.lock() {
+                                        *slot = Some(format!(
+                                            "Buffered capture-idle resume failed: {e:?}"
+                                        ));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            }
+                        }
+
+                        // MSA receives PAUSE/PLAY as explicit session commands.
+                        // Windows loopback has no equivalent EOF/pause event, so
+                        // infer PAUSE only when the endpoint returns *no frames
+                        // at all* for a sustained interval. SILENT packets count
+                        // as live PCM and continuously reset this timer.
+                        if !buffered_capture_paused
+                            && source_present_thread.load(Ordering::SeqCst)
+                        {
+                            let park_result = {
+                                let mut guard = match engine_thread.lock() {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        if let Ok(mut slot) = error_thread.lock() {
+                                            *slot = Some("native SOLO engine mutex poisoned".into());
+                                        }
+                                        running_thread.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+                                };
+                                if buffered_capture_idle_should_park(
+                                    true,
+                                    last_capture_frame_at.elapsed(),
+                                    guard.is_buffered(),
+                                    guard.runtime.state,
+                                    guard.content_paused(),
+                                    guard.content_stopped(),
+                                ) {
+                                    guard.pause_content().map(|_| true)
+                                } else {
+                                    Ok(false)
+                                }
+                            };
+                            match park_result {
+                                Ok(true) => {
+                                    buffered_capture_paused = true;
+                                    non_silent_seen =
+                                        non_silent_generation_thread.load(Ordering::SeqCst);
+                                    if let Ok(mut events) = events_thread.lock() {
+                                        events.push(format!(
+                                            "MSA INPUT Buffered capture idle for >={}ms: rate-0 PAUSE armed; receiver buffer preserved, no FLUSHBUFFERED.",
+                                            BUFFERED_CAPTURE_IDLE_PARK_INTERVAL.as_millis()
+                                        ));
+                                    }
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    if let Ok(mut slot) = error_thread.lock() {
+                                        *slot = Some(format!(
+                                            "Buffered capture-idle pause failed: {e:?}"
+                                        ));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            }
                         }
 
                         let has_packet = ring_thread
@@ -1082,6 +1255,8 @@ impl Drop for WindowsSoloAudioWorker {
 
 #[cfg(test)]
 mod source_lifecycle_tests {
+    use super::*;
+
     #[test]
     fn wasapi_silence_is_not_a_stop_signal() {
         // A Windows loopback SILENT packet still represents valid timeline
@@ -1091,6 +1266,42 @@ mod source_lifecycle_tests {
         let explicit_stop = false;
         assert!(wasapi_silent);
         assert!(!explicit_stop);
+    }
+
+    #[test]
+    fn buffered_capture_idle_parks_only_true_frame_absence() {
+        assert!(!buffered_capture_idle_should_park(
+            true,
+            BUFFERED_CAPTURE_IDLE_PARK_INTERVAL - Duration::from_millis(1),
+            true,
+            Ap2State::Streaming,
+            false,
+            false,
+        ));
+        assert!(buffered_capture_idle_should_park(
+            true,
+            BUFFERED_CAPTURE_IDLE_PARK_INTERVAL,
+            true,
+            Ap2State::Streaming,
+            false,
+            false,
+        ));
+        assert!(!buffered_capture_idle_should_park(
+            true,
+            BUFFERED_CAPTURE_IDLE_PARK_INTERVAL,
+            false,
+            Ap2State::Streaming,
+            false,
+            false,
+        ));
+        assert!(!buffered_capture_idle_should_park(
+            true,
+            BUFFERED_CAPTURE_IDLE_PARK_INTERVAL,
+            true,
+            Ap2State::Paused,
+            true,
+            false,
+        ));
     }
 
     #[test]
