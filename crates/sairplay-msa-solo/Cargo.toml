@@ -21,6 +21,6 @@ num-bigint = "0.4.6"
 chacha20poly1305 = "0.10.1"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_System_Com"] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_Security", "Win32_System_Com", "Win32_System_JobObjects", "Win32_System_Threading"] }
 libloading = "0.8"
 rubato = "=0.16.2"
