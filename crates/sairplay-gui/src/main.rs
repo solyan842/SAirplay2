@@ -47,7 +47,7 @@ enum PlaybackMode {
 }
 
 struct MsaReceiverGuiSession {
-    client: WindowsMsaSoloClient,
+    client: WindowsMsaReceiverSession,
     format: sairplay_engine::Ap2AudioFormat,
     initial_volume: Option<u8>,
     startup_events: Mutex<Vec<String>>,
@@ -75,7 +75,7 @@ enum ActiveSession {
 
 #[derive(Clone)]
 enum ActiveVolumeControl {
-    MsaSolo(WindowsMsaSoloVolumeControl),
+    MsaReceiver(WindowsMsaSoloVolumeControl),
     Native(sairplay_engine::NativeVolumeControl),
     Legacy(sairplay_engine::LegacyVolumeControl),
 }
@@ -237,7 +237,7 @@ impl ActiveSession {
                 .client
                 .volume_control()
                 .ok()
-                .map(ActiveVolumeControl::MsaSolo)
+                .map(ActiveVolumeControl::MsaReceiver)
                 .into_iter()
                 .collect(),
             Self::Single(session) => vec![ActiveVolumeControl::Native(session.volume_control())],
@@ -5201,7 +5201,7 @@ fn redact_msa_detail(detail: &str, credentials: Option<&str>) -> String {
     }
 }
 
-fn wait_msa_solo_clock_projection(client: &WindowsMsaSoloClient) -> (u64, String) {
+fn wait_msa_solo_clock_projection(client: &WindowsMsaReceiverSession) -> (u64, String) {
     if !client.uses_ptp() {
         return (
             0,
