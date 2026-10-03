@@ -149,7 +149,8 @@ impl WindowsSoloAudioWorker {
                     let mut non_silent_seen =
                         pcm_hub_thread.non_silent_generation();
                     let mut last_capture_frame_at = Instant::now();
-                    let mut buffered_capture_paused = false;
+                    let mut buffered_capture_parked = false;
+                    let mut buffered_park_flush_target: Option<u64> = None;
 
                     while running_thread.load(Ordering::SeqCst) {
                         let control_ok = {
@@ -184,7 +185,12 @@ impl WindowsSoloAudioWorker {
                             non_silent_seen =
                                 pcm_hub_thread.non_silent_generation();
                             last_capture_frame_at = Instant::now();
-                            buffered_capture_paused = false;
+                            if buffered_park_flush_target
+                                .map(|target| ack >= target)
+                                .unwrap_or(false)
+                            {
+                                buffered_park_flush_target = None;
+                            }
                         }
 
                         let capture_generation =
@@ -201,19 +207,18 @@ impl WindowsSoloAudioWorker {
                             non_silent_seen = non_silent_generation;
                         }
 
-                        // A Buffered session parked by *capture inactivity* is
-                        // resumed only by fresh non-silent source data. The
-                        // producer has already placed those first samples in
-                        // the bounded ring, so play_content() establishes the
-                        // new rate-1 anchor before the consumer releases them.
-                        if buffered_capture_paused && non_silent_edge {
-                            // Match MSA/cliairplay ordering: change the audio
-                            // state under the engine lock, then publish MRP only
-                            // after that lock has been released. Third-party
-                            // buffered receivers can use this state transition
-                            // to follow the fresh rate-1 anchor reliably.
-                            let (resume_result, resume_mrp) = {
-                                let mut guard = match engine_thread.lock() {
+                        // A capture-idle park is resumed only after the producer
+                        // has acknowledged the local PCM flush and fresh
+                        // non-silent PCM arrives. Re-arm the existing deferred
+                        // START path; NativeSoloEngine::start() then uses MSA's
+                        // post-FLUSH buffered resume and creates a fresh rate-1
+                        // anchor instead of attempting an in-place un-pause.
+                        if buffered_capture_parked
+                            && buffered_park_flush_target.is_none()
+                            && non_silent_edge
+                        {
+                            let restart_allowed = {
+                                let guard = match engine_thread.lock() {
                                     Ok(v) => v,
                                     Err(_) => {
                                         if let Ok(mut slot) = error_thread.lock() {
@@ -223,75 +228,38 @@ impl WindowsSoloAudioWorker {
                                         return;
                                     }
                                 };
-                                if guard.is_buffered()
-                                    && guard.content_paused()
-                                    && guard.runtime.state == Ap2State::Paused
-                                {
-                                    let result = guard.play_content().map(|_| true);
-                                    let mrp = if result.is_ok() {
-                                        guard.mrp_controller()
-                                    } else {
-                                        None
-                                    };
-                                    (result, mrp)
-                                } else {
-                                    (Ok(false), None)
-                                }
+                                guard.is_buffered()
+                                    && guard.runtime.state == Ap2State::Connected
+                                    && guard.content_stopped()
                             };
-                            match resume_result {
-                                Ok(true) => {
-                                    buffered_capture_paused = false;
-                                    last_capture_frame_at = Instant::now();
 
-                                    let mrp_result = resume_mrp.map(|mrp| {
-                                        mrp.publish_playback_state(
-                                            crate::MrpPlaybackState::Playing,
-                                            true,
-                                        )
-                                    });
-                                    let control_healthy = engine_thread
-                                        .lock()
-                                        .map(|guard| guard.control_healthy())
-                                        .unwrap_or(false);
-                                    let ring_fill = ring_thread
-                                        .lock()
-                                        .map(|ring| ring.fill())
-                                        .unwrap_or(0);
-
-                                    if let Ok(mut events) = events_thread.lock() {
-                                        events.push(format!(
-                                            "MSA INPUT Buffered source resumed: non-SILENT WASAPI returned; rate-1 anchor restored without FLUSHBUFFERED; MRP Playing publish={mrp_result:?}; control_healthy={control_healthy}; capture_gen={capture_generation}; non_silent_gen={non_silent_generation}; ring_fill={ring_fill}."
-                                        ));
-                                    }
+                            if restart_allowed {
+                                buffered_capture_parked = false;
+                                deferred_audio_seen = None;
+                                deferred_start_thread.store(true, Ordering::SeqCst);
+                                last_capture_frame_at = Instant::now();
+                                if let Ok(mut events) = events_thread.lock() {
+                                    events.push(
+                                        "MSA INPUT Buffered source resumed after idle park: fresh post-flush PCM detected; deferred Buffered START re-armed."
+                                            .into(),
+                                    );
                                 }
-                                Ok(false) => {
-                                    // An explicit GUI/session lifecycle command
-                                    // may have superseded the inferred park.
-                                    buffered_capture_paused = false;
-                                }
-                                Err(e) => {
-                                    if let Ok(mut slot) = error_thread.lock() {
-                                        *slot = Some(format!(
-                                            "Buffered capture-idle resume failed: {e:?}"
-                                        ));
-                                    }
-                                    running_thread.store(false, Ordering::SeqCst);
-                                    return;
-                                }
+                            } else {
+                                // Another explicit lifecycle command superseded
+                                // the inferred park. Do not manufacture a START.
+                                buffered_capture_parked = false;
                             }
                         }
 
-                        // MSA receives PAUSE/PLAY as explicit session commands.
-                        // Windows loopback has no equivalent EOF/pause event, so
-                        // infer PAUSE only when the endpoint returns *no frames
-                        // at all* for a sustained interval. SILENT packets count
-                        // as live PCM and continuously reset this timer.
-                        if !buffered_capture_paused
+                        // MSA receives PAUSE/PLAY as explicit commands; a
+                        // Windows capture gap is not one. For Buffered type103,
+                        // park the session with MSA STANDBY only after sustained
+                        // absence of *all* capture frames. STANDBY performs the
+                        // protocol-native rate-0 + FLUSHBUFFERED boundary and
+                        // leaves the live session CONNECTED for a clean restart.
+                        if !buffered_capture_parked
                             && pcm_hub_thread.source_present()
                         {
-                            // Keep MRP publication outside the engine/audio
-                            // critical section, matching upstream cliairplay's
-                            // PAUSE transition ordering.
                             let (park_result, park_mrp) = {
                                 let mut guard = match engine_thread.lock() {
                                     Ok(v) => v,
@@ -311,7 +279,7 @@ impl WindowsSoloAudioWorker {
                                     guard.content_paused(),
                                     guard.content_stopped(),
                                 ) {
-                                    let result = guard.pause_content().map(|_| true);
+                                    let result = guard.standby().map(|_| true);
                                     let mrp = if result.is_ok() {
                                         guard.mrp_controller()
                                     } else {
@@ -322,31 +290,28 @@ impl WindowsSoloAudioWorker {
                                     (Ok(false), None)
                                 }
                             };
+
                             match park_result {
                                 Ok(true) => {
-                                    buffered_capture_paused = true;
-                                    // Keep the last observed non-silent generation.
-                                    // If source audio returns concurrently with
-                                    // the rate-0 park, the next media-loop turn
-                                    // must still observe that edge and resume.
+                                    buffered_capture_parked = true;
+                                    deferred_start_thread.store(false, Ordering::SeqCst);
+                                    deferred_audio_seen = None;
+
+                                    // STANDBY has already flushed the receiver.
+                                    // Now discard every pre-boundary local PCM
+                                    // byte before allowing the fresh START.
+                                    let flush_target = pcm_hub_thread.request_flush();
+                                    buffered_park_flush_target = Some(flush_target);
+
                                     let mrp_result = park_mrp.map(|mrp| {
                                         mrp.publish_playback_state(
                                             crate::MrpPlaybackState::Paused,
                                             true,
                                         )
                                     });
-                                    let control_healthy = engine_thread
-                                        .lock()
-                                        .map(|guard| guard.control_healthy())
-                                        .unwrap_or(false);
-                                    let ring_fill = ring_thread
-                                        .lock()
-                                        .map(|ring| ring.fill())
-                                        .unwrap_or(0);
-
                                     if let Ok(mut events) = events_thread.lock() {
                                         events.push(format!(
-                                            "MSA INPUT Buffered capture idle for >={}ms: rate-0 PAUSE armed; receiver buffer preserved, no FLUSHBUFFERED; MRP Paused publish={mrp_result:?}; control_healthy={control_healthy}; capture_gen={capture_generation}; ring_fill={ring_fill}.",
+                                            "MSA INPUT Buffered capture idle for >={}ms: STANDBY + FLUSHBUFFERED completed; local PCM flush generation={flush_target}; waiting for fresh post-flush PCM before deferred START; MRP Paused publish={mrp_result:?}.",
                                             BUFFERED_CAPTURE_IDLE_PARK_INTERVAL.as_millis()
                                         ));
                                     }
@@ -355,7 +320,7 @@ impl WindowsSoloAudioWorker {
                                 Err(e) => {
                                     if let Ok(mut slot) = error_thread.lock() {
                                         *slot = Some(format!(
-                                            "Buffered capture-idle pause failed: {e:?}"
+                                            "Buffered capture-idle standby failed: {e:?}"
                                         ));
                                     }
                                     running_thread.store(false, Ordering::SeqCst);
@@ -444,8 +409,10 @@ impl WindowsSoloAudioWorker {
                                         } else {
                                             0
                                         };
+                                        let receiver_lead_ms =
+                                            guard.effective_lead_ms().max(DEFERRED_START_LEAD_MS);
                                         let mut requested =
-                                            now_unix_ms.saturating_add(DEFERRED_START_LEAD_MS);
+                                            now_unix_ms.saturating_add(receiver_lead_ms);
                                         if ready_at != 0 {
                                             requested = requested.max(
                                                 ready_at.saturating_add(
