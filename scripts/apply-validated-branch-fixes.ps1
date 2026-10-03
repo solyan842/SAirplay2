@@ -11,143 +11,327 @@ function Replace-Exact([string]$Path, [string]$Old, [string]$New, [int]$Expected
 }
 
 $worker = "crates/sairplay-msa-solo/src/windows_audio_worker.rs"
-$solo = "crates/sairplay-msa-solo/src/native_solo.rs"
 $gui = "crates/sairplay-gui/src/main.rs"
 
-# CI #1354 compile fix only: Pcm352Chunker exposes has_packet(), not fill().
+# Windows loopback has no explicit PAUSE/PLAY lifecycle. Do not map a capture
+# gap to MSA's rate-0/rate-1 un-pause path: live Naim testing proved that the
+# sender continues cleanly after rate-1 while the receiver can stay silent.
+# Instead, treat a sustained no-frame gap as a parked session boundary:
+# MSA STANDBY performs rate-0 + FLUSHBUFFERED + CONNECTED, local PCM is then
+# flushed, and only fresh post-flush non-silent PCM re-arms deferred START.
 Replace-Exact $worker @'
+                    let mut last_capture_frame_at = Instant::now();
+                    let mut buffered_capture_paused = false;
+'@ @'
+                    let mut last_capture_frame_at = Instant::now();
+                    let mut buffered_capture_parked = false;
+                    let mut buffered_park_flush_target: Option<u64> = None;
+'@ 1
+
+Replace-Exact $worker @'
+                            non_silent_seen =
+                                pcm_hub_thread.non_silent_generation();
+                            last_capture_frame_at = Instant::now();
+                            buffered_capture_paused = false;
+'@ @'
+                            non_silent_seen =
+                                pcm_hub_thread.non_silent_generation();
+                            last_capture_frame_at = Instant::now();
+                            if buffered_park_flush_target
+                                .map(|target| ack >= target)
+                                .unwrap_or(false)
+                            {
+                                buffered_park_flush_target = None;
+                            }
+'@ 1
+
+Replace-Exact $worker @'
+                        // A Buffered session parked by *capture inactivity* is
+                        // resumed only by fresh non-silent source data. The
+                        // producer has already placed those first samples in
+                        // the bounded ring, so play_content() establishes the
+                        // new rate-1 anchor before the consumer releases them.
+                        if buffered_capture_paused && non_silent_edge {
+                            // Match MSA/cliairplay ordering: change the audio
+                            // state under the engine lock, then publish MRP only
+                            // after that lock has been released. Third-party
+                            // buffered receivers can use this state transition
+                            // to follow the fresh rate-1 anchor reliably.
+                            let (resume_result, resume_mrp) = {
+                                let mut guard = match engine_thread.lock() {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        if let Ok(mut slot) = error_thread.lock() {
+                                            *slot = Some("native SOLO engine mutex poisoned".into());
+                                        }
+                                        running_thread.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+                                };
+                                if guard.is_buffered()
+                                    && guard.content_paused()
+                                    && guard.runtime.state == Ap2State::Paused
+                                {
+                                    let result = guard.play_content().map(|_| true);
+                                    let mrp = if result.is_ok() {
+                                        guard.mrp_controller()
+                                    } else {
+                                        None
+                                    };
+                                    (result, mrp)
+                                } else {
+                                    (Ok(false), None)
+                                }
+                            };
+                            match resume_result {
+                                Ok(true) => {
+                                    buffered_capture_paused = false;
+                                    last_capture_frame_at = Instant::now();
+
+                                    let mrp_result = resume_mrp.map(|mrp| {
+                                        mrp.publish_playback_state(
+                                            crate::MrpPlaybackState::Playing,
+                                            true,
+                                        )
+                                    });
+                                    let control_healthy = engine_thread
+                                        .lock()
+                                        .map(|guard| guard.control_healthy())
+                                        .unwrap_or(false);
                                     let ring_fill = ring_thread
                                         .lock()
                                         .map(|ring| ring.fill())
                                         .unwrap_or(0);
-'@ @'
-                                    let ring_has_packet = ring_thread
-                                        .lock()
-                                        .map(|ring| ring.has_packet())
-                                        .unwrap_or(false);
-'@ 2
-Replace-Exact $worker 'ring_fill={ring_fill}' 'ring_has_packet={ring_has_packet}' 2
 
-# control_healthy() needs mutable access to the native session guard.
-Replace-Exact $worker '.map(|guard| guard.control_healthy())' '.map(|mut guard| guard.control_healthy())' 2
-
-# Resume diagnostics only: expose queued type-103 tail and whether the data TCP
-# object is still attached. This does not alter pacing, anchors or media state.
-Replace-Exact $solo @'
-    pub splice_pad_frames: u64,
-    pub uses_ptp: bool,
-}
-'@ @'
-    pub splice_pad_frames: u64,
-    pub buffered_pending_bytes: usize,
-    pub buffered_connected: bool,
-    pub uses_ptp: bool,
-}
-'@ 1
-Replace-Exact $solo @'
-            splice_pad_frames: self.runtime.splice_pad_frames,
-            uses_ptp: self.runtime.use_ptp,
-'@ @'
-            splice_pad_frames: self.runtime.splice_pad_frames,
-            buffered_pending_bytes: self.runtime.pending.remaining().len(),
-            buffered_connected: self.ready.media.io.buffered_connected(),
-            uses_ptp: self.runtime.use_ptp,
-'@ 1
-
-# Arm one observation-only +500ms probe after an inferred Buffered resume.
-Replace-Exact $worker @'
-                    let mut last_capture_frame_at = Instant::now();
-                    let mut buffered_capture_paused = false;
-'@ @'
-                    let mut last_capture_frame_at = Instant::now();
-                    let mut buffered_capture_paused = false;
-                    let mut buffered_resume_probe: Option<(Instant, u64)> = None;
-'@ 1
-Replace-Exact $worker @'
-                            last_capture_frame_at = Instant::now();
-                            buffered_capture_paused = false;
-'@ @'
-                            last_capture_frame_at = Instant::now();
-                            buffered_capture_paused = false;
-                            buffered_resume_probe = None;
-'@ 1
-Replace-Exact $worker @'
-                        if non_silent_edge {
-                            non_silent_seen = non_silent_generation;
-                        }
-
-                        // A Buffered session parked by *capture inactivity* is
-'@ @'
-                        if non_silent_edge {
-                            non_silent_seen = non_silent_generation;
-                        }
-
-                        if let Some((due, baseline_audio_sent)) = buffered_resume_probe {
-                            if Instant::now() >= due {
-                                let resume_diag = engine_thread
-                                    .lock()
-                                    .ok()
-                                    .map(|guard| guard.diagnostics());
-                                let ring_pending_bytes = ring_thread
-                                    .lock()
-                                    .map(|ring| ring.pending_bytes())
-                                    .unwrap_or(0);
-                                if let Ok(mut events) = events_thread.lock() {
-                                    match resume_diag {
-                                        Some(diag) => events.push(format!(
-                                            "MSA INPUT Buffered resume +500ms: audio_sent_delta={}; diag={diag:?}; pcm_ring_bytes={ring_pending_bytes}.",
-                                            diag.audio_sent.saturating_sub(baseline_audio_sent)
-                                        )),
-                                        None => events.push(format!(
-                                            "MSA INPUT Buffered resume +500ms: engine diagnostics unavailable; pcm_ring_bytes={ring_pending_bytes}."
-                                        )),
+                                    if let Ok(mut events) = events_thread.lock() {
+                                        events.push(format!(
+                                            "MSA INPUT Buffered source resumed: non-SILENT WASAPI returned; rate-1 anchor restored without FLUSHBUFFERED; MRP Playing publish={mrp_result:?}; control_healthy={control_healthy}; capture_gen={capture_generation}; non_silent_gen={non_silent_generation}; ring_fill={ring_fill}."
+                                        ));
                                     }
                                 }
-                                buffered_resume_probe = None;
+                                Ok(false) => {
+                                    // An explicit GUI/session lifecycle command
+                                    // may have superseded the inferred park.
+                                    buffered_capture_paused = false;
+                                }
+                                Err(e) => {
+                                    if let Ok(mut slot) = error_thread.lock() {
+                                        *slot = Some(format!(
+                                            "Buffered capture-idle resume failed: {e:?}"
+                                        ));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
                             }
                         }
+'@ @'
+                        // A capture-idle park is resumed only after the producer
+                        // has acknowledged the local PCM flush and fresh
+                        // non-silent PCM arrives. Re-arm the existing deferred
+                        // START path; NativeSoloEngine::start() then uses MSA's
+                        // post-FLUSH buffered resume and creates a fresh rate-1
+                        // anchor instead of attempting an in-place un-pause.
+                        if buffered_capture_parked
+                            && buffered_park_flush_target.is_none()
+                            && non_silent_edge
+                        {
+                            let restart_allowed = {
+                                let guard = match engine_thread.lock() {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        if let Ok(mut slot) = error_thread.lock() {
+                                            *slot = Some("native SOLO engine mutex poisoned".into());
+                                        }
+                                        running_thread.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+                                };
+                                guard.is_buffered()
+                                    && guard.runtime.state == Ap2State::Connected
+                                    && guard.content_stopped()
+                            };
 
-                        // A Buffered session parked by *capture inactivity* is
+                            if restart_allowed {
+                                buffered_capture_parked = false;
+                                deferred_audio_seen = None;
+                                deferred_start_thread.store(true, Ordering::SeqCst);
+                                last_capture_frame_at = Instant::now();
+                                if let Ok(mut events) = events_thread.lock() {
+                                    events.push(
+                                        "MSA INPUT Buffered source resumed after idle park: fresh post-flush PCM detected; deferred Buffered START re-armed."
+                                            .into(),
+                                    );
+                                }
+                            } else {
+                                // Another explicit lifecycle command superseded
+                                // the inferred park. Do not manufacture a START.
+                                buffered_capture_parked = false;
+                            }
+                        }
 '@ 1
 
-# At the exact rate-1 transition, snapshot sender/timeline/TCP state and use its
-# audio_sent counter as the +500ms delta baseline. No behavior is changed.
 Replace-Exact $worker @'
-                                    let ring_has_packet = ring_thread
-                                        .lock()
-                                        .map(|ring| ring.has_packet())
-                                        .unwrap_or(false);
-
-                                    if let Ok(mut events) = events_thread.lock() {
-                                        events.push(format!(
-                                            "MSA INPUT Buffered source resumed: non-SILENT WASAPI returned; rate-1 anchor restored without FLUSHBUFFERED; MRP Playing publish={mrp_result:?}; control_healthy={control_healthy}; capture_gen={capture_generation}; non_silent_gen={non_silent_generation}; ring_has_packet={ring_has_packet}."
-                                        ));
+                        // MSA receives PAUSE/PLAY as explicit session commands.
+                        // Windows loopback has no equivalent EOF/pause event, so
+                        // infer PAUSE only when the endpoint returns *no frames
+                        // at all* for a sustained interval. SILENT packets count
+                        // as live PCM and continuously reset this timer.
+                        if !buffered_capture_paused
+                            && pcm_hub_thread.source_present()
+                        {
+                            // Keep MRP publication outside the engine/audio
+                            // critical section, matching upstream cliairplay's
+                            // PAUSE transition ordering.
+                            let (park_result, park_mrp) = {
+                                let mut guard = match engine_thread.lock() {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        if let Ok(mut slot) = error_thread.lock() {
+                                            *slot = Some("native SOLO engine mutex poisoned".into());
+                                        }
+                                        running_thread.store(false, Ordering::SeqCst);
+                                        return;
                                     }
-'@ @'
-                                    let ring_has_packet = ring_thread
+                                };
+                                if buffered_capture_idle_should_park(
+                                    true,
+                                    last_capture_frame_at.elapsed(),
+                                    guard.is_buffered(),
+                                    guard.runtime.state,
+                                    guard.content_paused(),
+                                    guard.content_stopped(),
+                                ) {
+                                    let result = guard.pause_content().map(|_| true);
+                                    let mrp = if result.is_ok() {
+                                        guard.mrp_controller()
+                                    } else {
+                                        None
+                                    };
+                                    (result, mrp)
+                                } else {
+                                    (Ok(false), None)
+                                }
+                            };
+                            match park_result {
+                                Ok(true) => {
+                                    buffered_capture_paused = true;
+                                    // Keep the last observed non-silent generation.
+                                    // If source audio returns concurrently with
+                                    // the rate-0 park, the next media-loop turn
+                                    // must still observe that edge and resume.
+                                    let mrp_result = park_mrp.map(|mrp| {
+                                        mrp.publish_playback_state(
+                                            crate::MrpPlaybackState::Paused,
+                                            true,
+                                        )
+                                    });
+                                    let control_healthy = engine_thread
                                         .lock()
-                                        .map(|ring| ring.has_packet())
+                                        .map(|guard| guard.control_healthy())
                                         .unwrap_or(false);
-                                    let pcm_ring_bytes = ring_thread
+                                    let ring_fill = ring_thread
                                         .lock()
-                                        .map(|ring| ring.pending_bytes())
+                                        .map(|ring| ring.fill())
                                         .unwrap_or(0);
-                                    let resume_diag = engine_thread
-                                        .lock()
-                                        .ok()
-                                        .map(|guard| guard.diagnostics());
-                                    if let Some(diag) = resume_diag {
-                                        buffered_resume_probe = Some((
-                                            Instant::now() + Duration::from_millis(500),
-                                            diag.audio_sent,
-                                        ));
-                                    }
 
                                     if let Ok(mut events) = events_thread.lock() {
                                         events.push(format!(
-                                            "MSA INPUT Buffered source resumed: non-SILENT WASAPI returned; rate-1 anchor restored without FLUSHBUFFERED; MRP Playing publish={mrp_result:?}; control_healthy={control_healthy}; capture_gen={capture_generation}; non_silent_gen={non_silent_generation}; ring_has_packet={ring_has_packet}; diag={resume_diag:?}; pcm_ring_bytes={pcm_ring_bytes}."
+                                            "MSA INPUT Buffered capture idle for >={}ms: rate-0 PAUSE armed; receiver buffer preserved, no FLUSHBUFFERED; MRP Paused publish={mrp_result:?}; control_healthy={control_healthy}; capture_gen={capture_generation}; ring_fill={ring_fill}.",
+                                            BUFFERED_CAPTURE_IDLE_PARK_INTERVAL.as_millis()
                                         ));
                                     }
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    if let Ok(mut slot) = error_thread.lock() {
+                                        *slot = Some(format!(
+                                            "Buffered capture-idle pause failed: {e:?}"
+                                        ));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            }
+                        }
+'@ @'
+                        // MSA receives PAUSE/PLAY as explicit commands; a
+                        // Windows capture gap is not one. For Buffered type103,
+                        // park the session with MSA STANDBY only after sustained
+                        // absence of *all* capture frames. STANDBY performs the
+                        // protocol-native rate-0 + FLUSHBUFFERED boundary and
+                        // leaves the live session CONNECTED for a clean restart.
+                        if !buffered_capture_parked
+                            && pcm_hub_thread.source_present()
+                        {
+                            let (park_result, park_mrp) = {
+                                let mut guard = match engine_thread.lock() {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        if let Ok(mut slot) = error_thread.lock() {
+                                            *slot = Some("native SOLO engine mutex poisoned".into());
+                                        }
+                                        running_thread.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+                                };
+                                if buffered_capture_idle_should_park(
+                                    true,
+                                    last_capture_frame_at.elapsed(),
+                                    guard.is_buffered(),
+                                    guard.runtime.state,
+                                    guard.content_paused(),
+                                    guard.content_stopped(),
+                                ) {
+                                    let result = guard.standby().map(|_| true);
+                                    let mrp = if result.is_ok() {
+                                        guard.mrp_controller()
+                                    } else {
+                                        None
+                                    };
+                                    (result, mrp)
+                                } else {
+                                    (Ok(false), None)
+                                }
+                            };
+
+                            match park_result {
+                                Ok(true) => {
+                                    buffered_capture_parked = true;
+                                    deferred_start_thread.store(false, Ordering::SeqCst);
+                                    deferred_audio_seen = None;
+
+                                    // STANDBY has already flushed the receiver.
+                                    // Now discard every pre-boundary local PCM
+                                    // byte before allowing the fresh START.
+                                    let flush_target = pcm_hub_thread.request_flush();
+                                    buffered_park_flush_target = Some(flush_target);
+
+                                    let mrp_result = park_mrp.map(|mrp| {
+                                        mrp.publish_playback_state(
+                                            crate::MrpPlaybackState::Paused,
+                                            true,
+                                        )
+                                    });
+                                    if let Ok(mut events) = events_thread.lock() {
+                                        events.push(format!(
+                                            "MSA INPUT Buffered capture idle for >={}ms: STANDBY + FLUSHBUFFERED completed; local PCM flush generation={flush_target}; waiting for fresh post-flush PCM before deferred START; MRP Paused publish={mrp_result:?}.",
+                                            BUFFERED_CAPTURE_IDLE_PARK_INTERVAL.as_millis()
+                                        ));
+                                    }
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    if let Ok(mut slot) = error_thread.lock() {
+                                        *slot = Some(format!(
+                                            "Buffered capture-idle standby failed: {e:?}"
+                                        ));
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            }
+                        }
 '@ 1
 
 # GUI top control cards: frame inner margins are 10px per side = 20px total.
@@ -179,4 +363,4 @@ Replace-Exact $gui @'
 '@ 1
 
 Write-Host "Validated branch fixes applied."
-git diff -- $worker $solo $gui
+git diff -- $worker $gui
