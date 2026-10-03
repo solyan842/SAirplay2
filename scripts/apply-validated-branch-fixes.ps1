@@ -4,7 +4,7 @@ function Replace-Exact([string]$Path, [string]$Old, [string]$New, [int]$Expected
     $text = [System.IO.File]::ReadAllText($Path)
     $count = ([regex]::Matches($text, [regex]::Escape($Old))).Count
     if ($count -ne $ExpectedCount) {
-        throw "$Path: expected $ExpectedCount exact match(es), found $count"
+        throw "${Path}: expected $ExpectedCount exact match(es), found $count"
     }
     $text = $text.Replace($Old, $New)
     [System.IO.File]::WriteAllText($Path, $text, [System.Text.UTF8Encoding]::new($false))
