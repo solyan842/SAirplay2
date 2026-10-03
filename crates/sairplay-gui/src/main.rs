@@ -2781,7 +2781,7 @@ impl SairplayApp {
         device: &DeviceRecord,
         stereo_pair: bool,
     ) {
-        const ROW_H: f32 = 72.0;
+        const ROW_H: f32 = 76.0;
         const SELECTOR_W: f32 = 24.0;
         const ART_W: f32 = 70.0;
         const STATUS_W: f32 = 166.0;
@@ -2825,7 +2825,7 @@ impl SairplayApp {
             ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), sense);
         // Keep a real vertical gutter between adjacent rows so selected/hover
         // rounded cards can never visually overlap the next receiver.
-        let body = row_rect.shrink2(egui::vec2(2.0, 5.0));
+        let body = row_rect.shrink2(egui::vec2(2.0, 6.0));
 
         if selected {
             ui.painter().rect_filled(
@@ -3136,6 +3136,7 @@ impl SairplayApp {
             .inner_margin(egui::Margin::same(11))
             .show(ui, |ui| {
                 ui.set_min_height(panel_content_height);
+                ui.set_max_height(panel_content_height);
 
                 ui.allocate_ui_with_layout(
                     egui::vec2(ui.available_width(), 36.0),
@@ -3589,7 +3590,7 @@ impl SairplayApp {
         let text = self.t("Dùng thử · còn 3 ngày", "Trial · 3 days left");
         let activate = self.t("Nhấn để kích hoạt", "Click to activate");
         let hint = self.t(
-            "Khi gặp lỗi khi phát âm thanh, vui lòng nhấn Dừng rồi Bắt đầu lại.",
+            "Gặp lỗi khi phát âm thanh, vui lòng nhấn Dừng rồi Bắt đầu lại.",
             "If audio playback issues occur, please press Stop, then Start again.",
         );
 
@@ -3663,8 +3664,9 @@ impl SairplayApp {
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(hint)
-                                .size(10.4)
-                                .color(UiTheme::text_soft()),
+                                .size(11.4)
+                                .italics()
+                                .color(UiTheme::blue()),
                         )
                         .truncate(),
                     );
@@ -3899,7 +3901,7 @@ impl eframe::App for SairplayApp {
                 // Consume the vertical space that was previously left blank
                 // under the trial row. Reserve only the fixed controls/trial
                 // block below the two device panels.
-                const LOWER_CONTROLS_RESERVE: f32 = 105.0;
+                const LOWER_CONTROLS_RESERVE: f32 = 110.0;
                 const PANEL_FRAME_VERTICAL_MARGIN: f32 = 22.0;
                 let panel_content_height = (
                     ui.available_height()
@@ -3925,9 +3927,9 @@ impl eframe::App for SairplayApp {
                     );
                 });
 
-                ui.add_space(7.0);
+                ui.add_space(10.0);
                 self.render_controls(ui);
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 self.render_trial_row(ui);
             });
 
