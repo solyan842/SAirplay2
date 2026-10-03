@@ -31,9 +31,12 @@ Replace-Exact $worker 'ring_fill={ring_fill}' 'ring_has_packet={ring_has_packet}
 Replace-Exact $worker '.map(|guard| guard.control_healthy())' '.map(|mut guard| guard.control_healthy())' 2
 
 # GUI top control cards: frame inner margins are 10px per side = 20px total.
-# The old 16px subtraction made every card render 4px wider than its allocated rect,
-# so two adjacent cards consumed the nominal 8px gap and visually touched.
 Replace-Exact $gui '        const CARD_HORIZONTAL_MARGIN: f32 = 16.0;' '        const CARD_HORIZONTAL_MARGIN: f32 = 20.0;' 1
+
+# GUI volume card: left_to_right layout also inserts the theme item spacing between
+# the fixed 54px speaker column, explicit 4px gap, and the volume controls.
+# Account for that automatic spacing so the first card cannot grow into card #2.
+Replace-Exact $gui '                            let volume_controls_w = (card_inner_w - 58.0).max(100.0);' '                            let volume_controls_w = (card_inner_w - 58.0 - ui.spacing().item_spacing.x).max(100.0);' 1
 
 # GUI: force a visible gutter between the two top device panels.
 Replace-Exact $gui @'
