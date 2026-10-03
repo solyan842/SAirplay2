@@ -1,0 +1,108 @@
+name: Promote MSA Buffered Source
+
+on:
+  push:
+    branches: ["dev/msa-core-architecture"]
+    paths:
+      - ".github/workflows/promote-msa-buffered-source.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Materialize validated runtime behavior into Rust source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Produce exactly the source that the field-tested Windows artifact used.
+          ./scripts/apply-validated-branch-fixes.ps1
+
+          # This promotion is audio-worker only. Keep GUI runtime patches in the
+          # existing validated-patch script until they are migrated separately.
+          git checkout -- crates/sairplay-gui/src/main.rs
+
+          # The committed worker candidate must already satisfy the hardware-proven
+          # Buffered resume invariants before it is allowed to replace the old source.
+          ./scripts/verify-buffered-resume-invariants.ps1
+
+          $guiOnly = @'
+          $ErrorActionPreference = "Stop"
+
+          function Replace-Exact([string]$Path, [string]$Old, [string]$New, [int]$ExpectedCount = 1) {
+              $text = [System.IO.File]::ReadAllText($Path)
+              $count = ([regex]::Matches($text, [regex]::Escape($Old))).Count
+              if ($count -ne $ExpectedCount) {
+                  throw "${Path}: expected $ExpectedCount exact match(es), found $count"
+              }
+              $text = $text.Replace($Old, $New)
+              [System.IO.File]::WriteAllText($Path, $text, [System.Text.UTF8Encoding]::new($false))
+          }
+
+          $gui = "crates/sairplay-gui/src/main.rs"
+
+          # GUI top control cards: frame inner margins are 10px per side = 20px total.
+          Replace-Exact $gui '        const CARD_HORIZONTAL_MARGIN: f32 = 16.0;' '        const CARD_HORIZONTAL_MARGIN: f32 = 20.0;' 1
+
+          # GUI volume card: left_to_right layout also inserts the theme item spacing between
+          # the fixed 54px speaker column, explicit 4px gap, and the volume controls.
+          # Account for that automatic spacing so the first card cannot grow into card #2.
+          Replace-Exact $gui '                            let volume_controls_w = (card_inner_w - 58.0).max(100.0);' '                            let volume_controls_w = (card_inner_w - 58.0 - ui.spacing().item_spacing.x).max(100.0);' 1
+
+          # GUI: force a visible gutter between the two top device panels.
+          Replace-Exact $gui @'
+                          ui.columns(2, |columns| {
+          '@ @'
+                          ui.spacing_mut().item_spacing.x = 14.0;
+                          ui.columns(2, |columns| {
+          '@ 1
+
+          # GUI: helper text returns to neutral gray, regular (non-italic) style.
+          Replace-Exact $gui @'
+                                      egui::RichText::new(hint)
+                                          .size(11.4)
+                                          .italics()
+                                          .color(UiTheme::blue()),
+          '@ @'
+                                      egui::RichText::new(hint)
+                                          .size(11.4)
+                                          .color(UiTheme::text_soft()),
+          '@ 1
+
+          Write-Host "Validated GUI-only branch fixes applied."
+          git diff -- $gui
+          '@
+
+          [System.IO.File]::WriteAllText(
+              "scripts/apply-validated-branch-fixes.ps1",
+              $guiOnly.TrimStart(),
+              [System.Text.UTF8Encoding]::new($false)
+          )
+
+          # The runtime patch layer must no longer own audio/worker behavior.
+          $patchText = [System.IO.File]::ReadAllText("scripts/apply-validated-branch-fixes.ps1")
+          if ($patchText.Contains('$worker') -or $patchText.Contains('windows_audio_worker.rs')) {
+              throw "audio worker runtime patch still present after promotion"
+          }
+
+          # Remove this one-shot workflow in the same promotion commit.
+          git rm .github/workflows/promote-msa-buffered-source.yml
+          git diff --check
+          git diff -- crates/sairplay-msa-solo/src/windows_audio_worker.rs scripts/apply-validated-branch-fixes.ps1
+
+      - name: Commit promoted source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add crates/sairplay-msa-solo/src/windows_audio_worker.rs scripts/apply-validated-branch-fixes.ps1 .github/workflows/promote-msa-buffered-source.yml
+          git commit -m "refactor: promote validated buffered resume into source"
+          git push origin HEAD:dev/msa-core-architecture
