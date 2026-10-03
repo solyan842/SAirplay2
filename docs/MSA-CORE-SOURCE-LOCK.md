@@ -84,7 +84,27 @@ MSA receiver core
 
 The producer must not block on receiver network I/O. Digital-zero PCM is valid PCM. A zero-frame WASAPI poll is not EOF.
 
-## Field-proven Buffered 16-bit baseline — LOCKED
+## Field-proven Buffered Type-103 lifecycle baseline — LOCKED
+
+**Scope:** this is a hardware-proven baseline for the **Buffered Type-103 Windows-adapter lifecycle only**. It is not the baseline for all 16-bit playback and is not a system-wide SAirplay2 baseline.
+
+It specifically locks:
+
+- how Windows capture-idle is adapted for a Buffered receiver;
+- how a Buffered session crosses STANDBY/FLUSHBUFFERED and restarts;
+- how fresh post-flush PCM gates deferred START;
+- how deferred START uses the receiver's negotiated effective lead;
+- regression expectations for this Type-103 16/44.1 lifecycle.
+
+It does **not** define or replace the independent baselines for:
+
+- realtime Type-96 / HomePod;
+- realtime Apple TV paths;
+- 24-bit transport;
+- RAOP / AirPlay 1;
+- Stereo Pair;
+- MultiRoom;
+- Session Coordinator behavior as a whole.
 
 Receiver: Naim Mu-so Qb
 Mode: Native AirPlay 2 / PTP / Buffered type 103
@@ -168,20 +188,20 @@ We are in **MSA Core / 16-bit consolidation and regression**, not 24-bit expansi
 Order of work:
 
 1. consolidate the validated runtime patch into committed source with zero behavior change;
-2. repeat Naim 16/44.1 lifecycle testing: Pause/Resume, Stop/Start, track changes, short/long idle, long run;
-3. regression-check HomePod 16/44.1;
-4. regression-check Apple TV 16/44.1;
+2. repeat Naim 16/44.1 Buffered lifecycle testing: Pause/Resume, Stop/Start, track changes, short/long idle, long run;
+3. regression-check HomePod 16/44.1 realtime Type-96;
+4. regression-check Apple TV 16/44.1 on its selected lane;
 5. keep AirPort Express explicit RAOP testing separate from native AP2;
-6. lock the 16-bit matrix;
+6. lock the 16-bit matrix as a collection of lane/device baselines, not as a Naim-derived global baseline;
 7. only then return to 24-bit work;
 8. only after Single/Core gates are sound, continue Stereo Pair and MultiRoom migration;
 9. GUI/productization remains above the transport core and must not drive protocol changes.
 
 ## 24-bit boundary
 
-Known previous 24-bit symptoms include missing audio, repeated pops/dropouts and noisy Stop/format-transition behavior. Those symptoms are not permission to alter the now-validated 16-bit baseline.
+Known previous 24-bit symptoms include missing audio, repeated pops/dropouts and noisy Stop/format-transition behavior. Those symptoms are not permission to alter the now-validated Buffered Type-103 16-bit lifecycle baseline.
 
-When 24-bit resumes, diagnose it as a separate format/codec/lifecycle extension on top of the locked 16-bit core.
+When 24-bit resumes, diagnose it as a separate format/codec/lifecycle extension on top of the appropriate locked 16-bit lane baselines.
 
 ## Drift-prevention questions
 
@@ -191,6 +211,7 @@ Before every future route/protocol/audio change, answer:
 2. What does pinned airplay-cli do for the same lifecycle/transport operation?
 3. Which layer does the hardware/log evidence identify?
 4. Is the proposed code in MSA Receiver Core or only a necessary Windows adapter?
-5. Does the change preserve the field-proven 16-bit baseline?
+5. Which exact lane/device baseline could this change affect?
+6. Does the change preserve every already field-proven baseline in scope?
 
 If these cannot be answered, do not change transport behavior.
