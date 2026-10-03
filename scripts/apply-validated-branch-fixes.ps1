@@ -27,6 +27,9 @@ Replace-Exact $worker @'
 '@ 2
 Replace-Exact $worker 'ring_fill={ring_fill}' 'ring_has_packet={ring_has_packet}' 2
 
+# control_healthy() needs mutable access to the native session guard.
+Replace-Exact $worker '.map(|guard| guard.control_healthy())' '.map(|mut guard| guard.control_healthy())' 2
+
 # GUI: force a visible gutter between the two top device panels.
 Replace-Exact $gui @'
                 ui.columns(2, |columns| {
