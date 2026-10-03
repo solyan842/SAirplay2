@@ -20,6 +20,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Apply validated branch fixes
+        shell: pwsh
+        run: ./scripts/apply-validated-branch-fixes.ps1
       - uses: dtolnay/rust-toolchain@stable
       - name: Check
         run: cargo check --workspace --all-targets
