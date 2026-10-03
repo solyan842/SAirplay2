@@ -1,20 +1,18 @@
-//! Windows WASAPI -> native AP2 SOLO media worker.
-//! The adapter deliberately splits capture from transport: one COM/WASAPI
-//! producer continuously drains the Windows engine into the same bounded PCM
-//! ring shape used by MSA, while a separate media consumer owns pacing/ALAC/
-//! network sends. Slow type-103 TCP or RTSP work therefore cannot starve the
-//! 100 ms WASAPI capture buffer.
+//! Windows PCM source -> native AP2 receiver media worker.
+//! Capture ownership lives in WindowsPcmSource. This worker owns only the
+//! receiver-facing media consumer and MSA lifecycle adaptation around the
+//! shared PCM hub, so slow type-103 TCP/RTSP work cannot block WASAPI capture.
 
 use crate::{
     ap2::Ap2State,
     native_media::SendResult,
     time_domain::SourceNtp,
-    Ap2AudioFormat, NativeSoloEngine, SoloClockReadinessState, WindowsPcmHub,
-    WasapiLoopbackCapture, WasapiLoopbackError,
+    Ap2AudioFormat, NativeSoloEngine, PcmSourceDiagnosticContext,
+    SoloClockReadinessState, WindowsPcmHub, WindowsPcmSource, WasapiLoopbackError,
 };
 use std::fmt;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
@@ -48,7 +46,6 @@ fn buffered_capture_idle_should_park(
         && idle_for >= BUFFERED_CAPTURE_IDLE_PARK_INTERVAL
 }
 
-
 #[derive(Debug)]
 pub enum WindowsSoloAudioWorkerError {
     Capture(WasapiLoopbackError),
@@ -73,11 +70,9 @@ pub struct WindowsSoloAudioWorker {
     engine: SharedNativeSoloEngine,
     pcm_hub: WindowsPcmHub,
     deferred_start_armed: Arc<AtomicBool>,
-    capture_worker: Option<JoinHandle<()>>,
+    pcm_source: WindowsPcmSource,
     media_worker: Option<JoinHandle<()>>,
     last_error: Arc<Mutex<Option<String>>>,
-    discontinuities: Arc<AtomicU64>,
-    last_discontinuity_frame: Arc<AtomicU64>,
     startup_events: Arc<Mutex<Vec<String>>>,
 }
 
@@ -98,233 +93,39 @@ impl WindowsSoloAudioWorker {
         let pcm_hub = WindowsPcmHub::new(audio_format);
         let deferred_start_armed = Arc::new(AtomicBool::new(false));
         let last_error = Arc::new(Mutex::new(None));
-        let discontinuities = Arc::new(AtomicU64::new(0));
-        let last_discontinuity_frame = Arc::new(AtomicU64::new(u64::MAX));
         let startup_events = Arc::new(Mutex::new(Vec::<String>::new()));
 
-        // Phase 2A: local PCM ownership is centralized in one hub. The
-        // existing producer/consumer threads and all AirPlay semantics remain
-        // unchanged around this ownership seam.
+        // Keep receiver diagnostics available to capture telemetry without
+        // coupling WindowsPcmSource to NativeSoloEngine or any AirPlay state.
+        let diagnostic_engine = Arc::clone(&engine);
+        let diagnostic_context: PcmSourceDiagnosticContext = Arc::new(move || {
+            let guard = diagnostic_engine.try_lock().ok()?;
+            let diag = guard.diagnostics();
+            Some(format!(
+                "state={:?} head_frame={} pacing_ahead_frames={} audio_sent={} audio_dropped={} sync_sent={} sync_dropped={}",
+                diag.state,
+                diag.head_frame,
+                diag.pacing_ahead_frames,
+                diag.audio_sent,
+                diag.audio_dropped,
+                diag.sync_sent,
+                diag.sync_dropped,
+            ))
+        });
 
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        // Spawn the transport-agnostic WASAPI producer first, matching the
+        // validated producer-before-media ordering. It writes only to pcm_hub.
+        let mut pcm_source = WindowsPcmSource::spawn(
+            audio_format,
+            pcm_hub.clone(),
+            Arc::clone(&running),
+            Arc::clone(&last_error),
+            Arc::clone(&startup_events),
+            Some(diagnostic_context),
+        )
+        .map_err(|error| WindowsSoloAudioWorkerError::Engine(error.to_string()))?;
 
-        // Producer: this thread does no RTSP, ALAC or media socket I/O.  Its
-        // only blocking dependency is the short PCM-ring mutex, which the
-        // consumer never holds while it touches the network.
-        let capture_worker = {
-            let running_thread = Arc::clone(&running);
-            let pcm_hub_thread = pcm_hub.clone();
-            let ring_thread = pcm_hub_thread.ring();
-            let error_thread = Arc::clone(&last_error);
-            let discontinuities_thread = Arc::clone(&discontinuities);
-            let last_discontinuity_thread = Arc::clone(&last_discontinuity_frame);
-            let events_thread = Arc::clone(&startup_events);
-            let engine_diag = Arc::clone(&engine);
-
-            thread::Builder::new()
-                .name("sairplay-msa-wasapi".into())
-                .spawn(move || {
-                    let mut capture = match WasapiLoopbackCapture::open_default_for_format(audio_format) {
-                        Ok(v) => {
-                            if let Ok(mut events) = events_thread.lock() {
-                                events.push(format!("MSA INPUT {}.", v.format_summary()));
-                                events.push(
-                                    "MSA INPUT capture/media split active: WASAPI producer cannot be blocked by type103 sender."
-                                        .into(),
-                                );
-                            }
-                            let _ = ready_tx.send(Ok(()));
-                            v
-                        }
-                        Err(e) => {
-                            let message = e.to_string();
-                            let _ = ready_tx.send(Err(message.clone()));
-                            if let Ok(mut slot) = error_thread.lock() {
-                                *slot = Some(message);
-                            }
-                            running_thread.store(false, Ordering::SeqCst);
-                            return;
-                        }
-                    };
-
-                    let ring_capacity = pcm_hub_thread.ring_capacity();
-                    let mut local_flush_generation = pcm_hub_thread.flush_generation();
-                    let mut captured_frames_total = 0u64;
-                    let mut last_capture_drain = Instant::now();
-
-                    while running_thread.load(Ordering::SeqCst) {
-                        let generation = pcm_hub_thread.flush_generation();
-                        if generation != local_flush_generation {
-                            let cleared = ring_thread
-                                .lock()
-                                .map(|mut ring| {
-                                    let bytes = ring.pending_bytes();
-                                    ring.clear();
-                                    bytes
-                                })
-                                .unwrap_or(0);
-                            capture.reset_conversion();
-                            pcm_hub_thread.reset_source_present();
-                            pcm_hub_thread.set_audio_ready(false);
-                            local_flush_generation = generation;
-                            pcm_hub_thread.acknowledge_flush(generation);
-                            if cleared != 0 {
-                                if let Ok(mut events) = events_thread.lock() {
-                                    events.push(format!(
-                                        "MSA INPUT flush reset: discarded {} queued PCM bytes.",
-                                        cleared
-                                    ));
-                                }
-                            }
-                        }
-
-                        let capture_gap_ms = last_capture_drain.elapsed().as_millis();
-                        let (pending_before_drain, report, pending_after_drain) = {
-                            let mut ring = match ring_thread.lock() {
-                                Ok(v) => v,
-                                Err(_) => {
-                                    if let Ok(mut slot) = error_thread.lock() {
-                                        *slot = Some("PCM ring mutex poisoned".into());
-                                    }
-                                    running_thread.store(false, Ordering::SeqCst);
-                                    return;
-                                }
-                            };
-                            let before = ring.pending_bytes();
-                            let report = match capture.drain_into(&mut ring) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    if let Ok(mut slot) = error_thread.lock() {
-                                        *slot = Some(format!("WASAPI capture failed: {e}"));
-                                    }
-                                    running_thread.store(false, Ordering::SeqCst);
-                                    return;
-                                }
-                            };
-                            let after = ring.pending_bytes();
-                            (before, report, after)
-                        };
-                        last_capture_drain = Instant::now();
-
-                        pcm_hub_thread.note_capture_frames(report.frames);
-
-                        if report.first_non_silent_frame_offset.is_some() {
-                            if pcm_hub_thread.note_non_silent_packet() {
-                                if let Ok(mut events) = events_thread.lock() {
-                                    events.push(
-                                        "MSA INPUT source-present: first non-SILENT WASAPI packet."
-                                            .into(),
-                                    );
-                                }
-                            }
-                        }
-
-                        if report.discontinuities != 0 {
-                            let total = discontinuities_thread
-                                .fetch_add(report.discontinuities, Ordering::SeqCst)
-                                .saturating_add(report.discontinuities);
-                            let absolute_frame = report.discontinuity_frame_offset.map(|offset| {
-                                captured_frames_total.saturating_add(offset)
-                            });
-                            if let Some(frame) = absolute_frame {
-                                last_discontinuity_thread.store(frame, Ordering::SeqCst);
-                            }
-
-                            let bytes_per_frame = audio_format.input_bytes_per_frame().max(1);
-                            let pending_before_frames = pending_before_drain / bytes_per_frame;
-                            let pending_after_frames = pending_after_drain / bytes_per_frame;
-                            let pending_excess_bytes =
-                                pending_after_drain.saturating_sub(ring_capacity);
-                            let diag = engine_diag.try_lock().ok().map(|guard| guard.diagnostics());
-
-                            if let Ok(mut events) = events_thread.lock() {
-                                if let Some(diag) = diag {
-                                    events.push(format!(
-                                        "MSA INPUT DISCONTINUITY diag total={} batch={} capture_gap={}ms drained_frames={} output_frames={} silent_frames={} pending_before={}f/{}B pending_after={}f/{}B excess={}B discontinuity_frame={:?} state={:?} head_frame={} pacing_ahead_frames={} audio_sent={} audio_dropped={} sync_sent={} sync_dropped={}.",
-                                        total,
-                                        report.discontinuities,
-                                        capture_gap_ms,
-                                        report.frames,
-                                        report.output_frames,
-                                        report.silent_frames,
-                                        pending_before_frames,
-                                        pending_before_drain,
-                                        pending_after_frames,
-                                        pending_after_drain,
-                                        pending_excess_bytes,
-                                        absolute_frame,
-                                        diag.state,
-                                        diag.head_frame,
-                                        diag.pacing_ahead_frames,
-                                        diag.audio_sent,
-                                        diag.audio_dropped,
-                                        diag.sync_sent,
-                                        diag.sync_dropped,
-                                    ));
-                                } else {
-                                    events.push(format!(
-                                        "MSA INPUT DISCONTINUITY diag total={} batch={} capture_gap={}ms drained_frames={} output_frames={} silent_frames={} pending_before={}f/{}B pending_after={}f/{}B excess={}B discontinuity_frame={:?}; engine diagnostics busy/unavailable.",
-                                        total,
-                                        report.discontinuities,
-                                        capture_gap_ms,
-                                        report.frames,
-                                        report.output_frames,
-                                        report.silent_frames,
-                                        pending_before_frames,
-                                        pending_before_drain,
-                                        pending_after_frames,
-                                        pending_after_drain,
-                                        pending_excess_bytes,
-                                        absolute_frame,
-                                    ));
-                                }
-                            }
-                        }
-                        captured_frames_total =
-                            captured_frames_total.saturating_add(report.frames as u64);
-
-                        if !pcm_hub_thread.source_present() {
-                            if let Ok(mut ring) = ring_thread.lock() {
-                                ring.clear();
-                            }
-                            capture.reset_conversion();
-                            pcm_hub_thread.set_audio_ready(false);
-                        } else {
-                            let (dropped, has_packet) = match ring_thread.lock() {
-                                Ok(mut ring) => {
-                                    let dropped = ring.truncate_pending(ring_capacity);
-                                    (dropped, ring.has_packet())
-                                }
-                                Err(_) => {
-                                    if let Ok(mut slot) = error_thread.lock() {
-                                        *slot = Some("PCM ring mutex poisoned".into());
-                                    }
-                                    running_thread.store(false, Ordering::SeqCst);
-                                    return;
-                                }
-                            };
-                            pcm_hub_thread.set_audio_ready(has_packet);
-                            if dropped != 0 {
-                                if let Ok(mut events) = events_thread.lock() {
-                                    events.push(format!(
-                                        "MSA INPUT bounded ring full: discarded {} newest PCM bytes (capacity={}B).",
-                                        dropped, ring_capacity
-                                    ));
-                                }
-                            }
-                        }
-
-                        if report.frames == 0 {
-                            thread::sleep(Duration::from_millis(1));
-                        }
-                    }
-                })
-                .map_err(|e| WindowsSoloAudioWorkerError::Engine(format!(
-                    "spawn WASAPI producer: {e}"
-                )))?
-        };
-
-        // Consumer: owns the MSA media loop.  It takes PCM from the ring, drops
+        // Consumer: owns the MSA media loop. It takes PCM from the hub, drops
         // that mutex immediately, then performs all potentially slow
         // pacing/ALAC/TCP/RTSP work.
         let media_worker = {
@@ -979,38 +780,30 @@ impl WindowsSoloAudioWorker {
                 )))?
         };
 
-        match ready_rx.recv_timeout(Duration::from_secs(3)) {
-            Ok(Ok(())) => Ok(Self {
+        match pcm_source.wait_ready(Duration::from_secs(3)) {
+            Ok(()) => Ok(Self {
                 running,
                 engine,
                 pcm_hub,
                 deferred_start_armed,
-                capture_worker: Some(capture_worker),
+                pcm_source,
                 media_worker: Some(media_worker),
                 last_error,
-                discontinuities,
-                last_discontinuity_frame,
                 startup_events,
             }),
-            Ok(Err(message)) => {
+            Err(error) => {
                 running.store(false, Ordering::SeqCst);
-                let _ = capture_worker.join();
+                // Preserve the validated failure cleanup order: source first,
+                // then media, after closing the shared run gate.
+                pcm_source.stop();
                 let _ = media_worker.join();
-                Err(WindowsSoloAudioWorkerError::Engine(message))
-            }
-            Err(_) => {
-                running.store(false, Ordering::SeqCst);
-                let _ = capture_worker.join();
-                let _ = media_worker.join();
-                Err(WindowsSoloAudioWorkerError::Engine(
-                    "WASAPI producer did not become ready".into(),
-                ))
+                Err(WindowsSoloAudioWorkerError::Engine(error.to_string()))
             }
         }
     }
 
     /// MSA ap2_session_flush equivalent for the WASAPI adapter: transport
-    /// FLUSH while sends are serialized, then wait until the capture worker
+    /// FLUSH while sends are serialized, then wait until the capture source
     /// has reset exactly the pre-FLUSH PCM before returning the frozen warm head.
     pub fn engine(&self) -> SharedNativeSoloEngine {
         Arc::clone(&self.engine)
@@ -1185,12 +978,11 @@ impl WindowsSoloAudioWorker {
     }
 
     pub fn discontinuities(&self) -> u64 {
-        self.discontinuities.load(Ordering::SeqCst)
+        self.pcm_source.discontinuities()
     }
 
     pub fn last_discontinuity_frame(&self) -> Option<u64> {
-        let v = self.last_discontinuity_frame.load(Ordering::SeqCst);
-        (v != u64::MAX).then_some(v)
+        self.pcm_source.last_discontinuity_frame()
     }
 
     pub fn startup_events(&self) -> Vec<String> {
@@ -1210,9 +1002,7 @@ impl WindowsSoloAudioWorker {
         if let Some(worker) = self.media_worker.take() {
             let _ = worker.join();
         }
-        if let Some(worker) = self.capture_worker.take() {
-            let _ = worker.join();
-        }
+        self.pcm_source.stop();
     }
 }
 
