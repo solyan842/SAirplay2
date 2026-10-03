@@ -334,6 +334,20 @@ Replace-Exact $worker @'
                         }
 '@ 1
 
+# A fresh WASAPI loopback source cannot burst-refill a flushed receiver like
+# MSA's stdin/ffmpeg source can. Use the receiver's negotiated effective lead
+# for deferred Buffered START so the type103 sender rebuilds its intended queue
+# depth after STANDBY/FLUSH instead of re-anchoring only ~400 ms ahead.
+Replace-Exact $worker @'
+                                        let mut requested =
+                                            now_unix_ms.saturating_add(DEFERRED_START_LEAD_MS);
+'@ @'
+                                        let receiver_lead_ms =
+                                            guard.effective_lead_ms().max(DEFERRED_START_LEAD_MS);
+                                        let mut requested =
+                                            now_unix_ms.saturating_add(receiver_lead_ms);
+'@ 1
+
 # GUI top control cards: frame inner margins are 10px per side = 20px total.
 Replace-Exact $gui '        const CARD_HORIZONTAL_MARGIN: f32 = 16.0;' '        const CARD_HORIZONTAL_MARGIN: f32 = 20.0;' 1
 
