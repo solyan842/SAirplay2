@@ -4,12 +4,10 @@ on:
   push:
     branches: [main, "dev/**", "rewrite/**"]
     paths-ignore:
-      - "docs/PROJECT-STATE.md"
-      - "docs/MSA-SOLO-SOURCE-LOCK.md"
+      - "docs/**"
   pull_request:
     paths-ignore:
-      - "docs/PROJECT-STATE.md"
-      - "docs/MSA-SOLO-SOURCE-LOCK.md"
+      - "docs/**"
 
 concurrency:
   group: sairplay2-${{ github.ref }}
@@ -20,17 +18,56 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Apply validated branch fixes
         shell: pwsh
         run: ./scripts/apply-validated-branch-fixes.ps1
+
       - uses: dtolnay/rust-toolchain@stable
-      - name: Check
+
+      # The active MSA Core branch owns native AP2 + the Rust RAOP adapter.
+      # For 16-bit hardware regression it does not need either historical
+      # cliraop helper or the 24-bit external ALAC bridge. Keep this lane short
+      # so every transport diagnostic can reach hardware quickly.
+      - name: Test MSA Core
+        if: github.ref == 'refs/heads/dev/msa-core-architecture'
+        run: cargo test -p sairplay-msa-solo --all-targets
+
+      - name: Check full workspace
+        if: github.ref != 'refs/heads/dev/msa-core-architecture'
         run: cargo check --workspace --all-targets
-      - name: Test invariants
+
+      - name: Test full workspace invariants
+        if: github.ref != 'refs/heads/dev/msa-core-architecture'
         run: cargo test --workspace --all-targets
+
       - name: Build GUI
         run: cargo build --release -p sairplay-gui
+
+      - name: Package MSA Core 16-bit test artifact
+        if: github.ref == 'refs/heads/dev/msa-core-architecture'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $out = "target/release/SAirplay2"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item "target/release/sairplay-gui.exe" "$out/sairplay-gui.exe" -Force
+          Get-FileHash "$out/sairplay-gui.exe" -Algorithm SHA256
+          Get-ChildItem $out
+
+      - name: Upload MSA Core 16-bit Windows artifact
+        if: github.ref == 'refs/heads/dev/msa-core-architecture'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SAirplay2-MSA-Core-16bit-Windows
+          path: target/release/SAirplay2/*
+
+      # Full/release packaging below is intentionally excluded from the active
+      # MSA Core 16-bit branch. cliraop.exe remains only for legacy/pairing
+      # packaging; cliraop-msa-solo.exe is historical comparison baggage and is
+      # not part of the new Rust MSA receiver-core runtime.
       - name: Build source-aligned ALAC24 bridge
+        if: github.ref != 'refs/heads/dev/msa-core-architecture'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -47,9 +84,6 @@ jobs:
 
           $alac = (Resolve-Path "$src/libcodecs/alac/codec").Path
 
-          # windows-latest may move to a newer Visual Studio image before the
-          # workflow is updated. Resolve the newest VS CMake generator exposed
-          # by the runner instead of pinning a marketing version.
           $cmakeHelp = cmake --help | Out-String
           $vsGenerators = [regex]::Matches(
             $cmakeHelp,
@@ -72,6 +106,7 @@ jobs:
           Get-FileHash $dll -Algorithm SHA256
 
       - name: Build MSA SOLO pinned libraop helper
+        if: github.ref != 'refs/heads/dev/msa-core-architecture'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -97,6 +132,7 @@ jobs:
           Get-FileHash "$src/bin/cliraop-msa-solo.exe" -Algorithm SHA256
 
       - name: Build current libraop helper from source
+        if: github.ref != 'refs/heads/dev/msa-core-architecture'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -125,9 +161,6 @@ jobs:
           if ($help -notmatch '\[-U <unix_ms>\]') {
             throw "Source-built cliraop.exe is missing Unix-ms clock bridge support"
           }
-          # Upstream cliraop returns -1 after printing usage. The binary has
-          # already been source-built successfully; normalize this documented
-          # help exit so it cannot fail the packaging job.
           if ($LASTEXITCODE -ne 0) {
             Write-Host "cliraop --help returned $LASTEXITCODE (upstream usage exit); continuing."
             $global:LASTEXITCODE = 0
@@ -135,6 +168,7 @@ jobs:
           Get-FileHash "$src/bin/cliraop.exe" -Algorithm SHA256
 
       - name: Bundle current libraop legacy transport
+        if: github.ref != 'refs/heads/dev/msa-core-architecture'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -153,9 +187,10 @@ jobs:
           Copy-Item "docs/LEGACY-TRANSPORT.md" "$out/LEGACY-TRANSPORT.md"
           Get-FileHash "$out/cliraop.exe" -Algorithm SHA256
           Get-ChildItem $out
-      - name: Upload Windows GUI
+
+      - name: Upload full Windows GUI
+        if: github.ref != 'refs/heads/dev/msa-core-architecture'
         uses: actions/upload-artifact@v4
         with:
           name: SAirplay2-v0.1.0-Windows
           path: target/release/SAirplay2/*
-
