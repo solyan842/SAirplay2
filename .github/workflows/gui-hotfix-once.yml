@@ -1,0 +1,103 @@
+name: GUI hotfix once
+
+on:
+  push:
+    branches:
+      - dev/msa-core-architecture
+    paths:
+      - .github/workflows/gui-hotfix-once.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-gui:
+    if: github.event.head_commit.message == 'chore: temporary GUI patch runner'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout working branch
+        uses: actions/checkout@v4
+        with:
+          ref: dev/msa-core-architecture
+          fetch-depth: 0
+
+      - name: Fast-forward to latest branch head
+        shell: bash
+        run: |
+          git fetch origin dev/msa-core-architecture
+          git merge --ff-only origin/dev/msa-core-architecture
+
+      - name: Apply GUI-only spacing and hint polish
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path('crates/sairplay-gui/src/main.rs')
+          text = path.read_text(encoding='utf-8')
+
+          replacements = [
+              (
+                  '        const ROW_H: f32 = 72.0;',
+                  '        const ROW_H: f32 = 76.0;',
+                  1,
+                  'receiver row height',
+              ),
+              (
+                  '        let body = row_rect.shrink2(egui::vec2(2.0, 5.0));',
+                  '        let body = row_rect.shrink2(egui::vec2(2.0, 6.0));',
+                  1,
+                  'receiver row vertical gutter',
+              ),
+              (
+                  '                ui.set_min_height(panel_content_height);',
+                  '                ui.set_min_height(panel_content_height);\n                ui.set_max_height(panel_content_height);',
+                  1,
+                  'paired panel equal height',
+              ),
+              (
+                  '                const LOWER_CONTROLS_RESERVE: f32 = 105.0;',
+                  '                const LOWER_CONTROLS_RESERVE: f32 = 110.0;',
+                  1,
+                  'lower controls reserve',
+              ),
+              (
+                  '                ui.add_space(7.0);\n                self.render_controls(ui);\n                ui.add_space(6.0);',
+                  '                ui.add_space(10.0);\n                self.render_controls(ui);\n                ui.add_space(8.0);',
+                  1,
+                  'panel/control/footer vertical spacing',
+              ),
+              (
+                  '            "Khi gặp lỗi khi phát âm thanh, vui lòng nhấn Dừng rồi Bắt đầu lại.",',
+                  '            "Gặp lỗi khi phát âm thanh, vui lòng nhấn Dừng rồi Bắt đầu lại.",',
+                  1,
+                  'Vietnamese playback hint',
+              ),
+              (
+                  '                            egui::RichText::new(hint)\n                                .size(10.4)\n                                .color(UiTheme::text_soft()),',
+                  '                            egui::RichText::new(hint)\n                                .size(11.4)\n                                .italics()\n                                .color(UiTheme::blue()),',
+                  1,
+                  'playback hint typography',
+              ),
+          ]
+
+          for old, new, expected, label in replacements:
+              count = text.count(old)
+              if count != expected:
+                  raise SystemExit(f'{label}: expected {expected} match, found {count}')
+              text = text.replace(old, new, expected)
+
+          path.write_text(text, encoding='utf-8')
+
+      - name: Remove one-shot workflow
+        shell: bash
+        run: rm .github/workflows/gui-hotfix-once.yml
+
+      - name: Commit GUI patch
+        shell: bash
+        run: |
+          git config user.name 'SolYan GUI Bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add crates/sairplay-gui/src/main.rs .github/workflows/gui-hotfix-once.yml
+          git diff --cached --check
+          git commit -m 'gui: align receiver layout and polish playback hint'
+          git push origin HEAD:dev/msa-core-architecture
