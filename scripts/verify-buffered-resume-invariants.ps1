@@ -21,7 +21,8 @@ function Require-Absent([string]$Needle, [string]$Label) {
 
 # Field-proven native AP2 Buffered resume path (Naim Mu-so Qb, 44.1/16):
 # capture idle -> STANDBY/FLUSHBUFFERED -> local PCM flush -> fresh PCM ->
-# deferred START with negotiated receiver lead. Keep this separate from MSA core.
+# deferred START with negotiated receiver lead. This lock is scoped to the
+# Buffered Type-103 Windows-adapter lifecycle; it is not a global 16-bit baseline.
 Require-Contains 'let mut buffered_capture_parked = false;' 'parked-state owner'
 Require-Contains 'buffered_park_flush_target: Option<u64> = None;' 'flush-generation gate'
 Require-Contains 'guard.standby().map(|_| true);' 'protocol-native STANDBY boundary'
