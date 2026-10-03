@@ -207,7 +207,12 @@ impl WindowsSoloAudioWorker {
                         // the bounded ring, so play_content() establishes the
                         // new rate-1 anchor before the consumer releases them.
                         if buffered_capture_paused && non_silent_edge {
-                            let resume_result = {
+                            // Match MSA/cliairplay ordering: change the audio
+                            // state under the engine lock, then publish MRP only
+                            // after that lock has been released. Third-party
+                            // buffered receivers can use this state transition
+                            // to follow the fresh rate-1 anchor reliably.
+                            let (resume_result, resume_mrp) = {
                                 let mut guard = match engine_thread.lock() {
                                     Ok(v) => v,
                                     Err(_) => {
@@ -222,20 +227,41 @@ impl WindowsSoloAudioWorker {
                                     && guard.content_paused()
                                     && guard.runtime.state == Ap2State::Paused
                                 {
-                                    guard.play_content().map(|_| true)
+                                    let result = guard.play_content().map(|_| true);
+                                    let mrp = if result.is_ok() {
+                                        guard.mrp_controller()
+                                    } else {
+                                        None
+                                    };
+                                    (result, mrp)
                                 } else {
-                                    Ok(false)
+                                    (Ok(false), None)
                                 }
                             };
                             match resume_result {
                                 Ok(true) => {
                                     buffered_capture_paused = false;
                                     last_capture_frame_at = Instant::now();
+
+                                    let mrp_result = resume_mrp.map(|mrp| {
+                                        mrp.publish_playback_state(
+                                            crate::MrpPlaybackState::Playing,
+                                            true,
+                                        )
+                                    });
+                                    let control_healthy = engine_thread
+                                        .lock()
+                                        .map(|guard| guard.control_healthy())
+                                        .unwrap_or(false);
+                                    let ring_fill = ring_thread
+                                        .lock()
+                                        .map(|ring| ring.fill())
+                                        .unwrap_or(0);
+
                                     if let Ok(mut events) = events_thread.lock() {
-                                        events.push(
-                                            "MSA INPUT Buffered source resumed: non-SILENT WASAPI returned; rate-1 anchor restored without FLUSHBUFFERED."
-                                                .into(),
-                                        );
+                                        events.push(format!(
+                                            "MSA INPUT Buffered source resumed: non-SILENT WASAPI returned; rate-1 anchor restored without FLUSHBUFFERED; MRP Playing publish={mrp_result:?}; control_healthy={control_healthy}; capture_gen={capture_generation}; non_silent_gen={non_silent_generation}; ring_fill={ring_fill}."
+                                        ));
                                     }
                                 }
                                 Ok(false) => {
@@ -263,7 +289,10 @@ impl WindowsSoloAudioWorker {
                         if !buffered_capture_paused
                             && pcm_hub_thread.source_present()
                         {
-                            let park_result = {
+                            // Keep MRP publication outside the engine/audio
+                            // critical section, matching upstream cliairplay's
+                            // PAUSE transition ordering.
+                            let (park_result, park_mrp) = {
                                 let mut guard = match engine_thread.lock() {
                                     Ok(v) => v,
                                     Err(_) => {
@@ -282,9 +311,15 @@ impl WindowsSoloAudioWorker {
                                     guard.content_paused(),
                                     guard.content_stopped(),
                                 ) {
-                                    guard.pause_content().map(|_| true)
+                                    let result = guard.pause_content().map(|_| true);
+                                    let mrp = if result.is_ok() {
+                                        guard.mrp_controller()
+                                    } else {
+                                        None
+                                    };
+                                    (result, mrp)
                                 } else {
-                                    Ok(false)
+                                    (Ok(false), None)
                                 }
                             };
                             match park_result {
@@ -294,9 +329,24 @@ impl WindowsSoloAudioWorker {
                                     // If source audio returns concurrently with
                                     // the rate-0 park, the next media-loop turn
                                     // must still observe that edge and resume.
+                                    let mrp_result = park_mrp.map(|mrp| {
+                                        mrp.publish_playback_state(
+                                            crate::MrpPlaybackState::Paused,
+                                            true,
+                                        )
+                                    });
+                                    let control_healthy = engine_thread
+                                        .lock()
+                                        .map(|guard| guard.control_healthy())
+                                        .unwrap_or(false);
+                                    let ring_fill = ring_thread
+                                        .lock()
+                                        .map(|ring| ring.fill())
+                                        .unwrap_or(0);
+
                                     if let Ok(mut events) = events_thread.lock() {
                                         events.push(format!(
-                                            "MSA INPUT Buffered capture idle for >={}ms: rate-0 PAUSE armed; receiver buffer preserved, no FLUSHBUFFERED.",
+                                            "MSA INPUT Buffered capture idle for >={}ms: rate-0 PAUSE armed; receiver buffer preserved, no FLUSHBUFFERED; MRP Paused publish={mrp_result:?}; control_healthy={control_healthy}; capture_gen={capture_generation}; ring_fill={ring_fill}.",
                                             BUFFERED_CAPTURE_IDLE_PARK_INTERVAL.as_millis()
                                         ));
                                     }
