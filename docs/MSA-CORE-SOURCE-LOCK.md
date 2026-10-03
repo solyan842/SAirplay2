@@ -1,6 +1,6 @@
 # MSA Core Architecture — Source Lock
 
-Last updated: 2026-10-03
+Last updated: 2026-10-04
 Working branch: `dev/msa-core-architecture`
 
 This file is the authoritative architecture/state lock for the current MSA Core migration branch.
@@ -161,25 +161,45 @@ The field-proven Buffered Resume path is protected by a dedicated invariant chec
 Relevant commits:
 
 - `0ae8270984a92fbe607c23fdf6e8ff0261198374` — lock field-proven buffered resume invariants;
-- `b3e895f37071cbd34c126b216ee0182de1f7fcee` — enforce buffered resume baseline in CI.
+- `b3e895f37071cbd34c126b216ee0182de1f7fcee` — enforce buffered resume baseline in CI;
+- `3c12e1d840bd0c6ac4eb78e581e8abe9f88d8067` — scope the invariant explicitly to the Type-103 Windows-adapter baseline.
 
 The invariant must fail if the old inferred rate-1 resume path returns or if receiver-derived deferred START lead is removed.
 
-## Source consolidation — ACTIVE NEXT STEP
+## Source consolidation — COMPLETE, HARDWARE REGRESSION GATE OPEN
 
-The current validated artifact still depends on `scripts/apply-validated-branch-fixes.ps1` to transform parts of committed `windows_audio_worker.rs` at CI build time.
+The validated Buffered idle/resume behavior has now been promoted into the committed Rust source.
 
-This is temporary migration debt and must now be removed without changing behavior:
+Source consolidation commit:
 
-1. copy the already hardware-validated Buffered idle/resume behavior into the committed Rust source;
-2. copy the already validated compile fixes into committed source;
-3. remove the corresponding audio/worker replacements from `apply-validated-branch-fixes.ps1`;
-4. retain unrelated GUI runtime replacements until they are migrated separately;
-5. require the same Buffered Resume invariant against the committed source;
-6. run full Windows CI;
-7. hardware-regression test the same Naim path before treating consolidation as complete.
+`f0450fee062fd2b9b4e52b150043a640c451d9ef` — `refactor: promote validated buffered resume into source`
 
-The consolidation is a source cleanup only. It is not permission to retune timing, PTP, RTP, ALAC, pacing or lifecycle.
+Current state:
+
+1. `windows_audio_worker.rs` now directly contains the validated STANDBY/FLUSHBUFFERED + fresh-PCM + deferred-START behavior;
+2. the corresponding audio/worker replacements have been removed from `scripts/apply-validated-branch-fixes.ps1`;
+3. the runtime patch script now contains GUI-only migration patches and does not own audio-worker behavior;
+4. the Buffered Resume invariant passes against the committed source;
+5. full Windows CI #1373 passed on commit `3c12e1d840bd0c6ac4eb78e581e8abe9f88d8067`;
+6. artifact `11279374418` was produced from that source-aligned build, SHA256 `9439b7a9a8ae99643cff50c2c4cd6f56a6e5d124a69e71724679f917c41580c0`.
+
+This consolidation made no intended transport behavior change. It removed source/runtime divergence only.
+
+**Do not advance this Type-103 consolidation checkpoint to hardware-complete until artifact #1373 is re-tested on the same Naim 16/44.1 path.**
+
+Required hardware regression for this gate:
+
+```text
+Naim Mu-so Qb / AP2 Buffered / 44.1/16
+    initial play
+    -> capture idle / pause
+    -> resume
+    -> repeat several times
+    -> Stop/Start
+    -> track transition
+```
+
+Acceptance remains: no silent resume, no choppy restart, no new pop/noise, no transport error, no unexplained audio/sync drops, and resumed pacing lead remains consistent with the negotiated receiver lead.
 
 ## Current implementation phase
 
@@ -187,8 +207,8 @@ We are in **MSA Core / 16-bit consolidation and regression**, not 24-bit expansi
 
 Order of work:
 
-1. consolidate the validated runtime patch into committed source with zero behavior change;
-2. repeat Naim 16/44.1 Buffered lifecycle testing: Pause/Resume, Stop/Start, track changes, short/long idle, long run;
+1. **current gate:** hardware-regression artifact #1373 on Naim 16/44.1 Buffered Type-103;
+2. after that gate passes, mark the source-consolidated Naim Type-103 baseline hardware-complete and stop modifying it without new evidence;
 3. regression-check HomePod 16/44.1 realtime Type-96;
 4. regression-check Apple TV 16/44.1 on its selected lane;
 5. keep AirPort Express explicit RAOP testing separate from native AP2;
