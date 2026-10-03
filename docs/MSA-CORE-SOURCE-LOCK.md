@@ -84,17 +84,26 @@ MSA receiver core
 
 The producer must not block on receiver network I/O. Digital-zero PCM is valid PCM. A zero-frame WASAPI poll is not EOF.
 
-## Field-proven Buffered Type-103 idle/resume baseline — HARDWARE LOCKED
+## Field-proven Buffered Type-103 16-bit lifecycle baseline — HARDWARE LOCKED
 
-**Scope:** this is a hardware-proven baseline for the **Buffered Type-103 Windows-adapter idle/resume lifecycle only**. It is not the baseline for all 16-bit playback and is not a system-wide SAirplay2 baseline.
+**Scope:** this is a hardware-proven baseline for the **Naim Mu-so Qb / Native AP2 / PTP / Buffered Type-103 / ALAC 16-bit / 44.1 kHz lane**. It is not the baseline for all 16-bit playback and is not a system-wide SAirplay2 baseline.
+
+It locks the tested Naim 16-bit lifecycle cases:
+
+- initial play;
+- capture idle / pause -> STANDBY + FLUSHBUFFERED;
+- fresh-PCM deferred Resume;
+- repeated Resume cycles;
+- explicit Stop/Start;
+- track transition.
 
 It specifically locks:
 
-- how Windows capture-idle is adapted for a Buffered receiver;
+- how Windows capture-idle is adapted for this Buffered receiver;
 - how a Buffered session crosses STANDBY/FLUSHBUFFERED and restarts;
 - how fresh post-flush PCM gates deferred START;
 - how deferred START uses the receiver's negotiated effective lead;
-- regression expectations for this Type-103 16/44.1 idle/resume lifecycle.
+- regression expectations for this Naim Type-103 16/44.1 lane.
 
 It does **not** define or replace the independent baselines for:
 
@@ -111,12 +120,13 @@ Mode: Native AirPlay 2 / PTP / Buffered type 103
 Format: ALAC 16-bit / 44.1 kHz
 Original field validation: 2026-10-03
 Source-consolidated hardware regression: 2026-10-04
+Full tested lifecycle confirmation: 2026-10-04
 
 Behavior baseline commit:
 
 `57756a04d58b66a1732fd87badacf06aea31e8fb` — `fix: honor receiver lead on buffered restart`
 
-Validated Windows adapter lifecycle:
+Validated Windows adapter idle/resume lifecycle:
 
 ```text
 Streaming
@@ -158,7 +168,9 @@ For all four source-consolidated Resume cycles:
 - no transport error was observed;
 - the user confirmed audible playback was smooth.
 
-This establishes that the committed-source implementation preserves the previously field-proven Buffered idle/resume behavior. Do not modify this idle/resume path without new hardware/log evidence identifying a regression in this exact lane.
+The user subsequently hardware-tested **explicit Stop/Start** and **track transition** on the same Naim 16/44.1 lane and confirmed both were OK. No additional detailed transport log was supplied for those two cases, so the lock records audible hardware confirmation without inventing packet/drop metrics that were not observed in the provided log.
+
+Therefore the tested Naim Buffered Type-103 16/44.1 Single-receiver lifecycle is now **HARDWARE LOCKED**. Do not modify this lane without new hardware/log evidence identifying a regression in this exact lane.
 
 ### Failed path — MUST NOT RETURN
 
@@ -180,7 +192,7 @@ Relevant commits:
 
 The invariant must fail if the old inferred rate-1 resume path returns or if receiver-derived deferred START lead is removed.
 
-## Source consolidation — COMPLETE AND HARDWARE PROVEN FOR BUFFERED IDLE/RESUME
+## Source consolidation — COMPLETE AND HARDWARE PROVEN FOR NAIM TYPE-103 16-BIT
 
 Source consolidation commit:
 
@@ -194,11 +206,10 @@ State:
 4. the Buffered Resume invariant passes against committed source;
 5. full Windows CI #1373 passed on commit `3c12e1d840bd0c6ac4eb78e581e8abe9f88d8067`;
 6. artifact `11279374418`, SHA256 `9439b7a9a8ae99643cff50c2c4cd6f56a6e5d124a69e71724679f917c41580c0`, was built from the source-aligned tree;
-7. hardware regression of that artifact reproduced four smooth Buffered Resume cycles with ~1.97–1.99 s receiver-derived pacing lead and zero reported audio/sync drops.
+7. hardware regression of that artifact reproduced four smooth Buffered Resume cycles with ~1.97–1.99 s receiver-derived pacing lead and zero reported audio/sync drops;
+8. explicit Stop/Start and track transition were subsequently hardware-tested and confirmed OK by the user.
 
-Therefore the **source/runtime divergence for this Buffered idle/resume path is closed**.
-
-This does not by itself claim that every Naim lifecycle case has been tested. Stop/Start and explicit track-transition behavior remain separate Naim 16-bit regression cases unless covered by later hardware evidence.
+Therefore the **source/runtime divergence for this Naim Buffered Type-103 16-bit lane is closed**, and its tested Single-receiver lifecycle baseline is locked.
 
 ## Current implementation phase
 
@@ -206,19 +217,18 @@ We are in **MSA Core / 16-bit lane regression**, not 24-bit expansion yet.
 
 Order of work:
 
-1. **complete:** Naim 16/44.1 Buffered Type-103 idle/resume source-consolidation hardware gate;
-2. finish remaining Naim 16-bit lifecycle regression cases that are not yet evidenced, especially explicit Stop/Start and track transitions;
-3. regression-check HomePod 16/44.1 realtime Type-96;
-4. regression-check Apple TV 16/44.1 on its selected lane;
-5. keep AirPort Express explicit RAOP testing separate from native AP2;
-6. lock the 16-bit matrix as a collection of lane/device baselines, not as a Naim-derived global baseline;
-7. only then return to 24-bit work;
-8. only after Single/Core gates are sound, continue Stereo Pair and MultiRoom migration;
-9. GUI/productization remains above the transport core and must not drive protocol changes.
+1. **complete and hardware locked:** Naim 16/44.1 Buffered Type-103 Single-receiver lifecycle baseline;
+2. **next:** regression-check HomePod 16/44.1 realtime Type-96;
+3. regression-check Apple TV 16/44.1 on its selected lane;
+4. keep AirPort Express explicit RAOP testing separate from native AP2;
+5. lock the 16-bit matrix as a collection of lane/device baselines, not as a Naim-derived global baseline;
+6. only then return to 24-bit work;
+7. only after Single/Core gates are sound, continue Stereo Pair and MultiRoom migration;
+8. GUI/productization remains above the transport core and must not drive protocol changes.
 
 ## 24-bit boundary
 
-Known previous 24-bit symptoms include missing audio, repeated pops/dropouts and noisy Stop/format-transition behavior. Those symptoms are not permission to alter the now-validated Buffered Type-103 16-bit idle/resume baseline.
+Known previous 24-bit symptoms include missing audio, repeated pops/dropouts and noisy Stop/format-transition behavior. Those symptoms are not permission to alter the now-validated Naim Buffered Type-103 16-bit baseline.
 
 When 24-bit resumes, diagnose it as a separate format/codec/lifecycle extension on top of the appropriate locked 16-bit lane baselines.
 
