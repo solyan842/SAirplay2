@@ -84,9 +84,9 @@ MSA receiver core
 
 The producer must not block on receiver network I/O. Digital-zero PCM is valid PCM. A zero-frame WASAPI poll is not EOF.
 
-## Field-proven Buffered Type-103 lifecycle baseline — LOCKED
+## Field-proven Buffered Type-103 idle/resume baseline — HARDWARE LOCKED
 
-**Scope:** this is a hardware-proven baseline for the **Buffered Type-103 Windows-adapter lifecycle only**. It is not the baseline for all 16-bit playback and is not a system-wide SAirplay2 baseline.
+**Scope:** this is a hardware-proven baseline for the **Buffered Type-103 Windows-adapter idle/resume lifecycle only**. It is not the baseline for all 16-bit playback and is not a system-wide SAirplay2 baseline.
 
 It specifically locks:
 
@@ -94,7 +94,7 @@ It specifically locks:
 - how a Buffered session crosses STANDBY/FLUSHBUFFERED and restarts;
 - how fresh post-flush PCM gates deferred START;
 - how deferred START uses the receiver's negotiated effective lead;
-- regression expectations for this Type-103 16/44.1 lifecycle.
+- regression expectations for this Type-103 16/44.1 idle/resume lifecycle.
 
 It does **not** define or replace the independent baselines for:
 
@@ -109,7 +109,8 @@ It does **not** define or replace the independent baselines for:
 Receiver: Naim Mu-so Qb
 Mode: Native AirPlay 2 / PTP / Buffered type 103
 Format: ALAC 16-bit / 44.1 kHz
-Validated: 2026-10-03
+Original field validation: 2026-10-03
+Source-consolidated hardware regression: 2026-10-04
 
 Behavior baseline commit:
 
@@ -139,12 +140,25 @@ START at now + max(400 ms, receiver effective lead)
 Buffered streaming restored
 ```
 
-For the tested Naim, negotiated `effective_lead_ms()` is ~2000 ms. After the fix, two consecutive real Resume operations reported:
+For this Naim, negotiated `effective_lead_ms()` is ~2000 ms. The original field fix produced two consecutive smooth Resume operations at ~1.991 s and ~1.986 s pacing lead.
 
-- `pacing_ahead_frames=87788` at 44.1 kHz ≈ 1.991 s;
-- `pacing_ahead_frames=87583` at 44.1 kHz ≈ 1.986 s.
+The source-consolidated artifact #1373 then reproduced the same behavior over four complete Resume cycles:
 
-Both STARTs had `TIME delta=0ms`, `corrected_forward=false`, `audio_dropped=0`, `sync_dropped=0`, and the user confirmed audible Resume playback is smooth.
+- `pacing_ahead_frames=87705` at 44.1 kHz ≈ 1.989 s;
+- `pacing_ahead_frames=87435` at 44.1 kHz ≈ 1.983 s;
+- `pacing_ahead_frames=87033` at 44.1 kHz ≈ 1.974 s;
+- `pacing_ahead_frames=87777` at 44.1 kHz ≈ 1.990 s.
+
+For all four source-consolidated Resume cycles:
+
+- `TIME delta=0ms`;
+- `corrected_forward=false`;
+- `audio_dropped=0`;
+- `sync_dropped=0`;
+- no transport error was observed;
+- the user confirmed audible playback was smooth.
+
+This establishes that the committed-source implementation preserves the previously field-proven Buffered idle/resume behavior. Do not modify this idle/resume path without new hardware/log evidence identifying a regression in this exact lane.
 
 ### Failed path — MUST NOT RETURN
 
@@ -166,49 +180,34 @@ Relevant commits:
 
 The invariant must fail if the old inferred rate-1 resume path returns or if receiver-derived deferred START lead is removed.
 
-## Source consolidation — COMPLETE, HARDWARE REGRESSION GATE OPEN
-
-The validated Buffered idle/resume behavior has now been promoted into the committed Rust source.
+## Source consolidation — COMPLETE AND HARDWARE PROVEN FOR BUFFERED IDLE/RESUME
 
 Source consolidation commit:
 
 `f0450fee062fd2b9b4e52b150043a640c451d9ef` — `refactor: promote validated buffered resume into source`
 
-Current state:
+State:
 
-1. `windows_audio_worker.rs` now directly contains the validated STANDBY/FLUSHBUFFERED + fresh-PCM + deferred-START behavior;
-2. the corresponding audio/worker replacements have been removed from `scripts/apply-validated-branch-fixes.ps1`;
-3. the runtime patch script now contains GUI-only migration patches and does not own audio-worker behavior;
-4. the Buffered Resume invariant passes against the committed source;
+1. `windows_audio_worker.rs` directly contains the validated STANDBY/FLUSHBUFFERED + fresh-PCM + deferred-START behavior;
+2. the corresponding audio/worker replacements are removed from `scripts/apply-validated-branch-fixes.ps1`;
+3. the runtime patch script contains GUI-only migration patches and does not own audio-worker behavior;
+4. the Buffered Resume invariant passes against committed source;
 5. full Windows CI #1373 passed on commit `3c12e1d840bd0c6ac4eb78e581e8abe9f88d8067`;
-6. artifact `11279374418` was produced from that source-aligned build, SHA256 `9439b7a9a8ae99643cff50c2c4cd6f56a6e5d124a69e71724679f917c41580c0`.
+6. artifact `11279374418`, SHA256 `9439b7a9a8ae99643cff50c2c4cd6f56a6e5d124a69e71724679f917c41580c0`, was built from the source-aligned tree;
+7. hardware regression of that artifact reproduced four smooth Buffered Resume cycles with ~1.97–1.99 s receiver-derived pacing lead and zero reported audio/sync drops.
 
-This consolidation made no intended transport behavior change. It removed source/runtime divergence only.
+Therefore the **source/runtime divergence for this Buffered idle/resume path is closed**.
 
-**Do not advance this Type-103 consolidation checkpoint to hardware-complete until artifact #1373 is re-tested on the same Naim 16/44.1 path.**
-
-Required hardware regression for this gate:
-
-```text
-Naim Mu-so Qb / AP2 Buffered / 44.1/16
-    initial play
-    -> capture idle / pause
-    -> resume
-    -> repeat several times
-    -> Stop/Start
-    -> track transition
-```
-
-Acceptance remains: no silent resume, no choppy restart, no new pop/noise, no transport error, no unexplained audio/sync drops, and resumed pacing lead remains consistent with the negotiated receiver lead.
+This does not by itself claim that every Naim lifecycle case has been tested. Stop/Start and explicit track-transition behavior remain separate Naim 16-bit regression cases unless covered by later hardware evidence.
 
 ## Current implementation phase
 
-We are in **MSA Core / 16-bit consolidation and regression**, not 24-bit expansion yet.
+We are in **MSA Core / 16-bit lane regression**, not 24-bit expansion yet.
 
 Order of work:
 
-1. **current gate:** hardware-regression artifact #1373 on Naim 16/44.1 Buffered Type-103;
-2. after that gate passes, mark the source-consolidated Naim Type-103 baseline hardware-complete and stop modifying it without new evidence;
+1. **complete:** Naim 16/44.1 Buffered Type-103 idle/resume source-consolidation hardware gate;
+2. finish remaining Naim 16-bit lifecycle regression cases that are not yet evidenced, especially explicit Stop/Start and track transitions;
 3. regression-check HomePod 16/44.1 realtime Type-96;
 4. regression-check Apple TV 16/44.1 on its selected lane;
 5. keep AirPort Express explicit RAOP testing separate from native AP2;
@@ -219,7 +218,7 @@ Order of work:
 
 ## 24-bit boundary
 
-Known previous 24-bit symptoms include missing audio, repeated pops/dropouts and noisy Stop/format-transition behavior. Those symptoms are not permission to alter the now-validated Buffered Type-103 16-bit lifecycle baseline.
+Known previous 24-bit symptoms include missing audio, repeated pops/dropouts and noisy Stop/format-transition behavior. Those symptoms are not permission to alter the now-validated Buffered Type-103 16-bit idle/resume baseline.
 
 When 24-bit resumes, diagnose it as a separate format/codec/lifecycle extension on top of the appropriate locked 16-bit lane baselines.
 
