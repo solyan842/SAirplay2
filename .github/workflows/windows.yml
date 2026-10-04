@@ -26,10 +26,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # The active MSA Core branch owns native AP2 + the Rust RAOP adapter.
-      # For 16-bit hardware regression it does not need either historical
-      # cliraop helper or the 24-bit external ALAC bridge. Keep this lane short
-      # so every transport diagnostic can reach hardware quickly.
+      # Native AP2 stays on the new MSA Core runtime. True RAOP-only receivers
+      # remain on the separate pinned-libraop adapter, so the fast artifact must
+      # carry only cliraop.exe + its OpenSSL runtime. Do not bring back the
+      # historical cliraop-msa-solo.exe or the 24-bit bridge here.
       - name: Test MSA Core
         if: github.ref == 'refs/heads/dev/msa-core-architecture'
         run: cargo test -p sairplay-msa-solo --all-targets
@@ -45,15 +45,70 @@ jobs:
       - name: Build GUI
         run: cargo build --release -p sairplay-gui
 
+      - name: Restore legacy RAOP helper cache
+        if: github.ref == 'refs/heads/dev/msa-core-architecture'
+        id: legacy-raop-cache
+        uses: actions/cache@v4
+        with:
+          path: target/legacy-raop-cache
+          key: legacy-raop-win-dadcfcaa26d988cdd3e3501ddf8286c224f1b494-${{ hashFiles('native/cliraop-runtime-volume.c') }}
+
+      - name: Build true RAOP helper on cache miss
+        if: github.ref == 'refs/heads/dev/msa-core-architecture' && steps.legacy-raop-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pin = "dadcfcaa26d988cdd3e3501ddf8286c224f1b494"
+          $src = "target/vendor/libraop-legacy"
+          $cache = "target/legacy-raop-cache"
+          if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+          if (Test-Path $cache) { Remove-Item -Recurse -Force $cache }
+
+          git clone --filter=blob:none https://github.com/philippe44/libraop.git $src
+          git -C $src checkout $pin
+          git -C $src submodule update --init --recursive
+          Copy-Item "$env:GITHUB_WORKSPACE/native/cliraop-runtime-volume.c" "$src/src/cliraop.c" -Force
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe |
+            Select-Object -First 1
+          if (-not $msbuild) { throw "MSBuild not found" }
+
+          & $msbuild "$src/libraop.sln" /m /p:Configuration=Release /p:Platform=x86
+          if ($LASTEXITCODE -ne 0) { throw "Legacy RAOP helper build failed" }
+          if (-not (Test-Path "$src/bin/cliraop.exe")) { throw "Legacy cliraop.exe missing" }
+
+          $help = (& "$src/bin/cliraop.exe" --help | Out-String)
+          $help | Write-Host
+          if ($help -notmatch '\[-V <runtime volume file>\]') {
+            throw "Legacy cliraop.exe is missing runtime-volume support"
+          }
+          if ($help -notmatch '\[-U <unix_ms>\]') {
+            throw "Legacy cliraop.exe is missing Unix-ms clock bridge support"
+          }
+          $global:LASTEXITCODE = 0
+
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          Copy-Item "$src/bin/cliraop.exe" "$cache/cliraop.exe" -Force
+          $base = "https://raw.githubusercontent.com/philippe44/libraop/$pin"
+          Invoke-WebRequest "$base/bin/libcrypto-1_1.dll" -OutFile "$cache/libcrypto-1_1.dll"
+          Invoke-WebRequest "$base/bin/libssl-1_1.dll" -OutFile "$cache/libssl-1_1.dll"
+          Get-FileHash "$cache/cliraop.exe" -Algorithm SHA256
+
       - name: Package MSA Core 16-bit test artifact
         if: github.ref == 'refs/heads/dev/msa-core-architecture'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $out = "target/release/SAirplay2"
+          $legacy = "target/legacy-raop-cache"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           Copy-Item "target/release/sairplay-gui.exe" "$out/sairplay-gui.exe" -Force
+          Copy-Item "$legacy/cliraop.exe" "$out/cliraop.exe" -Force
+          Copy-Item "$legacy/libcrypto-1_1.dll" "$out/libcrypto-1_1.dll" -Force
+          Copy-Item "$legacy/libssl-1_1.dll" "$out/libssl-1_1.dll" -Force
           Get-FileHash "$out/sairplay-gui.exe" -Algorithm SHA256
+          Get-FileHash "$out/cliraop.exe" -Algorithm SHA256
           Get-ChildItem $out
 
       - name: Upload MSA Core 16-bit Windows artifact
@@ -64,9 +119,8 @@ jobs:
           path: target/release/SAirplay2/*
 
       # Full/release packaging below is intentionally excluded from the active
-      # MSA Core 16-bit branch. cliraop.exe remains only for legacy/pairing
-      # packaging; cliraop-msa-solo.exe is historical comparison baggage and is
-      # not part of the new Rust MSA receiver-core runtime.
+      # MSA Core 16-bit branch. cliraop-msa-solo.exe remains historical
+      # comparison baggage and is not part of the new MSA Core test artifact.
       - name: Build source-aligned ALAC24 bridge
         if: github.ref != 'refs/heads/dev/msa-core-architecture'
         shell: pwsh
