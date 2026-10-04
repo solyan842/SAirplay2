@@ -3,6 +3,29 @@
 This file is a HARD GATE for any agent working on this repository.
 Read this file BEFORE inspecting, editing, committing, or proposing any change.
 
+## 0. Mandatory session-entry gate
+
+For EVERY future SAirplay2 session, including a new chat, a resumed chat, or a handoff, the agent MUST do this BEFORE any repository write:
+
+1. Read `/AGENTS.md` completely from the active branch.
+2. Read `docs/PROJECT-STATE.md` from the active branch.
+3. Read the current handoff/state file when one exists.
+4. State the single current task.
+5. Explicitly report to the user that the mandatory files above were read and that no repository write has happened yet.
+
+Until this visible checkpoint has been completed, repository writes are FORBIDDEN.
+
+If the agent notices that it has violated this gate:
+
+- STOP immediately;
+- do not make another code/workflow change to "fix forward";
+- report exactly what was touched;
+- restore/revert any unintended change if necessary and safe;
+- re-read `/AGENTS.md` and `docs/PROJECT-STATE.md` before resuming;
+- resume only with one explicitly scoped task.
+
+This gate exists specifically so the rules below are enforced in future sessions instead of merely being remembered conversationally.
+
 ## 1. Protected scope
 
 - NEVER modify, move, rebase, force-update, or otherwise touch protected stable checkpoints/branches.
@@ -106,6 +129,7 @@ Before doing any work:
 2. Read `docs/PROJECT-STATE.md` for current branch/state and architecture locks.
 3. Read the current handoff/state file when one exists.
 4. Confirm the single current task.
-5. Apply all gates above before touching the repository.
+5. Complete the visible session-entry checkpoint in section 0.
+6. Apply all gates above before touching the repository.
 
 These rules are mandatory, not advisory.
