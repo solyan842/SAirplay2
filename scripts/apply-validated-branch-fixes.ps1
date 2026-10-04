@@ -228,52 +228,11 @@ git diff -- $gui $worker
 
 # BEGIN ONE-SHOT MSA-CORE SOURCE PROMOTION
 if ($env:GITHUB_ACTIONS -eq "true" -and $env:GITHUB_REF -eq "refs/heads/dev/msa-core-architecture") {
-    Write-Host "Promoting validated MSA Core runtime patches into committed source..."
+    Write-Host "Promoting validated GUI + realtime diagnostics into committed source..."
 
-    $workflow = ".github/workflows/windows.yml"
-    $workflowText = [System.IO.File]::ReadAllText($workflow)
-
-    $permissionsBlock = @'
-permissions:
-  contents: write
-
-'@
-    $permissionsCount = ([regex]::Matches($workflowText, [regex]::Escape($permissionsBlock))).Count
-    if ($permissionsCount -ne 1) {
-        throw "windows.yml: expected one temporary permissions block, found $permissionsCount"
-    }
-    $workflowText = $workflowText.Replace($permissionsBlock, "")
-
-    $oldPatchStep = @'
-      - name: Apply validated branch fixes
-        shell: pwsh
-        run: ./scripts/apply-validated-branch-fixes.ps1
-'@
-    $newPatchStep = @'
-      - name: Apply validated branch fixes
-        if: github.ref != 'refs/heads/dev/msa-core-architecture'
-        shell: pwsh
-        run: ./scripts/apply-validated-branch-fixes.ps1
-'@
-    $patchStepCount = ([regex]::Matches($workflowText, [regex]::Escape($oldPatchStep))).Count
-    if ($patchStepCount -ne 1) {
-        throw "windows.yml: expected one runtime patch step, found $patchStepCount"
-    }
-    $workflowText = $workflowText.Replace($oldPatchStep, $newPatchStep)
-    [System.IO.File]::WriteAllText(
-        $workflow,
-        $workflowText,
-        [System.Text.UTF8Encoding]::new($false)
-    )
-
-    $temporaryWorkflow = ".github/workflows/promote-msa-core-source.yml"
-    if (Test-Path $temporaryWorkflow) {
-        git rm -- $temporaryWorkflow
-        if ($LASTEXITCODE -ne 0) { throw "failed to remove temporary promotion workflow" }
-    }
-
-    # Remove this one-shot block from the script before committing so the
-    # migration mechanism does not remain as project baggage.
+    # Self-remove the one-shot block before staging. The permanent script stays
+    # available for historical/full lanes, while MSA Core will stop invoking it
+    # after the workflow is switched by the connector.
     $selfPath = $PSCommandPath
     $selfText = [System.IO.File]::ReadAllText($selfPath)
     $beginMarker = "# BEGIN ONE-SHOT MSA-CORE SOURCE PROMOTION"
@@ -299,7 +258,6 @@ permissions:
     git add -- `
         "crates/sairplay-gui/src/main.rs" `
         "crates/sairplay-msa-solo/src/windows_audio_worker.rs" `
-        ".github/workflows/windows.yml" `
         "scripts/apply-validated-branch-fixes.ps1"
 
     git diff --cached --check
