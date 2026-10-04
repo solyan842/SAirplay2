@@ -180,6 +180,30 @@ The field-proven Windows adaptation is STANDBY/FLUSHBUFFERED + fresh PCM + defer
 
 Do not hard-code Naim=2000 ms. Always use the receiver's negotiated effective lead with the existing minimum deferred lead floor.
 
+## Field-proven HomePod Realtime Type-96 16-bit lifecycle baseline — HARDWARE LOCKED
+
+**Scope:** this is a hardware-proven baseline for the **HomePod mini `White` / Native AP2 / PTP / Realtime Type-96 / ALAC 16-bit / 44.1 kHz Single-receiver lane**. It does not redefine Buffered Type-103 behavior, Apple TV behavior, 24-bit transport, Stereo Pair or MultiRoom.
+
+Hardware-tested cases on Windows build #1397:
+
+- initial play;
+- normal continuous playback;
+- repeated source-idle / resume cycles;
+- long-idle resume after approximately 267 seconds;
+- long-idle resume after approximately 369 seconds;
+- track transitions;
+- explicit Stop/Start.
+
+The user confirmed these cases were audibly stable with no recurrence of the previous post-idle pop/chop/stutter symptom on the accepted test build.
+
+The long-idle hardware logs show fresh capture/non-silent generations returning while the session remains `Streaming`, PTP anchor remains valid, media packets continue as `Sent`, and the observed resume boundaries report `audio_dropped=0` and `sync_dropped=0`.
+
+The Windows realtime adapter may use MSA's existing input-gap recovery to re-establish safe realtime wire headroom when fresh non-silent PCM returns after a long capture gap. This is an adapter-level recovery only; it must not invent a separate PTP/RTP/ALAC contract or change the receiver-core semantics defined by pinned MSA.
+
+Important diagnostic note: the temporary `starvation-exit BEFORE/AFTER first PCM` labels are broader than their wording suggests because silence/pad packets can satisfy the logging path. Treat the counters and fresh capture/non-silent generation edges as evidence; do not treat every `starvation-exit` line as proof of first real program PCM.
+
+Therefore the tested HomePod Realtime Type-96 16/44.1 Single-receiver lifecycle is now **HARDWARE LOCKED**. Do not change this lane without new hardware/log evidence showing a regression in this exact lane.
+
 ## CI regression lock
 
 The field-proven Buffered Resume path is protected by a dedicated invariant check.
@@ -218,17 +242,17 @@ We are in **MSA Core / 16-bit lane regression**, not 24-bit expansion yet.
 Order of work:
 
 1. **complete and hardware locked:** Naim 16/44.1 Buffered Type-103 Single-receiver lifecycle baseline;
-2. **next:** regression-check HomePod 16/44.1 realtime Type-96;
-3. regression-check Apple TV 16/44.1 on its selected lane;
+2. **complete and hardware locked:** HomePod 16/44.1 Realtime Type-96 Single-receiver lifecycle baseline;
+3. **next:** regression-check Apple TV 16/44.1 on its selected lane;
 4. keep AirPort Express explicit RAOP testing separate from native AP2;
-5. lock the 16-bit matrix as a collection of lane/device baselines, not as a Naim-derived global baseline;
+5. lock the 16-bit matrix as a collection of lane/device baselines, not as a Naim- or HomePod-derived global baseline;
 6. only then return to 24-bit work;
 7. only after Single/Core gates are sound, continue Stereo Pair and MultiRoom migration;
 8. GUI/productization remains above the transport core and must not drive protocol changes.
 
 ## 24-bit boundary
 
-Known previous 24-bit symptoms include missing audio, repeated pops/dropouts and noisy Stop/format-transition behavior. Those symptoms are not permission to alter the now-validated Naim Buffered Type-103 16-bit baseline.
+Known previous 24-bit symptoms include missing audio, repeated pops/dropouts and noisy Stop/format-transition behavior. Those symptoms are not permission to alter the now-validated Naim Buffered Type-103 or HomePod Realtime Type-96 16-bit baselines.
 
 When 24-bit resumes, diagnose it as a separate format/codec/lifecycle extension on top of the appropriate locked 16-bit lane baselines.
 
