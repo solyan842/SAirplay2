@@ -223,6 +223,27 @@ The user confirmed the Apple TV passed the full test set with no audible error. 
 
 Therefore the tested Apple TV5,3 Realtime Type-96 16/44.1 Single-receiver lifecycle is now **HARDWARE LOCKED**. Do not generalize this lock to untested Apple TV models, and do not change this exact lane without new hardware/log evidence showing a regression.
 
+## Field-proven AirPort Express Buffered Type-103 16-bit lifecycle baseline — HARDWARE LOCKED
+
+**Scope:** this is a hardware-proven baseline for **`SOLYAN's AirPort Express` / model AirPort10,115 / Native AP2 / PTP / Buffered Type-103 / ALAC 16-bit / 44.1 kHz Single-receiver playback** on Windows build #1397. This lock follows the route actually observed on hardware; it does not classify every AirPort model as native AP2 and it does not remove the separate RAOP adapter needed for true AirPlay 1 receivers.
+
+The accepted hardware log shows:
+
+- negotiated ALAC 16-bit / 44.1 kHz;
+- `flow: AirPlay2Native`;
+- `timing: Ptp`;
+- `ptp=true`;
+- Buffered Type-103 deferred START after the first real WASAPI packet;
+- repeated capture-idle park via STANDBY + FLUSHBUFFERED;
+- fresh post-flush PCM re-arming deferred START;
+- `TIME delta=0ms` on resume;
+- approximately 87.9k frames of pacing lead after resume at 44.1 kHz, about 1.99 seconds;
+- `audio_dropped=0` in the observed resume cycles.
+
+The user confirmed audible playback on AirPort Express #1397 was fully stable and passed the same practical lifecycle tests used for the other Single-receiver 16-bit baselines.
+
+Therefore the tested AirPort10,115 Native AP2 / PTP / Buffered Type-103 16/44.1 Single-receiver lifecycle is now **HARDWARE LOCKED**. Do not force this tested receiver back to RAOP based on historical assumptions; route decisions for other receivers must still follow current capability/TXT evidence and pinned MSA behavior.
+
 ## CI regression lock
 
 The field-proven Buffered Resume path is protected by a dedicated invariant check.
@@ -263,15 +284,15 @@ Order of work:
 1. **complete and hardware locked:** Naim 16/44.1 Buffered Type-103 Single-receiver lifecycle baseline;
 2. **complete and hardware locked:** HomePod 16/44.1 Realtime Type-96 Single-receiver lifecycle baseline;
 3. **complete and hardware locked:** Apple TV5,3 `Phòng ngủ` 16/44.1 Realtime Type-96 Single-receiver lifecycle baseline;
-4. **next:** keep AirPort Express explicit RAOP testing separate from native AP2;
-5. lock the 16-bit matrix as a collection of lane/device baselines, not as a Naim-, HomePod- or Apple-TV-derived global baseline;
+4. **complete and hardware locked:** AirPort Express AirPort10,115 16/44.1 Native AP2 / PTP / Buffered Type-103 Single-receiver lifecycle baseline;
+5. **next:** lock the tested 16-bit Single-receiver matrix as a collection of lane/device baselines;
 6. only then return to 24-bit work;
 7. only after Single/Core gates are sound, continue Stereo Pair and MultiRoom migration;
 8. GUI/productization remains above the transport core and must not drive protocol changes.
 
 ## 24-bit boundary
 
-Known previous 24-bit symptoms include missing audio, repeated pops/dropouts and noisy Stop/format-transition behavior. Those symptoms are not permission to alter the now-validated Naim Buffered Type-103, HomePod Realtime Type-96 or Apple TV Realtime Type-96 16-bit baselines.
+Known previous 24-bit symptoms include missing audio, repeated pops/dropouts and noisy Stop/format-transition behavior. Those symptoms are not permission to alter the now-validated Naim Buffered Type-103, HomePod Realtime Type-96, Apple TV Realtime Type-96 or AirPort Express Buffered Type-103 16-bit baselines.
 
 When 24-bit resumes, diagnose it as a separate format/codec/lifecycle extension on top of the appropriate locked 16-bit lane baselines.
 
