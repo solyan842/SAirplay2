@@ -219,7 +219,7 @@ impl WindowsSoloAudioWorker {
                         let capture_edge = capture_generation != capture_frame_seen;
                         let capture_idle_before_edge = last_capture_frame_at.elapsed();
                         if capture_edge {
-                            capture_seen = capture_generation;
+                            capture_frame_seen = capture_generation;
                             last_capture_frame_at = Instant::now();
                         }
 
