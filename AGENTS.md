@@ -117,4 +117,21 @@ After editing, verify:
 
 - only intended files changed,
 - unrelated behavior was not modified,
-- the change still follows
+- the change still follows the verified current task and authoritative project rules.
+
+---
+
+## 8. DOCUMENTATION AUTHORITY
+
+For `dev/msa-core-architecture`, current authoritative documentation is limited to:
+
+1. `AGENTS.md` — work rules.
+2. `docs/MSA-CORE-SOURCE-LOCK.md` — current architecture/state/source lock.
+3. `docs/MSA-CORE-ARCHITECTURE.md` — Core migration architecture.
+
+Inherited `MSA-SOLO-*`, `PROJECT-STATE.md`, `SOURCE-AUDIT.md`,
+`ARCHITECTURE.md`, `DEVELOPMENT-RULES.md` and other older documents are
+historical/reference material only when they conflict with the current Core lock.
+
+Current branch, HEAD and GitHub Actions state must always be verified directly
+from GitHub and must not be inferred from documentation.
