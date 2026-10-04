@@ -17,6 +17,32 @@ function Invoke-Checked([scriptblock]$Command, [string]$Message) {
     if ($LASTEXITCODE -ne 0) { throw $Message }
 }
 
+function Import-Vs64Environment {
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found" }
+
+    $install = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
+        Select-Object -First 1)
+    if (-not $install) { throw "Visual Studio x64 C++ toolchain not found" }
+
+    $vcvars = Join-Path $install "VC\Auxiliary\Build\vcvars64.bat"
+    if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found: $vcvars" }
+
+    # A batch file cannot directly mutate its PowerShell parent's environment.
+    # Import the exact x64 developer environment once, then invoke nmake/cl
+    # normally from this process and all child CMake builds.
+    $lines = & cmd.exe /d /s /c "`"$vcvars`" >nul && set"
+    if ($LASTEXITCODE -ne 0) { throw "failed to initialize Visual Studio x64 environment" }
+    foreach ($line in $lines) {
+        $eq = $line.IndexOf('=')
+        if ($eq -gt 0) {
+            [Environment]::SetEnvironmentVariable($line.Substring(0, $eq), $line.Substring($eq + 1), 'Process')
+        }
+    }
+    if (-not (Get-Command nmake.exe -ErrorAction SilentlyContinue)) { throw "nmake.exe unavailable after vcvars64" }
+    if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) { throw "cl.exe unavailable after vcvars64" }
+}
+
 if (-not (Test-Path (Join-Path $vendor ".git"))) {
     New-Item -ItemType Directory -Force -Path (Split-Path $vendor) | Out-Null
     Invoke-Checked { git clone --filter=blob:none https://github.com/music-assistant/airplay-cli.git $vendor } "clone pinned MSA airplay-cli failed"
@@ -24,16 +50,26 @@ if (-not (Test-Path (Join-Path $vendor ".git"))) {
 Invoke-Checked { git -C $vendor fetch --depth=1 origin $msaPin } "fetch pinned MSA airplay-cli failed"
 Invoke-Checked { git -C $vendor checkout --detach $msaPin } "checkout pinned MSA airplay-cli failed"
 Invoke-Checked { git -C $vendor submodule sync --recursive } "MSA submodule sync failed"
-Invoke-Checked { git -C $vendor submodule update --init --recursive libraop } "MSA libraop submodules failed"
 
-$actualLibraop = (git -C (Join-Path $vendor "libraop") rev-parse HEAD).Trim()
+# Pull only the pinned source actually compiled into the in-process RAOP lane.
+# Avoid recursively cloning unrelated codecs, mdns and OpenSSL test submodules.
+Invoke-Checked { git -C $vendor submodule update --init libraop } "MSA libraop checkout failed"
+$libraop = Join-Path $vendor "libraop"
+Invoke-Checked { git -C $libraop submodule update --init crosstools dmap-parser libcodecs libopenssl libpthreads4w } "MSA libraop dependency checkout failed"
+Invoke-Checked { git -C (Join-Path $libraop "libcodecs") submodule update --init alac } "MSA ALAC source checkout failed"
+Invoke-Checked { git -C (Join-Path $libraop "libopenssl") submodule update --init openssl } "MSA OpenSSL source checkout failed"
+
+$actualLibraop = (git -C $libraop rev-parse HEAD).Trim()
 if ($actualLibraop -ne $libraopPin) {
     throw "MSA libraop pin mismatch: expected $libraopPin, got $actualLibraop"
 }
 
-$libraop = Join-Path $vendor "libraop"
 $opensslSrc = Join-Path $libraop "libopenssl/openssl"
 $pthreadSrc = Join-Path $libraop "libpthreads4w"
+
+# OpenSSL's Windows build uses nmake/cl. Initialize the VS x64 developer
+# environment before configuring or compiling any native static dependency.
+Import-Vs64Environment
 
 # Exact pinned OpenSSL source, built static for the same x64 process as Rust.
 $cryptoDst = Join-Path $opensslOut "sairplay_crypto.lib"
@@ -46,10 +82,10 @@ if (-not (Test-Path $cryptoDst) -or -not (Test-Path $sslDst)) {
         # source tree was previously configured for another target, reset only
         # generated OpenSSL build state, never the pinned source revision.
         if (Test-Path "Makefile") {
-            cmd /c "nmake clean" | Out-Host
+            Invoke-Checked { nmake.exe clean } "OpenSSL x64 clean failed"
         }
         Invoke-Checked { perl Configure VC-WIN64A no-shared no-tests } "OpenSSL VC-WIN64A configure failed"
-        Invoke-Checked { cmd /c "nmake build_libs" } "OpenSSL x64 static build failed"
+        Invoke-Checked { nmake.exe build_libs } "OpenSSL x64 static build failed"
         $crypto = Get-ChildItem -Recurse -File -Filter "libcrypto.lib" | Select-Object -First 1
         $ssl = Get-ChildItem -Recurse -File -Filter "libssl.lib" | Select-Object -First 1
         if (-not $crypto -or -not $ssl) { throw "OpenSSL static libraries not found" }
