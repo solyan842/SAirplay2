@@ -262,6 +262,58 @@ jobs:
           Get-FileHash $lib -Algorithm SHA256
           Get-ChildItem $stage -Recurse
 
+      - name: Build in-process RAOP bridge x64
+        if: github.ref == 'refs/heads/dev/msa-core-architecture'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
+            Select-Object -First 1
+          if (-not $vs) { throw "Visual Studio x64 C++ toolchain not found" }
+          $vcvars64 = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars64)) { throw "vcvars64.bat not found" }
+
+          $libraop = (Resolve-Path "target/vendor/libraop-client-x64-stage").Path
+          $openssl = (Resolve-Path "target/vendor/libopenssl-x64-stage").Path
+          $pthread = (Resolve-Path "target/vendor/libpthreads4w-x64-stage").Path
+          $alac = (Resolve-Path "target/vendor/libcodecs-x64-stage").Path
+          $stage = "target/vendor/sairplay-raop-x64-stage"
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+          $stageAbs = (New-Item -ItemType Directory -Force -Path $stage).FullName
+
+          $bridge = (Resolve-Path "native/raop-static/raop_bridge.c").Path
+          $bridgeInclude = (Resolve-Path "native/raop-static").Path
+          $bridgeObj = Join-Path $stageAbs "raop_bridge.obj"
+          $bridgeDll = Join-Path $stageAbs "sairplay-raop.dll"
+          $includeArgs = @(
+            "/I`"$bridgeInclude`"",
+            "/I`"$libraop/include`"",
+            "/I`"$pthread/include`"",
+            "/I`"$alac/include/addons`"",
+            "/I`"$openssl/include`""
+          ) -join " "
+
+          $compile = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /std:clatest /DNDEBUG /DWIN32 /DSSL_STATIC_LIB /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /D_CRT_NONSTDC_NO_DEPRECATE /DOPENSSL_SUPPRESS_DEPRECATED $includeArgs /Fo`"$bridgeObj`" `"$bridge`""
+          & cmd.exe /d /s /c $compile
+          if ($LASTEXITCODE -ne 0) { throw "In-process RAOP bridge x64 compile failed" }
+
+          $exports = @(
+            "sr_raop_open", "sr_raop_close", "sr_raop_healthy", "sr_raop_keepalive",
+            "sr_raop_commit_start", "sr_raop_start_after_flush", "sr_raop_flush",
+            "sr_raop_standby", "sr_raop_pause", "sr_raop_play", "sr_raop_stop",
+            "sr_raop_set_volume", "sr_raop_set_progress", "sr_raop_set_metadata",
+            "sr_raop_set_artwork", "sr_raop_write_packet", "sr_raop_head_audible_ms"
+          ) | ForEach-Object { "/EXPORT:$_" }
+          $exportArgs = $exports -join " "
+          $link = "call `"$vcvars64`" && link.exe /nologo /DLL /OUT:`"$bridgeDll`" `"$bridgeObj`" `"$libraop/libraop-client-x64.lib`" `"$alac/libalac-wrapper.lib`" `"$alac/libalac.lib`" `"$pthread/libpthread-static.lib`" `"$openssl/libcrypto.lib`" `"$openssl/libssl.lib`" ws2_32.lib wsock32.lib iphlpapi.lib $exportArgs"
+          & cmd.exe /d /s /c $link
+          if ($LASTEXITCODE -ne 0) { throw "In-process RAOP bridge x64 link failed" }
+          if (-not (Test-Path $bridgeDll)) { throw "sairplay-raop.dll missing" }
+
+          Get-FileHash $bridgeDll -Algorithm SHA256
+          Get-ChildItem $stageAbs
+
       # The active MSA Core branch owns native AP2 + the Rust RAOP adapter.
       # For 16-bit hardware regression it does not need either historical
       # cliraop helper or the 24-bit external ALAC bridge. Keep this lane short
@@ -289,7 +341,13 @@ jobs:
           $out = "target/release/SAirplay2"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           Copy-Item "target/release/sairplay-gui.exe" "$out/sairplay-gui.exe" -Force
+          Copy-Item "target/vendor/sairplay-raop-x64-stage/sairplay-raop.dll" "$out/sairplay-raop.dll" -Force
+          Copy-Item "target/vendor/libopenssl-x64-stage/libcrypto-1_1-x64.dll" "$out/libcrypto-1_1-x64.dll" -Force
+          Copy-Item "target/vendor/libopenssl-x64-stage/libssl-1_1-x64.dll" "$out/libssl-1_1-x64.dll" -Force
           Get-FileHash "$out/sairplay-gui.exe" -Algorithm SHA256
+          Get-FileHash "$out/sairplay-raop.dll" -Algorithm SHA256
+          Get-FileHash "$out/libcrypto-1_1-x64.dll" -Algorithm SHA256
+          Get-FileHash "$out/libssl-1_1-x64.dll" -Algorithm SHA256
           Get-ChildItem $out
 
       - name: Upload MSA Core 16-bit Windows artifact
