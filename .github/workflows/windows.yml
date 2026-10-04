@@ -9,6 +9,9 @@ on:
     paths-ignore:
       - "docs/**"
 
+permissions:
+  contents: write
+
 concurrency:
   group: sairplay2-${{ github.ref }}
   cancel-in-progress: true
