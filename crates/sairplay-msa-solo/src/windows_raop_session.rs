@@ -1,38 +1,91 @@
 #![cfg(windows)]
 
-//! Concrete Windows RAOP transport for the independent MSA SOLO engine.
-//! Owns a separate helper built from the exact libraop pin used by pinned MSA.
-//! The helper process and raopcl_s persist across FLUSH/START; legacy engine
-//! helpers are not touched or reused.
+//! In-process Windows RAOP adapter for the unified MSA Receiver Core.
+//! Route/lifecycle semantics remain pinned to Music Assistant; only the old
+//! cliraop helper/process boundary is removed.
 
 use crate::timing::StartResolution;
-use sairplay_helper_process::ManagedChild;
+use std::ffi::{c_char, c_int, c_void, CString};
 use std::fmt;
-use std::io::{BufRead, BufReader, Write};
 use std::net::IpAddr;
-use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::{ChildStdin, Command, Stdio};
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    mpsc,
-    Arc, Mutex,
-};
-use std::thread;
+use std::ptr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const MSA_LIBRAOP_PIN: &str = "81c2182649da8645ac2a58b78e9f370c79a4165b";
 pub const RAOP_FRAMES_PER_PACKET: usize = 352;
 pub const RAOP_PCM_PACKET_BYTES: usize = RAOP_FRAMES_PER_PACKET * 4;
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 
 fn input_bytes_per_frame(bit_depth: u16, channels: u16) -> usize {
     (if bit_depth <= 16 { 2 } else { 4 }) * channels as usize
 }
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
-const READY_TIMEOUT: Duration = Duration::from_secs(15);
-const DISCONNECT_GRACE: Duration = Duration::from_secs(2);
-const CREATE_NO_WINDOW: u32 = 0x08000000;
-static SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[repr(C)]
+struct SrRaopHandle {
+    _opaque: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct SrRaopReady {
+    latency_frames: u32,
+    sample_rate: u32,
+    bit_depth: u16,
+    channels: u16,
+}
+
+unsafe extern "C" {
+    fn sr_raop_open(
+        host_name: *const c_char,
+        port: u16,
+        volume: u8,
+        lead_ms: u32,
+        sample_rate: u32,
+        bit_depth: u16,
+        channels: u16,
+        compressed_alac: c_int,
+        auth: c_int,
+        encrypt: c_int,
+        secret: *const c_char,
+        password: *const c_char,
+        et: *const c_char,
+        md: *const c_char,
+        dacp_id: *const c_char,
+        active_remote: *const c_char,
+        bind_ip: *const c_char,
+        out_handle: *mut *mut SrRaopHandle,
+        out_ready: *mut SrRaopReady,
+        error: *mut c_char,
+        error_cap: usize,
+    ) -> c_int;
+    fn sr_raop_close(handle: *mut SrRaopHandle);
+    fn sr_raop_healthy(handle: *mut SrRaopHandle) -> c_int;
+    fn sr_raop_keepalive(handle: *mut SrRaopHandle) -> c_int;
+    fn sr_raop_commit_start(handle: *mut SrRaopHandle, requested_ms: u64, at_ms: *mut u64) -> c_int;
+    fn sr_raop_start_after_flush(handle: *mut SrRaopHandle, requested_ms: u64, at_ms: *mut u64) -> c_int;
+    fn sr_raop_flush(handle: *mut SrRaopHandle) -> c_int;
+    fn sr_raop_standby(handle: *mut SrRaopHandle) -> c_int;
+    fn sr_raop_pause(handle: *mut SrRaopHandle) -> c_int;
+    fn sr_raop_play(handle: *mut SrRaopHandle) -> c_int;
+    fn sr_raop_stop(handle: *mut SrRaopHandle) -> c_int;
+    fn sr_raop_set_volume(handle: *mut SrRaopHandle, percent: u8) -> c_int;
+    fn sr_raop_set_progress(handle: *mut SrRaopHandle, elapsed_s: u32, duration_s: u32) -> c_int;
+    fn sr_raop_set_metadata(
+        handle: *mut SrRaopHandle,
+        title: *const c_char,
+        artist: *const c_char,
+        album: *const c_char,
+    ) -> c_int;
+    fn sr_raop_set_artwork(
+        handle: *mut SrRaopHandle,
+        content_type: *const c_char,
+        data: *const u8,
+        size: usize,
+    ) -> c_int;
+    fn sr_raop_write(handle: *mut SrRaopHandle, packet: *const u8, packet_bytes: usize) -> c_int;
+    fn sr_raop_head_audible_ms(handle: *mut SrRaopHandle) -> u64;
+}
 
 #[derive(Debug, Clone)]
 pub struct MsaRaopConfig {
@@ -54,6 +107,7 @@ pub struct MsaRaopConfig {
     pub channels: u16,
     pub lead_ms: u32,
 }
+
 impl MsaRaopConfig {
     pub fn new(host: impl Into<String>, port: u16) -> Self {
         Self {
@@ -79,33 +133,30 @@ impl MsaRaopConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MsaRaopState { Connected, Streaming, Flushed, Paused, Stopped, Down }
+pub enum MsaRaopState {
+    Connected,
+    Streaming,
+    Flushed,
+    Paused,
+    Stopped,
+    Down,
+}
 
 #[derive(Debug)]
 pub enum MsaRaopError {
-    HelperMissing(PathBuf),
-    Spawn(std::io::Error),
-    Pipe,
-    ReadinessTimeout,
+    InvalidInput(String),
     Connect(String),
-    Io(std::io::Error),
-    AckTimeout { seq: u64 },
-    Command { seq: u64, command: String, detail: String },
-    InvalidAck(String),
+    Operation(&'static str),
+    Poisoned,
 }
+
 impl fmt::Display for MsaRaopError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::HelperMissing(p) => write!(f, "MSA RAOP helper missing: {}", p.display()),
-            Self::Spawn(e) => write!(f, "MSA RAOP helper spawn failed: {e}"),
-            Self::Pipe => write!(f, "MSA RAOP helper pipe missing"),
-            Self::ReadinessTimeout => write!(f, "MSA RAOP helper readiness timed out"),
-            Self::Connect(s) => write!(f, "MSA RAOP connect failed: {s}"),
-            Self::Io(e) => write!(f, "MSA RAOP I/O failed: {e}"),
-            Self::AckTimeout { seq } => write!(f, "MSA RAOP command {seq} timed out"),
-            Self::Command { seq, command, detail } =>
-                write!(f, "MSA RAOP command {seq} {command} failed: {detail}"),
-            Self::InvalidAck(s) => write!(f, "invalid MSA RAOP ack: {s}"),
+            Self::InvalidInput(v) => write!(f, "MSA RAOP invalid input: {v}"),
+            Self::Connect(v) => write!(f, "MSA RAOP connect failed: {v}"),
+            Self::Operation(v) => write!(f, "MSA RAOP in-process operation failed: {v}"),
+            Self::Poisoned => write!(f, "MSA RAOP in-process transport mutex poisoned"),
         }
     }
 }
@@ -119,271 +170,240 @@ pub struct MsaRaopReady {
     pub channels: u16,
 }
 
+struct RaopNative {
+    handle: *mut SrRaopHandle,
+}
+
+// All calls into the pinned C transport are serialized by Mutex<RaopNative>.
+unsafe impl Send for RaopNative {}
+
+impl RaopNative {
+    fn operation(&mut self, name: &'static str, f: impl FnOnce(*mut SrRaopHandle) -> c_int) -> Result<(), MsaRaopError> {
+        if self.handle.is_null() || f(self.handle) == 0 {
+            Err(MsaRaopError::Operation(name))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn close(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { sr_raop_close(self.handle) };
+            self.handle = ptr::null_mut();
+        }
+    }
+}
+impl Drop for RaopNative {
+    fn drop(&mut self) { self.close(); }
+}
+
 #[derive(Clone)]
 pub struct MsaRaopPcmWriter {
-    stdin: Arc<Mutex<ChildStdin>>,
+    inner: Arc<Mutex<RaopNative>>,
     packet_bytes: usize,
 }
+
 impl MsaRaopPcmWriter {
     pub fn write_packet(&self, packet: &[u8]) -> Result<(), MsaRaopError> {
         if packet.len() != self.packet_bytes {
-            return Err(MsaRaopError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("RAOP PCM packet must be {} bytes", self.packet_bytes),
+            return Err(MsaRaopError::InvalidInput(format!(
+                "RAOP PCM packet must be {} bytes, got {}",
+                self.packet_bytes,
+                packet.len()
             )));
         }
-        self.stdin.lock().map_err(|_| MsaRaopError::Pipe)?
-            .write_all(packet).map_err(MsaRaopError::Io)
+        let mut native = self.inner.lock().map_err(|_| MsaRaopError::Poisoned)?;
+        native.operation("write", |handle| unsafe {
+            sr_raop_write(handle, packet.as_ptr(), packet.len())
+        })
     }
 }
 
 pub struct MsaRaopSession {
-    child: ManagedChild,
-    stdin: Arc<Mutex<ChildStdin>>,
-    control_path: PathBuf,
-    ack_path: PathBuf,
-    metadata_path: PathBuf,
-    artwork_path: PathBuf,
-    head_audible_ms: Arc<AtomicU64>,
+    inner: Arc<Mutex<RaopNative>>,
     meta_delivered: bool,
     meta_title: String,
     meta_artist: String,
     meta_album: String,
     meta_duration_s: u32,
     meta_item_id: String,
-    next_seq: u64,
     state: MsaRaopState,
     ready: MsaRaopReady,
     log: Arc<Mutex<Vec<String>>>,
+    last_keepalive: Instant,
+}
+
+fn cstring(label: &str, value: &str) -> Result<CString, MsaRaopError> {
+    CString::new(value).map_err(|_| MsaRaopError::InvalidInput(format!("{label} contains NUL")))
+}
+
+fn optional_ptr(value: Option<&CString>) -> *const c_char {
+    value.map_or(ptr::null(), |v| v.as_ptr())
 }
 
 impl MsaRaopSession {
     pub fn connect(config: MsaRaopConfig) -> Result<Self, MsaRaopError> {
-        let helper = helper_path()?;
-        let id = SESSION_ID.fetch_add(1, Ordering::SeqCst);
-        let stem = format!("sairplay-msa-raop-{}-{id}", std::process::id());
-        let control_path = std::env::temp_dir().join(format!("{stem}.cmd"));
-        let ack_path = std::env::temp_dir().join(format!("{stem}.ack"));
-        let metadata_path = std::env::temp_dir().join(format!("{stem}.meta"));
-        let artwork_path = std::env::temp_dir().join(format!("{stem}.art"));
-        let _ = std::fs::remove_file(&control_path);
-        let _ = std::fs::remove_file(&ack_path);
-        let _ = std::fs::remove_file(&metadata_path);
-        let _ = std::fs::remove_file(&artwork_path);
+        let host = cstring("host", &config.host)?;
+        let et = cstring("et", &config.et)?;
+        let md = cstring("md", &config.md)?;
+        let dacp = cstring("dacp_id", &config.dacp_id)?;
+        let active_remote = cstring("active_remote", &config.active_remote)?;
+        let secret = config.secret.as_deref().map(|v| cstring("secret", v)).transpose()?;
+        let password = config.password.as_deref().map(|v| cstring("password", v)).transpose()?;
+        let bind = config.bind_ip.map(|v| cstring("bind_ip", &v.to_string())).transpose()?;
 
-        let mut cmd = Command::new(&helper);
-        cmd.arg("--control").arg(&control_path)
-            .arg("--ack").arg(&ack_path)
-            .arg("--metadata").arg(&metadata_path)
-            .arg("--artwork").arg(&artwork_path)
-            .arg("-p").arg(config.port.to_string())
-            .arg("-v").arg(config.volume.min(100).to_string())
-            .arg("-l").arg(config.lead_ms.to_string())
-            .arg("-r").arg(config.sample_rate.to_string())
-            .arg("-b").arg(config.bit_depth.to_string())
-            .arg("-c").arg(config.channels.to_string())
-            .arg("-D").arg(&config.dacp_id)
-            .arg("-R").arg(&config.active_remote)
-            .arg("-t").arg(&config.et)
-            .arg("-m").arg(&config.md);
-        if let Some(bind_ip) = config.bind_ip {
-            cmd.arg("--bind").arg(bind_ip.to_string());
-        }
-        if config.encrypt { cmd.arg("-e"); }
-        if !config.compressed_alac { cmd.arg("--pcm"); }
-        if config.mfi_auth { cmd.arg("-u"); }
-        if let Some(secret) = config.secret.as_deref().filter(|v| !v.trim().is_empty()) {
-            cmd.arg("-s").arg(secret);
-        }
-        if let Some(password) = config.password.as_deref().filter(|v| !v.is_empty()) {
-            cmd.arg("-P").arg(password);
-        }
-        cmd.arg(&config.host)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .creation_flags(CREATE_NO_WINDOW);
-
-        let mut child = ManagedChild::spawn(&mut cmd).map_err(MsaRaopError::Spawn)?;
-        let stdin = match child.take_stdin() {
-            Some(stdin) => Arc::new(Mutex::new(stdin)),
-            None => return Err(MsaRaopError::Pipe),
+        let mut handle = ptr::null_mut();
+        let mut ready = SrRaopReady::default();
+        let mut error = vec![0i8; 512];
+        let rc = unsafe {
+            sr_raop_open(
+                host.as_ptr(),
+                config.port,
+                config.volume.min(100),
+                config.lead_ms,
+                config.sample_rate,
+                config.bit_depth,
+                config.channels,
+                config.compressed_alac as c_int,
+                config.mfi_auth as c_int,
+                config.encrypt as c_int,
+                optional_ptr(secret.as_ref()),
+                optional_ptr(password.as_ref()),
+                et.as_ptr(),
+                md.as_ptr(),
+                dacp.as_ptr(),
+                active_remote.as_ptr(),
+                optional_ptr(bind.as_ref()),
+                &mut handle,
+                &mut ready,
+                error.as_mut_ptr(),
+                error.len(),
+            )
         };
-        let stderr = match child.take_stderr() {
-            Some(stderr) => stderr,
-            None => return Err(MsaRaopError::Pipe),
-        };
-        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<MsaRaopReady, String>>(1);
-        let log = Arc::new(Mutex::new(Vec::<String>::new()));
-        let head_audible_ms = Arc::new(AtomicU64::new(0));
-        let log_t = Arc::clone(&log);
-        let head_t = Arc::clone(&head_audible_ms);
-        let log_thread = thread::Builder::new().name("msa-raop-log".into()).spawn(move || {
-            let mut reported = false;
-            let mut last_error = None::<String>;
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if let Ok(mut lines) = log_t.lock() {
-                    if lines.len() >= 128 { lines.remove(0); }
-                    lines.push(line.clone());
-                }
-                if let Some(rest) = line.strip_prefix("MSA-RAOP READY ") {
-                    let mut latency = None;
-                    let mut rate = None;
-                    let mut depth = None;
-                    let mut channels = None;
-                    for token in rest.split_whitespace() {
-                        if let Some(v) = token.strip_prefix("latency=") {
-                            latency = v.parse::<u32>().ok();
-                        } else if let Some(v) = token.strip_prefix("sample_rate=") {
-                            rate = v.parse::<u32>().ok();
-                        } else if let Some(v) = token.strip_prefix("bit_depth=") {
-                            depth = v.parse::<u16>().ok();
-                        } else if let Some(v) = token.strip_prefix("channels=") {
-                            channels = v.parse::<u16>().ok();
-                        }
-                    }
-                    if let (Some(latency_frames), Some(sample_rate), Some(bit_depth), Some(channels)) =
-                        (latency, rate, depth, channels) {
-                        let _ = ready_tx.send(Ok(MsaRaopReady {
-                            latency_frames, sample_rate, bit_depth, channels
-                        }));
-                        reported = true;
-                    }
-                } else if let Some(rest) = line.strip_prefix("MSA-RAOP HEAD ") {
-                    for token in rest.split_whitespace() {
-                        if let Some(v) = token.strip_prefix("audible_ms=") {
-                            if let Ok(ms) = v.parse::<u64>() {
-                                head_t.store(ms, Ordering::SeqCst);
-                            }
-                        }
-                    }
-                } else if line.starts_with("MSA-RAOP ERROR ") {
-                    last_error = Some(line);
-                }
-            }
-            if !reported {
-                let _ = ready_tx.send(Err(last_error.unwrap_or_else(|| {
-                    "helper exited before reporting readiness".into()
-                })));
-            }
-        });
-        if let Err(error) = log_thread {
-            return Err(MsaRaopError::Spawn(error));
+        if rc != 0 || handle.is_null() {
+            let bytes = error.iter().map(|v| *v as u8).take_while(|v| *v != 0).collect::<Vec<_>>();
+            let detail = String::from_utf8_lossy(&bytes).trim().to_owned();
+            return Err(MsaRaopError::Connect(if detail.is_empty() {
+                format!("native bridge status={rc}")
+            } else {
+                format!("native bridge status={rc}: {detail}")
+            }));
         }
 
-        let ready = match ready_rx.recv_timeout(READY_TIMEOUT) {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => return Err(MsaRaopError::Connect(e)),
-            Err(_) => return Err(MsaRaopError::ReadinessTimeout),
+        let ready = MsaRaopReady {
+            latency_frames: ready.latency_frames,
+            sample_rate: ready.sample_rate,
+            bit_depth: ready.bit_depth,
+            channels: ready.channels,
         };
-
+        let log = Arc::new(Mutex::new(vec![format!(
+            "MSA-RAOP READY integration=in-process-static libraop={} latency={} sample_rate={} bit_depth={} channels={}",
+            MSA_LIBRAOP_PIN, ready.latency_frames, ready.sample_rate, ready.bit_depth, ready.channels
+        )]));
         Ok(Self {
-            child, stdin, control_path, ack_path, metadata_path, artwork_path,
-            head_audible_ms,
+            inner: Arc::new(Mutex::new(RaopNative { handle })),
             meta_delivered: false,
             meta_title: String::new(),
             meta_artist: String::new(),
             meta_album: String::new(),
             meta_duration_s: 0,
             meta_item_id: String::new(),
-            next_seq: 1,
-            state: MsaRaopState::Connected, ready, log,
+            state: MsaRaopState::Connected,
+            ready,
+            log,
+            last_keepalive: Instant::now(),
         })
     }
 
     pub fn ready(&self) -> MsaRaopReady { self.ready }
-    pub fn helper_alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
-    }
-
     pub fn state(&self) -> MsaRaopState { self.state }
-    pub fn logs(&self) -> Vec<String> {
-        self.log.lock().map(|v| v.clone()).unwrap_or_default()
+    pub fn logs(&self) -> Vec<String> { self.log.lock().map(|v| v.clone()).unwrap_or_default() }
+
+    pub fn transport_healthy(&mut self) -> bool {
+        let mut native = match self.inner.lock() {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if native.handle.is_null() {
+            return false;
+        }
+        if self.last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
+            if unsafe { sr_raop_keepalive(native.handle) } == 0 {
+                return false;
+            }
+            self.last_keepalive = Instant::now();
+        }
+        unsafe { sr_raop_healthy(native.handle) != 0 }
     }
 
     pub fn head_audible_unix_ms(&self) -> u64 {
-        self.head_audible_ms.load(Ordering::SeqCst)
+        self.inner.lock().ok().map(|native| unsafe {
+            if native.handle.is_null() { 0 } else { sr_raop_head_audible_ms(native.handle) }
+        }).unwrap_or(0)
+    }
+
+    fn start_call(&mut self, requested_unix_ms: u64, after_flush: bool) -> Result<StartResolution, MsaRaopError> {
+        let mut native = self.inner.lock().map_err(|_| MsaRaopError::Poisoned)?;
+        if native.handle.is_null() { return Err(MsaRaopError::Operation("start")); }
+        let mut at = 0u64;
+        let ok = unsafe {
+            if after_flush {
+                sr_raop_start_after_flush(native.handle, requested_unix_ms, &mut at)
+            } else {
+                sr_raop_commit_start(native.handle, requested_unix_ms, &mut at)
+            }
+        };
+        if ok == 0 { return Err(MsaRaopError::Operation(if after_flush { "start_after_flush" } else { "start" })); }
+        self.state = MsaRaopState::Streaming;
+        Ok(StartResolution {
+            requested_unix_ms,
+            at_unix_ms: at,
+            corrected_forward: requested_unix_ms != 0 && at != requested_unix_ms,
+        })
     }
 
     pub fn commit_start(&mut self, requested_unix_ms: u64) -> Result<StartResolution, MsaRaopError> {
-        self.head_audible_ms.store(0, Ordering::SeqCst);
-        let at = self.command("START", requested_unix_ms, 0)?;
-        self.state = MsaRaopState::Streaming;
-        Ok(StartResolution {
-            requested_unix_ms,
-            at_unix_ms: at,
-            corrected_forward: requested_unix_ms != 0 && at != requested_unix_ms,
-        })
+        self.start_call(requested_unix_ms, false)
     }
-
     pub fn start_after_flush(&mut self, requested_unix_ms: u64) -> Result<StartResolution, MsaRaopError> {
-        self.head_audible_ms.store(0, Ordering::SeqCst);
-        let at = self.command("START_AFTER_FLUSH", requested_unix_ms, 0)?;
-        self.state = MsaRaopState::Streaming;
-        Ok(StartResolution {
-            requested_unix_ms,
-            at_unix_ms: at,
-            corrected_forward: requested_unix_ms != 0 && at != requested_unix_ms,
-        })
+        self.start_call(requested_unix_ms, true)
     }
 
-    pub fn flush(&mut self) -> Result<(), MsaRaopError> {
-        self.head_audible_ms.store(0, Ordering::SeqCst);
-        self.command("FLUSH", 0, 0)?;
-        self.state = MsaRaopState::Flushed;
+    fn simple(&mut self, name: &'static str, call: unsafe extern "C" fn(*mut SrRaopHandle) -> c_int, next: MsaRaopState) -> Result<(), MsaRaopError> {
+        let mut native = self.inner.lock().map_err(|_| MsaRaopError::Poisoned)?;
+        native.operation(name, |handle| unsafe { call(handle) })?;
+        self.state = next;
         Ok(())
     }
-    pub fn standby(&mut self) -> Result<(), MsaRaopError> {
-        self.head_audible_ms.store(0, Ordering::SeqCst);
-        self.command("STANDBY", 0, 0)?;
-        self.state = MsaRaopState::Connected;
-        Ok(())
-    }
-    pub fn pause(&mut self) -> Result<(), MsaRaopError> {
-        self.head_audible_ms.store(0, Ordering::SeqCst);
-        self.command("PAUSE", 0, 0)?;
-        self.state = MsaRaopState::Paused;
-        Ok(())
-    }
-    pub fn play(&mut self) -> Result<(), MsaRaopError> {
-        self.head_audible_ms.store(0, Ordering::SeqCst);
-        self.command("PLAY", 0, 0)?;
-        self.state = MsaRaopState::Streaming;
-        Ok(())
-    }
-    pub fn stop(&mut self) -> Result<(), MsaRaopError> {
-        self.head_audible_ms.store(0, Ordering::SeqCst);
-        self.command("STOP", 0, 0)?;
-        self.state = MsaRaopState::Down;
-        Ok(())
-    }
+
+    pub fn flush(&mut self) -> Result<(), MsaRaopError> { self.simple("flush", sr_raop_flush, MsaRaopState::Flushed) }
+    pub fn standby(&mut self) -> Result<(), MsaRaopError> { self.simple("standby", sr_raop_standby, MsaRaopState::Connected) }
+    pub fn pause(&mut self) -> Result<(), MsaRaopError> { self.simple("pause", sr_raop_pause, MsaRaopState::Paused) }
+    pub fn play(&mut self) -> Result<(), MsaRaopError> { self.simple("play", sr_raop_play, MsaRaopState::Streaming) }
+    pub fn stop(&mut self) -> Result<(), MsaRaopError> { self.simple("stop", sr_raop_stop, MsaRaopState::Stopped) }
+
     pub fn set_volume(&mut self, percent: u8) -> Result<(), MsaRaopError> {
-        self.command("VOLUME", percent.min(100) as u64, 0).map(|_| ())
+        let mut native = self.inner.lock().map_err(|_| MsaRaopError::Poisoned)?;
+        native.operation("volume", |handle| unsafe { sr_raop_set_volume(handle, percent.min(100)) })
     }
+
     pub fn set_progress(&mut self, elapsed_s: u32, duration_s: u32) -> Result<(), MsaRaopError> {
-        self.command("PROGRESS", elapsed_s as u64, duration_s as u64).map(|_| ())
+        let mut native = self.inner.lock().map_err(|_| MsaRaopError::Poisoned)?;
+        native.operation("progress", |handle| unsafe { sr_raop_set_progress(handle, elapsed_s, duration_s) })
     }
 
-
-    pub fn set_metadata(
-        &mut self,
-        title: &str,
-        artist: &str,
-        album: &str,
-        duration_s: u32,
-        item_id: &str,
-    ) -> Result<(), MsaRaopError> {
-        if self.meta_delivered
-            && self.meta_title == title
-            && self.meta_artist == artist
-            && self.meta_album == album
-            && self.meta_duration_s == duration_s
-            && self.meta_item_id == item_id
-        {
+    pub fn set_metadata(&mut self, title: &str, artist: &str, album: &str, duration_s: u32, item_id: &str) -> Result<(), MsaRaopError> {
+        if self.meta_delivered && self.meta_title == title && self.meta_artist == artist
+            && self.meta_album == album && self.meta_duration_s == duration_s && self.meta_item_id == item_id {
             return Ok(());
         }
-        write_metadata_sidecar(&self.metadata_path, title, artist, album)?;
-        self.command("METADATA", 0, 0)?;
+        let title_c = cstring("title", title)?;
+        let artist_c = cstring("artist", artist)?;
+        let album_c = cstring("album", album)?;
+        let mut native = self.inner.lock().map_err(|_| MsaRaopError::Poisoned)?;
+        native.operation("metadata", |handle| unsafe {
+            sr_raop_set_metadata(handle, title_c.as_ptr(), artist_c.as_ptr(), album_c.as_ptr())
+        })?;
         self.meta_delivered = true;
         self.meta_title = title.to_owned();
         self.meta_artist = artist.to_owned();
@@ -394,23 +414,21 @@ impl MsaRaopSession {
     }
 
     pub fn ensure_initial_metadata(&mut self) -> Result<(), MsaRaopError> {
-        if self.meta_delivered {
-            Ok(())
-        } else {
-            self.set_metadata("cliairplay", "", "", 0, "")
-        }
+        if self.meta_delivered { Ok(()) } else { self.set_metadata("cliairplay", "", "", 0, "") }
     }
 
     pub fn set_artwork(&mut self, content_type: &str, data: &[u8]) -> Result<(), MsaRaopError> {
-        write_artwork_sidecar(&self.artwork_path, content_type, data)?;
-        self.command("ARTWORK", 0, 0).map(|_| ())
+        let mime = cstring("content_type", content_type)?;
+        let mut native = self.inner.lock().map_err(|_| MsaRaopError::Poisoned)?;
+        native.operation("artwork", |handle| unsafe {
+            sr_raop_set_artwork(handle, mime.as_ptr(), data.as_ptr(), data.len())
+        })
     }
 
     pub fn pcm_writer(&self) -> MsaRaopPcmWriter {
         MsaRaopPcmWriter {
-            stdin: Arc::clone(&self.stdin),
-            packet_bytes: RAOP_FRAMES_PER_PACKET
-                * input_bytes_per_frame(self.ready.bit_depth, self.ready.channels),
+            inner: Arc::clone(&self.inner),
+            packet_bytes: RAOP_FRAMES_PER_PACKET * input_bytes_per_frame(self.ready.bit_depth, self.ready.channels),
         }
     }
 
@@ -418,124 +436,28 @@ impl MsaRaopSession {
         self.pcm_writer().write_packet(packet)
     }
 
-    fn enqueue_command(&mut self, name: &str, arg1: u64, arg2: u64) -> Result<u64, MsaRaopError> {
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1).max(1);
-
-        let tmp = self.control_path.with_extension("cmd.tmp");
-        std::fs::write(&tmp, format!("{seq} {name} {arg1} {arg2}\n"))
-            .map_err(MsaRaopError::Io)?;
-        if self.control_path.exists() {
-            let _ = std::fs::remove_file(&self.control_path);
-        }
-        std::fs::rename(&tmp, &self.control_path).map_err(MsaRaopError::Io)?;
-        Ok(seq)
-    }
-
-    fn command(&mut self, name: &str, arg1: u64, arg2: u64) -> Result<u64, MsaRaopError> {
-        let seq = self.enqueue_command(name, arg1, arg2)?;
-
-        let deadline = Instant::now() + COMMAND_TIMEOUT;
-        loop {
-            if let Ok(text) = std::fs::read_to_string(&self.ack_path) {
-                if let Some((ack_seq, ok, at, detail)) = parse_ack(&text) {
-                    if ack_seq == seq {
-                        return if ok {
-                            Ok(at)
-                        } else {
-                            Err(MsaRaopError::Command {
-                                seq,
-                                command: name.into(),
-                                detail: detail.into(),
-                            })
-                        };
-                    }
-                }
-            }
-            if let Ok(Some(status)) = self.child.try_wait() {
-                return Err(MsaRaopError::Connect(format!(
-                    "helper exited while waiting for {name}: {status}"
-                )));
-            }
-            if Instant::now() >= deadline {
-                return Err(MsaRaopError::AckTimeout { seq });
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
-    }
-
     pub fn disconnect(&mut self) {
-        // Do not call command("QUIT") here: its normal command ACK timeout is
-        // 12 seconds, which made a closed GUI appear gone while the 32-bit
-        // helper still held the application directory. Queue QUIT once, allow
-        // one bounded graceful teardown window, then terminate the whole job.
-        let _ = self.enqueue_command("QUIT", 0, 0);
-        // Shared name-independent helper guard owns graceful timeout,
-        // whole-job termination and mandatory process reaping.
-        let _ = self.child.wait_or_terminate(DISCONNECT_GRACE);
+        if let Ok(mut native) = self.inner.lock() { native.close(); }
         self.state = MsaRaopState::Down;
-        let _ = std::fs::remove_file(&self.control_path);
-        let _ = std::fs::remove_file(&self.ack_path);
-        let _ = std::fs::remove_file(&self.metadata_path);
-        let _ = std::fs::remove_file(&self.artwork_path);
     }
 }
-impl Drop for MsaRaopSession { fn drop(&mut self) { self.disconnect(); } }
 
-
-fn write_u32_le(out: &mut Vec<u8>, value: usize) -> Result<(), MsaRaopError> {
-    let value = u32::try_from(value).map_err(|_| {
-        MsaRaopError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "sidecar field too large"))
-    })?;
-    out.extend_from_slice(&value.to_le_bytes());
-    Ok(())
-}
-
-fn write_metadata_sidecar(path: &Path, title: &str, artist: &str, album: &str) -> Result<(), MsaRaopError> {
-    let mut out = Vec::new();
-    for value in [title.as_bytes(), artist.as_bytes(), album.as_bytes()] {
-        write_u32_le(&mut out, value.len())?;
-        out.extend_from_slice(value);
-    }
-    std::fs::write(path, out).map_err(MsaRaopError::Io)
-}
-
-fn write_artwork_sidecar(path: &Path, content_type: &str, data: &[u8]) -> Result<(), MsaRaopError> {
-    let mut out = Vec::new();
-    write_u32_le(&mut out, content_type.len())?;
-    out.extend_from_slice(content_type.as_bytes());
-    write_u32_le(&mut out, data.len())?;
-    out.extend_from_slice(data);
-    std::fs::write(path, out).map_err(MsaRaopError::Io)
-}
-
-fn parse_ack(line: &str) -> Option<(u64, bool, u64, &str)> {
-    let mut parts = line.trim().splitn(4, ' ');
-    let seq = parts.next()?.parse().ok()?;
-    let ok = match parts.next()? { "OK" => true, "ERR" => false, _ => return None };
-    let at = parts.next()?.parse().ok()?;
-    let detail = parts.next().unwrap_or("");
-    Some((seq, ok, at, detail))
-}
-
-fn helper_path() -> Result<PathBuf, MsaRaopError> {
-    if let Some(path) = std::env::var_os("SAIRPLAY_MSA_RAOP_HELPER") {
-        let path = PathBuf::from(path);
-        if path.is_file() { return Ok(path); }
-        return Err(MsaRaopError::HelperMissing(path));
-    }
-    let exe = std::env::current_exe().map_err(MsaRaopError::Io)?;
-    let path = exe.parent().unwrap_or(Path::new(".")).join("cliraop-msa-solo.exe");
-    if path.is_file() { Ok(path) } else { Err(MsaRaopError::HelperMissing(path)) }
+impl Drop for MsaRaopSession {
+    fn drop(&mut self) { self.disconnect(); }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn ack_parser_preserves_scheduled_instant() {
-        assert_eq!(parse_ack("8 OK 12345 START\n"), Some((8, true, 12345, "START")));
-    }
-    #[test] fn helper_pin_is_exact_msa_submodule_pin() {
+
+    #[test]
+    fn helper_pin_is_exact_msa_submodule_pin() {
         assert_eq!(MSA_LIBRAOP_PIN, "81c2182649da8645ac2a58b78e9f370c79a4165b");
+    }
+
+    #[test]
+    fn packet_contract_tracks_requested_format() {
+        assert_eq!(RAOP_FRAMES_PER_PACKET * input_bytes_per_frame(16, 2), 1408);
+        assert_eq!(RAOP_FRAMES_PER_PACKET * input_bytes_per_frame(24, 2), 2816);
     }
 }
