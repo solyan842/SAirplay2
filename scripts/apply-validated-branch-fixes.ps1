@@ -225,3 +225,95 @@ Replace-Exact $worker @'
 
 Write-Host "Validated branch fixes applied."
 git diff -- $gui $worker
+
+# BEGIN ONE-SHOT MSA-CORE SOURCE PROMOTION
+if ($env:GITHUB_ACTIONS -eq "true" -and $env:GITHUB_REF -eq "refs/heads/dev/msa-core-architecture") {
+    Write-Host "Promoting validated MSA Core runtime patches into committed source..."
+
+    $workflow = ".github/workflows/windows.yml"
+    $workflowText = [System.IO.File]::ReadAllText($workflow)
+
+    $permissionsBlock = @'
+permissions:
+  contents: write
+
+'@
+    $permissionsCount = ([regex]::Matches($workflowText, [regex]::Escape($permissionsBlock))).Count
+    if ($permissionsCount -ne 1) {
+        throw "windows.yml: expected one temporary permissions block, found $permissionsCount"
+    }
+    $workflowText = $workflowText.Replace($permissionsBlock, "")
+
+    $oldPatchStep = @'
+      - name: Apply validated branch fixes
+        shell: pwsh
+        run: ./scripts/apply-validated-branch-fixes.ps1
+'@
+    $newPatchStep = @'
+      - name: Apply validated branch fixes
+        if: github.ref != 'refs/heads/dev/msa-core-architecture'
+        shell: pwsh
+        run: ./scripts/apply-validated-branch-fixes.ps1
+'@
+    $patchStepCount = ([regex]::Matches($workflowText, [regex]::Escape($oldPatchStep))).Count
+    if ($patchStepCount -ne 1) {
+        throw "windows.yml: expected one runtime patch step, found $patchStepCount"
+    }
+    $workflowText = $workflowText.Replace($oldPatchStep, $newPatchStep)
+    [System.IO.File]::WriteAllText(
+        $workflow,
+        $workflowText,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+
+    $temporaryWorkflow = ".github/workflows/promote-msa-core-source.yml"
+    if (Test-Path $temporaryWorkflow) {
+        git rm -- $temporaryWorkflow
+        if ($LASTEXITCODE -ne 0) { throw "failed to remove temporary promotion workflow" }
+    }
+
+    # Remove this one-shot block from the script before committing so the
+    # migration mechanism does not remain as project baggage.
+    $selfPath = $PSCommandPath
+    $selfText = [System.IO.File]::ReadAllText($selfPath)
+    $beginMarker = "# BEGIN ONE-SHOT MSA-CORE SOURCE PROMOTION"
+    $endMarker = "# END ONE-SHOT MSA-CORE SOURCE PROMOTION"
+    $beginIndex = $selfText.IndexOf($beginMarker, [System.StringComparison]::Ordinal)
+    $endIndex = $selfText.IndexOf($endMarker, [System.StringComparison]::Ordinal)
+    if ($beginIndex -lt 0 -or $endIndex -lt $beginIndex) {
+        throw "one-shot self-clean markers not found"
+    }
+    $endIndex += $endMarker.Length
+    while ($endIndex -lt $selfText.Length -and ($selfText[$endIndex] -eq "`r" -or $selfText[$endIndex] -eq "`n")) {
+        $endIndex++
+    }
+    $cleanSelf = $selfText.Substring(0, $beginIndex).TrimEnd() + "`n" + $selfText.Substring($endIndex)
+    [System.IO.File]::WriteAllText(
+        $selfPath,
+        $cleanSelf,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+
+    git config user.name "github-actions[bot]"
+    git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+    git add -- `
+        "crates/sairplay-gui/src/main.rs" `
+        "crates/sairplay-msa-solo/src/windows_audio_worker.rs" `
+        ".github/workflows/windows.yml" `
+        "scripts/apply-validated-branch-fixes.ps1"
+
+    git diff --cached --check
+    if ($LASTEXITCODE -ne 0) { throw "git diff --check failed" }
+
+    git diff --cached --quiet
+    if ($LASTEXITCODE -eq 0) { throw "source promotion produced no staged changes" }
+
+    git commit -m "refactor: promote validated MSA core fixes into source"
+    if ($LASTEXITCODE -ne 0) { throw "source promotion commit failed" }
+
+    git push origin HEAD:dev/msa-core-architecture
+    if ($LASTEXITCODE -ne 0) { throw "source promotion push failed" }
+
+    Write-Host "MSA Core source promotion pushed."
+}
+# END ONE-SHOT MSA-CORE SOURCE PROMOTION
