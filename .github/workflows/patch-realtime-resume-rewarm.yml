@@ -28,7 +28,7 @@ jobs:
               $script:text = $script:text
               $count = ([regex]::Matches($script:text, [regex]::Escape($Old))).Count
               if ($count -ne $ExpectedCount) {
-                  throw "$path: expected $ExpectedCount exact match(es), found $count"
+                  throw "${path}: expected $ExpectedCount exact match(es), found $count"
               }
               $script:text = $script:text.Replace($Old, $New)
           }
