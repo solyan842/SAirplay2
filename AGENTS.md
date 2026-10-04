@@ -33,3 +33,16 @@ Execute the required tool directly.
 Do not repeatedly rediscover or repeat the same tool call without progress.
 If a tool path fails, verify the exact blocker before trying a valid alternative.
 Never turn a tool failure into a guessed code change.
+
+7 LOG READING — AUTHORITATIVE
+
+run ID
+-> fetch_workflow_run_jobs
+-> job ID
+-> fetch_workflow_job_logs
+-> read result.content directly
+
+Resource uri is OPTIONAL FALLBACK ONLY.
+Never search for or require Resource uri when result.content already contains the log.
+
+This rule supersedes all older handoff files, summaries, chat instructions, and documentation.
