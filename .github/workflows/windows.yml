@@ -74,6 +74,92 @@ jobs:
           Get-FileHash "$stage/libssl-1_1-x64.dll" -Algorithm SHA256
           Get-ChildItem $stage
 
+      - name: Build pinned libcodecs ALAC/addons x64 prerequisites
+        if: github.ref == 'refs/heads/dev/msa-core-architecture'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pin = "3234c96680fbe9f45047936a14df10edca822e5e"
+          $src = "target/vendor/libcodecs-x64"
+          $stage = "target/vendor/libcodecs-x64-stage"
+
+          if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+
+          git clone --filter=blob:none https://github.com/Philippe44/libcodecs.git $src
+          git -C $src checkout $pin
+          git -C $src submodule update --init alac flac faac shine
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe |
+            Select-Object -First 1
+          if (-not $msbuild) { throw "MSBuild not found" }
+
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $stageAbs = (Resolve-Path $stage).Path + "\"
+
+          & $msbuild "$src/alac.vcxproj" /m /p:Configuration=Release /p:Platform=x64 /p:OutDir="$stageAbs" /p:TargetName=libalac
+          if ($LASTEXITCODE -ne 0) { throw "Pinned libcodecs ALAC x64 build failed" }
+
+          & $msbuild "$src/addons.vcxproj" /m /p:Configuration=Release /p:Platform=x64 /p:OutDir="$stageAbs" /p:TargetName=libaddons
+          if ($LASTEXITCODE -ne 0) { throw "Pinned libcodecs addons x64 build failed" }
+
+          foreach ($file in @("$stage/libalac.lib", "$stage/libaddons.lib")) {
+            if (-not (Test-Path $file)) { throw "Pinned libcodecs x64 output missing: $file" }
+            Get-FileHash $file -Algorithm SHA256
+          }
+
+          New-Item -ItemType Directory -Force -Path "$stage/include/alac" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stage/include/addons" | Out-Null
+          Copy-Item "$src/alac/codec/ALAC*.h" "$stage/include/alac" -Force
+          Copy-Item "$src/addons/*.h" "$stage/include/addons" -Force
+          Get-ChildItem $stage -Recurse
+
+      - name: Build pinned pthreads4w static x64 prerequisite
+        if: github.ref == 'refs/heads/dev/msa-core-architecture'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pin = "2ae750783281db5b5cd867649880b3b951ced781"
+          $src = "target/vendor/libpthreads4w-x64"
+          $build = "target/vendor/libpthreads4w-x64-build"
+          $stage = "target/vendor/libpthreads4w-x64-stage"
+
+          if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+          if (Test-Path $build) { Remove-Item -Recurse -Force $build }
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+
+          git clone --filter=blob:none https://github.com/philippe44/libpthreads4w.git $src
+          git -C $src checkout $pin
+
+          $cmakeHelp = cmake --help | Out-String
+          $vsGenerators = [regex]::Matches(
+            $cmakeHelp,
+            '(?m)^\*?\s*(Visual Studio \d+ \d{4})'
+          ) | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+          $vsGenerator = $vsGenerators |
+            Sort-Object { [int]([regex]::Match($_, 'Visual Studio (\d+)').Groups[1].Value) } -Descending |
+            Select-Object -First 1
+          if (-not $vsGenerator) { throw "No Visual Studio CMake generator found" }
+
+          cmake -S $src -B $build -G $vsGenerator -A x64 -DBUILD_TESTING=OFF -DPTHREADS4W_BUILD_C=ON -DPTHREADS4W_BUILD_CE=OFF -DPTHREADS4W_BUILD_SE=OFF
+          if ($LASTEXITCODE -ne 0) { throw "Pinned pthreads4w x64 configure failed" }
+
+          cmake --build $build --config Release --target pthreadVC-static
+          if ($LASTEXITCODE -ne 0) { throw "Pinned pthreads4w static x64 build failed" }
+
+          $staticLib = Get-ChildItem $build -Recurse -File -Filter "libpthread*.lib" |
+            Select-Object -First 1
+          if (-not $staticLib) { throw "Pinned pthreads4w static x64 library missing" }
+
+          New-Item -ItemType Directory -Force -Path "$stage/include" | Out-Null
+          Copy-Item $staticLib.FullName "$stage/libpthread-static.lib" -Force
+          Copy-Item "$src/pthread.h" "$stage/include/pthread.h" -Force
+          Copy-Item "$src/sched.h" "$stage/include/sched.h" -Force
+
+          Get-FileHash "$stage/libpthread-static.lib" -Algorithm SHA256
+          Get-ChildItem $stage -Recurse
+
       # The active MSA Core branch owns native AP2 + the Rust RAOP adapter.
       # For 16-bit hardware regression it does not need either historical
       # cliraop helper or the 24-bit external ALAC bridge. Keep this lane short
