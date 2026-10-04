@@ -74,7 +74,7 @@ jobs:
           Get-FileHash "$stage/libssl-1_1-x64.dll" -Algorithm SHA256
           Get-ChildItem $stage
 
-      - name: Build pinned libcodecs ALAC/addons x64 prerequisites
+      - name: Build pinned libcodecs ALAC wrapper x64 prerequisite
         if: github.ref == 'refs/heads/dev/msa-core-architecture'
         shell: pwsh
         run: |
@@ -88,12 +88,18 @@ jobs:
 
           git clone --filter=blob:none https://github.com/Philippe44/libcodecs.git $src
           git -C $src checkout $pin
-          git -C $src submodule update --init alac flac faac shine
+          git -C $src submodule update --init alac
 
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe |
             Select-Object -First 1
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
+            Select-Object -First 1
           if (-not $msbuild) { throw "MSBuild not found" }
+          if (-not $vs) { throw "Visual Studio x64 C++ toolchain not found" }
+
+          $vcvars64 = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars64)) { throw "vcvars64.bat not found" }
 
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           $stageAbs = (Resolve-Path $stage).Path + "\"
@@ -101,18 +107,23 @@ jobs:
           & $msbuild "$src/alac.vcxproj" /m /p:Configuration=Release /p:Platform=x64 /p:OutDir="$stageAbs" /p:TargetName=libalac
           if ($LASTEXITCODE -ne 0) { throw "Pinned libcodecs ALAC x64 build failed" }
 
-          & $msbuild "$src/addons.vcxproj" /m /p:Configuration=Release /p:Platform=x64 /p:OutDir="$stageAbs" /p:TargetName=libaddons
-          if ($LASTEXITCODE -ne 0) { throw "Pinned libcodecs addons x64 build failed" }
+          $alacInclude = (Resolve-Path "$src/alac/codec").Path
+          $wrapper = (Resolve-Path "$src/addons/alac_wrapper.cpp").Path
+          $wrapperObj = Join-Path (Resolve-Path $stage).Path "alac_wrapper.obj"
+          $wrapperLib = Join-Path (Resolve-Path $stage).Path "libalac-wrapper.lib"
+          $cmd = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /EHsc /I`"$alacInclude`" /Fo`"$wrapperObj`" `"$wrapper`" && lib.exe /nologo /OUT:`"$wrapperLib`" `"$wrapperObj`""
+          & cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "Pinned ALAC wrapper x64 build failed" }
 
-          foreach ($file in @("$stage/libalac.lib", "$stage/libaddons.lib")) {
-            if (-not (Test-Path $file)) { throw "Pinned libcodecs x64 output missing: $file" }
+          foreach ($file in @("$stage/libalac.lib", "$stage/libalac-wrapper.lib")) {
+            if (-not (Test-Path $file)) { throw "Pinned ALAC x64 output missing: $file" }
             Get-FileHash $file -Algorithm SHA256
           }
 
           New-Item -ItemType Directory -Force -Path "$stage/include/alac" | Out-Null
           New-Item -ItemType Directory -Force -Path "$stage/include/addons" | Out-Null
           Copy-Item "$src/alac/codec/ALAC*.h" "$stage/include/alac" -Force
-          Copy-Item "$src/addons/*.h" "$stage/include/addons" -Force
+          Copy-Item "$src/addons/alac_wrapper.h" "$stage/include/addons/alac_wrapper.h" -Force
           Get-ChildItem $stage -Recurse
 
       - name: Build pinned pthreads4w static x64 prerequisite
