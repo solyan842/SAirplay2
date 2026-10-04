@@ -5,13 +5,11 @@ on:
     branches: ["dev/msa-core-architecture"]
     paths:
       - "crates/sairplay-msa-solo/**"
-      - "scripts/apply-validated-branch-fixes.ps1"
       - "scripts/verify-buffered-resume-invariants.ps1"
       - ".github/workflows/msa-buffered-resume-invariants.yml"
   pull_request:
     paths:
       - "crates/sairplay-msa-solo/**"
-      - "scripts/apply-validated-branch-fixes.ps1"
       - "scripts/verify-buffered-resume-invariants.ps1"
       - ".github/workflows/msa-buffered-resume-invariants.yml"
 
@@ -24,9 +22,6 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Apply validated branch fixes
-        shell: pwsh
-        run: ./scripts/apply-validated-branch-fixes.ps1
       - name: Verify field-proven buffered resume invariants
         shell: pwsh
         run: ./scripts/verify-buffered-resume-invariants.ps1
