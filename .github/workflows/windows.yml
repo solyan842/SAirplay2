@@ -166,6 +166,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$stage/include" | Out-Null
           Copy-Item $staticLib.FullName "$stage/libpthread-static.lib" -Force
           Copy-Item "$src/pthread.h" "$stage/include/pthread.h" -Force
+          Copy-Item "$src/_ptw32.h" "$stage/include/_ptw32.h" -Force
           Copy-Item "$src/sched.h" "$stage/include/sched.h" -Force
           Copy-Item "$src/semaphore.h" "$stage/include/semaphore.h" -Force
 
@@ -257,7 +258,6 @@ jobs:
           Copy-Item "$src/crosstools/src/cross_ssl.h" "$stage/include/cross_ssl.h" -Force
           Copy-Item "$src/crosstools/src/cross_log.h" "$stage/include/cross_log.h" -Force
           Copy-Item "$src/crosstools/src/cross_util.h" "$stage/include/cross_util.h" -Force
-
           Get-FileHash $lib -Algorithm SHA256
           Get-ChildItem $stage -Recurse
 
