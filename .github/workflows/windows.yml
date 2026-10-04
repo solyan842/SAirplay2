@@ -26,6 +26,54 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Build pinned OpenSSL x64 prerequisite
+        if: github.ref == 'refs/heads/dev/msa-core-architecture'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pin = "ac74d79efc7a702386fcf00d4b7e0a785721a3ed"
+          $src = "target/vendor/libopenssl-x64"
+          $stage = "target/vendor/libopenssl-x64-stage"
+
+          if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+
+          git clone --filter=blob:none https://github.com/Philippe44/libopenssl.git $src
+          git -C $src checkout $pin
+          git -C $src submodule update --init openssl
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
+            Select-Object -First 1
+          if (-not $vs) { throw "Visual Studio x64 C++ toolchain not found" }
+
+          $vcvars64 = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars64)) { throw "vcvars64.bat not found" }
+
+          $openssl = (Resolve-Path "$src/openssl").Path
+          $cmd = "call `"$vcvars64`" && cd /d `"$openssl`" && perl Configure shared VC-WIN64A && nmake"
+          & cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "Pinned OpenSSL x64 build failed" }
+
+          $cryptoDll = Join-Path $openssl "libcrypto-1_1-x64.dll"
+          $sslDll = Join-Path $openssl "libssl-1_1-x64.dll"
+          $cryptoLib = Join-Path $openssl "libcrypto.lib"
+          $sslLib = Join-Path $openssl "libssl.lib"
+          foreach ($file in @($cryptoDll, $sslDll, $cryptoLib, $sslLib)) {
+            if (-not (Test-Path $file)) { throw "Pinned OpenSSL x64 output missing: $file" }
+          }
+
+          New-Item -ItemType Directory -Force -Path "$stage/include" | Out-Null
+          Copy-Item "$openssl/include/openssl" "$stage/include/openssl" -Recurse -Force
+          Copy-Item $cryptoDll $stage -Force
+          Copy-Item $sslDll $stage -Force
+          Copy-Item $cryptoLib $stage -Force
+          Copy-Item $sslLib $stage -Force
+
+          Get-FileHash "$stage/libcrypto-1_1-x64.dll" -Algorithm SHA256
+          Get-FileHash "$stage/libssl-1_1-x64.dll" -Algorithm SHA256
+          Get-ChildItem $stage
+
       # The active MSA Core branch owns native AP2 + the Rust RAOP adapter.
       # For 16-bit hardware regression it does not need either historical
       # cliraop helper or the 24-bit external ALAC bridge. Keep this lane short
