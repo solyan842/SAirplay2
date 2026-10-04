@@ -178,6 +178,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $pin = "81c2182649da8645ac2a58b78e9f370c79a4165b"
+          $dmapPin = "2f8ee61e2427a177beea919d72dde8931084fe51"
           $src = "target/vendor/libraop-client-x64"
           $stage = "target/vendor/libraop-client-x64-stage"
           $obj = "$stage/obj"
@@ -187,7 +188,9 @@ jobs:
 
           git clone --filter=blob:none https://github.com/philippe44/libraop.git $src
           git -C $src checkout $pin
-          git -C $src submodule update --init crosstools
+          git -C $src submodule update --init crosstools dmap-parser
+          $dmapHead = (git -C "$src/dmap-parser" rev-parse HEAD).Trim()
+          if ($dmapHead -ne $dmapPin) { throw "Pinned dmap-parser mismatch: $dmapHead" }
 
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
@@ -206,17 +209,22 @@ jobs:
           $includes = @(
             (Join-Path $srcAbs "src"),
             (Join-Path $srcAbs "crosstools/src"),
+            (Join-Path $srcAbs "dmap-parser"),
             $opensslInclude,
             $pthreadInclude,
             $alacWrapperInclude
           )
           $includeArgs = ($includes | ForEach-Object { "/I`"$_`"" }) -join " "
 
+          # Match the sender-side source set used by pinned MSA instead of
+          # guessing a smaller libraop subset.
           $sources = @(
             (Join-Path $srcAbs "src/raop_client.c"),
             (Join-Path $srcAbs "src/rtsp_client.c"),
             (Join-Path $srcAbs "src/aes.c"),
             (Join-Path $srcAbs "src/aes_ctr.c"),
+            (Join-Path $srcAbs "src/alac.c"),
+            (Join-Path $srcAbs "dmap-parser/dmap_parser.c"),
             (Join-Path $srcAbs "crosstools/src/cross_log.c"),
             (Join-Path $srcAbs "crosstools/src/cross_net.c"),
             (Join-Path $srcAbs "crosstools/src/cross_ssl.c"),
