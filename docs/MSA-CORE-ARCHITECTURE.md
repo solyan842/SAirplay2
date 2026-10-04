@@ -14,7 +14,8 @@ and current hardware evidence.
 
 ## Goal
 
-SAirplay2 must converge on one source of truth for AirPlay transport:
+SAirplay2 converges on one receiver architecture and one application process while
+keeping the protocol contracts separate exactly as pinned Music Assistant does:
 
 ```text
 Discovery + Capability
@@ -22,46 +23,88 @@ Discovery + Capability
 Route Policy
         |
 Session Coordinator
-  Single / Pair / MultiRoom
+ Single / Stereo Pair / MultiRoom
         |
 MSA Receiver Core
- control / timing / media
-        |
-Windows PCM Hub
+   |                         |
+   +-- Native AP2 Core       +-- RAOP Adapter
+   |   HAP / encrypted RTSP  |   pinned libraop
+   |   PTP / NTP             |   RAOP / AirPlay 1
+   |   Type 96 / Type 103    |   AP2 RAOP-compat
+   |   RTP / RTX / pacing    |   NTP / RAOP lifecycle
+   |   ALAC / crypto         |
+   |                         |
+   +------------+------------+
+                |
+        Windows PCM Hub
 ```
 
-Legacy AirPlay 1 / RAOP stays a separate pinned-libraop adapter.
+**Binary rule:** Native AP2 and RAOP are separate transport contracts inside the
+same `SAirplay2.exe`. Protocol separation does not imply a separate helper process.
+The target RAOP implementation is pinned libraop linked in-process through a thin
+C ABI/FFI boundary. `cliraop.exe` and `cliraop-msa-solo.exe` are historical CLI
+wrappers, not part of the target runtime architecture.
 
-## Non-negotiable migration rule
+This follows pinned `music-assistant/airplay-cli`: one unified owner resolves the
+route, then dispatches to native AP2 or libraop-backed RAOP. SAirplay2 must preserve
+that split instead of treating RAOP as an old/legacy engine.
 
-This branch does **not** merge the old native engine with MSA SOLO/Core.
+## Naming lock
 
-The old engine is a source of:
-- discovery/catalog/UI integration;
-- group-orchestration requirements;
-- hardware evidence and acceptance tests.
+Use these names for new MSA Core work:
 
-The MSA-derived implementation is the only implementation source for:
+- **MSA Receiver Core** — common receiver/session facade and route ownership.
+- **Native AP2 Core** — native AirPlay 2 transport implementation.
+- **RAOP Adapter** — AirPlay 1 / RAOP and MSA-selected AirPlay 2 RAOP-compat transport.
+- **Session Coordinator** — Single / Stereo Pair / MultiRoom orchestration only.
+- **Windows PCM Hub** — Windows capture, format conversion/resampling and bounded PCM fan-out.
+
+`LegacyGroupSession`, `LegacyMemberConfig` and `LegacyVolumeControl` are historical
+names in the old integration. When their responsibility is migrated, use
+`RaopGroupSession`, `RaopMemberConfig` and `RaopVolumeControl`. Do not perform a
+cosmetic rename before responsibility has actually moved.
+
+## Source-of-truth boundary
+
+Pinned references remain the authority:
+
+- `music-assistant/airplay-cli@431c5c582eef9307c4e39c50a0ea65e970bc1128`
+- `music-assistant/server@f09136859e240fc7859160e186c2e2186e917715`
+- MSA libraop submodule `81c2182649da8645ac2a58b78e9f370c79a4165b`
+
+The comparison/current libraop pin is not allowed to replace the MSA pin in the
+new RAOP Adapter.
+
+The MSA-derived implementation owns:
+
+- route resolution between Native AP2, RAOP and AP2 RAOP-compat;
 - HAP / encrypted RTSP;
 - PTP / NTP behavior;
 - START / PAUSE / PLAY / FLUSH / STANDBY / STOP lifecycle;
-- realtime type 96 and buffered type 103;
+- realtime Type-96 and buffered Type-103;
+- RAOP/libraop timing and lifecycle when the route is RAOP;
 - ALAC / crypto;
 - pacing / recovery;
 - RTX / feedback;
-- metadata / MRP transport semantics.
+- metadata / transport semantics.
 
-Windows-specific code may adapt capture and lifecycle signals to that contract
-but may not invent a second transport contract.
+Windows-specific code may adapt capture and lifecycle signals to that contract,
+but it must not invent a second AirPlay protocol contract. RAOP's private clock
+and lifecycle must never leak into Native AP2.
 
 ## Phase 1 — receiver facade
 
-Introduce a neutral receiver-level facade over the hardware-validated SOLO
-transport. Single playback uses this facade first.
+A neutral receiver-level facade owns one route decision and dispatches to the
+appropriate transport. Single playback migrates first.
 
-**Behavioral requirement:** zero wire change. Diagnostics may retain the
-`MSA SOLO` wording during migration so new builds can be compared directly
-with validated checkpoints.
+The current `WindowsMsaSoloClient` already has the correct shape: one input config
+resolves to `AirPlay2Native`, `Raop` or `AirPlay2Compat`. The remaining RAOP debt
+is below that facade: the Windows RAOP session still spawns a helper process.
+
+**Current implementation task:** replace that helper backend with an in-process,
+64-bit, static pinned-libraop adapter without changing the route/lifecycle contract.
+RAOP-only Single receivers must enter the same MSA Receiver facade even when they
+advertise only `_raop._tcp` and no `_airplay._tcp` service.
 
 ## Phase 2 — one Windows PCM hub
 
@@ -80,10 +123,10 @@ receiver receiver receiver
 The producer must never block on AirPlay network I/O. SILENT PCM remains valid
 PCM. Capture absence is an adapter signal, not protocol EOF.
 
-### Current validated Buffered idle/resume adapter
+### Field-proven Buffered idle/resume adapter
 
-Real Naim Mu-so Qb 16/44.1 hardware testing on 2026-10-03 established the
-current field-proven Windows adapter path:
+Real Naim Mu-so Qb 16/44.1 hardware testing established the field-proven Windows
+adapter path:
 
 ```text
 capture idle >= 500 ms
@@ -95,37 +138,14 @@ capture idle >= 500 ms
 ```
 
 Baseline commit: `57756a04d58b66a1732fd87badacf06aea31e8fb`.
-
-The tested Naim negotiated ~2000 ms lead and resumed at ~1.99 s pacing headroom
-on repeated cycles, with smooth audible playback. Do not replace this with the
-failed inferred in-place rate-0/rate-1 resume path.
-
-CI regression locks were added in:
-- `0ae8270984a92fbe607c23fdf6e8ff0261198374`;
-- `b3e895f37071cbd34c126b216ee0182de1f7fcee`.
-
-## Active consolidation step
-
-Before adding more transport behavior, migrate the already validated
-`windows_audio_worker.rs` runtime replacements out of
-`scripts/apply-validated-branch-fixes.ps1` and into committed Rust source.
-
-This consolidation must be **zero behavior change**. It exists only so:
-- GitHub source;
-- local builds;
-- CI builds;
-- field-tested artifacts
-
-all execute the same code without a hidden runtime source rewrite.
-
-Unrelated GUI runtime replacements may remain temporarily and are migrated
-separately.
+Do not replace this with the failed inferred in-place rate-0/rate-1 resume path.
 
 ## Phase 3 — coordinator-owned grouping
 
 Stereo Pair and MultiRoom become coordination layers over receiver sessions.
 
 Coordinator owns only:
+
 - membership;
 - one shared capture source;
 - shared group timing/START planning;
@@ -134,47 +154,39 @@ Coordinator owns only:
 - group-level format planning.
 
 Receiver Core continues to own every receiver's protocol lifecycle and media
-transport. No group-specific RTP/ALAC/PTP implementation is allowed.
+transport. No group-specific RTP/ALAC/PTP/RAOP implementation is allowed.
+Mixed Native AP2 + RAOP grouping is not enabled until the Session Coordinator has
+a proven shared cross-transport timeline.
 
-## Phase 4 — retire duplicate native transport
+## Phase 4 — retire duplicate transport integration
 
 Only after Single, Pair, MultiRoom and hardware gates pass on MSA Core:
+
 - remove old native Single sender;
 - remove old native Pair/MultiRoom transport duplication;
-- keep discovery/catalog/GUI pieces that remain useful;
-- keep legacy RAOP isolated.
+- remove helper-process RAOP integration after in-process RAOP hardware parity;
+- keep discovery/catalog/GUI pieces that remain useful.
 
 ## Hardware gates
 
 Current order is intentional:
 
-1. Naim Buffered 16/44.1 lifecycle regression around the validated baseline;
-2. HomePod 16/44.1 regression;
-3. Apple TV 16/44.1 regression;
-4. AirPort explicit RAOP path kept separate;
-5. lock the 16-bit matrix;
-6. then resume 24-bit work;
-7. then Stereo Pair;
-8. then MultiRoom.
-
-Broader migration must preserve or improve:
-- HomePod 16/44.1 realtime;
-- HomePod 24/48 opt-in realtime when that phase resumes;
-- Naim route/lifecycle selected by current evidence;
-- pause / long source-idle / resume;
-- clean Stop;
-- Stereo Pair;
-- MultiRoom member failure and rejoin;
-- AirPort explicit RAOP path.
+1. **locked:** Naim Native AP2 / PTP / Buffered Type-103 / 16/44.1;
+2. **locked:** HomePod Native AP2 / PTP / Realtime Type-96 / 16/44.1;
+3. **locked:** Apple TV5,3 Native AP2 / PTP / Realtime Type-96 / 16/44.1;
+4. **locked:** AirPort10,115 Native AP2 / PTP / Buffered Type-103 / 16/44.1;
+5. **open:** true RAOP-only Single receiver (`SolYan-Airplay` / N1000-SOtM) through the in-process RAOP Adapter;
+6. lock the complete 16-bit Single-receiver matrix only after that RAOP gate passes hardware;
+7. then resume 24-bit work;
+8. then migrate Stereo Pair and MultiRoom above the proven receiver core.
 
 CI PASS is not hardware PASS.
 
 ## Cleanup rule
 
-Do not rename/reorganize the MSA transport internals merely to reduce file
-count. First remove duplicate *responsibility*. File cleanup comes only after
-hardware parity.
+Do not rename/reorganize transport internals merely to reduce file count. First
+remove duplicate responsibility and prove hardware parity. File/name cleanup comes
+after the new owner is real.
 
-Do not move to 24-bit merely because one 16-bit device is now stable. First
-finish source consolidation and cross-device 16-bit regression so the MSA Core
-baseline cannot silently drift.
+Do not move to 24-bit merely because the Native AP2 16-bit lanes are stable. The
+true RAOP-only Single lane is part of the 16-bit core gate and must pass first.
