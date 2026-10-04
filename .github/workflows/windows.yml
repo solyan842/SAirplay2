@@ -9,9 +9,6 @@ on:
     paths-ignore:
       - "docs/**"
 
-permissions:
-  contents: write
-
 concurrency:
   group: sairplay2-${{ github.ref }}
   cancel-in-progress: true
@@ -23,6 +20,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Apply validated branch fixes
+        if: github.ref != 'refs/heads/dev/msa-core-architecture'
         shell: pwsh
         run: ./scripts/apply-validated-branch-fixes.ps1
 
