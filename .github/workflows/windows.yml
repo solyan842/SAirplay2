@@ -237,7 +237,7 @@ jobs:
           foreach ($source in $sources) {
             if (-not (Test-Path $source)) { throw "Pinned libraop client source missing: $source" }
             $objPath = Join-Path $objAbs (([IO.Path]::GetFileNameWithoutExtension($source)) + ".obj")
-            $cmd = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /DNDEBUG /DWIN32 /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /D_CRT_NONSTDC_NO_DEPRECATE /DOPENSSL_SUPPRESS_DEPRECATED $includeArgs /Fo`"$objPath`" `"$source`""
+            $cmd = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /std:c11 /DNDEBUG /DWIN32 /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /D_CRT_NONSTDC_NO_DEPRECATE /DOPENSSL_SUPPRESS_DEPRECATED $includeArgs /Fo`"$objPath`" `"$source`""
             & cmd.exe /d /s /c $cmd
             if ($LASTEXITCODE -ne 0) { throw "Pinned libraop client x64 compile failed: $source" }
             $objects += $objPath
