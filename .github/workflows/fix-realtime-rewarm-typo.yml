@@ -1,0 +1,48 @@
+name: Fix realtime rewarm typo
+
+on:
+  push:
+    branches: [dev/msa-core-architecture]
+    paths:
+      - ".github/workflows/fix-realtime-rewarm-typo.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  fix-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Fix typo and test MSA Core
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "crates/sairplay-msa-solo/src/windows_audio_worker.rs"
+          $text = [System.IO.File]::ReadAllText($path)
+          $old = "capture_seen = capture_generation;"
+          $new = "capture_frame_seen = capture_generation;"
+          $count = ([regex]::Matches($text, [regex]::Escape($old))).Count
+          if ($count -ne 1) { throw "expected exactly one typo, found $count" }
+          $text = $text.Replace($old, $new)
+          [System.IO.File]::WriteAllText($path, $text, [System.Text.UTF8Encoding]::new($false))
+
+          cargo test -p sairplay-msa-solo --all-targets
+          if ($LASTEXITCODE -ne 0) { throw "MSA Core tests failed" }
+
+          git diff --check -- $path
+          if ($LASTEXITCODE -ne 0) { throw "git diff --check failed" }
+          git diff -- $path
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add $path
+          git commit -m "fix: correct realtime resume capture generation state"
+          if ($LASTEXITCODE -ne 0) { throw "source fix commit failed" }
+          git push origin HEAD:dev/msa-core-architecture
+          if ($LASTEXITCODE -ne 0) { throw "source fix push failed" }
