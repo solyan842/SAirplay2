@@ -1,0 +1,257 @@
+name: Patch realtime resume rewarm
+
+on:
+  push:
+    branches: [dev/msa-core-architecture]
+    paths:
+      - ".github/workflows/patch-realtime-resume-rewarm.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch committed MSA Core source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "crates/sairplay-msa-solo/src/windows_audio_worker.rs"
+          $text = [System.IO.File]::ReadAllText($path)
+
+          function Replace-Exact([string]$Old, [string]$New, [int]$ExpectedCount = 1) {
+              $script:text = $script:text
+              $count = ([regex]::Matches($script:text, [regex]::Escape($Old))).Count
+              if ($count -ne $ExpectedCount) {
+                  throw "$path: expected $ExpectedCount exact match(es), found $count"
+              }
+              $script:text = $script:text.Replace($Old, $New)
+          }
+
+          Replace-Exact @'
+          fn buffered_capture_idle_should_park(
+              source_present: bool,
+              idle_for: Duration,
+              is_buffered: bool,
+              state: Ap2State,
+              content_paused: bool,
+              content_stopped: bool,
+          ) -> bool {
+              source_present
+                  && is_buffered
+                  && state == Ap2State::Streaming
+                  && !content_paused
+                  && !content_stopped
+                  && idle_for >= BUFFERED_CAPTURE_IDLE_PARK_INTERVAL
+          }
+          '@ @'
+          fn buffered_capture_idle_should_park(
+              source_present: bool,
+              idle_for: Duration,
+              is_buffered: bool,
+              state: Ap2State,
+              content_paused: bool,
+              content_stopped: bool,
+          ) -> bool {
+              source_present
+                  && is_buffered
+                  && state == Ap2State::Streaming
+                  && !content_paused
+                  && !content_stopped
+                  && idle_for >= BUFFERED_CAPTURE_IDLE_PARK_INTERVAL
+          }
+
+          fn realtime_capture_resume_should_rewarm(
+              source_present: bool,
+              capture_edge: bool,
+              non_silent_edge: bool,
+              idle_for: Duration,
+              is_buffered: bool,
+              state: Ap2State,
+              splice_timeline: bool,
+          ) -> bool {
+              source_present
+                  && capture_edge
+                  && non_silent_edge
+                  && idle_for >= STARVATION_RECOVERY_INTERVAL
+                  && !is_buffered
+                  && state == Ap2State::Streaming
+                  && splice_timeline
+          }
+          '@
+
+          Replace-Exact @'
+                          let capture_generation =
+                              pcm_hub_thread.capture_frame_generation();
+                          if capture_generation != capture_frame_seen {
+                              capture_frame_seen = capture_generation;
+                              last_capture_frame_at = Instant::now();
+                          }
+          '@ @'
+                          let capture_generation =
+                              pcm_hub_thread.capture_frame_generation();
+                          let capture_edge = capture_generation != capture_frame_seen;
+                          let capture_idle_before_edge = last_capture_frame_at.elapsed();
+                          if capture_edge {
+                              capture_frame_seen = capture_generation;
+                              last_capture_frame_at = Instant::now();
+                          }
+          '@
+
+          Replace-Exact @'
+                          if non_silent_edge {
+                              non_silent_seen = non_silent_generation;
+                          }
+
+                          // A capture-idle park is resumed only after the producer
+          '@ @'
+                          if non_silent_edge {
+                              non_silent_seen = non_silent_generation;
+                          }
+
+                          // A long Windows capture gap can leave the realtime splice
+                          // wire alive on queued silence while the receiver head has
+                          // fallen below MSA's warm floor. If fresh non-silent PCM
+                          // returns at that exact low-head phase, sending content
+                          // immediately is under-buffered and the HomePod can stutter.
+                          // Reuse MSA's own realtime recover_input_gap at the source
+                          // edge; it is a no-op when the effective head is already
+                          // warm, so good long-idle resumes are left untouched.
+                          let realtime_resume_rewarmed = {
+                              let mut guard = match engine_thread.lock() {
+                                  Ok(v) => v,
+                                  Err(_) => {
+                                      if let Ok(mut slot) = error_thread.lock() {
+                                          *slot = Some("native SOLO engine mutex poisoned".into());
+                                      }
+                                      running_thread.store(false, Ordering::SeqCst);
+                                      return;
+                                  }
+                              };
+                              if realtime_capture_resume_should_rewarm(
+                                  pcm_hub_thread.source_present(),
+                                  capture_edge,
+                                  non_silent_edge,
+                                  capture_idle_before_edge,
+                                  guard.is_buffered(),
+                                  guard.runtime.state,
+                                  guard.runtime.splice_timeline,
+                              ) {
+                                  let now_ntp = match SourceNtp::from_system_time(SystemTime::now()) {
+                                      Ok(v) => v,
+                                      Err(_) => SourceNtp::ZERO,
+                                  };
+                                  let now_frame = now_ntp.to_frames(
+                                      guard.runtime.media.timeline.sample_rate,
+                                  );
+                                  match guard.ready.timing_owner.sync_timing() {
+                                      Ok(timing) => {
+                                          let engine = &mut *guard;
+                                          engine.runtime.recover_input_gap(
+                                              now_frame,
+                                              &mut engine.ready.media.io,
+                                              timing,
+                                          )
+                                      }
+                                      Err(_) => false,
+                                  }
+                              } else {
+                                  false
+                              }
+                          };
+                          if realtime_resume_rewarmed {
+                              if let Ok(mut events) = events_thread.lock() {
+                                  events.push(format!(
+                                      "MSA INPUT REALTIME source-resume rewarm: capture idle {}ms; MSA timeline silence queued before fresh PCM.",
+                                      capture_idle_before_edge.as_millis()
+                                  ));
+                              }
+                          }
+
+                          // A capture-idle park is resumed only after the producer
+          '@
+
+          Replace-Exact @'
+              #[test]
+              fn realtime_starvation_waits_for_first_source_packet() {
+                  let source_present = false;
+                  let ring_has_packet = false;
+                  assert!(!(source_present && !ring_has_packet));
+
+                  let source_present = true;
+                  assert!(source_present && !ring_has_packet);
+              }
+          '@ @'
+              #[test]
+              fn realtime_starvation_waits_for_first_source_packet() {
+                  let source_present = false;
+                  let ring_has_packet = false;
+                  assert!(!(source_present && !ring_has_packet));
+
+                  let source_present = true;
+                  assert!(source_present && !ring_has_packet);
+              }
+
+              #[test]
+              fn realtime_long_idle_resume_rewarms_only_splice_lane() {
+                  assert!(!realtime_capture_resume_should_rewarm(
+                      true,
+                      true,
+                      true,
+                      STARVATION_RECOVERY_INTERVAL - Duration::from_millis(1),
+                      false,
+                      Ap2State::Streaming,
+                      true,
+                  ));
+                  assert!(realtime_capture_resume_should_rewarm(
+                      true,
+                      true,
+                      true,
+                      STARVATION_RECOVERY_INTERVAL,
+                      false,
+                      Ap2State::Streaming,
+                      true,
+                  ));
+                  assert!(!realtime_capture_resume_should_rewarm(
+                      true,
+                      true,
+                      true,
+                      STARVATION_RECOVERY_INTERVAL,
+                      true,
+                      Ap2State::Streaming,
+                      true,
+                  ));
+                  assert!(!realtime_capture_resume_should_rewarm(
+                      true,
+                      true,
+                      false,
+                      STARVATION_RECOVERY_INTERVAL,
+                      false,
+                      Ap2State::Streaming,
+                      true,
+                  ));
+              }
+          '@
+
+          [System.IO.File]::WriteAllText(
+              $path,
+              $text,
+              [System.Text.UTF8Encoding]::new($false)
+          )
+
+          git diff --check -- $path
+          if ($LASTEXITCODE -ne 0) { throw "git diff --check failed" }
+          git diff -- $path
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add $path
+          git commit -m "fix: rewarm realtime splice on long-idle source resume"
+          if ($LASTEXITCODE -ne 0) { throw "source fix commit failed" }
+          git push origin HEAD:dev/msa-core-architecture
+          if ($LASTEXITCODE -ne 0) { throw "source fix push failed" }
