@@ -142,6 +142,7 @@ impl WindowsSoloAudioWorker {
                 .spawn(move || {
                     let mut starvation_started: Option<Instant> = None;
                     let mut last_starvation_recovery: Option<Instant> = None;
+                    let mut starvation_recovery_count: u64 = 0;
                     let mut deferred_audio_seen: Option<Instant> = None;
                     let mut local_flush_ack = pcm_hub_thread.flush_ack_generation();
                     let mut capture_frame_seen =
@@ -179,6 +180,7 @@ impl WindowsSoloAudioWorker {
                             local_flush_ack = ack;
                             starvation_started = None;
                             last_starvation_recovery = None;
+                            starvation_recovery_count = 0;
                             deferred_audio_seen = None;
                             capture_frame_seen =
                                 pcm_hub_thread.capture_frame_generation();
@@ -685,13 +687,82 @@ impl WindowsSoloAudioWorker {
                                 {
                                     None
                                 } else {
+                                    if starvation_started.is_some() {
+                                        let diag = guard.diagnostics();
+                                        let elapsed_ms = starvation_started
+                                            .map(|started| started.elapsed().as_millis())
+                                            .unwrap_or(0);
+                                        if let Ok(mut events) = events_thread.lock() {
+                                            events.push(format!(
+                                                "MSA INPUT REALTIME starvation-exit BEFORE first PCM: elapsed={}ms recoveries={} capture_idle={}ms state={:?} seq={} rtp={} head_frame={} pacing_ahead_frames={} splice_pad_frames={} reanchors={} shifted_frames={} ptp_anchor_valid={} ptp_wall0_ns={} ptp_pos0={} audio_sent={} audio_dropped={} sync_sent={} sync_dropped={} capture_gen={} non_silent_gen={} flush_gen={} flush_ack={}.",
+                                                elapsed_ms,
+                                                starvation_recovery_count,
+                                                last_capture_frame_at.elapsed().as_millis(),
+                                                diag.state,
+                                                diag.seq,
+                                                diag.rtp,
+                                                diag.head_frame,
+                                                diag.pacing_ahead_frames,
+                                                guard.runtime.splice_pad_frames,
+                                                guard.runtime.timeline_reanchors,
+                                                guard.runtime.reanchor_shifted_frames,
+                                                guard.runtime.ptp_anchor.valid,
+                                                guard.runtime.ptp_anchor.wall0_ns,
+                                                guard.runtime.ptp_anchor.pos0,
+                                                diag.audio_sent,
+                                                diag.audio_dropped,
+                                                diag.sync_sent,
+                                                diag.sync_dropped,
+                                                pcm_hub_thread.capture_frame_generation(),
+                                                pcm_hub_thread.non_silent_generation(),
+                                                pcm_hub_thread.flush_generation(),
+                                                pcm_hub_thread.flush_ack_generation(),
+                                            ));
+                                        }
+                                    }
                                     Some(guard.send_pcm_352(&packet))
                                 }
                             };
 
                             match sent {
                                 None => {}
-                                Some(Ok(SendResult::Sent | SendResult::Dropped)) => {
+                                Some(Ok(result @ (SendResult::Sent | SendResult::Dropped))) => {
+                                    if starvation_started.is_some() {
+                                        let elapsed_ms = starvation_started
+                                            .map(|started| started.elapsed().as_millis())
+                                            .unwrap_or(0);
+                                        if let Ok(guard) = engine_thread.lock() {
+                                            let diag = guard.diagnostics();
+                                            if let Ok(mut events) = events_thread.lock() {
+                                                events.push(format!(
+                                                    "MSA INPUT REALTIME starvation-exit AFTER first PCM: result={:?} elapsed={}ms recoveries={} capture_idle={}ms state={:?} seq={} rtp={} head_frame={} pacing_ahead_frames={} splice_pad_frames={} reanchors={} shifted_frames={} ptp_anchor_valid={} ptp_wall0_ns={} ptp_pos0={} audio_sent={} audio_dropped={} sync_sent={} sync_dropped={} capture_gen={} non_silent_gen={} flush_gen={} flush_ack={}.",
+                                                    result,
+                                                    elapsed_ms,
+                                                    starvation_recovery_count,
+                                                    last_capture_frame_at.elapsed().as_millis(),
+                                                    diag.state,
+                                                    diag.seq,
+                                                    diag.rtp,
+                                                    diag.head_frame,
+                                                    diag.pacing_ahead_frames,
+                                                    guard.runtime.splice_pad_frames,
+                                                    guard.runtime.timeline_reanchors,
+                                                    guard.runtime.reanchor_shifted_frames,
+                                                    guard.runtime.ptp_anchor.valid,
+                                                    guard.runtime.ptp_anchor.wall0_ns,
+                                                    guard.runtime.ptp_anchor.pos0,
+                                                    diag.audio_sent,
+                                                    diag.audio_dropped,
+                                                    diag.sync_sent,
+                                                    diag.sync_dropped,
+                                                    pcm_hub_thread.capture_frame_generation(),
+                                                    pcm_hub_thread.non_silent_generation(),
+                                                    pcm_hub_thread.flush_generation(),
+                                                    pcm_hub_thread.flush_ack_generation(),
+                                                ));
+                                            }
+                                        }
+                                    }
                                     if pad_frames != 0 {
                                         if let Ok(mut guard) = engine_thread.lock() {
                                             guard.runtime.take_splice_pad_frames(pad_frames);
@@ -699,6 +770,7 @@ impl WindowsSoloAudioWorker {
                                     }
                                     starvation_started = None;
                                     last_starvation_recovery = None;
+                                    starvation_recovery_count = 0;
                                 }
                                 Some(Ok(SendResult::Fatal)) => {
                                     if let Ok(mut slot) = error_thread.lock() {
@@ -776,11 +848,43 @@ impl WindowsSoloAudioWorker {
                                 };
                                 last_starvation_recovery = Some(Instant::now());
                                 if recovered {
+                                    starvation_recovery_count =
+                                        starvation_recovery_count.saturating_add(1);
+                                    if starvation_recovery_count == 1 {
+                                        if let Ok(guard) = engine_thread.lock() {
+                                            let diag = guard.diagnostics();
+                                            if let Ok(mut events) = events_thread.lock() {
+                                                events.push(format!(
+                                                    "MSA INPUT REALTIME starvation BEGIN: capture_idle={}ms state={:?} seq={} rtp={} head_frame={} pacing_ahead_frames={} splice_pad_frames={} reanchors={} shifted_frames={} ptp_anchor_valid={} ptp_wall0_ns={} ptp_pos0={} audio_sent={} audio_dropped={} sync_sent={} sync_dropped={} capture_gen={} non_silent_gen={} flush_gen={} flush_ack={}.",
+                                                    last_capture_frame_at.elapsed().as_millis(),
+                                                    diag.state,
+                                                    diag.seq,
+                                                    diag.rtp,
+                                                    diag.head_frame,
+                                                    diag.pacing_ahead_frames,
+                                                    guard.runtime.splice_pad_frames,
+                                                    guard.runtime.timeline_reanchors,
+                                                    guard.runtime.reanchor_shifted_frames,
+                                                    guard.runtime.ptp_anchor.valid,
+                                                    guard.runtime.ptp_anchor.wall0_ns,
+                                                    guard.runtime.ptp_anchor.pos0,
+                                                    diag.audio_sent,
+                                                    diag.audio_dropped,
+                                                    diag.sync_sent,
+                                                    diag.sync_dropped,
+                                                    pcm_hub_thread.capture_frame_generation(),
+                                                    pcm_hub_thread.non_silent_generation(),
+                                                    pcm_hub_thread.flush_generation(),
+                                                    pcm_hub_thread.flush_ack_generation(),
+                                                ));
+                                            }
+                                        }
+                                    }
                                     if let Ok(mut events) = events_thread.lock() {
-                                        events.push(
-                                            "WASAPI input starvation recovery queued timeline silence."
-                                                .into(),
-                                        );
+                                        events.push(format!(
+                                            "WASAPI input starvation recovery queued timeline silence · count={}.",
+                                            starvation_recovery_count
+                                        ));
                                     }
                                 }
                             }

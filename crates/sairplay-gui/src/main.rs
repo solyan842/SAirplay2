@@ -3286,7 +3286,7 @@ impl SairplayApp {
         const CARD_OUTER_H: f32 = 58.0;
         const CARD_INNER_H: f32 = 42.0;
         const CARD_GAP: f32 = 8.0;
-        const CARD_HORIZONTAL_MARGIN: f32 = 16.0;
+        const CARD_HORIZONTAL_MARGIN: f32 = 20.0;
 
         // Own one exact full-width row and split it geometrically into three
         // cards. Do not use horizontal() here: egui adds item_spacing between
@@ -3396,7 +3396,7 @@ impl SairplayApp {
                             }
                             ui.add_space(4.0);
 
-                            let volume_controls_w = (card_inner_w - 58.0).max(100.0);
+                            let volume_controls_w = (card_inner_w - 58.0 - ui.spacing().item_spacing.x).max(100.0);
                             ui.allocate_ui_with_layout(
                                 egui::vec2(volume_controls_w, CARD_INNER_H),
                                 egui::Layout::top_down(egui::Align::Min),
@@ -3665,8 +3665,7 @@ impl SairplayApp {
                         egui::Label::new(
                             egui::RichText::new(hint)
                                 .size(11.4)
-                                .italics()
-                                .color(UiTheme::blue()),
+                                .color(UiTheme::text_soft()),
                         )
                         .truncate(),
                     );
@@ -3910,6 +3909,7 @@ impl eframe::App for SairplayApp {
                 )
                     .max(286.0);
 
+                ui.spacing_mut().item_spacing.x = 14.0;
                 ui.columns(2, |columns| {
                     self.render_device_panel(
                         &mut columns[0],

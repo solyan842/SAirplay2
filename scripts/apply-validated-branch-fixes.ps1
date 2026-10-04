@@ -225,18 +225,7 @@ Replace-Exact $worker @'
 
 Write-Host "Validated branch fixes applied."
 git diff -- $gui $worker
-
-# BEGIN ONE-SHOT MSA-CORE SOURCE PROMOTION
-if ($env:GITHUB_ACTIONS -eq "true" -and $env:GITHUB_REF -eq "refs/heads/dev/msa-core-architecture") {
-    Write-Host "Promoting validated GUI + realtime diagnostics into committed source..."
-
-    # Self-remove the one-shot block before staging. The permanent script stays
-    # available for historical/full lanes, while MSA Core will stop invoking it
-    # after the workflow is switched by the connector.
-    $selfPath = $PSCommandPath
-    $selfText = [System.IO.File]::ReadAllText($selfPath)
-    $beginMarker = "# BEGIN ONE-SHOT MSA-CORE SOURCE PROMOTION"
-    $endMarker = "# END ONE-SHOT MSA-CORE SOURCE PROMOTION"
+"
     $beginIndex = $selfText.IndexOf($beginMarker, [System.StringComparison]::Ordinal)
     $endIndex = $selfText.IndexOf($endMarker, [System.StringComparison]::Ordinal)
     if ($beginIndex -lt 0 -or $endIndex -lt $beginIndex) {
