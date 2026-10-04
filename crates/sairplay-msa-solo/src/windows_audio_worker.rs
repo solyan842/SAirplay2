@@ -46,6 +46,25 @@ fn buffered_capture_idle_should_park(
         && idle_for >= BUFFERED_CAPTURE_IDLE_PARK_INTERVAL
 }
 
+
+fn realtime_capture_resume_should_rewarm(
+    source_present: bool,
+    capture_edge: bool,
+    non_silent_edge: bool,
+    idle_for: Duration,
+    is_buffered: bool,
+    state: Ap2State,
+    splice_timeline: bool,
+) -> bool {
+    source_present
+        && capture_edge
+        && non_silent_edge
+        && idle_for >= STARVATION_RECOVERY_INTERVAL
+        && !is_buffered
+        && state == Ap2State::Streaming
+        && splice_timeline
+}
+
 #[derive(Debug)]
 pub enum WindowsSoloAudioWorkerError {
     Capture(WasapiLoopbackError),
@@ -197,8 +216,10 @@ impl WindowsSoloAudioWorker {
 
                         let capture_generation =
                             pcm_hub_thread.capture_frame_generation();
-                        if capture_generation != capture_frame_seen {
-                            capture_frame_seen = capture_generation;
+                        let capture_edge = capture_generation != capture_frame_seen;
+                        let capture_idle_before_edge = last_capture_frame_at.elapsed();
+                        if capture_edge {
+                            capture_seen = capture_generation;
                             last_capture_frame_at = Instant::now();
                         }
 
@@ -207,6 +228,60 @@ impl WindowsSoloAudioWorker {
                         let non_silent_edge = non_silent_generation != non_silent_seen;
                         if non_silent_edge {
                             non_silent_seen = non_silent_generation;
+                        }
+
+                        // Windows has no explicit player PAUSE event. During a long realtime
+                        // capture gap MSA keeps the splice wire alive with silence. If fresh
+                        // non-silent PCM returns while that wire head is in its low phase,
+                        // re-run MSA's own input-gap recovery before consuming content. When
+                        // the effective head is already warm this is deliberately a no-op.
+                        let realtime_resume_rewarmed = {
+                            let mut guard = match engine_thread.lock() {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    if let Ok(mut slot) = error_thread.lock() {
+                                        *slot = Some("native SOLO engine mutex poisoned".into());
+                                    }
+                                    running_thread.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            };
+                            if realtime_capture_resume_should_rewarm(
+                                pcm_hub_thread.source_present(),
+                                capture_edge,
+                                non_silent_edge,
+                                capture_idle_before_edge,
+                                guard.is_buffered(),
+                                guard.runtime.state,
+                                guard.runtime.splice_timeline,
+                            ) {
+                                let now_ntp = match SourceNtp::from_system_time(SystemTime::now()) {
+                                    Ok(v) => v,
+                                    Err(_) => SourceNtp::ZERO,
+                                };
+                                let now_frame = now_ntp.to_frames(guard.runtime.media.timeline.sample_rate);
+                                match guard.ready.timing_owner.sync_timing() {
+                                    Ok(timing) => {
+                                        let engine = &mut *guard;
+                                        engine.runtime.recover_input_gap(
+                                            now_frame,
+                                            &mut engine.ready.media.io,
+                                            timing,
+                                        )
+                                    }
+                                    Err(_) => false,
+                                }
+                            } else {
+                                false
+                            }
+                        };
+                        if realtime_resume_rewarmed {
+                            if let Ok(mut events) = events_thread.lock() {
+                                events.push(format!(
+                                    "MSA INPUT REALTIME source-resume rewarm: capture idle {}ms; MSA timeline silence queued before fresh PCM.",
+                                    capture_idle_before_edge.as_millis()
+                                ));
+                            }
                         }
 
                         // A capture-idle park is resumed only after the producer
