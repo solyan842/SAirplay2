@@ -258,6 +258,7 @@ jobs:
           Copy-Item "$src/crosstools/src/cross_ssl.h" "$stage/include/cross_ssl.h" -Force
           Copy-Item "$src/crosstools/src/cross_log.h" "$stage/include/cross_log.h" -Force
           Copy-Item "$src/crosstools/src/cross_util.h" "$stage/include/cross_util.h" -Force
+
           Get-FileHash $lib -Algorithm SHA256
           Get-ChildItem $stage -Recurse
 
