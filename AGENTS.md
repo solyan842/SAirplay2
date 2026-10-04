@@ -12,7 +12,8 @@ Do not change unrelated files or subsystems.
 
 3. FAILED ACTION
 For a failed Action:
-run -> failed job -> full decoded job log -> Resource uri -> read/search full log.
+run -> failed job -> fetch_workflow_job_logs -> read result.content.
+If result.content is incomplete and the connector returns a Resource uri, use read_resource/find_in_resource to continue reading the full log.
 Find the first meaningful failure.
 No full log = no diagnosis and no code change.
 One failure = one evidence = one minimal fix.

@@ -1,64 +1,41 @@
 # GitHub Actions — Full Log Reading Procedure
 
-Locked: 2026-10-04
-
 ## Purpose
 
-Prevent future debugging from incorrectly concluding that a GitHub Actions log is missing, truncated, or unavailable when only the connector preview is incomplete.
+Use one reliable path for GitHub Actions logs without treating `Resource uri` as a mandatory step.
 
 ## Mandatory procedure
 
-For any GitHub Actions failure investigation, use this sequence:
+For any GitHub Actions failure investigation:
 
 1. Resolve the workflow **run ID**.
-2. Resolve the workflow **job ID** for the failed job.
-3. Fetch the decoded log for that **job ID**.
-4. If the connector returns a `Resource uri`, treat that resource as the canonical full decoded job log.
-5. Read/search the resource in pages or by exact error text until the relevant beginning, failure point, and end of the job are verified.
-6. Do **not** conclude that the log is incomplete merely because the first tool response shows only a preview.
+2. Use `fetch_workflow_run_jobs` to resolve the exact failed **job ID**.
+3. Use `fetch_workflow_job_logs` for that job ID.
+4. Read the returned **`result.content` directly** and verify the relevant beginning, first meaningful failure, and end of the job.
+5. Only if `result.content` is incomplete **and** the connector returns a `Resource uri`, use `read_resource` / `find_in_resource` to continue reading or searching the full log.
+6. If neither complete `result.content` nor a usable `Resource uri` is available, STOP and report the tooling blocker. Do not diagnose or patch from incomplete evidence.
 
 Canonical flow:
 
 ```text
-run ID -> job ID -> decoded job log -> Resource uri -> paged read/search
+run ID -> job ID -> fetch_workflow_job_logs -> result.content
 ```
 
-## Do not use as proof of missing logs
-
-The workflow-run archive endpoint:
+Fallback only when needed:
 
 ```text
-/actions/runs/{run_id}/logs
+incomplete result.content + Resource uri -> read_resource / find_in_resource
 ```
 
-may return an empty exposed `content` field through the connector even when the individual job log is available. Therefore an empty response from that endpoint is **not** proof that the Action log cannot be read.
+## Do not
 
-Likewise, a truncated-looking tool preview is only a preview unless the underlying resource itself has been exhausted.
-
-## Verification case
-
-Windows Action **#1414** on `dev/msa-core-architecture` verified this procedure.
-
-- commit: `2fc9360e25f6781d5be1a9b1359f1179097e0cbe`
-- workflow run ID: `37212625732`
-- failed build job ID: `111466710010`
-- decoded job log was readable from the runner-provisioning/startup section through the compile failure.
-- the actual failure was found inside the full resource:
-
-```text
-pthread.h(72): fatal error C1083: Cannot open include file: '_ptw32.h': No such file or directory
-```
-
-The later wrapper message:
-
-```text
-Pinned libraop client x64 compile failed
-```
-
-is secondary; future debugging must inspect the preceding compiler error from the full job resource.
+- Do not require a `Resource uri` when `result.content` already contains the full decoded job log.
+- Do not repeatedly rediscover tools instead of calling the required job-log function directly.
+- Do not treat the workflow-run archive endpoint `/actions/runs/{run_id}/logs` as proof that an individual job log is unavailable.
+- Do not diagnose an Action from metadata, a wrapper error, or a screenshot when the full decoded job log is available.
 
 ## Debugging invariant
 
-**Never diagnose an Action from metadata, a screenshot, a wrapper error, or the initial log preview when a decoded job-log resource is available. Read/search the full resource first.**
+**Read `result.content` first. `Resource uri` is a fallback, not a prerequisite.**
 
 This is a tooling/debugging rule only. It does not change runtime, transport, MSA, RAOP, AirPlay 2, GUI, or stable code.
