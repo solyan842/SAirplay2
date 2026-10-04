@@ -167,8 +167,90 @@ jobs:
           Copy-Item $staticLib.FullName "$stage/libpthread-static.lib" -Force
           Copy-Item "$src/pthread.h" "$stage/include/pthread.h" -Force
           Copy-Item "$src/sched.h" "$stage/include/sched.h" -Force
+          Copy-Item "$src/semaphore.h" "$stage/include/semaphore.h" -Force
 
           Get-FileHash "$stage/libpthread-static.lib" -Algorithm SHA256
+          Get-ChildItem $stage -Recurse
+
+      - name: Build pinned libraop client static x64 prerequisite
+        if: github.ref == 'refs/heads/dev/msa-core-architecture'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pin = "81c2182649da8645ac2a58b78e9f370c79a4165b"
+          $src = "target/vendor/libraop-client-x64"
+          $stage = "target/vendor/libraop-client-x64-stage"
+          $obj = "$stage/obj"
+
+          if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+
+          git clone --filter=blob:none https://github.com/philippe44/libraop.git $src
+          git -C $src checkout $pin
+          git -C $src submodule update --init crosstools
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
+            Select-Object -First 1
+          if (-not $vs) { throw "Visual Studio x64 C++ toolchain not found" }
+          $vcvars64 = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars64)) { throw "vcvars64.bat not found" }
+
+          $srcAbs = (Resolve-Path $src).Path
+          $stageAbs = (New-Item -ItemType Directory -Force -Path $stage).FullName
+          $objAbs = (New-Item -ItemType Directory -Force -Path $obj).FullName
+          $opensslInclude = (Resolve-Path "target/vendor/libopenssl-x64-stage/include").Path
+          $pthreadInclude = (Resolve-Path "target/vendor/libpthreads4w-x64-stage/include").Path
+          $alacWrapperInclude = (Resolve-Path "target/vendor/libcodecs-x64-stage/include/addons").Path
+
+          $includes = @(
+            (Join-Path $srcAbs "src"),
+            (Join-Path $srcAbs "crosstools/src"),
+            $opensslInclude,
+            $pthreadInclude,
+            $alacWrapperInclude
+          )
+          $includeArgs = ($includes | ForEach-Object { "/I`"$_`"" }) -join " "
+
+          $sources = @(
+            (Join-Path $srcAbs "src/raop_client.c"),
+            (Join-Path $srcAbs "src/rtsp_client.c"),
+            (Join-Path $srcAbs "src/aes.c"),
+            (Join-Path $srcAbs "src/aes_ctr.c"),
+            (Join-Path $srcAbs "crosstools/src/cross_log.c"),
+            (Join-Path $srcAbs "crosstools/src/cross_net.c"),
+            (Join-Path $srcAbs "crosstools/src/cross_ssl.c"),
+            (Join-Path $srcAbs "crosstools/src/cross_util.c"),
+            (Join-Path $srcAbs "crosstools/src/platform.c")
+          )
+
+          $objects = @()
+          foreach ($source in $sources) {
+            if (-not (Test-Path $source)) { throw "Pinned libraop client source missing: $source" }
+            $objPath = Join-Path $objAbs (([IO.Path]::GetFileNameWithoutExtension($source)) + ".obj")
+            $cmd = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /DNDEBUG /DWIN32 /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /D_CRT_NONSTDC_NO_DEPRECATE /DOPENSSL_SUPPRESS_DEPRECATED $includeArgs /Fo`"$objPath`" `"$source`""
+            & cmd.exe /d /s /c $cmd
+            if ($LASTEXITCODE -ne 0) { throw "Pinned libraop client x64 compile failed: $source" }
+            $objects += $objPath
+          }
+
+          $lib = Join-Path $stageAbs "libraop-client-x64.lib"
+          $objectArgs = ($objects | ForEach-Object { "`"$_`"" }) -join " "
+          $cmd = "call `"$vcvars64`" && lib.exe /nologo /OUT:`"$lib`" $objectArgs"
+          & cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "Pinned libraop client static x64 archive failed" }
+          if (-not (Test-Path $lib)) { throw "Pinned libraop client static x64 library missing" }
+
+          New-Item -ItemType Directory -Force -Path "$stage/include" | Out-Null
+          Copy-Item "$src/src/raop_client.h" "$stage/include/raop_client.h" -Force
+          Copy-Item "$src/src/rtsp_client.h" "$stage/include/rtsp_client.h" -Force
+          Copy-Item "$src/crosstools/src/platform.h" "$stage/include/platform.h" -Force
+          Copy-Item "$src/crosstools/src/cross_net.h" "$stage/include/cross_net.h" -Force
+          Copy-Item "$src/crosstools/src/cross_ssl.h" "$stage/include/cross_ssl.h" -Force
+          Copy-Item "$src/crosstools/src/cross_log.h" "$stage/include/cross_log.h" -Force
+          Copy-Item "$src/crosstools/src/cross_util.h" "$stage/include/cross_util.h" -Force
+
+          Get-FileHash $lib -Algorithm SHA256
           Get-ChildItem $stage -Recurse
 
       # The active MSA Core branch owns native AP2 + the Rust RAOP adapter.
