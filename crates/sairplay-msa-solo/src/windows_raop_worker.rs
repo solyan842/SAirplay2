@@ -21,6 +21,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const RAOP_DIAG_SUMMARY_INTERVAL: Duration = Duration::from_secs(10);
+const RAOP_DIAG_STALL_THRESHOLD: Duration = Duration::from_millis(20);
 
 #[derive(Debug)]
 pub enum WindowsRaopWorkerError {
@@ -106,13 +108,42 @@ impl WindowsRaopAudioWorker {
         let running_w = Arc::clone(&running);
         let enabled_w = Arc::clone(&delivery_enabled);
         let gate_w = Arc::clone(&send_gate);
+        let hub_w = pcm_hub.clone();
         let ring_w = pcm_hub.ring();
         let error_w = Arc::clone(&last_error);
+        let events_w = Arc::clone(&startup_events);
+        let bytes_per_frame_w = audio_format.input_bytes_per_frame().max(1);
+        let sample_rate_w = audio_format.sample_rate.max(1) as usize;
         let writer_worker = match thread::Builder::new()
             .name("msa-raop-writer".into())
             .spawn(move || {
+                // Diagnostics are observation-only. They deliberately do not
+                // change queue sizing, pacing, START lead or libraop behavior.
+                let mut sent_packets_total = 0u64;
+                let mut starvation_events_total = 0u64;
+                let mut slow_writes_total = 0u64;
+                let mut last_summary = Instant::now();
+                let mut starvation_started: Option<Instant> = None;
+                let mut starvation_reported = false;
+                let mut last_send_done: Option<Instant> = None;
+                let mut max_starvation_ms = 0u128;
+                let mut max_write_ms = 0u128;
+                let mut max_send_gap_ms = 0u128;
+                let mut min_queue_frames = usize::MAX;
+                let mut max_queue_frames = 0usize;
+                let mut last_capture_generation = hub_w.capture_frame_generation();
+                let mut last_capture_progress = Instant::now();
+
                 while running_w.load(Ordering::SeqCst) {
+                    let capture_generation = hub_w.capture_frame_generation();
+                    if capture_generation != last_capture_generation {
+                        last_capture_generation = capture_generation;
+                        last_capture_progress = Instant::now();
+                    }
+
                     if !enabled_w.load(Ordering::SeqCst) {
+                        starvation_started = None;
+                        starvation_reported = false;
                         thread::sleep(Duration::from_millis(1));
                         continue;
                     }
@@ -120,6 +151,7 @@ impl WindowsRaopAudioWorker {
                     // The gate is the Windows equivalent of MSA's
                     // g_audio_send_lock: once a lifecycle command owns it, no
                     // old packet can enter libraop until that boundary ends.
+                    let gate_wait_started = Instant::now();
                     let _gate = match gate_w.lock() {
                         Ok(v) => v,
                         Err(_) => {
@@ -130,12 +162,25 @@ impl WindowsRaopAudioWorker {
                             break;
                         }
                     };
+                    let gate_wait = gate_wait_started.elapsed();
                     if !enabled_w.load(Ordering::SeqCst) {
                         continue;
                     }
+                    if gate_wait >= RAOP_DIAG_STALL_THRESHOLD {
+                        if let Ok(mut events) = events_w.lock() {
+                            events.push(format!(
+                                "MSA RAOP DIAG SEND-GATE stall={}ms capture_idle={}ms.",
+                                gate_wait.as_millis(),
+                                last_capture_progress.elapsed().as_millis(),
+                            ));
+                        }
+                    }
 
-                    let packet = match ring_w.lock() {
-                        Ok(mut ring) => ring.pop_packet(),
+                    let (packet, pending_before_bytes) = match ring_w.lock() {
+                        Ok(mut ring) => {
+                            let pending = ring.pending_bytes();
+                            (ring.pop_packet(), pending)
+                        }
                         Err(_) => {
                             if let Ok(mut slot) = error_w.lock() {
                                 *slot = Some("RAOP PCM ring mutex poisoned".into());
@@ -144,19 +189,109 @@ impl WindowsRaopAudioWorker {
                             break;
                         }
                     };
+                    let pending_before_frames = pending_before_bytes / bytes_per_frame_w;
+                    if hub_w.source_present() {
+                        min_queue_frames = min_queue_frames.min(pending_before_frames);
+                        max_queue_frames = max_queue_frames.max(pending_before_frames);
+                    }
 
                     let Some(packet) = packet else {
                         drop(_gate);
+                        if hub_w.source_present() {
+                            let started = starvation_started.get_or_insert_with(Instant::now);
+                            let empty_for = started.elapsed();
+                            max_starvation_ms = max_starvation_ms.max(empty_for.as_millis());
+                            if empty_for >= RAOP_DIAG_STALL_THRESHOLD && !starvation_reported {
+                                starvation_reported = true;
+                                starvation_events_total = starvation_events_total.saturating_add(1);
+                                if let Ok(mut events) = events_w.lock() {
+                                    events.push(format!(
+                                        "MSA RAOP DIAG PCM-STARVATION empty={}ms queue=0f capture_idle={}ms capture_gen={} events_total={}.",
+                                        empty_for.as_millis(),
+                                        last_capture_progress.elapsed().as_millis(),
+                                        last_capture_generation,
+                                        starvation_events_total,
+                                    ));
+                                }
+                            }
+                        } else {
+                            starvation_started = None;
+                            starvation_reported = false;
+                        }
                         thread::sleep(Duration::from_millis(1));
                         continue;
                     };
 
+                    if let Some(started) = starvation_started.take() {
+                        max_starvation_ms = max_starvation_ms.max(started.elapsed().as_millis());
+                    }
+                    starvation_reported = false;
+
+                    let write_started = Instant::now();
                     if let Err(e) = pcm_writer.write_packet(&packet) {
                         if let Ok(mut slot) = error_w.lock() {
                             *slot = Some(e.to_string());
                         }
                         running_w.store(false, Ordering::SeqCst);
                         break;
+                    }
+                    let write_elapsed = write_started.elapsed();
+                    let write_ms = write_elapsed.as_millis();
+                    max_write_ms = max_write_ms.max(write_ms);
+                    sent_packets_total = sent_packets_total.saturating_add(1);
+
+                    let send_done = Instant::now();
+                    if let Some(previous) = last_send_done.replace(send_done) {
+                        max_send_gap_ms = max_send_gap_ms.max(send_done.duration_since(previous).as_millis());
+                    }
+
+                    if write_elapsed >= RAOP_DIAG_STALL_THRESHOLD {
+                        slow_writes_total = slow_writes_total.saturating_add(1);
+                        let queue_ms = pending_before_frames.saturating_mul(1000) / sample_rate_w;
+                        if let Ok(mut events) = events_w.lock() {
+                            events.push(format!(
+                                "MSA RAOP DIAG WRITE-STALL write={}ms queue_before={}f/{}ms capture_idle={}ms capture_gen={} slow_total={}.",
+                                write_ms,
+                                pending_before_frames,
+                                queue_ms,
+                                last_capture_progress.elapsed().as_millis(),
+                                last_capture_generation,
+                                slow_writes_total,
+                            ));
+                        }
+                    }
+
+                    if last_summary.elapsed() >= RAOP_DIAG_SUMMARY_INTERVAL {
+                        let queue_ms = pending_before_frames.saturating_mul(1000) / sample_rate_w;
+                        let min_frames = if min_queue_frames == usize::MAX { 0 } else { min_queue_frames };
+                        let min_ms = min_frames.saturating_mul(1000) / sample_rate_w;
+                        let max_ms = max_queue_frames.saturating_mul(1000) / sample_rate_w;
+                        if let Ok(mut events) = events_w.lock() {
+                            events.push(format!(
+                                "MSA RAOP DIAG 10s sent_total={} queue_now={}f/{}ms queue_min={}f/{}ms queue_max={}f/{}ms starvation_total={} max_empty={}ms slow_write_total={} max_write={}ms max_send_gap={}ms capture_idle={}ms capture_gen={} source_present={}.",
+                                sent_packets_total,
+                                pending_before_frames,
+                                queue_ms,
+                                min_frames,
+                                min_ms,
+                                max_queue_frames,
+                                max_ms,
+                                starvation_events_total,
+                                max_starvation_ms,
+                                slow_writes_total,
+                                max_write_ms,
+                                max_send_gap_ms,
+                                last_capture_progress.elapsed().as_millis(),
+                                last_capture_generation,
+                                hub_w.source_present(),
+                            ));
+                        }
+                        last_summary = Instant::now();
+                        min_queue_frames = usize::MAX;
+                        max_queue_frames = 0;
+                        max_starvation_ms = 0;
+                        max_write_ms = 0;
+                        max_send_gap_ms = 0;
                     }
                 }
             }) {
@@ -207,6 +342,10 @@ impl WindowsRaopAudioWorker {
                 if let Ok(mut events) = startup_events.lock() {
                     events.push(
                         "MSA INPUT RAOP first-class lane: shared WindowsPcmSource + WindowsPcmHub active; transport remains pinned libraop."
+                            .into(),
+                    );
+                    events.push(
+                        "MSA RAOP DIAG active: observation-only queue/starvation/write-gap telemetry; transport parameters unchanged."
                             .into(),
                     );
                 }
