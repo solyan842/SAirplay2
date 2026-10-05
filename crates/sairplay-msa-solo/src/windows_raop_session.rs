@@ -152,6 +152,21 @@ struct SrRaopReady {
     sample_rate: u32,
     bit_depth: u16,
     channels: u16,
+    open_error_stage: u32,
+}
+
+fn inproc_open_stage_name(stage: u32) -> &'static str {
+    match stage {
+        1 => "config",
+        2 => "runtime-init",
+        3 => "resolve-ipv4",
+        4 => "bind-ip",
+        5 => "handle-alloc",
+        6 => "packed24-alloc",
+        7 => "raopcl-create",
+        8 => "raopcl-connect",
+        _ => "unknown",
+    }
 }
 
 type OpenFn = unsafe extern "C" fn(*const SrRaopConfig, *mut SrRaopReady) -> *mut c_void;
@@ -375,7 +390,20 @@ fn try_open_inproc(config: &MsaRaopConfig) -> Result<Option<(Arc<InprocCore>, Ms
     let mut ready = SrRaopReady::default();
     let raw = unsafe { (api.open)(&ffi, &mut ready) };
     if raw.is_null() {
-        return Err(MsaRaopError::InProcess("sr_raop_open returned null".into()));
+        return Err(MsaRaopError::InProcess(format!(
+            "sr_raop_open failed stage={} host={} port={} format={}/{}/{} et={} md={} mfi_auth={} encrypt={} compressed_alac={}",
+            inproc_open_stage_name(ready.open_error_stage),
+            config.host,
+            config.port,
+            config.sample_rate,
+            config.bit_depth,
+            config.channels,
+            config.et,
+            config.md,
+            config.mfi_auth,
+            config.encrypt,
+            config.compressed_alac,
+        )));
     }
     let core = Arc::new(InprocCore {
         api,
