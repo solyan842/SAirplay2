@@ -1,6 +1,6 @@
 # MSA Core Architecture — Source Lock
 
-Last updated: 2026-10-04
+Last updated: 2026-10-05
 Working branch: `dev/msa-core-architecture`
 
 This file is the authoritative architecture/state lock for the current MSA Core migration branch.
@@ -244,6 +244,36 @@ The user confirmed audible playback on AirPort Express #1397 was fully stable an
 
 Therefore the tested AirPort10,115 Native AP2 / PTP / Buffered Type-103 16/44.1 Single-receiver lifecycle is now **HARDWARE LOCKED**. Do not force this tested receiver back to RAOP based on historical assumptions; route decisions for other receivers must still follow current capability/TXT evidence and pinned MSA behavior.
 
+## Field-proven SOtM / Eunhasu RAOP 16-bit baseline — HARDWARE LOCKED
+
+**Scope:** this is a hardware-proven baseline for **SOtM/Eunhasu `SolYan-Airplay` / true RAOP-only / NTP / ALAC 16-bit / 44.1 kHz / Single receiver** on the MSA Core branch after RAOP-only Single routing was moved onto the in-process pinned-libraop path.
+
+Validated branch baseline:
+
+`97bd40c5343f98ccc0c9fe96e9d5c101be6de0fd` — `fix: route RAOP-only single receivers through MSA Core`
+
+The accepted hardware logs show:
+
+- discovery as `_raop._tcp` on `N1000-SOtM.local.:5000` with no required `_airplay._tcp` service for the validated RAOP-only mode;
+- `flow: Raop`, `timing: Ntp`, `ptp=false`;
+- negotiated ALAC 16-bit / 44.1 kHz;
+- the in-process pinned-libraop transport rather than the legacy `cliraop.exe` fallback;
+- AP1 reservoir prime target `4224` frames, approximately `96 ms` at 44.1 kHz;
+- stable steady-state local PCM queue generally around `160-230 ms`;
+- `starvation_total=0` and `max_empty=0ms` through the validated continuous-playback runs;
+- stable RAOP audible-head telemetry around approximately `+2.2 s`;
+- repeated explicit Stop/Start reconnects returning to audible playback cleanly;
+- write stalls, including startup stalls around 100 ms, absorbed by the existing reservoir without local PCM starvation;
+- user-confirmed audible playback with no observed fault in the accepted SOtM/Eunhasu RAOP-only test runs.
+
+This lock protects the **generic AP1/RAOP 16/44.1 Single path as proven on SOtM/Eunhasu**, including the current 12-packet startup reservoir. Do not increase, decrease, remove, or otherwise retune that reservoir, RAOP pacing, START headroom, or NTP lifecycle merely to accommodate an unproven/non-reference receiver while this SOtM lane remains healthy.
+
+This lock does **not** apply to the separate Eunhasu configuration where ShairportSync advertises Native AirPlay 2 on port 7000 and then forwards audio into Diretta. That AP2/PTP/ShairportSync/Diretta configuration is a different receiver path and has separate observed lifecycle/PTP issues; it must not be used to invalidate this RAOP-only hardware baseline.
+
+Cayin/AirPin Pro is also not a reference receiver for this lock. Its rare stutter/starvation behavior is treated as a compatibility exception unless the same failure is reproduced on hardware-proven RAOP receivers such as SOtM/Eunhasu.
+
+Therefore the tested SOtM/Eunhasu RAOP-only / NTP / ALAC 16/44.1 Single-receiver path is now **HARDWARE LOCKED**. Future MiTV or other receiver compatibility work must preserve this baseline and must not change shared AP1 transport behavior without evidence that the locked SOtM path itself regressed.
+
 ## CI regression lock
 
 The field-proven Buffered Resume path is protected by a dedicated invariant check.
@@ -285,14 +315,15 @@ Order of work:
 2. **complete and hardware locked:** HomePod 16/44.1 Realtime Type-96 Single-receiver lifecycle baseline;
 3. **complete and hardware locked:** Apple TV5,3 `Phòng ngủ` 16/44.1 Realtime Type-96 Single-receiver lifecycle baseline;
 4. **complete and hardware locked:** AirPort Express AirPort10,115 16/44.1 Native AP2 / PTP / Buffered Type-103 Single-receiver lifecycle baseline;
-5. **next:** lock the tested 16-bit Single-receiver matrix as a collection of lane/device baselines;
-6. only then return to 24-bit work;
-7. only after Single/Core gates are sound, continue Stereo Pair and MultiRoom migration;
-8. GUI/productization remains above the transport core and must not drive protocol changes.
+5. **complete and hardware locked:** SOtM/Eunhasu RAOP-only / NTP / ALAC 16/44.1 Single-receiver baseline;
+6. **current compatibility work:** diagnose MiTV RAOP interoperability without changing any locked lane unless evidence identifies a shared-Core regression;
+7. only then return to 24-bit work;
+8. only after Single/Core gates are sound, continue Stereo Pair and MultiRoom migration;
+9. GUI/productization remains above the transport core and must not drive protocol changes.
 
 ## 24-bit boundary
 
-Known previous 24-bit symptoms include missing audio, repeated pops/dropouts and noisy Stop/format-transition behavior. Those symptoms are not permission to alter the now-validated Naim Buffered Type-103, HomePod Realtime Type-96, Apple TV Realtime Type-96 or AirPort Express Buffered Type-103 16-bit baselines.
+Known previous 24-bit symptoms include missing audio, repeated pops/dropouts and noisy Stop/format-transition behavior. Those symptoms are not permission to alter the now-validated Naim Buffered Type-103, HomePod Realtime Type-96, Apple TV Realtime Type-96, AirPort Express Buffered Type-103, or SOtM/Eunhasu RAOP 16-bit baselines.
 
 When 24-bit resumes, diagnose it as a separate format/codec/lifecycle extension on top of the appropriate locked 16-bit lane baselines.
 
