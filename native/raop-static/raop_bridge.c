@@ -522,6 +522,7 @@ int sr_raop_write_packet(sr_raop_handle *handle,
         uint8_t *send_buffer;
         uint64_t playtime = 0;
         uint64_t next_head;
+        raop_state_t state;
 
         EnterCriticalSection(&handle->lock);
         if (!handle->client) {
@@ -531,8 +532,11 @@ int sr_raop_write_packet(sr_raop_handle *handle,
 
         /* A packet that races a FLUSH belongs to the old generation. The Rust
          * generation barrier owns the discard; consuming it here without
-         * treating the transport as failed preserves that contract. */
-        if (raopcl_state(handle->client) != RAOP_STREAMING) {
+         * treating the transport as failed preserves that contract. A FLUSHED
+         * session after START must still reach raopcl_accept_frames(), because
+         * pinned libraop performs FLUSHED -> STREAMING at that pacing gate. */
+        state = raopcl_state(handle->client);
+        if (state != RAOP_STREAMING && state != RAOP_FLUSHED) {
             LeaveCriticalSection(&handle->lock);
             return 1;
         }
