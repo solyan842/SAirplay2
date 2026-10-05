@@ -2323,10 +2323,12 @@ impl SairplayApp {
         self.active_fullnames.clear();
         self.last_feedback_error = None;
 
+        // MSA Core owns every Single receiver, including true RAOP-only
+        // devices that advertise only _raop._tcp. Absence of _airplay._tcp is
+        // normal for AP1 and must never route Single playback through the
+        // external legacy helper path.
         let msa_solo_single =
-            requested_mode == PlaybackMode::Single
-                && member_count == 1
-                && selected_devices[0].1.airplay.is_some();
+            requested_mode == PlaybackMode::Single && member_count == 1;
 
         if msa_solo_single {
                 let (fullname, device) = &selected_devices[0];
@@ -5113,13 +5115,29 @@ fn msa_solo_config_for_device(
     raop_secret: Option<String>,
     hires_enabled: bool,
 ) -> Result<(WindowsMsaSoloConfig, sairplay_engine::Ap2AudioFormat, String), String> {
-    let service = device
-        .airplay
+    let airplay_service = device.airplay.as_ref();
+    let raop_service = device
+        .raop
         .as_ref()
-        .ok_or_else(|| format!("{} has no AirPlay service", device.display_name))?;
-    let raop_service = device.raop.as_ref().unwrap_or(service);
-    let host = preferred_service_address(service);
-    let txt = msa_solo_route_txt(service)?;
+        .or(airplay_service)
+        .ok_or_else(|| format!("{} has no AirPlay/RAOP service", device.display_name))?;
+    // Native fields are unused when Auto resolves to RAOP, but keeping a
+    // concrete endpoint lets one config type cover AP2, dual-service and
+    // RAOP-only receivers without inventing a synthetic AirPlay service.
+    let native_service = airplay_service.unwrap_or(raop_service);
+    let native_host = preferred_service_address(native_service);
+    let raop_host = preferred_service_address(raop_service);
+    let txt = match airplay_service {
+        Some(service) => match msa_solo_route_txt(service) {
+            Ok(value) => Some(value),
+            // A receiver with a valid RAOP service remains playable even when
+            // its optional AirPlay advertisement carries no usable route TXT.
+            // Auto + no AP2 feature bits resolves to the pinned RAOP lane.
+            Err(_) if device.raop.is_some() => None,
+            Err(error) => return Err(error),
+        },
+        None => None,
+    };
 
     // GUI policy: transport is always Automatic. MSA route/fallback remains
     // inside the engine; there is no user-visible or persisted protocol override.
@@ -5132,18 +5150,28 @@ fn msa_solo_config_for_device(
         (44_100, 16)
     };
 
-    let mut config = WindowsMsaSoloConfig::new(host.clone(), service.port, raop_service.port);
+    let mut config = WindowsMsaSoloConfig::new(
+        native_host.clone(),
+        native_service.port,
+        raop_service.port,
+    );
+    // _airplay._tcp and _raop._tcp may resolve to different hosts/ports. The
+    // RAOP lane must always use the RAOP endpoint rather than inheriting the
+    // native endpoint merely because both services belong to one DeviceRecord.
+    config.raop.host = raop_host.clone();
     config.protocol = protocol;
     config.ptp_override = ptp_override;
-    config.txt = Some(txt.clone());
+    config.txt = txt.clone();
     // Match pinned Music Assistant stream.py exactly: RAOP transport
     // properties (et/md/am/pk/pw/cn) come from the _raop._tcp service.
-    // The full _airplay._tcp TXT remains in config.txt for Auto/AP2 routing.
+    // The _airplay._tcp TXT, when present, is retained only for Auto/AP2 routing.
     // Do not project AirPlay model=AppleTV... into RAOP am: third-party
     // receivers often spoof that model and would falsely trigger the legacy
     // AppleTV secret guard when their RAOP service itself never advertised am.
     config.am = raop_service.txt.fields.get("am").cloned();
-    config.pw_txt = service.txt.fields.get("pw").cloned();
+    config.pw_txt = airplay_service
+        .and_then(|service| service.txt.fields.get("pw").cloned())
+        .or_else(|| raop_service.txt.fields.get("pw").cloned());
     config.raop_cn = raop_service.txt.fields.get("cn").cloned();
 
     // MSA server treats sf/flags 0x8 (PIN_REQUIRED) and 0x200
@@ -5166,6 +5194,9 @@ fn msa_solo_config_for_device(
     if let Some(et) = raop_service.txt.fields.get("et") {
         config.raop.et = et.clone();
     }
+    if let Some(md) = raop_service.txt.fields.get("md") {
+        config.raop.md = md.clone();
+    }
     config.native.control.receiver_name = device.display_name.clone();
     config.native.control.auth_credentials = credentials;
     config.native.control.audio_format = MsaAp2AudioFormat {
@@ -5179,13 +5210,20 @@ fn msa_solo_config_for_device(
         bit_depth,
         channels: 2,
     };
-    let features = sairplay_msa_solo::route::txt_features(Some(&txt));
-    let flags = sairplay_msa_solo::route::txt_flags(Some(&txt));
+    let features = sairplay_msa_solo::route::txt_features(txt.as_deref());
+    let flags = sairplay_msa_solo::route::txt_flags(txt.as_deref());
+    let endpoint_summary = if airplay_service.is_some() {
+        format!(
+            "ap2_endpoint={}:{} raop_endpoint={}:{}",
+            native_host, native_service.port, raop_host, raop_service.port
+        )
+    } else {
+        format!("raop_endpoint={}:{}", raop_host, raop_service.port)
+    };
     let summary = format!(
-        "MSA SOLO CONNECT target={} endpoint={}:{} requested={}/{} streaming_mode=auto protocol={:?} features={:#018x} flags={:#x} pairing_required={}; credentials are never printed.",
+        "MSA SOLO CONNECT target={} {} requested={}/{} streaming_mode=auto protocol={:?} features={:#018x} flags={:#x} pairing_required={}; credentials are never printed.",
         device.display_name,
-        host,
-        service.port,
+        endpoint_summary,
         sample_rate,
         bit_depth,
         config.protocol,
@@ -5656,6 +5694,51 @@ mod gui_tests {
         };
 
         assert!(SairplayApp::pairing_flags_required(&device));
+    }
+
+    #[test]
+    fn raop_only_single_builds_msa_core_config_without_legacy_helper() {
+        let device = DeviceRecord {
+            display_name: "SolYan-Airplay".into(),
+            airplay: None,
+            raop: Some(DiscoveredService {
+                kind: ServiceKind::Raop,
+                fullname: "001122334455@SolYan-Airplay._raop._tcp.local.".into(),
+                display_name: "SolYan-Airplay".into(),
+                host: "N1000-SOtM.local.".into(),
+                port: 5000,
+                addresses: vec!["192.168.88.60".into()],
+                txt: AirPlayTxt::parse([
+                    ("et", "0,4"),
+                    ("md", "0,1,2"),
+                    ("cn", "0,1"),
+                ])
+                .unwrap(),
+            }),
+        };
+
+        let (config, format, summary) =
+            msa_solo_config_for_device(&device, None, None, false).unwrap();
+        assert_eq!(config.protocol, MsaProtocolPreference::Auto);
+        assert!(config.txt.is_none());
+        assert_eq!(config.raop.host, "192.168.88.60");
+        assert_eq!(config.raop.port, 5000);
+        assert_eq!(config.raop.et, "0,4");
+        assert_eq!(config.raop.md, "0,1,2");
+        assert_eq!(format.sample_rate, 44_100);
+        assert_eq!(format.bit_depth, 16);
+        assert!(summary.contains("raop_endpoint=192.168.88.60:5000"));
+
+        let route = sairplay_msa_solo::route::resolve_route_from_txt(
+            config.protocol,
+            config.txt.as_deref(),
+            config.pw_txt.as_deref(),
+            false,
+            false,
+            config.force_native,
+            config.ptp_override,
+        );
+        assert_eq!(route.flow, MsaFlow::Raop);
     }
 
     #[test]
