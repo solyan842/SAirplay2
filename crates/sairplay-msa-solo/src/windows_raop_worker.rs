@@ -54,6 +54,33 @@ fn unix_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+// Diagnostic only: mirror the exact pinned crosstools Windows gettime_us()
+// epoch arithmetic without touching libraop's clock.  POSIX MSA expects NTP
+// seconds = Unix + 2208988800, while the pinned Windows implementation derives
+// seconds from FILETIME (1601 epoch) and then adds the same NTP offset.  Report
+// the resulting modular 32-bit second delta so receiver interoperability can be
+// proven before any clock/timing behavior is changed.
+fn pinned_windows_clock_diag(now_unix_ms: u64) -> (u32, u32, i64) {
+    const NTP_UNIX_EPOCH_DELTA_SECS: u64 = 2_208_988_800;
+    const FILETIME_UNIX_EPOCH_DELTA_SECS: u64 = 11_644_473_600;
+    const NTP_ERA_SECS: i64 = 1i64 << 32;
+
+    let unix_secs = now_unix_ms / 1000;
+    let expected_ntp_sec = ((unix_secs + NTP_UNIX_EPOCH_DELTA_SECS) & 0xffff_ffff) as u32;
+    let pinned_windows_sec = ((unix_secs
+        + FILETIME_UNIX_EPOCH_DELTA_SECS
+        + NTP_UNIX_EPOCH_DELTA_SECS)
+        & 0xffff_ffff) as u32;
+
+    let mut delta = i64::from(pinned_windows_sec) - i64::from(expected_ntp_sec);
+    if delta > i64::from(i32::MAX) {
+        delta -= NTP_ERA_SECS;
+    } else if delta < i64::from(i32::MIN) {
+        delta += NTP_ERA_SECS;
+    }
+    (pinned_windows_sec, expected_ntp_sec, delta)
+}
+
 fn live_source_start_floor_unix_ms(
     now_unix_ms: u64,
     latency_frames: u32,
@@ -128,8 +155,31 @@ pub struct WindowsRaopAudioWorker {
 
 impl WindowsRaopAudioWorker {
     pub fn connect(config: MsaRaopConfig) -> Result<Self, WindowsRaopWorkerError> {
+        let now_unix_ms = unix_now_ms();
+        let (pinned_windows_ntp_sec, expected_ntp_sec, clock_delta_sec) =
+            pinned_windows_clock_diag(now_unix_ms);
+        let codec = if config.compressed_alac { "ALAC" } else { "ALAC-raw" };
+        let crypto = if config.encrypt && config.et.contains('1') { "RSA" } else { "clear" };
+        let wire_diag = format!(
+            "MSA RAOP DIAG WIRE clock=pinned-windows-crosstools source_ntp_sec={} expected_ntp_sec={} delta={}s et={} md={} codec={} crypto={} mfi_auth={} sample_rate={} bit_depth={} channels={}; observation-only, transport unchanged.",
+            pinned_windows_ntp_sec,
+            expected_ntp_sec,
+            clock_delta_sec,
+            config.et,
+            config.md,
+            codec,
+            crypto,
+            config.mfi_auth,
+            config.sample_rate,
+            config.bit_depth,
+            config.channels,
+        );
         let session = Arc::new(Mutex::new(MsaRaopSession::connect(config)?));
-        Self::start(session)
+        let worker = Self::start(session)?;
+        if let Ok(mut events) = worker.startup_events.lock() {
+            events.push(wire_diag);
+        }
+        Ok(worker)
     }
 
     pub fn start(session: SharedMsaRaopSession) -> Result<Self, WindowsRaopWorkerError> {
@@ -746,5 +796,11 @@ mod tests {
     #[test]
     fn ap1_reservoir_remains_packet_based_at_48000() {
         assert_eq!(raop_reservoir_ms(48_000), 88);
+    }
+
+    #[test]
+    fn pinned_windows_clock_diag_exposes_epoch_offset_without_changing_transport() {
+        let (_, _, delta) = pinned_windows_clock_diag(1_791_219_581_000);
+        assert_eq!(delta, -1_240_428_288);
     }
 }
