@@ -15,6 +15,7 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -280,13 +281,62 @@ void sr_raop_close(sr_raop_handle *handle)
     free(handle);
 }
 
+static const char *sr_raop_state_name(raop_state_t state)
+{
+    switch (state) {
+    case RAOP_DOWN: return "down";
+    case RAOP_FLUSHING: return "flushing";
+    case RAOP_FLUSHED: return "flushed";
+    case RAOP_STREAMING: return "streaming";
+    default: return "unknown";
+    }
+}
+
+static void sr_raop_log_health_failure(sr_raop_handle *handle, const char *where)
+{
+    int connected;
+    int sane;
+    raop_state_t state;
+    const char *failure_class;
+
+    if (!handle || !handle->client) {
+        fprintf(stderr, "MSA-RAOP HEALTH failure where=%s class=no-client\n",
+                where ? where : "unknown");
+        fflush(stderr);
+        return;
+    }
+
+    state = raopcl_state(handle->client);
+    connected = raopcl_is_connected(handle->client) ? 1 : 0;
+    sane = raopcl_is_sane(handle->client) ? 1 : 0;
+    failure_class = !connected ? "rtsp-control"
+        : !sane ? "rtp-media-control-timing"
+        : "unknown";
+
+    fprintf(stderr,
+            "MSA-RAOP HEALTH failure where=%s class=%s state=%s(%d) connected=%d sane=%d head_audible_ms=%llu\n",
+            where ? where : "unknown",
+            failure_class,
+            sr_raop_state_name(state),
+            (int)state,
+            connected,
+            sane,
+            (unsigned long long)handle->head_audible_ms);
+    fflush(stderr);
+}
+
 int sr_raop_healthy(sr_raop_handle *handle)
 {
+    int connected = 0;
+    int sane = 0;
     int ok = 0;
     if (!handle) return 0;
     EnterCriticalSection(&handle->lock);
     if (handle->client) {
-        ok = raopcl_is_connected(handle->client) && raopcl_is_sane(handle->client);
+        connected = raopcl_is_connected(handle->client) ? 1 : 0;
+        sane = raopcl_is_sane(handle->client) ? 1 : 0;
+        ok = connected && sane;
+        if (!ok) sr_raop_log_health_failure(handle, "health-monitor");
     }
     LeaveCriticalSection(&handle->lock);
     return ok;
@@ -542,6 +592,7 @@ int sr_raop_write_packet(sr_raop_handle *handle,
         }
 
         if (!raopcl_is_connected(handle->client) || !raopcl_is_sane(handle->client)) {
+            sr_raop_log_health_failure(handle, "write-preflight");
             LeaveCriticalSection(&handle->lock);
             return 0;
         }
@@ -562,6 +613,7 @@ int sr_raop_write_packet(sr_raop_handle *handle,
                                send_buffer,
                                SR_FRAMES_PER_CHUNK,
                                &playtime)) {
+            sr_raop_log_health_failure(handle, "send-chunk");
             LeaveCriticalSection(&handle->lock);
             return 0;
         }
