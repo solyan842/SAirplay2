@@ -192,6 +192,8 @@ jobs:
           git -C $src submodule update --init crosstools dmap-parser
           $dmapHead = (git -C "$src/dmap-parser" rev-parse HEAD).Trim()
           if ($dmapHead -ne $dmapPin) { throw "Pinned dmap-parser mismatch: $dmapHead" }
+          python scripts/patch_pinned_raop_wire_diag.py $src
+          if ($LASTEXITCODE -ne 0) { throw "Pinned RAOP wire diagnostic patch failed" }
 
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
@@ -330,7 +332,8 @@ jobs:
             "sr_raop_commit_start", "sr_raop_start_after_flush", "sr_raop_flush",
             "sr_raop_standby", "sr_raop_pause", "sr_raop_play", "sr_raop_stop",
             "sr_raop_set_volume", "sr_raop_set_progress", "sr_raop_set_metadata",
-            "sr_raop_set_artwork", "sr_raop_write_packet", "sr_raop_head_audible_ms"
+            "sr_raop_set_artwork", "sr_raop_write_packet", "sr_raop_head_audible_ms",
+            "sr_raop_diag_snapshot"
           ) | ForEach-Object { "/EXPORT:$_" }
           $exportArgs = $exports -join " "
           $link = "call `"$vcvars64`" && link.exe /nologo /DLL /OUT:`"$bridgeDll`" `"$bridgeObj`" `"$clockShimObj`" `"$logGlobalsObj`" `"$libraop/libraop-client-x64.lib`" `"$alac/libalac-wrapper.lib`" `"$alac/libalac.lib`" `"$pthread/libpthread-static.lib`" `"$openssl/libcrypto.lib`" `"$openssl/libssl.lib`" ws2_32.lib wsock32.lib iphlpapi.lib $exportArgs"
