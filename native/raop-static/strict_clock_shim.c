@@ -9,6 +9,11 @@ __declspec(dllexport) void sr_raop_set_strict_ntp_clock(int enabled)
     InterlockedExchange(&g_strict_ntp_clock, enabled ? 1 : 0);
 }
 
+int sr_raop_strict_ntp_clock_enabled(void)
+{
+    return InterlockedCompareExchange(&g_strict_ntp_clock, 0, 0) != 0;
+}
+
 void WINAPI sr_clock_GetSystemTimeAsFileTime(LPFILETIME file_time)
 {
     FILETIME raw;

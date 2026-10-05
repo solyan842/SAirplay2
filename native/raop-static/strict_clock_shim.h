@@ -16,6 +16,7 @@ extern "C" {
  * to standards-correct NTP by subtracting the FILETIME->Unix epoch offset. */
 void WINAPI sr_clock_GetSystemTimeAsFileTime(LPFILETIME file_time);
 __declspec(dllexport) void sr_raop_set_strict_ntp_clock(int enabled);
+int sr_raop_strict_ntp_clock_enabled(void);
 
 #ifdef __cplusplus
 }

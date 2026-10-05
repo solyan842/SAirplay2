@@ -62,6 +62,23 @@ typedef struct sr_raop_ready {
     uint32_t open_error_stage;
 } sr_raop_ready;
 
+typedef struct sr_raop_wire_diag {
+    uint16_t audio_lport, audio_rport;
+    uint16_t control_lport, control_rport;
+    uint16_t timing_lport, timing_rport;
+    uint32_t state;
+    uint32_t seq_number;
+    uint32_t sane_ctrl, sane_time;
+    uint32_t sane_audio_avail, sane_audio_select, sane_audio_send;
+    uint64_t audio_send_ok, audio_send_fail;
+    uint64_t sync_send_ok, sync_send_fail;
+    uint64_t timing_requests, timing_responses, timing_response_fail;
+    uint64_t control_requests;
+    uint64_t retransmit;
+    uint32_t first_audio_timestamp, last_audio_timestamp;
+    uint16_t first_audio_seq, last_audio_seq;
+} sr_raop_wire_diag;
+
 sr_raop_handle *sr_raop_open(const sr_raop_config *config, sr_raop_ready *ready);
 void sr_raop_close(sr_raop_handle *handle);
 
@@ -99,6 +116,7 @@ int sr_raop_write_packet(sr_raop_handle *handle,
                          size_t packet_bytes);
 
 uint64_t sr_raop_head_audible_ms(sr_raop_handle *handle);
+int sr_raop_diag_snapshot(sr_raop_handle *handle, sr_raop_wire_diag *out);
 
 #ifdef __cplusplus
 }

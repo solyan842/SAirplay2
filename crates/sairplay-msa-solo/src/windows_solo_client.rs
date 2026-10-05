@@ -15,7 +15,7 @@ use crate::{
 };
 use crate::route::{
     apple_model, buffered_route, follow_receiver_clock, resolve_route_from_txt,
-    Flow, ProtocolPreference, RouteDecision, Timing as RouteTiming,
+    txt_features, txt_flags, Flow, ProtocolPreference, RouteDecision, Timing as RouteTiming,
 };
 use crate::timing::StartResolution;
 use crate::windows_raop_worker::WindowsRaopAudioWorker;
@@ -169,12 +169,19 @@ impl WindowsMsaSoloVolumeControl {
 }
 
 fn raop_strict_ntp_compat(txt: Option<&str>, am: Option<&str>) -> bool {
+    const MITV_FEATURES: u64 = 0x0000001e527ffff7;
+    const MITV_FLAGS: u64 = 0x4;
+
     let txt_model = txt.and_then(|txt| {
         txt.split_whitespace()
             .find_map(|token| token.strip_prefix("model="))
     });
-    txt_model.is_some_and(|model| model.starts_with("AppleTV3,"))
-        || am.is_some_and(|model| model.starts_with("AppleTV3,"))
+    let model_match = txt_model.is_some_and(|model| model == "AppleTV3,1")
+        || am.is_some_and(|model| model == "AppleTV3,1");
+
+    model_match
+        && txt_features(txt) == MITV_FEATURES
+        && txt_flags(txt) == MITV_FLAGS
 }
 
 impl WindowsMsaSoloClient {
@@ -859,23 +866,30 @@ mod strict_ntp_compat_tests {
     use super::raop_strict_ntp_compat;
 
     #[test]
-    fn raop_strict_ntp_compat_selects_appletv3_family() {
+    fn raop_strict_ntp_compat_selects_exact_mitv_profile_without_port() {
         assert!(raop_strict_ntp_compat(
             Some("features=0x1e527ffff7 model=AppleTV3,1 flags=0x4"),
             None,
         ));
-        assert!(raop_strict_ntp_compat(None, Some("AppleTV3,2")));
     }
 
     #[test]
-    fn raop_strict_ntp_compat_does_not_touch_locked_non_appletv3_lanes() {
+    fn raop_strict_ntp_compat_does_not_touch_other_appletv3_or_locked_lanes() {
+        assert!(!raop_strict_ntp_compat(
+            Some("features=0x1e527ffff7 model=AppleTV3,2 flags=0x4"),
+            Some("AppleTV3,2"),
+        ));
+        assert!(!raop_strict_ntp_compat(
+            Some("features=0x123 model=AppleTV3,1 flags=0x4"),
+            Some("AppleTV3,1"),
+        ));
         assert!(!raop_strict_ntp_compat(None, Some("ShairportSync")));
         assert!(!raop_strict_ntp_compat(
-            Some("model=AppleTV5,3 features=0x123"),
+            Some("model=AppleTV5,3 features=0x123 flags=0"),
             None,
         ));
         assert!(!raop_strict_ntp_compat(
-            Some("model=AudioAccessory5,1 features=0x123"),
+            Some("model=AudioAccessory5,1 features=0x123 flags=0"),
             None,
         ));
     }
