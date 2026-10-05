@@ -206,6 +206,7 @@ jobs:
           $opensslInclude = (Resolve-Path "target/vendor/libopenssl-x64-stage/include").Path
           $pthreadInclude = (Resolve-Path "target/vendor/libpthreads4w-x64-stage/include").Path
           $alacWrapperInclude = (Resolve-Path "target/vendor/libcodecs-x64-stage/include/addons").Path
+          $strictClockHeader = (Resolve-Path "native/raop-static/strict_clock_shim.h").Path
 
           $includes = @(
             (Join-Path $srcAbs "src"),
@@ -237,7 +238,14 @@ jobs:
           foreach ($source in $sources) {
             if (-not (Test-Path $source)) { throw "Pinned libraop client source missing: $source" }
             $objPath = Join-Path $objAbs (([IO.Path]::GetFileNameWithoutExtension($source)) + ".obj")
-            $cmd = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /MD /std:clatest /DNDEBUG /DSSL_STATIC_LIB /DWIN32 /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /D_CRT_NONSTDC_NO_DEPRECATE /DOPENSSL_SUPPRESS_DEPRECATED $includeArgs /Fo`"$objPath`" `"$source`""
+            $sourceExtraArgs = ""
+            if ([IO.Path]::GetFileName($source) -eq "cross_util.c") {
+              # Redirect only the pinned Windows clock call through our module-
+              # local shim. Default mode returns raw FILETIME exactly; the
+              # separately loaded strict DLL opts into corrected NTP.
+              $sourceExtraArgs = "/DGetSystemTimeAsFileTime=sr_clock_GetSystemTimeAsFileTime /FI`"$strictClockHeader`""
+            }
+            $cmd = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /MD /std:clatest /DNDEBUG /DSSL_STATIC_LIB /DWIN32 /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /D_CRT_NONSTDC_NO_DEPRECATE /DOPENSSL_SUPPRESS_DEPRECATED $sourceExtraArgs $includeArgs /Fo`"$objPath`" `"$source`""
             & cmd.exe /d /s /c $cmd
             if ($LASTEXITCODE -ne 0) { throw "Pinned libraop client x64 compile failed: $source" }
             $objects += $objPath
@@ -283,11 +291,14 @@ jobs:
           $stageAbs = (New-Item -ItemType Directory -Force -Path $stage).FullName
 
           $bridge = (Resolve-Path "native/raop-static/raop_bridge.c").Path
+          $clockShim = (Resolve-Path "native/raop-static/strict_clock_shim.c").Path
           $bridgeInclude = (Resolve-Path "native/raop-static").Path
           $bridgeObj = Join-Path $stageAbs "raop_bridge.obj"
+          $clockShimObj = Join-Path $stageAbs "strict_clock_shim.obj"
           $logGlobals = Join-Path $stageAbs "raop_log_globals.c"
           $logGlobalsObj = Join-Path $stageAbs "raop_log_globals.obj"
           $bridgeDll = Join-Path $stageAbs "sairplay-raop.dll"
+          $strictBridgeDll = Join-Path $stageAbs "sairplay-raop-strict.dll"
           $includeArgs = @(
             "/I`"$bridgeInclude`"",
             "/I`"$libraop/include`"",
@@ -306,6 +317,10 @@ jobs:
           & cmd.exe /d /s /c $compile
           if ($LASTEXITCODE -ne 0) { throw "In-process RAOP bridge x64 compile failed" }
 
+          $compileClockShim = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /MD /std:clatest /DNDEBUG /DWIN32 $includeArgs /Fo`"$clockShimObj`" `"$clockShim`""
+          & cmd.exe /d /s /c $compileClockShim
+          if ($LASTEXITCODE -ne 0) { throw "Strict NTP clock shim x64 compile failed" }
+
           $compileGlobals = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /MD /std:clatest /DNDEBUG /DWIN32 $includeArgs /Fo`"$logGlobalsObj`" `"$logGlobals`""
           & cmd.exe /d /s /c $compileGlobals
           if ($LASTEXITCODE -ne 0) { throw "In-process RAOP log globals x64 compile failed" }
@@ -318,12 +333,19 @@ jobs:
             "sr_raop_set_artwork", "sr_raop_write_packet", "sr_raop_head_audible_ms"
           ) | ForEach-Object { "/EXPORT:$_" }
           $exportArgs = $exports -join " "
-          $link = "call `"$vcvars64`" && link.exe /nologo /DLL /OUT:`"$bridgeDll`" `"$bridgeObj`" `"$logGlobalsObj`" `"$libraop/libraop-client-x64.lib`" `"$alac/libalac-wrapper.lib`" `"$alac/libalac.lib`" `"$pthread/libpthread-static.lib`" `"$openssl/libcrypto.lib`" `"$openssl/libssl.lib`" ws2_32.lib wsock32.lib iphlpapi.lib $exportArgs"
+          $link = "call `"$vcvars64`" && link.exe /nologo /DLL /OUT:`"$bridgeDll`" `"$bridgeObj`" `"$clockShimObj`" `"$logGlobalsObj`" `"$libraop/libraop-client-x64.lib`" `"$alac/libalac-wrapper.lib`" `"$alac/libalac.lib`" `"$pthread/libpthread-static.lib`" `"$openssl/libcrypto.lib`" `"$openssl/libssl.lib`" ws2_32.lib wsock32.lib iphlpapi.lib $exportArgs"
           & cmd.exe /d /s /c $link
           if ($LASTEXITCODE -ne 0) { throw "In-process RAOP bridge x64 link failed" }
           if (-not (Test-Path $bridgeDll)) { throw "sairplay-raop.dll missing" }
+          # Loading the same binary under a second filename gives Windows a
+          # separate module instance and therefore a separate clock-mode global.
+          # Normal SOtM/RAOP sessions use sairplay-raop.dll (mode 0); only the
+          # AppleTV3 compatibility selector loads this strict copy and enables 1.
+          Copy-Item $bridgeDll $strictBridgeDll -Force
+          if (-not (Test-Path $strictBridgeDll)) { throw "sairplay-raop-strict.dll missing" }
 
           Get-FileHash $bridgeDll -Algorithm SHA256
+          Get-FileHash $strictBridgeDll -Algorithm SHA256
           Get-ChildItem $stageAbs
 
       # The active MSA Core branch owns native AP2 + the Rust RAOP adapter.
@@ -354,10 +376,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           Copy-Item "target/release/sairplay-gui.exe" "$out/sairplay-gui.exe" -Force
           Copy-Item "target/vendor/sairplay-raop-x64-stage/sairplay-raop.dll" "$out/sairplay-raop.dll" -Force
+          Copy-Item "target/vendor/sairplay-raop-x64-stage/sairplay-raop-strict.dll" "$out/sairplay-raop-strict.dll" -Force
           Copy-Item "target/vendor/libopenssl-x64-stage/libcrypto-1_1-x64.dll" "$out/libcrypto-1_1-x64.dll" -Force
           Copy-Item "target/vendor/libopenssl-x64-stage/libssl-1_1-x64.dll" "$out/libssl-1_1-x64.dll" -Force
           Get-FileHash "$out/sairplay-gui.exe" -Algorithm SHA256
           Get-FileHash "$out/sairplay-raop.dll" -Algorithm SHA256
+          Get-FileHash "$out/sairplay-raop-strict.dll" -Algorithm SHA256
           Get-FileHash "$out/libcrypto-1_1-x64.dll" -Algorithm SHA256
           Get-FileHash "$out/libssl-1_1-x64.dll" -Algorithm SHA256
           Get-ChildItem $out
