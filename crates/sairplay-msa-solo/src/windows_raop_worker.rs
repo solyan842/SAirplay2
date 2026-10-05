@@ -18,7 +18,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const RAOP_DIAG_SUMMARY_INTERVAL: Duration = Duration::from_secs(10);
@@ -48,6 +48,19 @@ impl From<WasapiLoopbackError> for WindowsRaopWorkerError {
 }
 
 pub type SharedMsaRaopSession = Arc<Mutex<MsaRaopSession>>;
+
+fn diagnostic_head_ahead_ms(session: &SharedMsaRaopSession) -> Option<i128> {
+    let guard = session.try_lock().ok()?;
+    let head_unix_ms = guard.head_audible_unix_ms();
+    if head_unix_ms == 0 {
+        return None;
+    }
+    let now_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i128;
+    Some(head_unix_ms as i128 - now_unix_ms)
+}
 
 pub struct WindowsRaopAudioWorker {
     session: SharedMsaRaopSession,
@@ -108,6 +121,7 @@ impl WindowsRaopAudioWorker {
         let running_w = Arc::clone(&running);
         let enabled_w = Arc::clone(&delivery_enabled);
         let gate_w = Arc::clone(&send_gate);
+        let session_w = Arc::clone(&session);
         let hub_w = pcm_hub.clone();
         let ring_w = pcm_hub.ring();
         let error_w = Arc::clone(&last_error);
@@ -124,6 +138,7 @@ impl WindowsRaopAudioWorker {
                 let mut slow_writes_total = 0u64;
                 let mut last_summary = Instant::now();
                 let mut starvation_started: Option<Instant> = None;
+                let mut starvation_capture_generation = 0u64;
                 let mut starvation_reported = false;
                 let mut last_send_done: Option<Instant> = None;
                 let mut max_starvation_ms = 0u128;
@@ -143,6 +158,7 @@ impl WindowsRaopAudioWorker {
 
                     if !enabled_w.load(Ordering::SeqCst) {
                         starvation_started = None;
+                        starvation_capture_generation = last_capture_generation;
                         starvation_reported = false;
                         thread::sleep(Duration::from_millis(1));
                         continue;
@@ -169,9 +185,10 @@ impl WindowsRaopAudioWorker {
                     if gate_wait >= RAOP_DIAG_STALL_THRESHOLD {
                         if let Ok(mut events) = events_w.lock() {
                             events.push(format!(
-                                "MSA RAOP DIAG SEND-GATE stall={}ms capture_idle={}ms.",
+                                "MSA RAOP DIAG SEND-GATE stall={}ms capture_idle={}ms head_ahead_ms={:?}.",
                                 gate_wait.as_millis(),
                                 last_capture_progress.elapsed().as_millis(),
+                                diagnostic_head_ahead_ms(&session_w),
                             ));
                         }
                     }
@@ -198,24 +215,32 @@ impl WindowsRaopAudioWorker {
                     let Some(packet) = packet else {
                         drop(_gate);
                         if hub_w.source_present() {
-                            let started = starvation_started.get_or_insert_with(Instant::now);
-                            let empty_for = started.elapsed();
+                            if starvation_started.is_none() {
+                                starvation_started = Some(Instant::now());
+                                starvation_capture_generation = last_capture_generation;
+                            }
+                            let empty_for = starvation_started
+                                .as_ref()
+                                .map(Instant::elapsed)
+                                .unwrap_or_default();
                             max_starvation_ms = max_starvation_ms.max(empty_for.as_millis());
                             if empty_for >= RAOP_DIAG_STALL_THRESHOLD && !starvation_reported {
                                 starvation_reported = true;
                                 starvation_events_total = starvation_events_total.saturating_add(1);
                                 if let Ok(mut events) = events_w.lock() {
                                     events.push(format!(
-                                        "MSA RAOP DIAG PCM-STARVATION empty={}ms queue=0f capture_idle={}ms capture_gen={} events_total={}.",
+                                        "MSA RAOP DIAG PCM-STARVATION empty={}ms queue=0f capture_idle={}ms capture_gen={} events_total={} head_ahead_ms={:?}.",
                                         empty_for.as_millis(),
                                         last_capture_progress.elapsed().as_millis(),
                                         last_capture_generation,
                                         starvation_events_total,
+                                        diagnostic_head_ahead_ms(&session_w),
                                     ));
                                 }
                             }
                         } else {
                             starvation_started = None;
+                            starvation_capture_generation = last_capture_generation;
                             starvation_reported = false;
                         }
                         thread::sleep(Duration::from_millis(1));
@@ -223,10 +248,33 @@ impl WindowsRaopAudioWorker {
                     };
 
                     if let Some(started) = starvation_started.take() {
-                        max_starvation_ms = max_starvation_ms.max(started.elapsed().as_millis());
+                        let empty_elapsed = started.elapsed();
+                        max_starvation_ms = max_starvation_ms.max(empty_elapsed.as_millis());
+                        if starvation_reported {
+                            let capture_generation_now = hub_w.capture_frame_generation();
+                            let capture_gen_delta = capture_generation_now
+                                .saturating_sub(starvation_capture_generation);
+                            if capture_generation_now != last_capture_generation {
+                                last_capture_generation = capture_generation_now;
+                                last_capture_progress = Instant::now();
+                            }
+                            let queue_ms = pending_before_frames.saturating_mul(1000) / sample_rate_w;
+                            if let Ok(mut events) = events_w.lock() {
+                                events.push(format!(
+                                    "MSA RAOP DIAG STARVATION-RECOVER empty={}ms capture_gen_delta={} capture_idle={}ms queue_after={}f/{}ms head_ahead_ms={:?}.",
+                                    empty_elapsed.as_millis(),
+                                    capture_gen_delta,
+                                    last_capture_progress.elapsed().as_millis(),
+                                    pending_before_frames,
+                                    queue_ms,
+                                    diagnostic_head_ahead_ms(&session_w),
+                                ));
+                            }
+                        }
                     }
                     starvation_reported = false;
 
+                    let capture_generation_before_write = hub_w.capture_frame_generation();
                     let write_started = Instant::now();
                     if let Err(e) = pcm_writer.write_packet(&packet) {
                         if let Ok(mut slot) = error_w.lock() {
@@ -240,6 +288,14 @@ impl WindowsRaopAudioWorker {
                     max_write_ms = max_write_ms.max(write_ms);
                     sent_packets_total = sent_packets_total.saturating_add(1);
 
+                    let capture_generation_after_write = hub_w.capture_frame_generation();
+                    let capture_gen_during_write = capture_generation_after_write
+                        .saturating_sub(capture_generation_before_write);
+                    if capture_generation_after_write != last_capture_generation {
+                        last_capture_generation = capture_generation_after_write;
+                        last_capture_progress = Instant::now();
+                    }
+
                     let send_done = Instant::now();
                     if let Some(previous) = last_send_done.replace(send_done) {
                         max_send_gap_ms = max_send_gap_ms.max(send_done.duration_since(previous).as_millis());
@@ -248,15 +304,22 @@ impl WindowsRaopAudioWorker {
                     if write_elapsed >= RAOP_DIAG_STALL_THRESHOLD {
                         slow_writes_total = slow_writes_total.saturating_add(1);
                         let queue_ms = pending_before_frames.saturating_mul(1000) / sample_rate_w;
+                        let queue_after_frames = ring_w
+                            .try_lock()
+                            .map(|ring| ring.pending_bytes() / bytes_per_frame_w)
+                            .ok();
                         if let Ok(mut events) = events_w.lock() {
                             events.push(format!(
-                                "MSA RAOP DIAG WRITE-STALL write={}ms queue_before={}f/{}ms capture_idle={}ms capture_gen={} slow_total={}.",
+                                "MSA RAOP DIAG WRITE-STALL write={}ms queue_before={}f/{}ms queue_after_frames={:?} capture_gen_during_write={} capture_idle={}ms capture_gen={} slow_total={} head_ahead_ms={:?}.",
                                 write_ms,
                                 pending_before_frames,
                                 queue_ms,
+                                queue_after_frames,
+                                capture_gen_during_write,
                                 last_capture_progress.elapsed().as_millis(),
                                 last_capture_generation,
                                 slow_writes_total,
+                                diagnostic_head_ahead_ms(&session_w),
                             ));
                         }
                     }
@@ -268,7 +331,7 @@ impl WindowsRaopAudioWorker {
                         let max_ms = max_queue_frames.saturating_mul(1000) / sample_rate_w;
                         if let Ok(mut events) = events_w.lock() {
                             events.push(format!(
-                                "MSA RAOP DIAG 10s sent_total={} queue_now={}f/{}ms queue_min={}f/{}ms queue_max={}f/{}ms starvation_total={} max_empty={}ms slow_write_total={} max_write={}ms max_send_gap={}ms capture_idle={}ms capture_gen={} source_present={}.",
+                                "MSA RAOP DIAG 10s sent_total={} queue_now={}f/{}ms queue_min={}f/{}ms queue_max={}f/{}ms starvation_total={} max_empty={}ms slow_write_total={} max_write={}ms max_send_gap={}ms capture_idle={}ms capture_gen={} source_present={} head_ahead_ms={:?}.",
                                 sent_packets_total,
                                 pending_before_frames,
                                 queue_ms,
@@ -284,6 +347,7 @@ impl WindowsRaopAudioWorker {
                                 last_capture_progress.elapsed().as_millis(),
                                 last_capture_generation,
                                 hub_w.source_present(),
+                                diagnostic_head_ahead_ms(&session_w),
                             ));
                         }
                         last_summary = Instant::now();
@@ -345,7 +409,7 @@ impl WindowsRaopAudioWorker {
                             .into(),
                     );
                     events.push(
-                        "MSA RAOP DIAG active: observation-only queue/starvation/write-gap telemetry; transport parameters unchanged."
+                        "MSA RAOP DIAG active: observation-only queue/starvation-recovery/capture-progress/write-gap/head-ahead telemetry; transport parameters unchanged."
                             .into(),
                     );
                 }
