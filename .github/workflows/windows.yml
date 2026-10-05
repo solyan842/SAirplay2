@@ -111,7 +111,7 @@ jobs:
           $wrapper = (Resolve-Path "$src/addons/alac_wrapper.cpp").Path
           $wrapperObj = Join-Path (Resolve-Path $stage).Path "alac_wrapper.obj"
           $wrapperLib = Join-Path (Resolve-Path $stage).Path "libalac-wrapper.lib"
-          $cmd = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /EHsc /I`"$alacInclude`" /Fo`"$wrapperObj`" `"$wrapper`" && lib.exe /nologo /OUT:`"$wrapperLib`" `"$wrapperObj`""
+          $cmd = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /MD /EHsc /I`"$alacInclude`" /Fo`"$wrapperObj`" `"$wrapper`" && lib.exe /nologo /OUT:`"$wrapperLib`" `"$wrapperObj`""
           & cmd.exe /d /s /c $cmd
           if ($LASTEXITCODE -ne 0) { throw "Pinned ALAC wrapper x64 build failed" }
 
@@ -237,7 +237,7 @@ jobs:
           foreach ($source in $sources) {
             if (-not (Test-Path $source)) { throw "Pinned libraop client source missing: $source" }
             $objPath = Join-Path $objAbs (([IO.Path]::GetFileNameWithoutExtension($source)) + ".obj")
-            $cmd = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /std:clatest /DNDEBUG /DSSL_STATIC_LIB /DWIN32 /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /D_CRT_NONSTDC_NO_DEPRECATE /DOPENSSL_SUPPRESS_DEPRECATED $includeArgs /Fo`"$objPath`" `"$source`""
+            $cmd = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /MD /std:clatest /DNDEBUG /DSSL_STATIC_LIB /DWIN32 /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /D_CRT_NONSTDC_NO_DEPRECATE /DOPENSSL_SUPPRESS_DEPRECATED $includeArgs /Fo`"$objPath`" `"$source`""
             & cmd.exe /d /s /c $cmd
             if ($LASTEXITCODE -ne 0) { throw "Pinned libraop client x64 compile failed: $source" }
             $objects += $objPath
@@ -285,6 +285,8 @@ jobs:
           $bridge = (Resolve-Path "native/raop-static/raop_bridge.c").Path
           $bridgeInclude = (Resolve-Path "native/raop-static").Path
           $bridgeObj = Join-Path $stageAbs "raop_bridge.obj"
+          $logGlobals = Join-Path $stageAbs "raop_log_globals.c"
+          $logGlobalsObj = Join-Path $stageAbs "raop_log_globals.obj"
           $bridgeDll = Join-Path $stageAbs "sairplay-raop.dll"
           $includeArgs = @(
             "/I`"$bridgeInclude`"",
@@ -294,9 +296,19 @@ jobs:
             "/I`"$openssl/include`""
           ) -join " "
 
-          $compile = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /std:clatest /DNDEBUG /DWIN32 /DSSL_STATIC_LIB /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /D_CRT_NONSTDC_NO_DEPRECATE /DOPENSSL_SUPPRESS_DEPRECATED $includeArgs /Fo`"$bridgeObj`" `"$bridge`""
+          @'
+#include "cross_log.h"
+log_level raop_loglevel = lWARN;
+log_level util_loglevel = lWARN;
+'@ | Set-Content -Path $logGlobals -Encoding ascii
+
+          $compile = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /MD /std:clatest /DNDEBUG /DWIN32 /DSSL_STATIC_LIB /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /D_CRT_NONSTDC_NO_DEPRECATE /DOPENSSL_SUPPRESS_DEPRECATED $includeArgs /Fo`"$bridgeObj`" `"$bridge`""
           & cmd.exe /d /s /c $compile
           if ($LASTEXITCODE -ne 0) { throw "In-process RAOP bridge x64 compile failed" }
+
+          $compileGlobals = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /MD /std:clatest /DNDEBUG /DWIN32 $includeArgs /Fo`"$logGlobalsObj`" `"$logGlobals`""
+          & cmd.exe /d /s /c $compileGlobals
+          if ($LASTEXITCODE -ne 0) { throw "In-process RAOP log globals x64 compile failed" }
 
           $exports = @(
             "sr_raop_open", "sr_raop_close", "sr_raop_healthy", "sr_raop_keepalive",
@@ -306,7 +318,7 @@ jobs:
             "sr_raop_set_artwork", "sr_raop_write_packet", "sr_raop_head_audible_ms"
           ) | ForEach-Object { "/EXPORT:$_" }
           $exportArgs = $exports -join " "
-          $link = "call `"$vcvars64`" && link.exe /nologo /DLL /OUT:`"$bridgeDll`" `"$bridgeObj`" `"$libraop/libraop-client-x64.lib`" `"$alac/libalac-wrapper.lib`" `"$alac/libalac.lib`" `"$pthread/libpthread-static.lib`" `"$openssl/libcrypto.lib`" `"$openssl/libssl.lib`" ws2_32.lib wsock32.lib iphlpapi.lib $exportArgs"
+          $link = "call `"$vcvars64`" && link.exe /nologo /DLL /OUT:`"$bridgeDll`" `"$bridgeObj`" `"$logGlobalsObj`" `"$libraop/libraop-client-x64.lib`" `"$alac/libalac-wrapper.lib`" `"$alac/libalac.lib`" `"$pthread/libpthread-static.lib`" `"$openssl/libcrypto.lib`" `"$openssl/libssl.lib`" ws2_32.lib wsock32.lib iphlpapi.lib $exportArgs"
           & cmd.exe /d /s /c $link
           if ($LASTEXITCODE -ne 0) { throw "In-process RAOP bridge x64 link failed" }
           if (-not (Test-Path $bridgeDll)) { throw "sairplay-raop.dll missing" }
