@@ -1,0 +1,527 @@
+name: Windows
+
+on:
+  push:
+    branches: [main, "dev/**", "rewrite/**"]
+    paths-ignore:
+      - "docs/**"
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+
+concurrency:
+  group: sairplay2-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply validated branch fixes
+        if: github.ref != 'refs/heads/dev/msa-core-architecture'
+        shell: pwsh
+        run: ./scripts/apply-validated-branch-fixes.ps1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build pinned OpenSSL x64 prerequisite
+        if: github.ref == 'refs/heads/dev/msa-core-architecture'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pin = "ac74d79efc7a702386fcf00d4b7e0a785721a3ed"
+          $src = "target/vendor/libopenssl-x64"
+          $stage = "target/vendor/libopenssl-x64-stage"
+
+          if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+
+          git clone --filter=blob:none https://github.com/Philippe44/libopenssl.git $src
+          git -C $src checkout $pin
+          git -C $src submodule update --init openssl
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
+            Select-Object -First 1
+          if (-not $vs) { throw "Visual Studio x64 C++ toolchain not found" }
+
+          $vcvars64 = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars64)) { throw "vcvars64.bat not found" }
+
+          $openssl = (Resolve-Path "$src/openssl").Path
+          $cmd = "call `"$vcvars64`" && cd /d `"$openssl`" && perl Configure shared VC-WIN64A && nmake"
+          & cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "Pinned OpenSSL x64 build failed" }
+
+          $cryptoDll = Join-Path $openssl "libcrypto-1_1-x64.dll"
+          $sslDll = Join-Path $openssl "libssl-1_1-x64.dll"
+          $cryptoLib = Join-Path $openssl "libcrypto.lib"
+          $sslLib = Join-Path $openssl "libssl.lib"
+          foreach ($file in @($cryptoDll, $sslDll, $cryptoLib, $sslLib)) {
+            if (-not (Test-Path $file)) { throw "Pinned OpenSSL x64 output missing: $file" }
+          }
+
+          New-Item -ItemType Directory -Force -Path "$stage/include" | Out-Null
+          Copy-Item "$openssl/include/openssl" "$stage/include/openssl" -Recurse -Force
+          Copy-Item $cryptoDll $stage -Force
+          Copy-Item $sslDll $stage -Force
+          Copy-Item $cryptoLib $stage -Force
+          Copy-Item $sslLib $stage -Force
+
+          Get-FileHash "$stage/libcrypto-1_1-x64.dll" -Algorithm SHA256
+          Get-FileHash "$stage/libssl-1_1-x64.dll" -Algorithm SHA256
+          Get-ChildItem $stage
+
+      - name: Build pinned libcodecs ALAC wrapper x64 prerequisite
+        if: github.ref == 'refs/heads/dev/msa-core-architecture'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pin = "3234c96680fbe9f45047936a14df10edca822e5e"
+          $src = "target/vendor/libcodecs-x64"
+          $stage = "target/vendor/libcodecs-x64-stage"
+
+          if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+
+          git clone --filter=blob:none https://github.com/Philippe44/libcodecs.git $src
+          git -C $src checkout $pin
+          git -C $src submodule update --init alac
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe |
+            Select-Object -First 1
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
+            Select-Object -First 1
+          if (-not $msbuild) { throw "MSBuild not found" }
+          if (-not $vs) { throw "Visual Studio x64 C++ toolchain not found" }
+
+          $vcvars64 = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars64)) { throw "vcvars64.bat not found" }
+
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $stageAbs = (Resolve-Path $stage).Path + "\"
+
+          & $msbuild "$src/alac.vcxproj" /m /p:Configuration=Release /p:Platform=x64 /p:OutDir="$stageAbs" /p:TargetName=libalac
+          if ($LASTEXITCODE -ne 0) { throw "Pinned libcodecs ALAC x64 build failed" }
+
+          $alacInclude = (Resolve-Path "$src/alac/codec").Path
+          $wrapper = (Resolve-Path "$src/addons/alac_wrapper.cpp").Path
+          $wrapperObj = Join-Path (Resolve-Path $stage).Path "alac_wrapper.obj"
+          $wrapperLib = Join-Path (Resolve-Path $stage).Path "libalac-wrapper.lib"
+          $cmd = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /MD /EHsc /I`"$alacInclude`" /Fo`"$wrapperObj`" `"$wrapper`" && lib.exe /nologo /OUT:`"$wrapperLib`" `"$wrapperObj`""
+          & cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "Pinned ALAC wrapper x64 build failed" }
+
+          foreach ($file in @("$stage/libalac.lib", "$stage/libalac-wrapper.lib")) {
+            if (-not (Test-Path $file)) { throw "Pinned ALAC x64 output missing: $file" }
+            Get-FileHash $file -Algorithm SHA256
+          }
+
+          New-Item -ItemType Directory -Force -Path "$stage/include/alac" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stage/include/addons" | Out-Null
+          Copy-Item "$src/alac/codec/ALAC*.h" "$stage/include/alac" -Force
+          Copy-Item "$src/addons/alac_wrapper.h" "$stage/include/addons/alac_wrapper.h" -Force
+          Get-ChildItem $stage -Recurse
+
+      - name: Build pinned pthreads4w static x64 prerequisite
+        if: github.ref == 'refs/heads/dev/msa-core-architecture'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pin = "2ae750783281db5b5cd867649880b3b951ced781"
+          $src = "target/vendor/libpthreads4w-x64"
+          $build = "target/vendor/libpthreads4w-x64-build"
+          $stage = "target/vendor/libpthreads4w-x64-stage"
+
+          if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+          if (Test-Path $build) { Remove-Item -Recurse -Force $build }
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+
+          git clone --filter=blob:none https://github.com/philippe44/libpthreads4w.git $src
+          git -C $src checkout $pin
+
+          $cmakeHelp = cmake --help | Out-String
+          $vsGenerators = [regex]::Matches(
+            $cmakeHelp,
+            '(?m)^\*?\s*(Visual Studio \d+ \d{4})'
+          ) | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+          $vsGenerator = $vsGenerators |
+            Sort-Object { [int]([regex]::Match($_, 'Visual Studio (\d+)').Groups[1].Value) } -Descending |
+            Select-Object -First 1
+          if (-not $vsGenerator) { throw "No Visual Studio CMake generator found" }
+
+          cmake -S $src -B $build -G $vsGenerator -A x64 -DBUILD_TESTING=OFF -DPTHREADS4W_BUILD_C=ON -DPTHREADS4W_BUILD_CE=OFF -DPTHREADS4W_BUILD_SE=OFF
+          if ($LASTEXITCODE -ne 0) { throw "Pinned pthreads4w x64 configure failed" }
+
+          cmake --build $build --config Release --target pthreadVC-static
+          if ($LASTEXITCODE -ne 0) { throw "Pinned pthreads4w static x64 build failed" }
+
+          $staticLib = Get-ChildItem $build -Recurse -File -Filter "libpthread*.lib" |
+            Select-Object -First 1
+          if (-not $staticLib) { throw "Pinned pthreads4w static x64 library missing" }
+
+          New-Item -ItemType Directory -Force -Path "$stage/include" | Out-Null
+          Copy-Item $staticLib.FullName "$stage/libpthread-static.lib" -Force
+          Copy-Item "$src/pthread.h" "$stage/include/pthread.h" -Force
+          Copy-Item "$src/_ptw32.h" "$stage/include/_ptw32.h" -Force
+          Copy-Item "$src/sched.h" "$stage/include/sched.h" -Force
+          Copy-Item "$src/semaphore.h" "$stage/include/semaphore.h" -Force
+
+          Get-FileHash "$stage/libpthread-static.lib" -Algorithm SHA256
+          Get-ChildItem $stage -Recurse
+
+      - name: Build pinned libraop client static x64 prerequisite
+        if: github.ref == 'refs/heads/dev/msa-core-architecture'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pin = "81c2182649da8645ac2a58b78e9f370c79a4165b"
+          $dmapPin = "2f8ee61e2427a177beea919d72dde8931084fe51"
+          $src = "target/vendor/libraop-client-x64"
+          $stage = "target/vendor/libraop-client-x64-stage"
+          $obj = "$stage/obj"
+
+          if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+
+          git clone --filter=blob:none https://github.com/philippe44/libraop.git $src
+          git -C $src checkout $pin
+          git -C $src submodule update --init crosstools dmap-parser
+          $dmapHead = (git -C "$src/dmap-parser" rev-parse HEAD).Trim()
+          if ($dmapHead -ne $dmapPin) { throw "Pinned dmap-parser mismatch: $dmapHead" }
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
+            Select-Object -First 1
+          if (-not $vs) { throw "Visual Studio x64 C++ toolchain not found" }
+          $vcvars64 = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars64)) { throw "vcvars64.bat not found" }
+
+          $srcAbs = (Resolve-Path $src).Path
+          $stageAbs = (New-Item -ItemType Directory -Force -Path $stage).FullName
+          $objAbs = (New-Item -ItemType Directory -Force -Path $obj).FullName
+          $opensslInclude = (Resolve-Path "target/vendor/libopenssl-x64-stage/include").Path
+          $pthreadInclude = (Resolve-Path "target/vendor/libpthreads4w-x64-stage/include").Path
+          $alacWrapperInclude = (Resolve-Path "target/vendor/libcodecs-x64-stage/include/addons").Path
+          $strictClockHeader = (Resolve-Path "native/raop-static/strict_clock_shim.h").Path
+
+          $includes = @(
+            (Join-Path $srcAbs "src"),
+            (Join-Path $srcAbs "crosstools/src"),
+            (Join-Path $srcAbs "dmap-parser"),
+            $opensslInclude,
+            $pthreadInclude,
+            $alacWrapperInclude
+          )
+          $includeArgs = ($includes | ForEach-Object { "/I`"$_`"" }) -join " "
+
+          # Match the sender-side source set used by pinned MSA instead of
+          # guessing a smaller libraop subset.
+          $sources = @(
+            (Join-Path $srcAbs "src/raop_client.c"),
+            (Join-Path $srcAbs "src/rtsp_client.c"),
+            (Join-Path $srcAbs "src/aes.c"),
+            (Join-Path $srcAbs "src/aes_ctr.c"),
+            (Join-Path $srcAbs "src/alac.c"),
+            (Join-Path $srcAbs "dmap-parser/dmap_parser.c"),
+            (Join-Path $srcAbs "crosstools/src/cross_log.c"),
+            (Join-Path $srcAbs "crosstools/src/cross_net.c"),
+            (Join-Path $srcAbs "crosstools/src/cross_ssl.c"),
+            (Join-Path $srcAbs "crosstools/src/cross_util.c"),
+            (Join-Path $srcAbs "crosstools/src/platform.c")
+          )
+
+          $objects = @()
+          foreach ($source in $sources) {
+            if (-not (Test-Path $source)) { throw "Pinned libraop client source missing: $source" }
+            $objPath = Join-Path $objAbs (([IO.Path]::GetFileNameWithoutExtension($source)) + ".obj")
+            $sourceExtraArgs = ""
+            if ([IO.Path]::GetFileName($source) -eq "cross_util.c") {
+              # Redirect only the pinned Windows clock call through our module-
+              # local shim. Default mode returns raw FILETIME exactly; the
+              # separately loaded strict DLL opts into corrected NTP.
+              $sourceExtraArgs = "/DGetSystemTimeAsFileTime=sr_clock_GetSystemTimeAsFileTime /FI`"$strictClockHeader`""
+            }
+            $cmd = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /MD /std:clatest /DNDEBUG /DSSL_STATIC_LIB /DWIN32 /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /D_CRT_NONSTDC_NO_DEPRECATE /DOPENSSL_SUPPRESS_DEPRECATED $sourceExtraArgs $includeArgs /Fo`"$objPath`" `"$source`""
+            & cmd.exe /d /s /c $cmd
+            if ($LASTEXITCODE -ne 0) { throw "Pinned libraop client x64 compile failed: $source" }
+            $objects += $objPath
+          }
+
+          $lib = Join-Path $stageAbs "libraop-client-x64.lib"
+          $objectArgs = ($objects | ForEach-Object { "`"$_`"" }) -join " "
+          $cmd = "call `"$vcvars64`" && lib.exe /nologo /OUT:`"$lib`" $objectArgs"
+          & cmd.exe /d /s /c $cmd
+          if ($LASTEXITCODE -ne 0) { throw "Pinned libraop client static x64 archive failed" }
+          if (-not (Test-Path $lib)) { throw "Pinned libraop client static x64 library missing" }
+
+          New-Item -ItemType Directory -Force -Path "$stage/include" | Out-Null
+          Copy-Item "$src/src/raop_client.h" "$stage/include/raop_client.h" -Force
+          Copy-Item "$src/src/rtsp_client.h" "$stage/include/rtsp_client.h" -Force
+          Copy-Item "$src/crosstools/src/platform.h" "$stage/include/platform.h" -Force
+          Copy-Item "$src/crosstools/src/cross_net.h" "$stage/include/cross_net.h" -Force
+          Copy-Item "$src/crosstools/src/cross_ssl.h" "$stage/include/cross_ssl.h" -Force
+          Copy-Item "$src/crosstools/src/cross_log.h" "$stage/include/cross_log.h" -Force
+          Copy-Item "$src/crosstools/src/cross_util.h" "$stage/include/cross_util.h" -Force
+
+          Get-FileHash $lib -Algorithm SHA256
+          Get-ChildItem $stage -Recurse
+
+      - name: Build in-process RAOP bridge x64
+        if: github.ref == 'refs/heads/dev/msa-core-architecture'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
+            Select-Object -First 1
+          if (-not $vs) { throw "Visual Studio x64 C++ toolchain not found" }
+          $vcvars64 = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars64)) { throw "vcvars64.bat not found" }
+
+          $libraop = (Resolve-Path "target/vendor/libraop-client-x64-stage").Path
+          $openssl = (Resolve-Path "target/vendor/libopenssl-x64-stage").Path
+          $pthread = (Resolve-Path "target/vendor/libpthreads4w-x64-stage").Path
+          $alac = (Resolve-Path "target/vendor/libcodecs-x64-stage").Path
+          $stage = "target/vendor/sairplay-raop-x64-stage"
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+          $stageAbs = (New-Item -ItemType Directory -Force -Path $stage).FullName
+
+          $bridge = (Resolve-Path "native/raop-static/raop_bridge.c").Path
+          $clockShim = (Resolve-Path "native/raop-static/strict_clock_shim.c").Path
+          $bridgeInclude = (Resolve-Path "native/raop-static").Path
+          $bridgeObj = Join-Path $stageAbs "raop_bridge.obj"
+          $clockShimObj = Join-Path $stageAbs "strict_clock_shim.obj"
+          $logGlobals = Join-Path $stageAbs "raop_log_globals.c"
+          $logGlobalsObj = Join-Path $stageAbs "raop_log_globals.obj"
+          $bridgeDll = Join-Path $stageAbs "sairplay-raop.dll"
+          $strictBridgeDll = Join-Path $stageAbs "sairplay-raop-strict.dll"
+          $includeArgs = @(
+            "/I`"$bridgeInclude`"",
+            "/I`"$libraop/include`"",
+            "/I`"$pthread/include`"",
+            "/I`"$alac/include/addons`"",
+            "/I`"$openssl/include`""
+          ) -join " "
+
+          Set-Content -Path $logGlobals -Encoding ascii -Value @(
+            '#include "cross_log.h"',
+            'log_level raop_loglevel = lWARN;',
+            'log_level util_loglevel = lWARN;'
+          )
+
+          $compile = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /MD /std:clatest /DNDEBUG /DWIN32 /DSSL_STATIC_LIB /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /D_CRT_NONSTDC_NO_DEPRECATE /DOPENSSL_SUPPRESS_DEPRECATED $includeArgs /Fo`"$bridgeObj`" `"$bridge`""
+          & cmd.exe /d /s /c $compile
+          if ($LASTEXITCODE -ne 0) { throw "In-process RAOP bridge x64 compile failed" }
+
+          $compileClockShim = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /MD /std:clatest /DNDEBUG /DWIN32 $includeArgs /Fo`"$clockShimObj`" `"$clockShim`""
+          & cmd.exe /d /s /c $compileClockShim
+          if ($LASTEXITCODE -ne 0) { throw "Strict NTP clock shim x64 compile failed" }
+
+          $compileGlobals = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /MD /std:clatest /DNDEBUG /DWIN32 $includeArgs /Fo`"$logGlobalsObj`" `"$logGlobals`""
+          & cmd.exe /d /s /c $compileGlobals
+          if ($LASTEXITCODE -ne 0) { throw "In-process RAOP log globals x64 compile failed" }
+
+          $exports = @(
+            "sr_raop_open", "sr_raop_close", "sr_raop_healthy", "sr_raop_keepalive",
+            "sr_raop_commit_start", "sr_raop_start_after_flush", "sr_raop_flush",
+            "sr_raop_standby", "sr_raop_pause", "sr_raop_play", "sr_raop_stop",
+            "sr_raop_set_volume", "sr_raop_set_progress", "sr_raop_set_metadata",
+            "sr_raop_set_artwork", "sr_raop_write_packet", "sr_raop_head_audible_ms"
+          ) | ForEach-Object { "/EXPORT:$_" }
+          $exportArgs = $exports -join " "
+          $link = "call `"$vcvars64`" && link.exe /nologo /DLL /OUT:`"$bridgeDll`" `"$bridgeObj`" `"$clockShimObj`" `"$logGlobalsObj`" `"$libraop/libraop-client-x64.lib`" `"$alac/libalac-wrapper.lib`" `"$alac/libalac.lib`" `"$pthread/libpthread-static.lib`" `"$openssl/libcrypto.lib`" `"$openssl/libssl.lib`" ws2_32.lib wsock32.lib iphlpapi.lib $exportArgs"
+          & cmd.exe /d /s /c $link
+          if ($LASTEXITCODE -ne 0) { throw "In-process RAOP bridge x64 link failed" }
+          if (-not (Test-Path $bridgeDll)) { throw "sairplay-raop.dll missing" }
+          # Loading the same binary under a second filename gives Windows a
+          # separate module instance and therefore a separate clock-mode global.
+          # Normal SOtM/RAOP sessions use sairplay-raop.dll (mode 0); only the
+          # AppleTV3 compatibility selector loads this strict copy and enables 1.
+          Copy-Item $bridgeDll $strictBridgeDll -Force
+          if (-not (Test-Path $strictBridgeDll)) { throw "sairplay-raop-strict.dll missing" }
+
+          Get-FileHash $bridgeDll -Algorithm SHA256
+          Get-FileHash $strictBridgeDll -Algorithm SHA256
+          Get-ChildItem $stageAbs
+
+      # The active MSA Core branch owns native AP2 + the Rust RAOP adapter.
+      # For 16-bit hardware regression it does not need either historical
+      # cliraop helper or the 24-bit external ALAC bridge. Keep this lane short
+      # so every transport diagnostic can reach hardware quickly.
+      - name: Test MSA Core
+        if: github.ref == 'refs/heads/dev/msa-core-architecture'
+        run: cargo test -p sairplay-msa-solo --all-targets
+
+      - name: Check full workspace
+        if: github.ref != 'refs/heads/dev/msa-core-architecture'
+        run: cargo check --workspace --all-targets
+
+      - name: Test full workspace invariants
+        if: github.ref != 'refs/heads/dev/msa-core-architecture'
+        run: cargo test --workspace --all-targets
+
+      - name: Build GUI
+        run: cargo build --release -p sairplay-gui
+
+      - name: Package MSA Core 16-bit test artifact
+        if: github.ref == 'refs/heads/dev/msa-core-architecture'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $out = "target/release/SAirplay2"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item "target/release/sairplay-gui.exe" "$out/sairplay-gui.exe" -Force
+          Copy-Item "target/vendor/sairplay-raop-x64-stage/sairplay-raop.dll" "$out/sairplay-raop.dll" -Force
+          Copy-Item "target/vendor/sairplay-raop-x64-stage/sairplay-raop-strict.dll" "$out/sairplay-raop-strict.dll" -Force
+          Copy-Item "target/vendor/libopenssl-x64-stage/libcrypto-1_1-x64.dll" "$out/libcrypto-1_1-x64.dll" -Force
+          Copy-Item "target/vendor/libopenssl-x64-stage/libssl-1_1-x64.dll" "$out/libssl-1_1-x64.dll" -Force
+          Get-FileHash "$out/sairplay-gui.exe" -Algorithm SHA256
+          Get-FileHash "$out/sairplay-raop.dll" -Algorithm SHA256
+          Get-FileHash "$out/sairplay-raop-strict.dll" -Algorithm SHA256
+          Get-FileHash "$out/libcrypto-1_1-x64.dll" -Algorithm SHA256
+          Get-FileHash "$out/libssl-1_1-x64.dll" -Algorithm SHA256
+          Get-ChildItem $out
+
+      - name: Upload MSA Core 16-bit Windows artifact
+        if: github.ref == 'refs/heads/dev/msa-core-architecture'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SAirplay2-MSA-Core-16bit-Windows
+          path: target/release/SAirplay2/*
+
+      # Full/release packaging below is intentionally excluded from the active
+      # MSA Core 16-bit branch. cliraop.exe remains only for legacy/pairing
+      # packaging; cliraop-msa-solo.exe is historical comparison baggage and is
+      # not part of the new Rust MSA receiver-core runtime.
+      - name: Build source-aligned ALAC24 bridge
+        if: github.ref != 'refs/heads/dev/msa-core-architecture'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $libraopPin = "81c2182649da8645ac2a58b78e9f370c79a4165b"
+          $src = "target/vendor/airplay-cli-libraop"
+          $build = "target/alac24-build"
+
+          if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+          if (Test-Path $build) { Remove-Item -Recurse -Force $build }
+
+          git clone --filter=blob:none https://github.com/philippe44/libraop.git $src
+          git -C $src checkout $libraopPin
+          git -C $src submodule update --init --recursive libcodecs
+
+          $alac = (Resolve-Path "$src/libcodecs/alac/codec").Path
+
+          $cmakeHelp = cmake --help | Out-String
+          $vsGenerators = [regex]::Matches(
+            $cmakeHelp,
+            '(?m)^\*?\s*(Visual Studio \d+ \d{4})'
+          ) | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+          $vsGenerator = $vsGenerators |
+            Sort-Object { [int]([regex]::Match($_, 'Visual Studio (\d+)').Groups[1].Value) } -Descending |
+            Select-Object -First 1
+          if (-not $vsGenerator) { throw "No Visual Studio CMake generator found" }
+          Write-Host "Using CMake generator: $vsGenerator"
+
+          cmake -S "native/alac24" -B $build -G $vsGenerator -A x64 "-DALAC_SOURCE=$alac"
+          if ($LASTEXITCODE -ne 0) { throw "ALAC24 CMake configure failed" }
+
+          cmake --build $build --config Release
+          if ($LASTEXITCODE -ne 0) { throw "ALAC24 build failed" }
+
+          $dll = "$build/Release/sairplay-alac24.dll"
+          if (-not (Test-Path $dll)) { throw "sairplay-alac24.dll missing" }
+          Get-FileHash $dll -Algorithm SHA256
+
+      - name: Build MSA SOLO pinned libraop helper
+        if: github.ref != 'refs/heads/dev/msa-core-architecture'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pin = "81c2182649da8645ac2a58b78e9f370c79a4165b"
+          $src = "target/vendor/libraop-msa-solo"
+          if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+
+          git clone --filter=blob:none https://github.com/philippe44/libraop.git $src
+          git -C $src checkout $pin
+          git -C $src submodule update --init --recursive
+          Copy-Item "$env:GITHUB_WORKSPACE/native/cliraop-msa-solo.c" "$src/src/cliraop.c" -Force
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe |
+            Select-Object -First 1
+          if (-not $msbuild) { throw "MSBuild not found" }
+
+          & $msbuild "$src/libraop.sln" /m /p:Configuration=Release /p:Platform=x86
+          if ($LASTEXITCODE -ne 0) { throw "MSA SOLO pinned libraop build failed" }
+          if (-not (Test-Path "$src/bin/cliraop.exe")) { throw "MSA SOLO cliraop.exe missing" }
+
+          Copy-Item "$src/bin/cliraop.exe" "$src/bin/cliraop-msa-solo.exe" -Force
+          Get-FileHash "$src/bin/cliraop-msa-solo.exe" -Algorithm SHA256
+
+      - name: Build current libraop helper from source
+        if: github.ref != 'refs/heads/dev/msa-core-architecture'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pin = "dadcfcaa26d988cdd3e3501ddf8286c224f1b494"
+          $src = "target/vendor/libraop"
+          if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+          git clone --filter=blob:none https://github.com/philippe44/libraop.git $src
+          git -C $src checkout $pin
+          git -C $src submodule update --init --recursive
+          Copy-Item "$env:GITHUB_WORKSPACE/native/cliraop-runtime-volume.c" "$src/src/cliraop.c" -Force
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe |
+            Select-Object -First 1
+          if (-not $msbuild) { throw "MSBuild not found" }
+
+          & $msbuild "$src/libraop.sln" /m /p:Configuration=Release /p:Platform=x86
+          if ($LASTEXITCODE -ne 0) { throw "Current libraop source build failed" }
+          if (-not (Test-Path "$src/bin/cliraop.exe")) { throw "Source-built cliraop.exe missing" }
+
+          $help = (& "$src/bin/cliraop.exe" --help | Out-String)
+          $help | Write-Host
+          if ($help -notmatch '\[-V <runtime volume file>\]') {
+            throw "Source-built cliraop.exe is missing runtime-volume support"
+          }
+          if ($help -notmatch '\[-U <unix_ms>\]') {
+            throw "Source-built cliraop.exe is missing Unix-ms clock bridge support"
+          }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "cliraop --help returned $LASTEXITCODE (upstream usage exit); continuing."
+            $global:LASTEXITCODE = 0
+          }
+          Get-FileHash "$src/bin/cliraop.exe" -Algorithm SHA256
+
+      - name: Bundle current libraop legacy transport
+        if: github.ref != 'refs/heads/dev/msa-core-architecture'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pin = "dadcfcaa26d988cdd3e3501ddf8286c224f1b494"
+          $base = "https://raw.githubusercontent.com/philippe44/libraop/$pin"
+          $src = "target/vendor/libraop"
+          $out = "target/release/SAirplay2"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item "target/release/sairplay-gui.exe" "$out/sairplay-gui.exe"
+          Copy-Item "target/alac24-build/Release/sairplay-alac24.dll" "$out/sairplay-alac24.dll"
+          Copy-Item "$src/bin/cliraop.exe" "$out/cliraop.exe"
+          Copy-Item "target/vendor/libraop-msa-solo/bin/cliraop-msa-solo.exe" "$out/cliraop-msa-solo.exe"
+          Invoke-WebRequest "$base/bin/libcrypto-1_1.dll" -OutFile "$out/libcrypto-1_1.dll"
+          Invoke-WebRequest "$base/bin/libssl-1_1.dll" -OutFile "$out/libssl-1_1.dll"
+          Invoke-WebRequest "$base/README.md" -OutFile "$out/LIBRAOP-README.md"
+          Copy-Item "docs/LEGACY-TRANSPORT.md" "$out/LEGACY-TRANSPORT.md"
+          Get-FileHash "$out/cliraop.exe" -Algorithm SHA256
+          Get-ChildItem $out
+
+      - name: Upload full Windows GUI
+        if: github.ref != 'refs/heads/dev/msa-core-architecture'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SAirplay2-v0.1.0-Windows
+          path: target/release/SAirplay2/*

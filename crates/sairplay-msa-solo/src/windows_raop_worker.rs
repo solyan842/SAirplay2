@@ -160,20 +160,41 @@ impl WindowsRaopAudioWorker {
             pinned_windows_clock_diag(now_unix_ms);
         let codec = if config.compressed_alac { "ALAC" } else { "ALAC-raw" };
         let crypto = if config.encrypt && config.et.contains('1') { "RSA" } else { "clear" };
-        let wire_diag = format!(
-            "MSA RAOP DIAG WIRE clock=pinned-windows-crosstools source_ntp_sec={} expected_ntp_sec={} delta={}s et={} md={} codec={} crypto={} mfi_auth={} sample_rate={} bit_depth={} channels={}; observation-only, transport unchanged.",
-            pinned_windows_ntp_sec,
-            expected_ntp_sec,
-            clock_delta_sec,
-            config.et,
-            config.md,
-            codec,
-            crypto,
-            config.mfi_auth,
-            config.sample_rate,
-            config.bit_depth,
-            config.channels,
-        );
+        // Preserve the existing diagnostic text byte-for-byte for every normal
+        // RAOP receiver. Only the isolated AppleTV3 strict-NTP module reports
+        // the corrected active clock; the legacy delta remains visible for A/B.
+        let wire_diag = if config.strict_ntp_clock {
+            format!(
+                "MSA RAOP DIAG WIRE clock=strict-ntp-compat source_ntp_sec={} expected_ntp_sec={} delta=0s legacy_source_ntp_sec={} legacy_delta={}s et={} md={} codec={} crypto={} mfi_auth={} sample_rate={} bit_depth={} channels={}; isolated AppleTV3 RAOP compatibility path active.",
+                expected_ntp_sec,
+                expected_ntp_sec,
+                pinned_windows_ntp_sec,
+                clock_delta_sec,
+                config.et,
+                config.md,
+                codec,
+                crypto,
+                config.mfi_auth,
+                config.sample_rate,
+                config.bit_depth,
+                config.channels,
+            )
+        } else {
+            format!(
+                "MSA RAOP DIAG WIRE clock=pinned-windows-crosstools source_ntp_sec={} expected_ntp_sec={} delta={}s et={} md={} codec={} crypto={} mfi_auth={} sample_rate={} bit_depth={} channels={}; observation-only, transport unchanged.",
+                pinned_windows_ntp_sec,
+                expected_ntp_sec,
+                clock_delta_sec,
+                config.et,
+                config.md,
+                codec,
+                crypto,
+                config.mfi_auth,
+                config.sample_rate,
+                config.bit_depth,
+                config.channels,
+            )
+        };
         let session = Arc::new(Mutex::new(MsaRaopSession::connect(config)?));
         let worker = Self::start(session)?;
         if let Ok(mut events) = worker.startup_events.lock() {

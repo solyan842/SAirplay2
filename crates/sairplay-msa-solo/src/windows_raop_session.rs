@@ -55,6 +55,9 @@ pub struct MsaRaopConfig {
     pub sample_rate: u32,
     pub bit_depth: u16,
     pub channels: u16,
+    /// Select the isolated strict-NTP DLL for AppleTV3-class RAOP receivers.
+    /// False preserves the hardware-locked legacy Windows clock path exactly.
+    pub strict_ntp_clock: bool,
     pub lead_ms: u32,
 }
 impl MsaRaopConfig {
@@ -76,6 +79,7 @@ impl MsaRaopConfig {
             sample_rate: 44_100,
             bit_depth: 16,
             channels: 2,
+            strict_ntp_clock: false,
             lead_ms: 2_000,
         }
     }
@@ -179,11 +183,13 @@ type MetadataFn = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char
 type ArtworkFn = unsafe extern "C" fn(*mut c_void, *const c_char, *const u8, usize) -> i32;
 type WriteFn = unsafe extern "C" fn(*mut c_void, *const u8, usize) -> i32;
 type HeadFn = unsafe extern "C" fn(*mut c_void) -> u64;
+type ClockModeFn = unsafe extern "C" fn(i32);
 
 struct InprocApi {
     _library: Library,
     open: OpenFn,
     close: CloseFn,
+    set_strict_ntp_clock: ClockModeFn,
     healthy: BoolFn,
     keepalive: BoolFn,
     commit_start: StartFn,
@@ -213,6 +219,7 @@ impl InprocApi {
         }
         let open = symbol!("sr_raop_open", OpenFn);
         let close = symbol!("sr_raop_close", CloseFn);
+        let set_strict_ntp_clock = symbol!("sr_raop_set_strict_ntp_clock", ClockModeFn);
         let healthy = symbol!("sr_raop_healthy", BoolFn);
         let keepalive = symbol!("sr_raop_keepalive", BoolFn);
         let commit_start = symbol!("sr_raop_commit_start", StartFn);
@@ -229,7 +236,7 @@ impl InprocApi {
         let write_packet = symbol!("sr_raop_write_packet", WriteFn);
         let head_audible_ms = symbol!("sr_raop_head_audible_ms", HeadFn);
         Ok(Self {
-            _library: library, open, close, healthy, keepalive, commit_start,
+            _library: library, open, close, set_strict_ntp_clock, healthy, keepalive, commit_start,
             start_after_flush, flush, standby, pause, play, stop, set_volume,
             set_progress, set_metadata, set_artwork, write_packet, head_audible_ms,
         })
@@ -344,20 +351,43 @@ fn cstring(value: &str, field: &str) -> Result<CString, MsaRaopError> {
     CString::new(value).map_err(|_| MsaRaopError::InProcess(format!("{field} contains NUL")))
 }
 
-fn inproc_dll_path() -> Result<Option<PathBuf>, MsaRaopError> {
-    if let Some(path) = std::env::var_os("SAIRPLAY_RAOP_INPROC_DLL") {
+fn inproc_dll_path(strict_ntp_clock: bool) -> Result<Option<PathBuf>, MsaRaopError> {
+    let override_name = if strict_ntp_clock {
+        "SAIRPLAY_RAOP_STRICT_INPROC_DLL"
+    } else {
+        "SAIRPLAY_RAOP_INPROC_DLL"
+    };
+    if let Some(path) = std::env::var_os(override_name) {
         let path = PathBuf::from(path);
         if path.is_file() { return Ok(Some(path)); }
-        return Err(MsaRaopError::InProcess(format!("configured DLL missing: {}", path.display())));
+        return Err(MsaRaopError::InProcess(format!(
+            "configured {} missing: {}",
+            if strict_ntp_clock { "strict-NTP DLL" } else { "DLL" },
+            path.display(),
+        )));
     }
     let exe = std::env::current_exe().map_err(MsaRaopError::Io)?;
-    let path = exe.parent().unwrap_or(Path::new(".")).join("sairplay-raop.dll");
+    let file_name = if strict_ntp_clock {
+        "sairplay-raop-strict.dll"
+    } else {
+        "sairplay-raop.dll"
+    };
+    let path = exe.parent().unwrap_or(Path::new(".")).join(file_name);
+    if strict_ntp_clock && !path.is_file() {
+        return Err(MsaRaopError::InProcess(format!(
+            "strict-NTP RAOP DLL missing: {}",
+            path.display(),
+        )));
+    }
     Ok(path.is_file().then_some(path))
 }
 
 fn try_open_inproc(config: &MsaRaopConfig) -> Result<Option<(Arc<InprocCore>, MsaRaopReady, PathBuf)>, MsaRaopError> {
-    let Some(path) = inproc_dll_path()? else { return Ok(None) };
+    let Some(path) = inproc_dll_path(config.strict_ntp_clock)? else { return Ok(None) };
     let api = unsafe { InprocApi::load(&path)? };
+    unsafe {
+        (api.set_strict_ntp_clock)(if config.strict_ntp_clock { 1 } else { 0 });
+    }
 
     let host = cstring(&config.host, "host")?;
     let bind_ip = config.bind_ip.map(|v| cstring(&v.to_string(), "bind_ip")).transpose()?;
@@ -498,7 +528,9 @@ impl MsaRaopSession {
                 state: MsaRaopState::Connected,
                 ready,
                 log: Arc::new(Mutex::new(vec![format!(
-                    "MSA-RAOP backend=in-process dll={}", path.display()
+                    "MSA-RAOP backend=in-process dll={} clock={}",
+                    path.display(),
+                    if config.strict_ntp_clock { "strict-ntp" } else { "pinned-windows" },
                 )])),
             });
         }

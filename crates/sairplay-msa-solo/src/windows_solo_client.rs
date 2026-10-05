@@ -168,6 +168,15 @@ impl WindowsMsaSoloVolumeControl {
     }
 }
 
+fn raop_strict_ntp_compat(txt: Option<&str>, am: Option<&str>) -> bool {
+    let txt_model = txt.and_then(|txt| {
+        txt.split_whitespace()
+            .find_map(|token| token.strip_prefix("model="))
+    });
+    txt_model.is_some_and(|model| model.starts_with("AppleTV3,"))
+        || am.is_some_and(|model| model.starts_with("AppleTV3,"))
+}
+
 impl WindowsMsaSoloClient {
     pub fn connect(mut config: WindowsMsaSoloConfig) -> Result<Self, SoloConnectError> {
         let have_credentials = config.native.control.auth_credentials.is_some();
@@ -183,6 +192,13 @@ impl WindowsMsaSoloClient {
         config.raop.dacp_id = config.native.control.dacp_id.clone();
         config.raop.active_remote = config.native.control.active_remote.clone();
         config.raop.bind_ip = config.native.control.bind_ip;
+        // AppleTV3-class receivers (including common embedded clones) require
+        // standards-correct absolute NTP on Windows. Keep this selector model-
+        // based rather than port-based so equivalent receivers on other ports
+        // use the same compatibility path. Other RAOP receivers remain on the
+        // hardware-locked pinned-Windows clock module.
+        config.raop.strict_ntp_clock =
+            raop_strict_ntp_compat(config.txt.as_deref(), config.am.as_deref());
         config.raop.mfi_auth = config.raop.mfi_auth
             || config.am.as_deref().is_some_and(|v| v.to_ascii_lowercase().contains("airport"));
 
@@ -836,4 +852,31 @@ impl WindowsMsaSoloClient {
         }
     }
 
+}
+
+#[cfg(test)]
+mod strict_ntp_compat_tests {
+    use super::raop_strict_ntp_compat;
+
+    #[test]
+    fn raop_strict_ntp_compat_selects_appletv3_family() {
+        assert!(raop_strict_ntp_compat(
+            Some("features=0x1e527ffff7 model=AppleTV3,1 flags=0x4"),
+            None,
+        ));
+        assert!(raop_strict_ntp_compat(None, Some("AppleTV3,2")));
+    }
+
+    #[test]
+    fn raop_strict_ntp_compat_does_not_touch_locked_non_appletv3_lanes() {
+        assert!(!raop_strict_ntp_compat(None, Some("ShairportSync")));
+        assert!(!raop_strict_ntp_compat(
+            Some("model=AppleTV5,3 features=0x123"),
+            None,
+        ));
+        assert!(!raop_strict_ntp_compat(
+            Some("model=AudioAccessory5,1 features=0x123"),
+            None,
+        ));
+    }
 }
