@@ -11,7 +11,6 @@ permissions:
 
 jobs:
   apply:
-    if: github.event.head_commit.message == 'chore: fix strict NTP compatibility applicator'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
