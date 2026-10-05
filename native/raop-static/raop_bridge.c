@@ -63,6 +63,11 @@ static int sr_runtime_init(void)
     return InitOnceExecuteOnce(&g_runtime_once, sr_runtime_init_once, NULL, NULL) ? 1 : 0;
 }
 
+static void sr_set_open_error(sr_raop_ready *ready, uint32_t stage)
+{
+    if (ready) ready->open_error_stage = stage;
+}
+
 /* Pinned MSA treats raopcl_get_ntp(NULL) as Unix 32.32 on its normal POSIX
  * deployment. The pinned libraop Windows clock is FILETIME-derived, so the
  * #1397 Windows adapter bridges only at this boundary using a relative delta.
@@ -156,15 +161,33 @@ sr_raop_handle *sr_raop_open(const sr_raop_config *config, sr_raop_ready *ready)
     float initial_volume;
     sr_raop_handle *handle;
 
-    if (!sr_validate_config(config) || !sr_runtime_init()) return NULL;
-    if (!sr_resolve_ipv4(config->host, &player)) return NULL;
+    if (ready) memset(ready, 0, sizeof(*ready));
+
+    if (!sr_validate_config(config)) {
+        sr_set_open_error(ready, SR_RAOP_OPEN_CONFIG);
+        return NULL;
+    }
+    if (!sr_runtime_init()) {
+        sr_set_open_error(ready, SR_RAOP_OPEN_RUNTIME);
+        return NULL;
+    }
+    if (!sr_resolve_ipv4(config->host, &player)) {
+        sr_set_open_error(ready, SR_RAOP_OPEN_RESOLVE_IPV4);
+        return NULL;
+    }
 
     if (config->bind_ip && *config->bind_ip) {
-        if (inet_pton(AF_INET, config->bind_ip, &local) != 1) return NULL;
+        if (inet_pton(AF_INET, config->bind_ip, &local) != 1) {
+            sr_set_open_error(ready, SR_RAOP_OPEN_BIND_IP);
+            return NULL;
+        }
     }
 
     handle = (sr_raop_handle *)calloc(1, sizeof(*handle));
-    if (!handle) return NULL;
+    if (!handle) {
+        sr_set_open_error(ready, SR_RAOP_OPEN_HANDLE_ALLOC);
+        return NULL;
+    }
 
     InitializeCriticalSection(&handle->lock);
     handle->sample_rate = config->sample_rate;
@@ -178,6 +201,7 @@ sr_raop_handle *sr_raop_open(const sr_raop_config *config, sr_raop_ready *ready)
         handle->packed24 = (uint8_t *)malloc(
             (size_t)SR_FRAMES_PER_CHUNK * 3U * (size_t)config->channels);
         if (!handle->packed24) {
+            sr_set_open_error(ready, SR_RAOP_OPEN_PACKED24_ALLOC);
             DeleteCriticalSection(&handle->lock);
             free(handle);
             return NULL;
@@ -213,6 +237,7 @@ sr_raop_handle *sr_raop_open(const sr_raop_config *config, sr_raop_ready *ready)
         initial_volume);
 
     if (!handle->client) {
+        sr_set_open_error(ready, SR_RAOP_OPEN_RAOPCL_CREATE);
         free(handle->packed24);
         DeleteCriticalSection(&handle->lock);
         free(handle);
@@ -220,6 +245,7 @@ sr_raop_handle *sr_raop_open(const sr_raop_config *config, sr_raop_ready *ready)
     }
 
     if (!raopcl_connect(handle->client, player, config->port, config->volume > 0)) {
+        sr_set_open_error(ready, SR_RAOP_OPEN_RAOPCL_CONNECT);
         raopcl_destroy(handle->client);
         free(handle->packed24);
         DeleteCriticalSection(&handle->lock);
@@ -232,6 +258,7 @@ sr_raop_handle *sr_raop_open(const sr_raop_config *config, sr_raop_ready *ready)
         ready->sample_rate = raopcl_sample_rate(handle->client);
         ready->bit_depth = config->bit_depth;
         ready->channels = config->channels;
+        ready->open_error_stage = SR_RAOP_OPEN_OK;
     }
 
     return handle;
