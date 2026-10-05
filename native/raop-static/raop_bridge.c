@@ -32,14 +32,12 @@
 
 #define SR_FRAMES_PER_CHUNK 352
 #define SR_START_LEAD_MS 200
-#define SR_MITV_RAOP_PORT 52266
 
 struct sr_raop_handle {
     struct raopcl_s *client;
     uint32_t sample_rate;
     uint16_t bit_depth;
     uint16_t channels;
-    uint16_t receiver_port;
     int keepalive_compat_logged;
     size_t packet_bytes;
     uint8_t *packed24;
@@ -197,7 +195,6 @@ sr_raop_handle *sr_raop_open(const sr_raop_config *config, sr_raop_ready *ready)
     handle->sample_rate = config->sample_rate;
     handle->bit_depth = config->bit_depth;
     handle->channels = config->channels;
-    handle->receiver_port = config->port;
     handle->packet_bytes = (size_t)SR_FRAMES_PER_CHUNK
         * (size_t)(config->bit_depth <= 16 ? 2 : 4)
         * (size_t)config->channels;
@@ -353,20 +350,19 @@ int sr_raop_keepalive(sr_raop_handle *handle)
     EnterCriticalSection(&handle->lock);
     if (handle->client) {
         ok = raopcl_keepalive(handle->client) ? 1 : 0;
-        /* MiTV's AppleTV3-class RAOP clone on port 52266 accepts the normal
-         * session but does not reliably implement RTSP OPTIONS keepalive.
-         * Do not turn an OPTIONS-only incompatibility into a transport death.
-         * This exception is deliberately endpoint-scoped: every other RAOP
-         * receiver, including the hardware-locked SOtM baseline, retains the
-         * exact pinned-MSA keepalive semantics. Real socket/media failure still
-         * trips sr_raop_healthy() on the next health-monitor pass. */
-        if (!ok && handle->receiver_port == SR_MITV_RAOP_PORT
+        /* Some RAOP receivers accept SETUP/RECORD and stream media correctly
+         * but do not implement RTSP OPTIONS keepalive reliably. Detect that
+         * compatibility case by runtime transport state, never by model/port:
+         * an OPTIONS-only failure is tolerated only while the pinned transport
+         * still reports connected + sane. Healthy receivers keep the exact
+         * normal path because this branch is dormant unless OPTIONS fails;
+         * real RTSP/RTP failure still trips sr_raop_healthy() immediately. */
+        if (!ok
                 && raopcl_is_connected(handle->client)
                 && raopcl_is_sane(handle->client)) {
             if (!handle->keepalive_compat_logged) {
                 fprintf(stderr,
-                        "MSA-RAOP COMPAT MiTV port=%u: RTSP OPTIONS keepalive unsupported; transport still connected/sane, ignoring OPTIONS-only failure.\n",
-                        (unsigned)handle->receiver_port);
+                        "MSA-RAOP COMPAT: RTSP OPTIONS keepalive unsupported/unacknowledged; transport still connected/sane, ignoring OPTIONS-only failure.\n");
                 fflush(stderr);
                 handle->keepalive_compat_logged = 1;
             }
