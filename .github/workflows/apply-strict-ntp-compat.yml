@@ -26,13 +26,21 @@ jobs:
         run: |
           set -euo pipefail
           git diff --check
-          git status --short
           test -f native/raop-static/strict_clock_shim.c
           test -f native/raop-static/strict_clock_shim.h
           grep -F 'strict_ntp_clock' crates/sairplay-msa-solo/src/windows_raop_session.rs
           grep -F 'sairplay-raop-strict.dll' .github/workflows/windows.yml
 
-      - name: Commit exact compatibility patch
+      - name: Stage workflow blob without pushing workflow changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp .github/workflows/windows.yml scripts/generated-windows-strict.yml
+          git checkout -- .github/workflows/windows.yml
+          git diff --check
+          git status --short
+
+      - name: Commit source compatibility patch
         shell: bash
         run: |
           set -euo pipefail
@@ -50,6 +58,6 @@ jobs:
             crates/sairplay-msa-solo/src/windows_raop_worker.rs \
             native/raop-static/strict_clock_shim.c \
             native/raop-static/strict_clock_shim.h \
-            .github/workflows/windows.yml
+            scripts/generated-windows-strict.yml
           git commit -m "fix: isolate strict NTP clock for AppleTV3 RAOP"
           git push origin HEAD:dev/msa-core-architecture
