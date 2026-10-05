@@ -296,11 +296,11 @@ jobs:
             "/I`"$openssl/include`""
           ) -join " "
 
-          @'
-#include "cross_log.h"
-log_level raop_loglevel = lWARN;
-log_level util_loglevel = lWARN;
-'@ | Set-Content -Path $logGlobals -Encoding ascii
+          Set-Content -Path $logGlobals -Encoding ascii -Value @(
+            '#include "cross_log.h"',
+            'log_level raop_loglevel = lWARN;',
+            'log_level util_loglevel = lWARN;'
+          )
 
           $compile = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /MD /std:clatest /DNDEBUG /DWIN32 /DSSL_STATIC_LIB /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /D_CRT_NONSTDC_NO_DEPRECATE /DOPENSSL_SUPPRESS_DEPRECATED $includeArgs /Fo`"$bridgeObj`" `"$bridge`""
           & cmd.exe /d /s /c $compile
