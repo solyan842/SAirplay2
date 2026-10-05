@@ -34,15 +34,19 @@ For a failed GitHub Action, inspect the actual failed run before changing code:
 run ID  
 -> fetch workflow run jobs  
 -> identify failed job ID  
--> fetch workflow job logs  
--> read the actual log content directly  
+-> fetch workflow job logs exactly once  
+-> consume that returned result completely  
 -> identify the first relevant failure and its root cause
 
+After fetching the workflow job log, consume that exact returned result before making another GitHub tool call.
+
+If the returned result contains the log content, read it directly.
+
+If the connector exposes that same returned result through a response resource, read only that exact returned resource until the relevant log content is consumed. Do not search for another resource, rediscover the log tool, or fetch the same job log again.
+
+If `fetch_workflow_job_logs` itself returns an error, report the exact connector error and STOP. Do not retry automatically, guess the build failure, or modify code.
+
 Do not infer the failure from an Action title, commit message, previous run, memory, or handoff.
-
-Resource URI is an optional fallback only.
-
-Never search for or require a Resource URI when the returned result already contains the required log content.
 
 Do not modify code until the actual failure has been identified from evidence.
 
