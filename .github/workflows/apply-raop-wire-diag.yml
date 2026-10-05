@@ -1,0 +1,59 @@
+name: Apply RAOP wire diagnostic source patch
+
+on:
+  push:
+    branches: [dev/msa-core-architecture]
+    paths:
+      - ".github/workflows/apply-raop-wire-diag.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev/msa-core-architecture
+          fetch-depth: 0
+
+      - name: Apply source patch
+        run: python scripts/apply_raop_wire_diag_source.py
+
+      - name: Stage generated Windows workflow without pushing workflow changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp .github/workflows/windows.yml scripts/generated-windows-wire-diag.yml
+          git checkout -- .github/workflows/windows.yml
+          git diff --check
+          test -f scripts/generated-windows-wire-diag.yml
+          grep -F 'MSA RAOP DIAG WIRE-UDP' crates/sairplay-msa-solo/src/windows_raop_session.rs
+          grep -F 'MITV_FEATURES' crates/sairplay-msa-solo/src/windows_solo_client.rs
+          grep -F 'sr_raop_diag_snapshot' native/raop-static/raop_bridge.c
+          git status --short
+
+      - name: Commit source patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$(git rev-parse HEAD)"
+          git fetch origin dev/msa-core-architecture
+          if [ "$(git rev-parse origin/dev/msa-core-architecture)" != "$base" ]; then
+            echo "Branch moved while RAOP diagnostic patch was being prepared; refusing to push."
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            crates/sairplay-msa-solo/src/windows_solo_client.rs \
+            crates/sairplay-msa-solo/src/windows_raop_session.rs \
+            crates/sairplay-msa-solo/src/windows_raop_worker.rs \
+            native/raop-static/strict_clock_shim.h \
+            native/raop-static/strict_clock_shim.c \
+            native/raop-static/raop_bridge.h \
+            native/raop-static/raop_bridge.c \
+            scripts/generated-windows-wire-diag.yml
+          git commit -m "diag: expose isolated RAOP wire health telemetry"
+          git push origin HEAD:dev/msa-core-architecture
