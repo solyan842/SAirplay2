@@ -41,6 +41,7 @@ struct sr_raop_handle {
     int keepalive_compat_logged;
     size_t packet_bytes;
     uint8_t *packed24;
+    uint64_t first_start_audible_ms;
     uint64_t head_audible_ms;
     CRITICAL_SECTION lock;
 };
@@ -380,6 +381,7 @@ int sr_raop_commit_start(sr_raop_handle *handle,
     int ok = 0;
     uint64_t audible;
     uint64_t latency;
+    uint64_t resolved_at_ms = 0;
     raop_state_t state;
 
     if (!handle) return 0;
@@ -389,12 +391,14 @@ int sr_raop_commit_start(sr_raop_handle *handle,
     state = raopcl_state(handle->client);
     if (state != RAOP_STREAMING && state != RAOP_FLUSHED) goto done;
 
-    audible = sr_resolve_start(requested_unix_ms, at_unix_ms);
+    audible = sr_resolve_start(requested_unix_ms, &resolved_at_ms);
+    if (at_unix_ms) *at_unix_ms = resolved_at_ms;
     raopcl_stop(handle->client);
     if (state == RAOP_STREAMING && !raopcl_flush(handle->client)) goto done;
     latency = TS2NTP(raopcl_latency(handle->client), raopcl_sample_rate(handle->client));
     handle->head_audible_ms = 0;
     ok = raopcl_start_at(handle->client, audible - latency) ? 1 : 0;
+    handle->first_start_audible_ms = ok ? resolved_at_ms : 0;
 
 done:
     LeaveCriticalSection(&handle->lock);
@@ -413,6 +417,7 @@ int sr_raop_start_after_flush(sr_raop_handle *handle,
     EnterCriticalSection(&handle->lock);
     if (!handle->client || raopcl_state(handle->client) != RAOP_FLUSHED) goto done;
 
+    handle->first_start_audible_ms = 0;
     audible = sr_resolve_start(requested_unix_ms, at_unix_ms);
     latency = TS2NTP(raopcl_latency(handle->client), raopcl_sample_rate(handle->client));
     handle->head_audible_ms = 0;
@@ -435,7 +440,10 @@ int sr_raop_flush(sr_raop_handle *handle)
     if (state != RAOP_STREAMING && state != RAOP_FLUSHED) goto done;
     raopcl_stop(handle->client);
     ok = state == RAOP_FLUSHED ? 1 : (raopcl_flush(handle->client) ? 1 : 0);
-    if (ok) handle->head_audible_ms = 0;
+    if (ok) {
+        handle->first_start_audible_ms = 0;
+        handle->head_audible_ms = 0;
+    }
 
 done:
     LeaveCriticalSection(&handle->lock);
@@ -457,13 +465,17 @@ int sr_raop_pause(sr_raop_handle *handle)
     if (!handle->client) goto done;
     state = raopcl_state(handle->client);
     if (state == RAOP_FLUSHED) {
+        handle->first_start_audible_ms = 0;
         ok = 1;
         goto done;
     }
     if (state != RAOP_STREAMING) goto done;
     raopcl_pause(handle->client);
     ok = raopcl_flush(handle->client) ? 1 : 0;
-    if (ok) handle->head_audible_ms = 0;
+    if (ok) {
+        handle->first_start_audible_ms = 0;
+        handle->head_audible_ms = 0;
+    }
 
 done:
     LeaveCriticalSection(&handle->lock);
@@ -482,6 +494,7 @@ int sr_raop_play(sr_raop_handle *handle)
     if (!handle->client) goto done;
     state = raopcl_state(handle->client);
     if (state != RAOP_FLUSHED && state != RAOP_STREAMING) goto done;
+    handle->first_start_audible_ms = 0;
     audible = raopcl_get_ntp(NULL) + MS2NTP(SR_START_LEAD_MS);
     latency = TS2NTP(raopcl_latency(handle->client), raopcl_sample_rate(handle->client));
     handle->head_audible_ms = 0;
@@ -501,6 +514,7 @@ int sr_raop_stop(sr_raop_handle *handle)
         return 0;
     }
     raopcl_stop(handle->client);
+    handle->first_start_audible_ms = 0;
     handle->head_audible_ms = 0;
     LeaveCriticalSection(&handle->lock);
     return 1;
@@ -618,6 +632,43 @@ int sr_raop_write_packet(sr_raop_handle *handle,
             return 0;
         }
 
+        /* Some receivers can stall the mandatory initial metadata RTSP request
+         * long enough that the first START's audible target is already in the
+         * past before PCM delivery opens.  Re-arm only that stale first START,
+         * while libraop is still FLUSHED and before any audio packet is sent.
+         * Healthy receivers (including the locked SOtM baseline) never enter
+         * this branch, so their START/pacing semantics remain byte-for-byte
+         * equivalent after the condition check. */
+        if (state == RAOP_FLUSHED && handle->first_start_audible_ms != 0) {
+            uint64_t now_unix_ms = sr_unix_now_ms();
+            if (handle->first_start_audible_ms <= now_unix_ms) {
+                uint32_t sample_rate = raopcl_sample_rate(handle->client);
+                uint32_t latency_frames = raopcl_latency(handle->client);
+                uint64_t latency_ms = sample_rate
+                    ? ((uint64_t)latency_frames * 1000ULL) / (uint64_t)sample_rate
+                    : 0;
+                uint64_t stale_by_ms = now_unix_ms - handle->first_start_audible_ms;
+                uint64_t source_start = raopcl_get_ntp(NULL) + MS2NTP(SR_START_LEAD_MS);
+                uint64_t rearmed_audible_ms = now_unix_ms
+                    + latency_ms
+                    + SR_START_LEAD_MS;
+
+                if (!raopcl_start_at(handle->client, source_start)) {
+                    sr_raop_log_health_failure(handle, "first-start-rearm");
+                    LeaveCriticalSection(&handle->lock);
+                    return 0;
+                }
+                handle->first_start_audible_ms = rearmed_audible_ms;
+                fprintf(stderr,
+                        "MSA-RAOP COMPAT: stale first START re-armed before first PCM; stale_by=%llums new_audible=%llu latency=%llums guard=%ums.\n",
+                        (unsigned long long)stale_by_ms,
+                        (unsigned long long)rearmed_audible_ms,
+                        (unsigned long long)latency_ms,
+                        (unsigned)SR_START_LEAD_MS);
+                fflush(stderr);
+            }
+        }
+
         if (!raopcl_accept_frames(handle->client)) {
             LeaveCriticalSection(&handle->lock);
             Sleep(1);
@@ -639,6 +690,7 @@ int sr_raop_write_packet(sr_raop_handle *handle,
             return 0;
         }
 
+        handle->first_start_audible_ms = 0;
         next_head = playtime
             + TS2NTP(SR_FRAMES_PER_CHUNK, raopcl_sample_rate(handle->client));
         handle->head_audible_ms = sr_source_ntp_to_unix_ms(next_head);
