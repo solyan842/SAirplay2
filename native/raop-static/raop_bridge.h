@@ -42,11 +42,24 @@ typedef struct sr_raop_config {
     uint32_t lead_ms;
 } sr_raop_config;
 
+enum sr_raop_open_error_stage {
+    SR_RAOP_OPEN_OK = 0,
+    SR_RAOP_OPEN_CONFIG = 1,
+    SR_RAOP_OPEN_RUNTIME = 2,
+    SR_RAOP_OPEN_RESOLVE_IPV4 = 3,
+    SR_RAOP_OPEN_BIND_IP = 4,
+    SR_RAOP_OPEN_HANDLE_ALLOC = 5,
+    SR_RAOP_OPEN_PACKED24_ALLOC = 6,
+    SR_RAOP_OPEN_RAOPCL_CREATE = 7,
+    SR_RAOP_OPEN_RAOPCL_CONNECT = 8
+};
+
 typedef struct sr_raop_ready {
     uint32_t latency_frames;
     uint32_t sample_rate;
     uint16_t bit_depth;
     uint16_t channels;
+    uint32_t open_error_stage;
 } sr_raop_ready;
 
 sr_raop_handle *sr_raop_open(const sr_raop_config *config, sr_raop_ready *ready);
