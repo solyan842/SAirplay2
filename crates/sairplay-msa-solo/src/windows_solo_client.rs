@@ -571,14 +571,14 @@ impl WindowsMsaSoloClient {
     pub fn startup_events(&self) -> Vec<String> {
         match &self.transport {
             Transport::Native { worker, .. } => worker.startup_events(),
-            Transport::Raop { .. } => Vec::new(),
+            Transport::Raop { worker } => worker.startup_events(),
         }
     }
 
     pub fn drain_startup_events(&self) -> Vec<String> {
         match &self.transport {
             Transport::Native { worker, .. } => worker.drain_startup_events(),
-            Transport::Raop { .. } => Vec::new(),
+            Transport::Raop { worker } => worker.drain_startup_events(),
         }
     }
 
@@ -760,7 +760,7 @@ impl WindowsMsaSoloClient {
     pub fn input_discontinuities(&self) -> u64 {
         match &self.transport {
             Transport::Native { worker, .. } => worker.discontinuities(),
-            Transport::Raop { .. } => 0,
+            Transport::Raop { worker } => worker.discontinuities(),
         }
     }
 
