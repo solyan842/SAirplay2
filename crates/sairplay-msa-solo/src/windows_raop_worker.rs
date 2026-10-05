@@ -23,6 +23,37 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const RAOP_DIAG_SUMMARY_INTERVAL: Duration = Duration::from_secs(10);
 const RAOP_DIAG_STALL_THRESHOLD: Duration = Duration::from_millis(20);
+// Pinned MSA/libraop needs 200 ms of feasible sender-side START lead.  MSA's
+// normal FFmpeg/stdin producer can burst pre-buffered PCM before START, whereas
+// WASAPI loopback is a hard realtime producer and cannot supply audio from the
+// past.  Keep the receiver's negotiated render latency in front of a live
+// source, then retain the same 200 ms sender-side feasibility floor.
+const RAOP_LIVE_SOURCE_GUARD_MS: u64 = 200;
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn live_source_start_floor_unix_ms(
+    now_unix_ms: u64,
+    latency_frames: u32,
+    sample_rate: u32,
+) -> (u64, u64) {
+    let receiver_latency_ms = if sample_rate == 0 {
+        0
+    } else {
+        u64::from(latency_frames).saturating_mul(1000) / u64::from(sample_rate)
+    };
+    (
+        now_unix_ms
+            .saturating_add(receiver_latency_ms)
+            .saturating_add(RAOP_LIVE_SOURCE_GUARD_MS),
+        receiver_latency_ms,
+    )
+}
 
 #[derive(Debug)]
 pub enum WindowsRaopWorkerError {
@@ -469,11 +500,18 @@ impl WindowsRaopAudioWorker {
             .session
             .lock()
             .map_err(|_| WindowsRaopWorkerError::Worker("RAOP session mutex poisoned".into()))?;
+        let ready = session.ready();
+        let (live_floor_unix_ms, receiver_latency_ms) = live_source_start_floor_unix_ms(
+            unix_now_ms(),
+            ready.latency_frames,
+            ready.sample_rate,
+        );
+        let effective_requested_unix_ms = requested_unix_ms.max(live_floor_unix_ms);
         let first = !self.first_start_done.load(Ordering::SeqCst);
-        let start = if first {
-            session.commit_start(requested_unix_ms)?
+        let mut start = if first {
+            session.commit_start(effective_requested_unix_ms)?
         } else {
-            session.start_after_flush(requested_unix_ms)?
+            session.start_after_flush(effective_requested_unix_ms)?
         };
         if first {
             // Same gate as cliairplay session_commit: metadata must land after
@@ -482,6 +520,25 @@ impl WindowsRaopAudioWorker {
         }
         self.first_start_done.store(true, Ordering::SeqCst);
         self.delivery_enabled.store(true, Ordering::SeqCst);
+
+        // Preserve the caller's requested anchor in the public resolution so a
+        // coordinator/GUI can see that the Windows live-source floor corrected
+        // it.  The accepted instant still comes directly from pinned libraop.
+        let accepted_unix_ms = start.at_unix_ms;
+        start.requested_unix_ms = requested_unix_ms;
+        start.corrected_forward = requested_unix_ms != 0 && accepted_unix_ms != requested_unix_ms;
+        if effective_requested_unix_ms != requested_unix_ms {
+            if let Ok(mut events) = self.startup_events.lock() {
+                events.push(format!(
+                    "MSA RAOP LIVE START floor: requested={} effective={} accepted={} receiver_latency={}ms guard={}ms; preserving negotiated receiver headroom for realtime WASAPI.",
+                    requested_unix_ms,
+                    effective_requested_unix_ms,
+                    accepted_unix_ms,
+                    receiver_latency_ms,
+                    RAOP_LIVE_SOURCE_GUARD_MS,
+                ));
+            }
+        }
         Ok(start)
     }
 
@@ -590,4 +647,23 @@ impl WindowsRaopAudioWorker {
 
 impl Drop for WindowsRaopAudioWorker {
     fn drop(&mut self) { self.stop(); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_source_floor_keeps_receiver_latency_plus_raop_guard() {
+        let (floor, latency_ms) = live_source_start_floor_unix_ms(1_000_000, 99_225, 44_100);
+        assert_eq!(latency_ms, 2_250);
+        assert_eq!(floor, 1_002_450);
+    }
+
+    #[test]
+    fn live_source_floor_is_generic_for_other_receiver_latencies() {
+        let (floor, latency_ms) = live_source_start_floor_unix_ms(5_000, 44_100, 44_100);
+        assert_eq!(latency_ms, 1_000);
+        assert_eq!(floor, 6_200);
+    }
 }
