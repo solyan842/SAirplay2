@@ -29,6 +29,23 @@ const RAOP_DIAG_STALL_THRESHOLD: Duration = Duration::from_millis(20);
 // past.  Keep the receiver's negotiated render latency in front of a live
 // source, then retain the same 200 ms sender-side feasibility floor.
 const RAOP_LIVE_SOURCE_GUARD_MS: u64 = 200;
+// AP1-only elasticity floor.  Twelve 352-frame RAOP packets are ~95.8 ms at
+// 44.1 kHz, comfortably above the measured 23-31 ms resampler burst and the
+// ~40 ms worst steady empty interval.  This primes the existing PCM hub only;
+// it does not add another queue, alter libraop pacing, or touch native AP2.
+const RAOP_RESERVOIR_PACKETS: usize = 12;
+const RAOP_RESERVOIR_FRAMES: usize = RAOP_RESERVOIR_PACKETS * 352;
+
+fn raop_reservoir_ms(sample_rate: usize) -> usize {
+    if sample_rate == 0 {
+        0
+    } else {
+        RAOP_RESERVOIR_FRAMES
+            .saturating_mul(1000)
+            .saturating_add(sample_rate - 1)
+            / sample_rate
+    }
+}
 
 fn unix_now_ms() -> u64 {
     SystemTime::now()
@@ -159,11 +176,10 @@ impl WindowsRaopAudioWorker {
         let events_w = Arc::clone(&startup_events);
         let bytes_per_frame_w = audio_format.input_bytes_per_frame().max(1);
         let sample_rate_w = audio_format.sample_rate.max(1) as usize;
+        let reservoir_ms_w = raop_reservoir_ms(sample_rate_w);
         let writer_worker = match thread::Builder::new()
             .name("msa-raop-writer".into())
             .spawn(move || {
-                // Diagnostics are observation-only. They deliberately do not
-                // change queue sizing, pacing, START lead or libraop behavior.
                 let mut sent_packets_total = 0u64;
                 let mut starvation_events_total = 0u64;
                 let mut slow_writes_total = 0u64;
@@ -179,6 +195,8 @@ impl WindowsRaopAudioWorker {
                 let mut max_queue_frames = 0usize;
                 let mut last_capture_generation = hub_w.capture_frame_generation();
                 let mut last_capture_progress = Instant::now();
+                let mut reservoir_primed = false;
+                let mut reservoir_wait_started: Option<Instant> = None;
 
                 while running_w.load(Ordering::SeqCst) {
                     let capture_generation = hub_w.capture_frame_generation();
@@ -191,8 +209,51 @@ impl WindowsRaopAudioWorker {
                         starvation_started = None;
                         starvation_capture_generation = last_capture_generation;
                         starvation_reported = false;
+                        reservoir_primed = false;
+                        reservoir_wait_started = None;
                         thread::sleep(Duration::from_millis(1));
                         continue;
+                    }
+
+                    // A live WASAPI producer arrives in short resampler bursts.
+                    // Prime a small AP1-only reservoir before the first packet
+                    // after each lifecycle boundary.  Do this outside send_gate
+                    // so FLUSH/PAUSE/STOP can never wait on local buffering.
+                    if !reservoir_primed {
+                        if !hub_w.source_present() {
+                            reservoir_wait_started = None;
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        let pending_frames = match ring_w.lock() {
+                            Ok(ring) => ring.pending_bytes() / bytes_per_frame_w,
+                            Err(_) => {
+                                if let Ok(mut slot) = error_w.lock() {
+                                    *slot = Some("RAOP PCM ring mutex poisoned".into());
+                                }
+                                running_w.store(false, Ordering::SeqCst);
+                                break;
+                            }
+                        };
+                        if pending_frames < RAOP_RESERVOIR_FRAMES {
+                            reservoir_wait_started.get_or_insert_with(Instant::now);
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        let waited_ms = reservoir_wait_started
+                            .take()
+                            .map(|started| started.elapsed().as_millis())
+                            .unwrap_or(0);
+                        reservoir_primed = true;
+                        if let Ok(mut events) = events_w.lock() {
+                            events.push(format!(
+                                "MSA RAOP RESERVOIR primed target={}f/{}ms queued={}f waited={}ms; AP1-only elasticity active.",
+                                RAOP_RESERVOIR_FRAMES,
+                                reservoir_ms_w,
+                                pending_frames,
+                                waited_ms,
+                            ));
+                        }
                     }
 
                     // The gate is the Windows equivalent of MSA's
@@ -362,7 +423,7 @@ impl WindowsRaopAudioWorker {
                         let max_ms = max_queue_frames.saturating_mul(1000) / sample_rate_w;
                         if let Ok(mut events) = events_w.lock() {
                             events.push(format!(
-                                "MSA RAOP DIAG 10s sent_total={} queue_now={}f/{}ms queue_min={}f/{}ms queue_max={}f/{}ms starvation_total={} max_empty={}ms slow_write_total={} max_write={}ms max_send_gap={}ms capture_idle={}ms capture_gen={} source_present={} head_ahead_ms={:?}.",
+                                "MSA RAOP DIAG 10s sent_total={} queue_now={}f/{}ms queue_min={}f/{}ms queue_max={}f/{}ms starvation_total={} max_empty={}ms slow_write_total={} max_write={}ms max_send_gap={}ms capture_idle={}ms capture_gen={} source_present={} reservoir_primed={} reservoir_target={}f/{}ms head_ahead_ms={:?}.",
                                 sent_packets_total,
                                 pending_before_frames,
                                 queue_ms,
@@ -378,6 +439,9 @@ impl WindowsRaopAudioWorker {
                                 last_capture_progress.elapsed().as_millis(),
                                 last_capture_generation,
                                 hub_w.source_present(),
+                                reservoir_primed,
+                                RAOP_RESERVOIR_FRAMES,
+                                reservoir_ms_w,
                                 diagnostic_head_ahead_ms(&session_w),
                             ));
                         }
@@ -439,8 +503,14 @@ impl WindowsRaopAudioWorker {
                         "MSA INPUT RAOP first-class lane: shared WindowsPcmSource + WindowsPcmHub active; transport remains pinned libraop."
                             .into(),
                     );
+                    events.push(format!(
+                        "MSA RAOP RESERVOIR active: AP1-only prime target={}f/{}ms ({} packets); native AP2 untouched.",
+                        RAOP_RESERVOIR_FRAMES,
+                        raop_reservoir_ms(audio_format.sample_rate.max(1) as usize),
+                        RAOP_RESERVOIR_PACKETS,
+                    ));
                     events.push(
-                        "MSA RAOP DIAG active: observation-only queue/starvation-recovery/capture-progress/write-gap/head-ahead telemetry; transport parameters unchanged."
+                        "MSA RAOP DIAG active: queue/starvation-recovery/capture-progress/write-gap/head-ahead telemetry retained."
                             .into(),
                     );
                 }
@@ -665,5 +735,16 @@ mod tests {
         let (floor, latency_ms) = live_source_start_floor_unix_ms(5_000, 44_100, 44_100);
         assert_eq!(latency_ms, 1_000);
         assert_eq!(floor, 6_200);
+    }
+
+    #[test]
+    fn ap1_reservoir_is_about_96ms_at_44100() {
+        assert_eq!(RAOP_RESERVOIR_FRAMES, 4_224);
+        assert_eq!(raop_reservoir_ms(44_100), 96);
+    }
+
+    #[test]
+    fn ap1_reservoir_remains_packet_based_at_48000() {
+        assert_eq!(raop_reservoir_ms(48_000), 88);
     }
 }
