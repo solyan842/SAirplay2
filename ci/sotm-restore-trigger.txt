@@ -1,4 +1,2 @@
-SOtM restored baseline build trigger.
-
-Active source baseline remains the hardware-locked SOtM RAOP 16-bit path.
-This file exists only to trigger Windows CI after a docs-only rollback.
+Trigger Windows CI for restored SOtM hardware-locked baseline.
+No engine, transport, RAOP, pacing, START, reservoir, or lifecycle behavior is changed by this file.
