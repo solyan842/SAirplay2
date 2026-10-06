@@ -276,7 +276,15 @@ impl InprocCore {
             .map_err(|_| MsaRaopError::InProcess("keepalive lock poisoned".into()))?;
         if last.elapsed() >= INPROC_KEEPALIVE {
             let keepalive_ok = self.with_handle(|p| unsafe { (self.api.keepalive)(p) != 0 })?;
-            if !keepalive_ok { return Ok(false); }
+            if !keepalive_ok {
+                // Some otherwise healthy RAOP receivers do not reliably
+                // acknowledge RTSP OPTIONS. Treat that as a compatibility-only
+                // failure while the transport still reports connected + sane;
+                // real control/media failure still returns false immediately.
+                let transport_still_healthy =
+                    self.with_handle(|p| unsafe { (self.api.healthy)(p) != 0 })?;
+                if !transport_still_healthy { return Ok(false); }
+            }
             *last = Instant::now();
         }
         Ok(true)
