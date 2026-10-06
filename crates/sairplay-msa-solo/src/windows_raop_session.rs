@@ -745,7 +745,7 @@ impl MsaRaopSession {
             }
             if let Some(child) = self.child.as_mut() {
                 if let Ok(Some(status)) = child.try_wait() {
-                    return Err(MsaRaopError::Connect(format!("helper exited while waiting for {name}: {status}"));
+                    return Err(MsaRaopError::Connect(format!("helper exited while waiting for {name}: {status}")));
                 }
             }
             if Instant::now() >= deadline { return Err(MsaRaopError::AckTimeout { seq }); }
