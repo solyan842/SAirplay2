@@ -403,7 +403,8 @@ int sr_raop_commit_start(sr_raop_handle *handle,
     latency = TS2NTP(raopcl_latency(handle->client), raopcl_sample_rate(handle->client));
     handle->head_audible_ms = 0;
     ok = raopcl_start_at(handle->client, audible - latency) ? 1 : 0;
-    handle->first_start_audible_ms = ok ? resolved_at_ms : 0;
+    handle->first_start_audible_ms =
+        (ok && sr_raop_strict_ntp_clock_enabled()) ? resolved_at_ms : 0;
 
 done:
     LeaveCriticalSection(&handle->lock);
@@ -639,12 +640,13 @@ int sr_raop_write_packet(sr_raop_handle *handle,
 
         /* Some receivers can stall the mandatory initial metadata RTSP request
          * long enough that the first START's audible target is already in the
-         * past before PCM delivery opens.  Re-arm only that stale first START,
-         * while libraop is still FLUSHED and before any audio packet is sent.
-         * Healthy receivers (including the locked SOtM baseline) never enter
-         * this branch, so their START/pacing semantics remain byte-for-byte
-         * equivalent after the condition check. */
-        if (state == RAOP_FLUSHED && handle->first_start_audible_ms != 0) {
+         * past before PCM delivery opens.  This re-arm belongs only to the
+         * isolated strict-NTP compatibility DLL used by the MiTV profile.
+         * The normal RAOP DLL therefore preserves the hardware-locked SOtM
+         * first-START behavior and never enters this compatibility path. */
+        if (sr_raop_strict_ntp_clock_enabled()
+                && state == RAOP_FLUSHED
+                && handle->first_start_audible_ms != 0) {
             uint64_t now_unix_ms = sr_unix_now_ms();
             if (handle->first_start_audible_ms <= now_unix_ms) {
                 uint32_t sample_rate = raopcl_sample_rate(handle->client);
