@@ -15,18 +15,71 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: dev/msa-core-architecture
           fetch-depth: 0
-      - name: Remove temporary patch workflows and trigger file
+
+      - name: Isolate stale first-start rearm to strict-NTP compatibility path
+        shell: bash
         run: |
           set -euo pipefail
-          rm -f .github/workflows/patch-realtime-resume-rewarm.yml
-          rm -f .github/workflows/patch-realtime-resume-rewarm-v2.yml
-          rm -f .github/workflows/patch-realtime-resume-rewarm-v3.yml
-          rm -f .github/workflows/patch-realtime-resume-rewarm-v4.yml
-          rm -f .github/workflows/fix-realtime-rewarm-typo.yml
-          rm -f .github/msa-core-ci-trigger
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('native/raop-static/raop_bridge.c')
+          text = path.read_text(encoding='utf-8')
+
+          old = '    handle->first_start_audible_ms = ok ? resolved_at_ms : 0;'
+          new = '''    handle->first_start_audible_ms =
+        (ok && sr_raop_strict_ntp_clock_enabled()) ? resolved_at_ms : 0;'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one first-start assignment, got {text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = '''        /* Some receivers can stall the mandatory initial metadata RTSP request
+         * long enough that the first START's audible target is already in the
+         * past before PCM delivery opens.  Re-arm only that stale first START,
+         * while libraop is still FLUSHED and before any audio packet is sent.
+         * Healthy receivers (including the locked SOtM baseline) never enter
+         * this branch, so their START/pacing semantics remain byte-for-byte
+         * equivalent after the condition check. */
+        if (state == RAOP_FLUSHED && handle->first_start_audible_ms != 0) {'''
+          new = '''        /* Some receivers can stall the mandatory initial metadata RTSP request
+         * long enough that the first START's audible target is already in the
+         * past before PCM delivery opens.  This re-arm belongs only to the
+         * isolated strict-NTP compatibility DLL used by the MiTV profile.
+         * The normal RAOP DLL therefore preserves the hardware-locked SOtM
+         * first-START behavior and never enters this compatibility path. */
+        if (sr_raop_strict_ntp_clock_enabled()
+                && state == RAOP_FLUSHED
+                && handle->first_start_audible_ms != 0) {'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one stale-start block, got {text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          path.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Verify only intended source changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          test "$(git diff --name-only | tr -d '\r')" = "native/raop-static/raop_bridge.c"
+          grep -F '(ok && sr_raop_strict_ntp_clock_enabled()) ? resolved_at_ms : 0;' native/raop-static/raop_bridge.c
+          grep -F '&& state == RAOP_FLUSHED' native/raop-static/raop_bridge.c
+
+      - name: Commit minimal SoTM regression isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$(git rev-parse HEAD)"
+          git fetch origin dev/msa-core-architecture
+          if [ "$(git rev-parse origin/dev/msa-core-architecture)" != "$base" ]; then
+            echo "Branch moved while patch was prepared; refusing to push."
+            exit 1
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "ci: remove temporary realtime patch workflows"
+          git add native/raop-static/raop_bridge.c
+          git commit -m "fix: isolate stale RAOP first-start rearm to MiTV"
           git push origin HEAD:dev/msa-core-architecture
