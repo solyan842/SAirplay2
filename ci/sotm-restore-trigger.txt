@@ -1,0 +1,2 @@
+Trigger Windows CI for restored SOtM hardware-locked baseline.
+No engine, transport, RAOP, pacing, START, reservoir, or lifecycle behavior is changed by this file.
