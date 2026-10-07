@@ -15,6 +15,7 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -31,6 +32,8 @@
 
 #define SR_FRAMES_PER_CHUNK 352
 #define SR_START_LEAD_MS 200
+#define SR_HAPPYCAST_DIAG_PORT 52266
+#define SR_FEEDBACK_PROBE_TIMEOUT_MS 1500
 
 struct sr_raop_handle {
     struct raopcl_s *client;
@@ -140,6 +143,122 @@ static int sr_resolve_ipv4(const char *host_name, struct in_addr *out)
     memset(out, 0, sizeof(*out));
     memcpy(&out->s_addr, he->h_addr_list[0], he->h_length);
     return 1;
+}
+
+/* Diagnostic only. This is deliberately NOT receiver classification and does
+ * not alter the active libraop RTSP session. The observed Xiaomi SmartShare /
+ * HappyCast endpoint uses 52266; probe POST /feedback on a short-lived sidecar
+ * connection so the next hardware run tells us whether that endpoint exposes
+ * the AirPlay-v1 feedback capability used by pyatv/Apple senders. */
+static void sr_probe_happycast_feedback(const sr_raop_config *config,
+                                        struct in_addr player)
+{
+    SOCKET fd = INVALID_SOCKET;
+    struct sockaddr_in addr;
+    DWORD timeout = SR_FEEDBACK_PROBE_TIMEOUT_MS;
+    char request[768];
+    char response[2048];
+    int request_len;
+    int sent = 0;
+    int received;
+    char *headers_end;
+    size_t i;
+
+    if (!config || config->port != SR_HAPPYCAST_DIAG_PORT) return;
+
+    fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd == INVALID_SOCKET) {
+        fprintf(stderr,
+                "MSA RAOP COMPAT feedback probe: socket failed wsa=%d\n",
+                WSAGetLastError());
+        fflush(stderr);
+        return;
+    }
+
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+               (const char *)&timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+               (const char *)&timeout, sizeof(timeout));
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr = player;
+    addr.sin_port = htons(config->port);
+
+    if (connect(fd, (const struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        fprintf(stderr,
+                "MSA RAOP COMPAT feedback probe: connect %s:%u failed wsa=%d\n",
+                inet_ntoa(player), (unsigned)config->port, WSAGetLastError());
+        fflush(stderr);
+        closesocket(fd);
+        return;
+    }
+
+    request_len = snprintf(
+        request, sizeof(request),
+        "POST /feedback RTSP/1.0\r\n"
+        "CSeq: 1\r\n"
+        "DACP-ID: %s\r\n"
+        "Active-Remote: %s\r\n"
+        "Client-Instance: %s\r\n"
+        "User-Agent: AirPlay/550.10\r\n"
+        "Content-Length: 0\r\n\r\n",
+        config->dacp_id ? config->dacp_id : "1A2B3D4EA1B2C3D4",
+        config->active_remote ? config->active_remote : "0",
+        config->dacp_id ? config->dacp_id : "1A2B3D4EA1B2C3D4");
+    if (request_len <= 0 || request_len >= (int)sizeof(request)) {
+        fprintf(stderr, "MSA RAOP COMPAT feedback probe: request build failed\n");
+        fflush(stderr);
+        closesocket(fd);
+        return;
+    }
+
+    while (sent < request_len) {
+        int n = send(fd, request + sent, request_len - sent, 0);
+        if (n == SOCKET_ERROR || n == 0) {
+            fprintf(stderr,
+                    "MSA RAOP COMPAT feedback probe: send failed wsa=%d\n",
+                    WSAGetLastError());
+            fflush(stderr);
+            closesocket(fd);
+            return;
+        }
+        sent += n;
+    }
+
+    received = recv(fd, response, (int)sizeof(response) - 1, 0);
+    if (received == SOCKET_ERROR) {
+        fprintf(stderr,
+                "MSA RAOP COMPAT feedback probe: recv failed wsa=%d\n",
+                WSAGetLastError());
+        fflush(stderr);
+        closesocket(fd);
+        return;
+    }
+    if (received == 0) {
+        fprintf(stderr,
+                "MSA RAOP COMPAT feedback probe: peer closed without response\n");
+        fflush(stderr);
+        closesocket(fd);
+        return;
+    }
+
+    response[received] = '\0';
+    headers_end = strstr(response, "\r\n\r\n");
+    if (headers_end) headers_end[2] = '\0';
+
+    /* Keep all returned headers visible but single-line so GUI logs remain
+     * readable. No body is needed for this capability probe. */
+    for (i = 0; response[i] != '\0'; ++i) {
+        if (response[i] == '\r') response[i] = ' ';
+        else if (response[i] == '\n') response[i] = '|';
+    }
+
+    fprintf(stderr,
+            "MSA RAOP COMPAT feedback probe: target=%s:%u response=%s\n",
+            inet_ntoa(player), (unsigned)config->port, response);
+    fflush(stderr);
+    closesocket(fd);
 }
 
 static int sr_validate_config(const sr_raop_config *config)
@@ -253,6 +372,8 @@ sr_raop_handle *sr_raop_open(const sr_raop_config *config, sr_raop_ready *ready)
         return NULL;
     }
 
+    sr_probe_happycast_feedback(config, player);
+
     if (ready) {
         ready->latency_frames = raopcl_latency(handle->client);
         ready->sample_rate = raopcl_sample_rate(handle->client);
@@ -346,7 +467,6 @@ int sr_raop_start_after_flush(sr_raop_handle *handle,
     latency = TS2NTP(raopcl_latency(handle->client), raopcl_sample_rate(handle->client));
     handle->head_audible_ms = 0;
     ok = raopcl_start_at(handle->client, audible - latency) ? 1 : 0;
-
 done:
     LeaveCriticalSection(&handle->lock);
     return ok;
