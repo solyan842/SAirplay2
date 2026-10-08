@@ -35,6 +35,21 @@
 #define SR_HAPPYCAST_DIAG_PORT 52266
 #define SR_FEEDBACK_PROBE_TIMEOUT_MS 1500
 
+enum sr_feedback_probe_class {
+    SR_FEEDBACK_PROBE_NONE = 0,
+    SR_FEEDBACK_PROBE_RTSP_RESPONSE = 1,
+    SR_FEEDBACK_PROBE_SOCKET_ERROR = 2,
+    SR_FEEDBACK_PROBE_CONNECT_ERROR = 3,
+    SR_FEEDBACK_PROBE_REQUEST_ERROR = 4,
+    SR_FEEDBACK_PROBE_SEND_ERROR = 5,
+    SR_FEEDBACK_PROBE_RECV_ERROR = 6,
+    SR_FEEDBACK_PROBE_PEER_CLOSED = 7
+};
+
+static volatile LONG g_feedback_probe_attempted = 0;
+static volatile LONG g_feedback_probe_status = 0;
+static volatile LONG g_feedback_probe_class = SR_FEEDBACK_PROBE_NONE;
+
 struct sr_raop_handle {
     struct raopcl_s *client;
     uint32_t sample_rate;
@@ -69,6 +84,13 @@ static int sr_runtime_init(void)
 static void sr_set_open_error(sr_raop_ready *ready, uint32_t stage)
 {
     if (ready) ready->open_error_stage = stage;
+}
+
+static void sr_set_feedback_probe_result(LONG attempted, LONG status, LONG result_class)
+{
+    InterlockedExchange(&g_feedback_probe_attempted, attempted);
+    InterlockedExchange(&g_feedback_probe_status, status);
+    InterlockedExchange(&g_feedback_probe_class, result_class);
 }
 
 /* Pinned MSA treats raopcl_get_ntp(NULL) as Unix 32.32 on its normal POSIX
@@ -161,17 +183,15 @@ static void sr_probe_happycast_feedback(const sr_raop_config *config,
     int request_len;
     int sent = 0;
     int received;
-    char *headers_end;
-    size_t i;
+    int status = 0;
 
     if (!config || config->port != SR_HAPPYCAST_DIAG_PORT) return;
 
+    sr_set_feedback_probe_result(1, 0, SR_FEEDBACK_PROBE_NONE);
+
     fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd == INVALID_SOCKET) {
-        fprintf(stderr,
-                "MSA RAOP COMPAT feedback probe: socket failed wsa=%d\n",
-                WSAGetLastError());
-        fflush(stderr);
+        sr_set_feedback_probe_result(1, 0, SR_FEEDBACK_PROBE_SOCKET_ERROR);
         return;
     }
 
@@ -186,10 +206,7 @@ static void sr_probe_happycast_feedback(const sr_raop_config *config,
     addr.sin_port = htons(config->port);
 
     if (connect(fd, (const struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        fprintf(stderr,
-                "MSA RAOP COMPAT feedback probe: connect %s:%u failed wsa=%d\n",
-                inet_ntoa(player), (unsigned)config->port, WSAGetLastError());
-        fflush(stderr);
+        sr_set_feedback_probe_result(1, 0, SR_FEEDBACK_PROBE_CONNECT_ERROR);
         closesocket(fd);
         return;
     }
@@ -207,8 +224,7 @@ static void sr_probe_happycast_feedback(const sr_raop_config *config,
         config->active_remote ? config->active_remote : "0",
         config->dacp_id ? config->dacp_id : "1A2B3D4EA1B2C3D4");
     if (request_len <= 0 || request_len >= (int)sizeof(request)) {
-        fprintf(stderr, "MSA RAOP COMPAT feedback probe: request build failed\n");
-        fflush(stderr);
+        sr_set_feedback_probe_result(1, 0, SR_FEEDBACK_PROBE_REQUEST_ERROR);
         closesocket(fd);
         return;
     }
@@ -216,10 +232,7 @@ static void sr_probe_happycast_feedback(const sr_raop_config *config,
     while (sent < request_len) {
         int n = send(fd, request + sent, request_len - sent, 0);
         if (n == SOCKET_ERROR || n == 0) {
-            fprintf(stderr,
-                    "MSA RAOP COMPAT feedback probe: send failed wsa=%d\n",
-                    WSAGetLastError());
-            fflush(stderr);
+            sr_set_feedback_probe_result(1, 0, SR_FEEDBACK_PROBE_SEND_ERROR);
             closesocket(fd);
             return;
         }
@@ -228,37 +241,35 @@ static void sr_probe_happycast_feedback(const sr_raop_config *config,
 
     received = recv(fd, response, (int)sizeof(response) - 1, 0);
     if (received == SOCKET_ERROR) {
-        fprintf(stderr,
-                "MSA RAOP COMPAT feedback probe: recv failed wsa=%d\n",
-                WSAGetLastError());
-        fflush(stderr);
+        sr_set_feedback_probe_result(1, 0, SR_FEEDBACK_PROBE_RECV_ERROR);
         closesocket(fd);
         return;
     }
     if (received == 0) {
-        fprintf(stderr,
-                "MSA RAOP COMPAT feedback probe: peer closed without response\n");
-        fflush(stderr);
+        sr_set_feedback_probe_result(1, 0, SR_FEEDBACK_PROBE_PEER_CLOSED);
         closesocket(fd);
         return;
     }
 
     response[received] = '\0';
-    headers_end = strstr(response, "\r\n\r\n");
-    if (headers_end) headers_end[2] = '\0';
-
-    /* Keep all returned headers visible but single-line so GUI logs remain
-     * readable. No body is needed for this capability probe. */
-    for (i = 0; response[i] != '\0'; ++i) {
-        if (response[i] == '\r') response[i] = ' ';
-        else if (response[i] == '\n') response[i] = '|';
+    if (sscanf(response, "RTSP/%*s %d", &status) != 1) {
+        (void)sscanf(response, "HTTP/%*s %d", &status);
     }
-
-    fprintf(stderr,
-            "MSA RAOP COMPAT feedback probe: target=%s:%u response=%s\n",
-            inet_ntoa(player), (unsigned)config->port, response);
-    fflush(stderr);
+    sr_set_feedback_probe_result(1, status, SR_FEEDBACK_PROBE_RTSP_RESPONSE);
     closesocket(fd);
+}
+
+/* Diagnostic FFI only. Rust reads this after sr_raop_open() so the result is
+ * routed through the normal GUI startup-event logger. It does not mutate the
+ * active RAOP session or enable periodic feedback. */
+__declspec(dllexport)
+int sr_raop_last_feedback_probe(int *attempted, int *status, int *result_class)
+{
+    if (!attempted || !status || !result_class) return 0;
+    *attempted = (int)InterlockedCompareExchange(&g_feedback_probe_attempted, 0, 0);
+    *status = (int)InterlockedCompareExchange(&g_feedback_probe_status, 0, 0);
+    *result_class = (int)InterlockedCompareExchange(&g_feedback_probe_class, 0, 0);
+    return 1;
 }
 
 static int sr_validate_config(const sr_raop_config *config)

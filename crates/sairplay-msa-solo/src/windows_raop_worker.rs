@@ -15,6 +15,8 @@ mod base;
 pub use base::{SharedMsaRaopSession, WindowsRaopWorkerError};
 
 use crate::{MsaRaopConfig, MsaRaopSession, MsaRaopState};
+use libloading::Library;
+use std::ffi::c_int;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
@@ -31,6 +33,72 @@ const RAOP_SOURCE_EMPTY_MIN: Duration = Duration::from_millis(250);
 // then wait for fresh PCM and let the base worker create START_AFTER_FLUSH.
 const RAOP_REANCHOR_HEAD_FLOOR_MS: i128 = 200;
 const RAOP_LIFECYCLE_POLL: Duration = Duration::from_millis(5);
+const RAOP_HAPPYCAST_DIAG_PORT: u16 = 52266;
+
+type FeedbackProbeFn = unsafe extern "C" fn(*mut c_int, *mut c_int, *mut c_int) -> c_int;
+
+fn feedback_probe_class_name(value: c_int) -> &'static str {
+    match value {
+        0 => "none",
+        1 => "rtsp-response",
+        2 => "socket-error",
+        3 => "connect-error",
+        4 => "request-error",
+        5 => "send-error",
+        6 => "recv-error",
+        7 => "peer-closed",
+        _ => "unknown",
+    }
+}
+
+fn read_feedback_probe_event() -> String {
+    let path = match std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|parent| parent.join("sairplay-raop.dll")))
+    {
+        Some(path) => path,
+        None => {
+            return "MSA RAOP COMPAT feedback probe: attempted=unknown status=0 class=ffi-path-error"
+                .into();
+        }
+    };
+
+    let library = match unsafe { Library::new(&path) } {
+        Ok(library) => library,
+        Err(error) => {
+            return format!(
+                "MSA RAOP COMPAT feedback probe: attempted=unknown status=0 class=ffi-load-error detail={error}"
+            );
+        }
+    };
+
+    let probe = match unsafe {
+        library.get::<FeedbackProbeFn>(b"sr_raop_last_feedback_probe\0")
+    } {
+        Ok(probe) => probe,
+        Err(error) => {
+            return format!(
+                "MSA RAOP COMPAT feedback probe: attempted=unknown status=0 class=ffi-symbol-error detail={error}"
+            );
+        }
+    };
+
+    let mut attempted: c_int = 0;
+    let mut status: c_int = 0;
+    let mut result_class: c_int = 0;
+    let ok = unsafe { probe(&mut attempted, &mut status, &mut result_class) };
+    if ok == 0 {
+        return "MSA RAOP COMPAT feedback probe: attempted=unknown status=0 class=ffi-call-error"
+            .into();
+    }
+
+    format!(
+        "MSA RAOP COMPAT feedback probe: attempted={} status={} class={}",
+        attempted != 0,
+        status,
+        feedback_probe_class_name(result_class),
+    )
+}
 
 fn unix_now_ms() -> i128 {
     SystemTime::now()
@@ -89,7 +157,15 @@ pub struct WindowsRaopAudioWorker {
 
 impl WindowsRaopAudioWorker {
     pub fn connect(config: MsaRaopConfig) -> Result<Self, WindowsRaopWorkerError> {
-        Self::wrap(base::WindowsRaopAudioWorker::connect(config)?)
+        let feedback_probe_target = config.port == RAOP_HAPPYCAST_DIAG_PORT;
+        let inner = base::WindowsRaopAudioWorker::connect(config)?;
+        let worker = Self::wrap(inner)?;
+        if feedback_probe_target {
+            if let Ok(mut events) = worker.lifecycle_events.lock() {
+                events.push(read_feedback_probe_event());
+            }
+        }
+        Ok(worker)
     }
 
     pub fn start(session: SharedMsaRaopSession) -> Result<Self, WindowsRaopWorkerError> {
