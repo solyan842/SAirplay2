@@ -37,14 +37,14 @@ def patch_libraop(root: Path) -> None:
     replace_once(
         raop_h,
         "bool \traopcl_keepalive(struct raopcl_s *p);\n",
-        "bool \traopcl_keepalive(struct raopcl_s *p);\nbool \traopcl_feedback(struct raopcl_s *p);\n",
+        "bool \traopcl_keepalive(struct raopcl_s *p);\nbool \traopcl_feedback(struct raopcl_s *p);\nbool \traopcl_refresh_record(struct raopcl_s *p, uint64_t start_time);\n",
     )
     replace_once(
         raop_c,
         '''bool raopcl_keepalive(struct raopcl_s *p) {\n\treturn rtspcl_options(p->rtspcl, NULL);\n}\n''',
-        '''bool raopcl_keepalive(struct raopcl_s *p) {\n\treturn rtspcl_options(p->rtspcl, NULL);\n}\n\n/* AirPlay-v1 /feedback on the active RTSP connection. */\nbool raopcl_feedback(struct raopcl_s *p) {\n\tif (!p) return false;\n\treturn rtspcl_feedback(p->rtspcl);\n}\n''',
+        '''bool raopcl_keepalive(struct raopcl_s *p) {\n\treturn rtspcl_options(p->rtspcl, NULL);\n}\n\n/* AirPlay-v1 /feedback on the active RTSP connection. */\nbool raopcl_feedback(struct raopcl_s *p) {\n\tif (!p) return false;\n\treturn rtspcl_feedback(p->rtspcl);\n}\n\n/* MiTV/HappyCast only: refresh RECORD after a delayed live-source START so\n * RTP-Info advertises the same seq/timestamp as the first packet. The normal\n * MSA/libraop path is unchanged and never calls this helper. */\nbool raopcl_refresh_record(struct raopcl_s *p, uint64_t start_time) {\n\tkey_data_t kd[64];\n\tbool rc;\n\tuint16_t seq_number;\n\tuint32_t timestamp;\n\n\tif (!p || !p->rtspcl || !start_time) return false;\n\tkd[0].key = NULL;\n\n\tpthread_mutex_lock(&p->mutex);\n\tseq_number = p->seq_number + 1;\n\ttimestamp = (uint32_t)NTP2TS(start_time, p->sample_rate);\n\tpthread_mutex_unlock(&p->mutex);\n\n\trc = rtspcl_record(p->rtspcl, seq_number, timestamp, kd);\n\tp->diag_record_status = (uint32_t)rtspcl_last_status(p->rtspcl);\n\tif (rc) {\n\t\tp->diag_record_seq = seq_number;\n\t\tp->diag_record_ts = timestamp;\n\t\tif (kd_lookup(kd, "Audio-Latency")) {\n\t\t\tint latency = atoi(kd_lookup(kd, "Audio-Latency"));\n\t\t\tp->latency_frames = max((uint32_t) latency, p->latency_frames);\n\t\t}\n\t}\n\tkd_free(kd);\n\treturn rc;\n}\n''',
     )
-    print(f"patched active-session feedback into pinned libraop under {root}")
+    print(f"patched active-session feedback + delayed RECORD refresh into pinned libraop under {root}")
 
 
 def patch_repo(root: Path) -> None:
@@ -75,6 +75,16 @@ def patch_repo(root: Path) -> None:
         bridge_c,
         '''int sr_raop_keepalive(sr_raop_handle *handle)\n{\n    int ok = 0;\n    if (!handle) return 0;\n    EnterCriticalSection(&handle->lock);\n    if (handle->client) ok = raopcl_keepalive(handle->client) ? 1 : 0;\n    LeaveCriticalSection(&handle->lock);\n    return ok;\n}\n''',
         '''int sr_raop_keepalive(sr_raop_handle *handle)\n{\n    int ok = 0;\n    if (!handle) return 0;\n    EnterCriticalSection(&handle->lock);\n    if (handle->client) {\n        if (handle->happycast_feedback && handle->feedback_supported) {\n            ok = raopcl_feedback(handle->client) ? 1 : 0;\n            if (ok) handle->feedback_ok++;\n            else handle->feedback_fail++;\n        } else {\n            ok = raopcl_keepalive(handle->client) ? 1 : 0;\n        }\n    }\n    LeaveCriticalSection(&handle->lock);\n    return ok;\n}\n''',
+    )
+    replace_once(
+        bridge_c,
+        '''    uint64_t audible;\n    uint64_t latency;\n    raop_state_t state;\n''',
+        '''    uint64_t audible;\n    uint64_t latency;\n    uint64_t stream_start;\n    raop_state_t state;\n''',
+    )
+    replace_once(
+        bridge_c,
+        '''    latency = TS2NTP(raopcl_latency(handle->client), raopcl_sample_rate(handle->client));\n    handle->head_audible_ms = 0;\n    ok = raopcl_start_at(handle->client, audible - latency) ? 1 : 0;\n\ndone:\n''',
+        '''    latency = TS2NTP(raopcl_latency(handle->client), raopcl_sample_rate(handle->client));\n    stream_start = audible - latency;\n    handle->head_audible_ms = 0;\n    ok = raopcl_start_at(handle->client, stream_start) ? 1 : 0;\n    /* HappyCast appears to bind playback to the RTP-Info from RECORD. Because\n     * the Windows live-source lifecycle can defer START for seconds after the\n     * initial connect-time RECORD, refresh only this receiver's initial RECORD\n     * so seq/rtptime match the first packet on the re-anchored timeline. */\n    if (ok && handle->happycast_feedback && state == RAOP_FLUSHED) {\n        ok = raopcl_refresh_record(handle->client, stream_start) ? 1 : 0;\n    }\n\ndone:\n''',
     )
     replace_once(
         bridge_c,
@@ -131,7 +141,7 @@ def patch_repo(root: Path) -> None:
         encoding="utf-8",
     )
 
-    print(f"patched MiTV active-session feedback experiment under {root}")
+    print(f"patched MiTV active-session feedback + delayed RECORD refresh experiment under {root}")
 
 
 def main() -> None:
