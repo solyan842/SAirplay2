@@ -1,0 +1,58 @@
+name: Apply pure RAOP wire diagnostics
+
+on:
+  push:
+    branches: [dev/msa-core-architecture]
+    paths:
+      - ".github/workflows/apply-pure-raop-wire-diag.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev/msa-core-architecture
+          fetch-depth: 0
+
+      - name: Apply diagnostic-only source patch
+        run: python scripts/apply_pure_raop_wire_diag.py
+
+      - name: Verify isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          grep -F 'python scripts/patch_pinned_raop_wire_diag.py $src' .github/workflows/windows.yml
+          grep -F 'raopcl_diag_enable(handle->client, config->port == SR_HAPPYCAST_DIAG_PORT);' native/raop-static/raop_bridge.c
+          grep -F 'MSA RAOP DIAG WIRE-UDP' crates/sairplay-msa-solo/src/windows_raop_session.rs
+          grep -F 'wire_diagnostic_line()' crates/sairplay-msa-solo/src/windows_raop_worker_base.rs
+          if git diff | grep -Ei 'strict[_ -]?ntp|RAOP_RESERVOIR_FRAMES|SR_START_LEAD_MS|raopcl_start_at|raopcl_flush'; then
+            echo 'Diagnostic patch touched forbidden timing/lifecycle semantics.' >&2
+            exit 1
+          fi
+
+      - name: Commit diagnostic-only patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$(git rev-parse HEAD)"
+          git fetch origin dev/msa-core-architecture
+          if [ "$(git rev-parse origin/dev/msa-core-architecture)" != "$base" ]; then
+            echo "Branch moved while pure RAOP wire diagnostics were prepared; refusing to push." >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            .github/workflows/windows.yml \
+            scripts/patch_pinned_raop_wire_diag.py \
+            native/raop-static/raop_bridge.h \
+            native/raop-static/raop_bridge.c \
+            crates/sairplay-msa-solo/src/windows_raop_session.rs \
+            crates/sairplay-msa-solo/src/windows_raop_worker_base.rs
+          git commit -m "diag: restore pure MiTV RAOP wire telemetry"
+          git push origin HEAD:dev/msa-core-architecture
