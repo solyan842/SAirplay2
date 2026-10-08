@@ -16,6 +16,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Initialize durable build log
+        shell: pwsh
+        run: |
+          "MiTV HappyCast durable build log" | Set-Content -Path build.log -Encoding utf8
+          "Run: $env:GITHUB_RUN_ID attempt $env:GITHUB_RUN_ATTEMPT" | Add-Content -Path build.log -Encoding utf8
+          "Commit: $env:GITHUB_SHA" | Add-Content -Path build.log -Encoding utf8
+
       - name: Apply isolated MiTV repository patch
         shell: pwsh
         run: |
@@ -46,8 +53,9 @@ jobs:
           $vcvars64 = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
           $openssl = (Resolve-Path "$src/openssl").Path
           $cmd = "call `"$vcvars64`" && cd /d `"$openssl`" && perl Configure shared VC-WIN64A && nmake"
-          & cmd.exe /d /s /c $cmd
-          if ($LASTEXITCODE -ne 0) { throw "Pinned OpenSSL x64 build failed" }
+          & cmd.exe /d /s /c $cmd 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "Pinned OpenSSL x64 build failed ($code)" }
           New-Item -ItemType Directory -Force -Path "$stage/include" | Out-Null
           Copy-Item "$openssl/include/openssl" "$stage/include/openssl" -Recurse -Force
           Copy-Item "$openssl/libcrypto-1_1-x64.dll" $stage -Force
@@ -74,15 +82,17 @@ jobs:
           $vcvars64 = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           $stageAbs = (Resolve-Path $stage).Path + "\"
-          & $msbuild "$src/alac.vcxproj" /m /p:Configuration=Release /p:Platform=x64 /p:OutDir="$stageAbs" /p:TargetName=libalac
-          if ($LASTEXITCODE -ne 0) { throw "Pinned ALAC build failed" }
+          & $msbuild "$src/alac.vcxproj" /m /p:Configuration=Release /p:Platform=x64 /p:OutDir="$stageAbs" /p:TargetName=libalac 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "Pinned ALAC build failed ($code)" }
           $alacInclude = (Resolve-Path "$src/alac/codec").Path
           $wrapper = (Resolve-Path "$src/addons/alac_wrapper.cpp").Path
           $wrapperObj = Join-Path (Resolve-Path $stage).Path "alac_wrapper.obj"
           $wrapperLib = Join-Path (Resolve-Path $stage).Path "libalac-wrapper.lib"
           $cmd = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /MD /EHsc /I`"$alacInclude`" /Fo`"$wrapperObj`" `"$wrapper`" && lib.exe /nologo /OUT:`"$wrapperLib`" `"$wrapperObj`""
-          & cmd.exe /d /s /c $cmd
-          if ($LASTEXITCODE -ne 0) { throw "Pinned ALAC wrapper build failed" }
+          & cmd.exe /d /s /c $cmd 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "Pinned ALAC wrapper build failed ($code)" }
           New-Item -ItemType Directory -Force -Path "$stage/include/alac" | Out-Null
           New-Item -ItemType Directory -Force -Path "$stage/include/addons" | Out-Null
           Copy-Item "$src/alac/codec/ALAC*.h" "$stage/include/alac" -Force
@@ -104,10 +114,12 @@ jobs:
           $cmakeHelp = cmake --help | Out-String
           $vsGenerator = [regex]::Matches($cmakeHelp, '(?m)^\*?\s*(Visual Studio \d+ \d{4})') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique | Sort-Object { [int]([regex]::Match($_, 'Visual Studio (\d+)').Groups[1].Value) } -Descending | Select-Object -First 1
           if (-not $vsGenerator) { throw "No Visual Studio CMake generator found" }
-          cmake -S $src -B $build -G $vsGenerator -A x64 -DBUILD_TESTING=OFF -DPTHREADS4W_BUILD_C=ON -DPTHREADS4W_BUILD_CE=OFF -DPTHREADS4W_BUILD_SE=OFF
-          if ($LASTEXITCODE -ne 0) { throw "pthreads4w configure failed" }
-          cmake --build $build --config Release --target pthreadVC-static
-          if ($LASTEXITCODE -ne 0) { throw "pthreads4w build failed" }
+          cmake -S $src -B $build -G $vsGenerator -A x64 -DBUILD_TESTING=OFF -DPTHREADS4W_BUILD_C=ON -DPTHREADS4W_BUILD_CE=OFF -DPTHREADS4W_BUILD_SE=OFF 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "pthreads4w configure failed ($code)" }
+          cmake --build $build --config Release --target pthreadVC-static 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "pthreads4w build failed ($code)" }
           $staticLib = Get-ChildItem $build -Recurse -File -Filter "libpthread*.lib" | Select-Object -First 1
           if (-not $staticLib) { throw "pthreads4w static library missing" }
           New-Item -ItemType Directory -Force -Path "$stage/include" | Out-Null
@@ -154,15 +166,17 @@ jobs:
           foreach ($source in $sources) {
             $objPath = Join-Path $objAbs (([IO.Path]::GetFileNameWithoutExtension($source)) + ".obj")
             $cmd = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /MD /std:clatest /DNDEBUG /DSSL_STATIC_LIB /DWIN32 /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /D_CRT_NONSTDC_NO_DEPRECATE /DOPENSSL_SUPPRESS_DEPRECATED $includeArgs /Fo`"$objPath`" `"$source`""
-            & cmd.exe /d /s /c $cmd
-            if ($LASTEXITCODE -ne 0) { throw "Pinned libraop compile failed: $source" }
+            & cmd.exe /d /s /c $cmd 2>&1 | Tee-Object -FilePath build.log -Append
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw "Pinned libraop compile failed: $source ($code)" }
             $objects += $objPath
           }
           $lib = Join-Path $stageAbs "libraop-client-x64.lib"
           $objectArgs = ($objects | ForEach-Object { "`"$_`"" }) -join " "
           $cmd = "call `"$vcvars64`" && lib.exe /nologo /OUT:`"$lib`" $objectArgs"
-          & cmd.exe /d /s /c $cmd
-          if ($LASTEXITCODE -ne 0) { throw "Pinned libraop archive failed" }
+          & cmd.exe /d /s /c $cmd 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "Pinned libraop archive failed ($code)" }
           New-Item -ItemType Directory -Force -Path "$stage/include" | Out-Null
           Copy-Item "$src/src/raop_client.h" "$stage/include/raop_client.h" -Force
           Copy-Item "$src/src/rtsp_client.h" "$stage/include/rtsp_client.h" -Force
@@ -195,22 +209,33 @@ jobs:
           $includeArgs = @("/I`"$bridgeInclude`"","/I`"$libraop/include`"","/I`"$pthread/include`"","/I`"$alac/include/addons`"","/I`"$openssl/include`"") -join " "
           Set-Content -Path $logGlobals -Encoding ascii -Value @('#include "cross_log.h"','log_level raop_loglevel = lWARN;','log_level util_loglevel = lWARN;')
           $compile = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /MD /std:clatest /DNDEBUG /DWIN32 /DSSL_STATIC_LIB /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /D_CRT_NONSTDC_NO_DEPRECATE /DOPENSSL_SUPPRESS_DEPRECATED $includeArgs /Fo`"$bridgeObj`" `"$bridge`""
-          & cmd.exe /d /s /c $compile
-          if ($LASTEXITCODE -ne 0) { throw "RAOP bridge compile failed" }
+          & cmd.exe /d /s /c $compile 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "RAOP bridge compile failed ($code)" }
           $compileGlobals = "call `"$vcvars64`" && cl.exe /nologo /c /O2 /MD /std:clatest /DNDEBUG /DWIN32 $includeArgs /Fo`"$logGlobalsObj`" `"$logGlobals`""
-          & cmd.exe /d /s /c $compileGlobals
-          if ($LASTEXITCODE -ne 0) { throw "RAOP log globals compile failed" }
+          & cmd.exe /d /s /c $compileGlobals 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "RAOP log globals compile failed ($code)" }
           $exports = @("sr_raop_open","sr_raop_close","sr_raop_healthy","sr_raop_keepalive","sr_raop_commit_start","sr_raop_start_after_flush","sr_raop_flush","sr_raop_standby","sr_raop_pause","sr_raop_play","sr_raop_stop","sr_raop_set_volume","sr_raop_set_progress","sr_raop_set_metadata","sr_raop_set_artwork","sr_raop_write_packet","sr_raop_head_audible_ms","sr_raop_diag_snapshot") | ForEach-Object { "/EXPORT:$_" }
           $exportArgs = $exports -join " "
           $link = "call `"$vcvars64`" && link.exe /nologo /DLL /OUT:`"$bridgeDll`" `"$bridgeObj`" `"$logGlobalsObj`" `"$libraop/libraop-client-x64.lib`" `"$alac/libalac-wrapper.lib`" `"$alac/libalac.lib`" `"$pthread/libpthread-static.lib`" `"$openssl/libcrypto.lib`" `"$openssl/libssl.lib`" ws2_32.lib wsock32.lib iphlpapi.lib $exportArgs"
-          & cmd.exe /d /s /c $link
-          if ($LASTEXITCODE -ne 0) { throw "RAOP bridge link failed" }
+          & cmd.exe /d /s /c $link 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "RAOP bridge link failed ($code)" }
 
       - name: Test MSA SOLO
-        run: cargo test -p sairplay-msa-solo --all-targets
+        shell: pwsh
+        run: |
+          cargo test -p sairplay-msa-solo --all-targets 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { exit $code }
 
       - name: Build GUI
-        run: cargo build --release -p sairplay-gui
+        shell: pwsh
+        run: |
+          cargo build --release -p sairplay-gui 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { exit $code }
 
       - name: Package MiTV HappyCast test artifact
         shell: pwsh
@@ -224,6 +249,15 @@ jobs:
           Copy-Item "target/vendor/libopenssl-x64-stage/libssl-1_1-x64.dll" "$out/libssl-1_1-x64.dll" -Force
           Get-FileHash "$out/sairplay-gui.exe" -Algorithm SHA256
           Get-FileHash "$out/sairplay-raop.dll" -Algorithm SHA256
+
+      - name: Upload durable MiTV build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiTV-HappyCast-build-log
+          path: build.log
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload MiTV HappyCast Windows artifact
         uses: actions/upload-artifact@v4
