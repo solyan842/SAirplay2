@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import argparse
+import apply_mitv_handshake_diag as handshake_diag
 
 HAPPYCAST_PORT = 52266
 
@@ -141,9 +142,13 @@ def main() -> None:
     if bool(args.repo) == bool(args.libraop):
         raise SystemExit("pass exactly one of --repo or --libraop")
     if args.repo:
-        patch_repo(args.repo.resolve())
+        root = args.repo.resolve()
+        patch_repo(root)
+        handshake_diag.patch_repo(root)
     else:
-        patch_libraop(args.libraop.resolve())
+        root = args.libraop.resolve()
+        patch_libraop(root)
+        handshake_diag.patch_libraop(root)
 
 
 if __name__ == "__main__":
