@@ -120,6 +120,17 @@ def patch_repo(root: Path) -> None:
 
     replace_once(
         session_rs,
+        '''#[repr(C)]\n#[derive(Default)]\nstruct SrRaopWireDiag {\n''',
+        '''#[repr(C)]\nstruct SrRaopWireDiag {\n''',
+    )
+    replace_once(
+        session_rs,
+        '''    feedback_ok: u64, feedback_fail: u64,\n}\n\nfn inproc_open_stage_name''',
+        '''    feedback_ok: u64, feedback_fail: u64,\n}\n\nimpl Default for SrRaopWireDiag {\n    fn default() -> Self {\n        // C ABI diagnostic snapshot: every field is an integer or c_char array,\n        // so an all-zero representation is valid and preserves the old derived\n        // Default semantics while supporting arrays larger than 32 elements.\n        unsafe { std::mem::zeroed() }\n    }\n}\n\nfn inproc_open_stage_name''',
+    )
+
+    replace_once(
+        session_rs,
         '''    first_audio_timestamp: u32, last_audio_timestamp: u32,\n    first_audio_seq: u16, last_audio_seq: u16,\n    feedback_active: u32,\n''',
         '''    first_audio_timestamp: u32, last_audio_timestamp: u32,\n    first_audio_seq: u16, last_audio_seq: u16,\n    handshake_sid: [c_char; 11],\n    handshake_client_instance: [c_char; 17],\n    handshake_et: [c_char; 16],\n    handshake_dacp_id: [c_char; 17],\n    handshake_active_remote: [c_char; 11],\n    handshake_sdp: [c_char; 1024],\n    handshake_setup_transport: [c_char; 512],\n    handshake_setup_session: [c_char; 128],\n    handshake_audio_latency: [c_char; 64],\n    handshake_codec: u32,\n    handshake_crypto: u32,\n    handshake_encrypt: u32,\n    handshake_auth: u32,\n    handshake_auth_setup_attempted: u32,\n    handshake_auth_setup_status: u32,\n    handshake_announce_status: u32,\n    handshake_setup_status: u32,\n    handshake_record_status: u32,\n    handshake_record_seq: u16,\n    handshake_record_ts: u32,\n    feedback_active: u32,\n''',
     )
