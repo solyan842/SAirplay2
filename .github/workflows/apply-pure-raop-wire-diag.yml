@@ -35,7 +35,7 @@ jobs:
             exit 1
           fi
 
-      - name: Commit diagnostic-only patch
+      - name: Commit diagnostic-only source patch
         shell: bash
         run: |
           set -euo pipefail
@@ -48,8 +48,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add \
-            .github/workflows/windows.yml \
-            scripts/patch_pinned_raop_wire_diag.py \
             native/raop-static/raop_bridge.h \
             native/raop-static/raop_bridge.c \
             crates/sairplay-msa-solo/src/windows_raop_session.rs \
