@@ -421,6 +421,10 @@ impl WindowsRaopAudioWorker {
                         let min_frames = if min_queue_frames == usize::MAX { 0 } else { min_queue_frames };
                         let min_ms = min_frames.saturating_mul(1000) / sample_rate_w;
                         let max_ms = max_queue_frames.saturating_mul(1000) / sample_rate_w;
+                        let wire_diag = session_w
+                            .try_lock()
+                            .ok()
+                            .and_then(|session| session.wire_diagnostic_line());
                         if let Ok(mut events) = events_w.lock() {
                             events.push(format!(
                                 "MSA RAOP DIAG 10s sent_total={} queue_now={}f/{}ms queue_min={}f/{}ms queue_max={}f/{}ms starvation_total={} max_empty={}ms slow_write_total={} max_write={}ms max_send_gap={}ms capture_idle={}ms capture_gen={} source_present={} reservoir_primed={} reservoir_target={}f/{}ms head_ahead_ms={:?}.",
@@ -444,6 +448,7 @@ impl WindowsRaopAudioWorker {
                                 reservoir_ms_w,
                                 diagnostic_head_ahead_ms(&session_w),
                             ));
+                            if let Some(line) = wire_diag { events.push(line); }
                         }
                         last_summary = Instant::now();
                         min_queue_frames = usize::MAX;

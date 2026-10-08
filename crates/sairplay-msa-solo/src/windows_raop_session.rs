@@ -155,6 +155,25 @@ struct SrRaopReady {
     open_error_stage: u32,
 }
 
+#[repr(C)]
+#[derive(Default)]
+struct SrRaopWireDiag {
+    audio_lport: u16, audio_rport: u16,
+    control_lport: u16, control_rport: u16,
+    timing_lport: u16, timing_rport: u16,
+    state: u32,
+    seq_number: u32,
+    sane_ctrl: u32, sane_time: u32,
+    sane_audio_avail: u32, sane_audio_select: u32, sane_audio_send: u32,
+    audio_send_ok: u64, audio_send_fail: u64,
+    sync_send_ok: u64, sync_send_fail: u64,
+    timing_requests: u64, timing_responses: u64, timing_response_fail: u64,
+    control_requests: u64,
+    retransmit: u64,
+    first_audio_timestamp: u32, last_audio_timestamp: u32,
+    first_audio_seq: u16, last_audio_seq: u16,
+}
+
 fn inproc_open_stage_name(stage: u32) -> &'static str {
     match stage {
         1 => "config",
@@ -179,6 +198,7 @@ type MetadataFn = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char
 type ArtworkFn = unsafe extern "C" fn(*mut c_void, *const c_char, *const u8, usize) -> i32;
 type WriteFn = unsafe extern "C" fn(*mut c_void, *const u8, usize) -> i32;
 type HeadFn = unsafe extern "C" fn(*mut c_void) -> u64;
+type WireDiagFn = unsafe extern "C" fn(*mut c_void, *mut SrRaopWireDiag) -> i32;
 
 struct InprocApi {
     _library: Library,
@@ -199,6 +219,7 @@ struct InprocApi {
     set_artwork: ArtworkFn,
     write_packet: WriteFn,
     head_audible_ms: HeadFn,
+    wire_diag: WireDiagFn,
 }
 
 impl InprocApi {
@@ -228,10 +249,11 @@ impl InprocApi {
         let set_artwork = symbol!("sr_raop_set_artwork", ArtworkFn);
         let write_packet = symbol!("sr_raop_write_packet", WriteFn);
         let head_audible_ms = symbol!("sr_raop_head_audible_ms", HeadFn);
+        let wire_diag = symbol!("sr_raop_diag_snapshot", WireDiagFn);
         Ok(Self {
             _library: library, open, close, healthy, keepalive, commit_start,
             start_after_flush, flush, standby, pause, play, stop, set_volume,
-            set_progress, set_metadata, set_artwork, write_packet, head_audible_ms,
+            set_progress, set_metadata, set_artwork, write_packet, head_audible_ms, wire_diag,
         })
     }
 }
@@ -344,6 +366,29 @@ impl InprocCore {
 
     fn head_audible_ms(&self) -> u64 {
         self.with_handle(|p| unsafe { (self.api.head_audible_ms)(p) }).unwrap_or(0)
+    }
+
+    fn wire_diagnostic_line(&self) -> Option<String> {
+        let mut diag = SrRaopWireDiag::default();
+        let ok = self
+            .with_handle(|p| unsafe { (self.api.wire_diag)(p, &mut diag) })
+            .ok()?;
+        if ok == 0 { return None; }
+        Some(format!(
+            "MSA RAOP DIAG WIRE-UDP ports=audio:{}->{} control:{}->{} timing:{}->{} state={} seq={} audio_ok={} audio_fail={} sync_ok={} sync_fail={} timing_req={} timing_rsp={} timing_rsp_fail={} control_req={} retransmit={} first_seq={} first_ts={} last_seq={} last_ts={} sane=ctrl:{} time:{} audio_avail:{} audio_select:{} audio_send:{}",
+            diag.audio_lport, diag.audio_rport,
+            diag.control_lport, diag.control_rport,
+            diag.timing_lport, diag.timing_rport,
+            diag.state, diag.seq_number,
+            diag.audio_send_ok, diag.audio_send_fail,
+            diag.sync_send_ok, diag.sync_send_fail,
+            diag.timing_requests, diag.timing_responses, diag.timing_response_fail,
+            diag.control_requests, diag.retransmit,
+            diag.first_audio_seq, diag.first_audio_timestamp,
+            diag.last_audio_seq, diag.last_audio_timestamp,
+            diag.sane_ctrl, diag.sane_time, diag.sane_audio_avail,
+            diag.sane_audio_select, diag.sane_audio_send,
+        ))
     }
 }
 impl Drop for InprocCore { fn drop(&mut self) { self.close(); } }
@@ -627,6 +672,9 @@ impl MsaRaopSession {
     pub fn head_audible_unix_ms(&self) -> u64 {
         if let Some(core) = self.inproc.as_ref() { core.head_audible_ms() }
         else { self.head_audible_ms.load(Ordering::SeqCst) }
+    }
+    pub fn wire_diagnostic_line(&self) -> Option<String> {
+        self.inproc.as_ref()?.wire_diagnostic_line()
     }
 
     pub fn commit_start(&mut self, requested_unix_ms: u64) -> Result<StartResolution, MsaRaopError> {

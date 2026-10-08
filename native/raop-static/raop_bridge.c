@@ -374,6 +374,8 @@ sr_raop_handle *sr_raop_open(const sr_raop_config *config, sr_raop_ready *ready)
         return NULL;
     }
 
+    raopcl_diag_enable(handle->client, config->port == SR_HAPPYCAST_DIAG_PORT);
+
     if (!raopcl_connect(handle->client, player, config->port, config->volume > 0)) {
         sr_set_open_error(ready, SR_RAOP_OPEN_RAOPCL_CONNECT);
         raopcl_destroy(handle->client);
@@ -713,4 +715,45 @@ uint64_t sr_raop_head_audible_ms(sr_raop_handle *handle)
     value = handle->head_audible_ms;
     LeaveCriticalSection(&handle->lock);
     return value;
+}
+
+int sr_raop_diag_snapshot(sr_raop_handle *handle, sr_raop_wire_diag *out)
+{
+    raop_diag_snapshot_t raw;
+    int ok = 0;
+    if (!handle || !out) return 0;
+    memset(out, 0, sizeof(*out));
+
+    EnterCriticalSection(&handle->lock);
+    if (handle->client && raopcl_diag_snapshot(handle->client, &raw)) {
+        out->audio_lport = raw.audio_lport;
+        out->audio_rport = raw.audio_rport;
+        out->control_lport = raw.control_lport;
+        out->control_rport = raw.control_rport;
+        out->timing_lport = raw.timing_lport;
+        out->timing_rport = raw.timing_rport;
+        out->state = raw.state;
+        out->seq_number = raw.seq_number;
+        out->sane_ctrl = raw.sane_ctrl;
+        out->sane_time = raw.sane_time;
+        out->sane_audio_avail = raw.sane_audio_avail;
+        out->sane_audio_select = raw.sane_audio_select;
+        out->sane_audio_send = raw.sane_audio_send;
+        out->audio_send_ok = raw.audio_send_ok;
+        out->audio_send_fail = raw.audio_send_fail;
+        out->sync_send_ok = raw.sync_send_ok;
+        out->sync_send_fail = raw.sync_send_fail;
+        out->timing_requests = raw.timing_requests;
+        out->timing_responses = raw.timing_responses;
+        out->timing_response_fail = raw.timing_response_fail;
+        out->control_requests = raw.control_requests;
+        out->retransmit = raw.retransmit;
+        out->first_audio_timestamp = raw.first_audio_timestamp;
+        out->last_audio_timestamp = raw.last_audio_timestamp;
+        out->first_audio_seq = raw.first_audio_seq;
+        out->last_audio_seq = raw.last_audio_seq;
+        ok = 1;
+    }
+    LeaveCriticalSection(&handle->lock);
+    return ok;
 }
