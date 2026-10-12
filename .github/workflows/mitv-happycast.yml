@@ -27,8 +27,12 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          python scripts/apply_mitv_active_feedback.py --repo .
+          python scripts/apply_mitv_active_feedback.py --repo . 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "MiTV repository patch failed ($code)" }
           git diff --check
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "MiTV repository patch produced an invalid diff ($code)" }
           $changed = git diff --name-only
           $changed | Write-Host
           if ($changed -contains "crates/sairplay-msa-solo/src/windows_raop_worker_base.rs") {
@@ -143,8 +147,12 @@ jobs:
           git clone --filter=blob:none https://github.com/philippe44/libraop.git $src
           git -C $src checkout $pin
           git -C $src submodule update --init crosstools dmap-parser
-          python scripts/patch_pinned_raop_wire_diag.py $src
-          python scripts/apply_mitv_active_feedback.py --libraop $src
+          python scripts/patch_pinned_raop_wire_diag.py $src 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "Pinned libraop wire diagnostic patch failed ($code)" }
+          python scripts/apply_mitv_active_feedback.py --libraop $src 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "Pinned libraop MiTV patch failed ($code)" }
           $dmapHead = (git -C "$src/dmap-parser" rev-parse HEAD).Trim()
           if ($dmapHead -ne $dmapPin) { throw "Pinned dmap-parser mismatch: $dmapHead" }
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
