@@ -30,6 +30,9 @@ jobs:
           python scripts/apply_mitv_active_feedback.py --repo . 2>&1 | Tee-Object -FilePath build.log -Append
           $code = $LASTEXITCODE
           if ($code -ne 0) { throw "MiTV repository patch failed ($code)" }
+          python scripts/apply_mitv_record_refresh_diag.py --repo . 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "MiTV RECORD refresh diagnostic patch failed ($code)" }
           git diff --check
           $code = $LASTEXITCODE
           if ($code -ne 0) { throw "MiTV repository patch produced an invalid diff ($code)" }
@@ -168,7 +171,7 @@ jobs:
           $includes = @((Join-Path $srcAbs "src"),(Join-Path $srcAbs "crosstools/src"),(Join-Path $srcAbs "dmap-parser"),$opensslInclude,$pthreadInclude,$alacWrapperInclude)
           $includeArgs = ($includes | ForEach-Object { "/I`"$_`"" }) -join " "
           $sources = @(
-            (Join-Path $srcAbs "src/raop_client.c"),(Join-Path $srcAbs "src/rtsp_client.c"),(Join-Path $srcAbs "src/aes.c"),(Join-Path $srcAbs "src/aes_ctr.c"),(Join-Path $srcAbs "src/alac.c"),(Join-Path $srcAbs "dmap-parser/dmap_parser.c"),(Join-Path $srcAbs "crosstools/src/cross_log.c"),(Join-Path $srcAbs "crosstools/src/cross_net.c"),(Join-Path $srcAbs "crosstools/src/cross_ssl.c"),(Join-Path $srcAbs "crosstools/src/cross_util.c"),(Join-Path $srcAbs "crosstools/src/platform.c")
+            (Join-Path $srcAbs "src/raop_client.c"),(Join-Path $srcAbs "src/rtsp_client.c"),(Join-Path $srcAbs "src/aes.c"),(Join-Path $srcAbs "src/aes_ctr.c"),(Join-Path $srcAbs "src/alac.c"),(Join-Path $srcAbs "dmap-parser/dmap_parser.c"),(Join-Path $srcAbs "crosstools/src/cross_log.c"),(Join-Path $srcAbs "crosstools/src/cross_net.c"),(Join-Path $srcAbs "crosstools/src/cross_ssl.c"),(Join-Path $srcAbs "crosstools/src/cross_log.c"),(Join-Path $srcAbs "crosstools/src/cross_util.c"),(Join-Path $srcAbs "crosstools/src/platform.c")
           )
           $objects = @()
           foreach ($source in $sources) {
