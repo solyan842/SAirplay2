@@ -171,7 +171,7 @@ jobs:
           $includes = @((Join-Path $srcAbs "src"),(Join-Path $srcAbs "crosstools/src"),(Join-Path $srcAbs "dmap-parser"),$opensslInclude,$pthreadInclude,$alacWrapperInclude)
           $includeArgs = ($includes | ForEach-Object { "/I`"$_`"" }) -join " "
           $sources = @(
-            (Join-Path $srcAbs "src/raop_client.c"),(Join-Path $srcAbs "src/rtsp_client.c"),(Join-Path $srcAbs "src/aes.c"),(Join-Path $srcAbs "src/aes_ctr.c"),(Join-Path $srcAbs "src/alac.c"),(Join-Path $srcAbs "dmap-parser/dmap_parser.c"),(Join-Path $srcAbs "crosstools/src/cross_log.c"),(Join-Path $srcAbs "crosstools/src/cross_net.c"),(Join-Path $srcAbs "crosstools/src/cross_ssl.c"),(Join-Path $srcAbs "crosstools/src/cross_log.c"),(Join-Path $srcAbs "crosstools/src/cross_util.c"),(Join-Path $srcAbs "crosstools/src/platform.c")
+            (Join-Path $srcAbs "src/raop_client.c"),(Join-Path $srcAbs "src/rtsp_client.c"),(Join-Path $srcAbs "src/aes.c"),(Join-Path $srcAbs "src/aes_ctr.c"),(Join-Path $srcAbs "src/alac.c"),(Join-Path $srcAbs "dmap-parser/dmap_parser.c"),(Join-Path $srcAbs "crosstools/src/cross_log.c"),(Join-Path $srcAbs "crosstools/src/cross_net.c"),(Join-Path $srcAbs "crosstools/src/cross_ssl.c"),(Join-Path $srcAbs "crosstools/src/cross_util.c"),(Join-Path $srcAbs "crosstools/src/platform.c")
           )
           $objects = @()
           foreach ($source in $sources) {
