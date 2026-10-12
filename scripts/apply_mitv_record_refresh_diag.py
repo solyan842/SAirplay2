@@ -66,10 +66,10 @@ def patch_repo(root: Path) -> None:
     replace_once(
         active_feedback_py,
         '''        patch_libraop(root)\n        handshake_diag.patch_libraop(root)\n''',
-        '''        patch_libraop(root)\n        handshake_diag.patch_libraop(root)\n        import apply_mitv_user_agent_ab as user_agent_ab\n        user_agent_ab.patch_libraop(root)\n''',
+        '''        patch_libraop(root)\n        handshake_diag.patch_libraop(root)\n        import apply_mitv_sync_after_audio_ab as sync_after_audio_ab\n        sync_after_audio_ab.patch_libraop(root)\n''',
     )
 
-    print(f"patched MiTV RECORD refresh telemetry + staged User-Agent A/B under {root}")
+    print(f"patched MiTV RECORD refresh telemetry + staged first-SYNC-after-audio A/B under {root}")
 
 
 def main() -> None:
