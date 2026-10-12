@@ -78,13 +78,13 @@ def patch_repo(root: Path) -> None:
     )
     replace_once(
         bridge_c,
-        '''    uint64_t audible;\n    uint64_t latency;\n    raop_state_t state;\n''',
-        '''    uint64_t audible;\n    uint64_t latency;\n    uint64_t stream_start;\n    raop_state_t state;\n''',
+        '''int sr_raop_commit_start(sr_raop_handle *handle,\n                         uint64_t requested_unix_ms,\n                         uint64_t *at_unix_ms)\n{\n    int ok = 0;\n    uint64_t audible;\n    uint64_t latency;\n    raop_state_t state;\n''',
+        '''int sr_raop_commit_start(sr_raop_handle *handle,\n                         uint64_t requested_unix_ms,\n                         uint64_t *at_unix_ms)\n{\n    int ok = 0;\n    uint64_t audible;\n    uint64_t latency;\n    uint64_t stream_start;\n    raop_state_t state;\n''',
     )
     replace_once(
         bridge_c,
-        '''    latency = TS2NTP(raopcl_latency(handle->client), raopcl_sample_rate(handle->client));\n    handle->head_audible_ms = 0;\n    ok = raopcl_start_at(handle->client, audible - latency) ? 1 : 0;\n\ndone:\n''',
-        '''    latency = TS2NTP(raopcl_latency(handle->client), raopcl_sample_rate(handle->client));\n    stream_start = audible - latency;\n    handle->head_audible_ms = 0;\n    ok = raopcl_start_at(handle->client, stream_start) ? 1 : 0;\n    /* HappyCast appears to bind playback to the RTP-Info from RECORD. Because\n     * the Windows live-source lifecycle can defer START for seconds after the\n     * initial connect-time RECORD, refresh only this receiver's initial RECORD\n     * so seq/rtptime match the first packet on the re-anchored timeline. */\n    if (ok && handle->happycast_feedback && state == RAOP_FLUSHED) {\n        ok = raopcl_refresh_record(handle->client, stream_start) ? 1 : 0;\n    }\n\ndone:\n''',
+        '''    audible = sr_resolve_start(requested_unix_ms, at_unix_ms);\n    raopcl_stop(handle->client);\n    if (state == RAOP_STREAMING && !raopcl_flush(handle->client)) goto done;\n    latency = TS2NTP(raopcl_latency(handle->client), raopcl_sample_rate(handle->client));\n    handle->head_audible_ms = 0;\n    ok = raopcl_start_at(handle->client, audible - latency) ? 1 : 0;\n\ndone:\n''',
+        '''    audible = sr_resolve_start(requested_unix_ms, at_unix_ms);\n    raopcl_stop(handle->client);\n    if (state == RAOP_STREAMING && !raopcl_flush(handle->client)) goto done;\n    latency = TS2NTP(raopcl_latency(handle->client), raopcl_sample_rate(handle->client));\n    stream_start = audible - latency;\n    handle->head_audible_ms = 0;\n    ok = raopcl_start_at(handle->client, stream_start) ? 1 : 0;\n    /* HappyCast appears to bind playback to the RTP-Info from RECORD. Because\n     * the Windows live-source lifecycle can defer START for seconds after the\n     * initial connect-time RECORD, refresh only this receiver's initial RECORD\n     * so seq/rtptime match the first packet on the re-anchored timeline. */\n    if (ok && handle->happycast_feedback && state == RAOP_FLUSHED) {\n        ok = raopcl_refresh_record(handle->client, stream_start) ? 1 : 0;\n    }\n\ndone:\n''',
     )
     replace_once(
         bridge_c,
