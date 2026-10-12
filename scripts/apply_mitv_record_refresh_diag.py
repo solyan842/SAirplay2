@@ -16,8 +16,8 @@ def patch_repo(root: Path) -> None:
     bridge_c = root / "native" / "raop-static" / "raop_bridge.c"
     bridge_h = root / "native" / "raop-static" / "raop_bridge.h"
     session_rs = root / "crates" / "sairplay-msa-solo" / "src" / "windows_raop_session.rs"
-    solo_rs = root / "crates" / "sairplay-msa-solo" / "src" / "windows_solo_client.rs"
-    for path in (bridge_c, bridge_h, session_rs, solo_rs):
+    active_feedback_py = root / "scripts" / "apply_mitv_active_feedback.py"
+    for path in (bridge_c, bridge_h, session_rs, active_feedback_py):
         if not path.is_file():
             raise SystemExit(f"missing repository source: {path}")
 
@@ -60,19 +60,16 @@ def patch_repo(root: Path) -> None:
         '''            diag.feedback_active, diag.feedback_ok, diag.feedback_fail,\n            diag.refresh_record_attempted, diag.refresh_record_ok,\n            diag.refresh_record_fail, diag.refresh_record_ts,\n            cstr(&diag.handshake_et),''',
     )
 
-    # Diagnostic A/B only. The explicit RAOP path normally honors the receiver's
-    # cn field and uses compressed ALAC when cn advertises codec 1. HappyCast has
-    # now ACKed the complete compressed-ALAC RTSP/RTP timeline yet remained
-    # silent, so force only its known port to the pinned libraop ALAC_RAW path.
-    # No route, timing, packet size, latency, receiver identity or other device
-    # behavior is changed.
+    # Stage one additional vendor-only A/B in the already isolated MiTV patch
+    # pipeline. This mutates only the workflow worktree copy of the patch driver;
+    # the actual pinned libraop source is still cloned fresh later in the job.
     replace_once(
-        solo_rs,
-        '''                    if let Some(cn) = config.raop_cn.as_deref() {\n                        if !cn.contains('1') {\n                            config.raop.compressed_alac = false;\n                        }\n                    }\n                    // Exact cliairplay RAOP rule: RSA is legal only when the\n''',
-        '''                    if let Some(cn) = config.raop_cn.as_deref() {\n                        if !cn.contains('1') {\n                            config.raop.compressed_alac = false;\n                        }\n                    }\n                    if config.raop.port == 52_266 {\n                        config.raop.compressed_alac = false;\n                    }\n                    // Exact cliairplay RAOP rule: RSA is legal only when the\n''',
+        active_feedback_py,
+        '''        patch_libraop(root)\n        handshake_diag.patch_libraop(root)\n''',
+        '''        patch_libraop(root)\n        handshake_diag.patch_libraop(root)\n        import apply_mitv_user_agent_ab as user_agent_ab\n        user_agent_ab.patch_libraop(root)\n''',
     )
 
-    print(f"patched MiTV RECORD refresh telemetry + raw-ALAC A/B under {root}")
+    print(f"patched MiTV RECORD refresh telemetry + staged User-Agent A/B under {root}")
 
 
 def main() -> None:
