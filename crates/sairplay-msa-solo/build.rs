@@ -1,16 +1,14 @@
 use std::{env, fs, path::{Path, PathBuf}};
 
-fn require_marker(path: &Path, marker: &str) {
+fn marker_present(path: &Path, marker: &str) -> Result<(), String> {
     let text = fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("MiTV patch gate: cannot read {}: {e}", path.display()));
-    if !text.contains(marker) {
-        panic!(
-            "MiTV patch gate: required marker missing in {}: {:?}",
-            path.display(),
-            marker
-        );
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if text.contains(marker) {
+        println!("cargo:warning=MiTV patch gate PASS: {} contains {:?}", path.display(), marker);
+        Ok(())
+    } else {
+        Err(format!("{} missing {:?}", path.display(), marker))
     }
-    println!("cargo:warning=MiTV patch gate PASS: {} contains {:?}", path.display(), marker);
 }
 
 fn main() {
@@ -30,10 +28,27 @@ fn main() {
     let bridge = manifest.join("../../native/raop-static/raop_bridge.c");
 
     // These markers exist only after the isolated MiTV workflow patch has run.
-    // The gate changes no runtime behavior; it prevents CI from packaging a
-    // stale/unpatched binary while reporting a successful build.
-    require_marker(&worker, "MSA RAOP COMPAT active feedback:");
-    require_marker(&session, "feedback_active={}");
-    require_marker(&session, "HANDSHAKE user_agent=");
-    require_marker(&bridge, "raopcl_refresh_record(handle->client, stream_start)");
+    // Collect every failure in one pass so one CI run identifies whether the
+    // patch loss is isolated to one source file or affects the whole repo patch.
+    let checks = [
+        (&worker, "MSA RAOP COMPAT active feedback:"),
+        (&session, "feedback_active={}"),
+        (&session, "HANDSHAKE user_agent="),
+        (&bridge, "raopcl_refresh_record(handle->client, stream_start)"),
+    ];
+
+    let mut missing = Vec::new();
+    for (path, marker) in checks {
+        if let Err(error) = marker_present(path, marker) {
+            missing.push(error);
+        }
+    }
+
+    if !missing.is_empty() {
+        panic!(
+            "MiTV patch gate: {} required marker(s) missing after workflow patch:\n{}",
+            missing.len(),
+            missing.join("\n")
+        );
+    }
 }
