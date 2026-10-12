@@ -16,13 +16,14 @@ def patch_repo(root: Path) -> None:
     bridge_c = root / "native" / "raop-static" / "raop_bridge.c"
     bridge_h = root / "native" / "raop-static" / "raop_bridge.h"
     session_rs = root / "crates" / "sairplay-msa-solo" / "src" / "windows_raop_session.rs"
-    for path in (bridge_c, bridge_h, session_rs):
+    solo_rs = root / "crates" / "sairplay-msa-solo" / "src" / "windows_solo_client.rs"
+    for path in (bridge_c, bridge_h, session_rs, solo_rs):
         if not path.is_file():
             raise SystemExit(f"missing repository source: {path}")
 
-    # Telemetry only: retain the exact existing HappyCast RECORD-refresh behavior,
-    # but make its attempt/result and requested RTP timestamp visible in the
-    # existing 10-second wire diagnostic.
+    # Retain the exact existing HappyCast RECORD-refresh behavior, but make its
+    # attempt/result and requested RTP timestamp visible in the existing
+    # 10-second wire diagnostic.
     replace_once(
         bridge_c,
         '''    uint64_t feedback_ok;\n    uint64_t feedback_fail;\n    CRITICAL_SECTION lock;\n''',
@@ -59,7 +60,19 @@ def patch_repo(root: Path) -> None:
         '''            diag.feedback_active, diag.feedback_ok, diag.feedback_fail,\n            diag.refresh_record_attempted, diag.refresh_record_ok,\n            diag.refresh_record_fail, diag.refresh_record_ts,\n            cstr(&diag.handshake_et),''',
     )
 
-    print(f"patched MiTV delayed RECORD refresh diagnostics under {root}")
+    # Diagnostic A/B only. The explicit RAOP path normally honors the receiver's
+    # cn field and uses compressed ALAC when cn advertises codec 1. HappyCast has
+    # now ACKed the complete compressed-ALAC RTSP/RTP timeline yet remained
+    # silent, so force only its known port to the pinned libraop ALAC_RAW path.
+    # No route, timing, packet size, latency, receiver identity or other device
+    # behavior is changed.
+    replace_once(
+        solo_rs,
+        '''                    if let Some(cn) = config.raop_cn.as_deref() {\n                        if !cn.contains('1') {\n                            config.raop.compressed_alac = false;\n                        }\n                    }\n                    // Exact cliairplay RAOP rule: RSA is legal only when the\n''',
+        '''                    if let Some(cn) = config.raop_cn.as_deref() {\n                        if !cn.contains('1') {\n                            config.raop.compressed_alac = false;\n                        }\n                    }\n                    if config.raop.port == 52_266 {\n                        config.raop.compressed_alac = false;\n                    }\n                    // Exact cliairplay RAOP rule: RSA is legal only when the\n''',
+    )
+
+    print(f"patched MiTV RECORD refresh telemetry + raw-ALAC A/B under {root}")
 
 
 def main() -> None:
