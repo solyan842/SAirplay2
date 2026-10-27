@@ -1,5 +1,43 @@
 # Explicit MiTV native AirPlay / NTP experiment
 
+## Broad source review and directly reproduced fix after #27
+
+The earlier conclusion that key presence was sufficient was WRONG. #27 used
+false, which the actual receiver branch at 0x202e90 sends to stream validation.
+The adapter now uses true. The key does not itself create a video stream; the
+subsequent SETUP still contains only type-96 ALAC audio.
+
+An independent pyatv transient-HAP probe was run directly against this MiTV,
+without SAirplay2 or a new GUI build. Requests differ only in this boolean:
+
+| isScreenMirroringSession | Session SETUP | RECORD | ALAC stream SETUP |
+| --- | --- | --- | --- |
+| false | 500 | not attempted | not attempted |
+| true | 200 | 200 | 200, returned type=96 and data/control UDP ports |
+
+The stream dictionary matches the existing MSA settings: audioFormat=262144,
+ct=2, spf=352, sr=44100, type=96, SHK, local data/control ports and standard
+latency fields. No audio was transmitted by this control-only probe. Speaker
+output, sustained playback and Stop/Start remain unverified.
+
+Wider primary references support the direction:
+- UxPlay's AirPlay2 analysis (HappyPlay lineage) shows true in initial NTP SETUP:
+  https://github.com/FDH2/UxPlay/wiki/AirPlay2
+- A current iPhone SETUP example also uses true:
+  https://github.com/FDH2/UxPlay/issues/535
+- pyatv's transient HAP implementation supplied the independent control
+  connection; no encryption or pairing bypass was used.
+
+Correction to the earlier feasibility assessment: pyatv's legacy ValueError
+parsing DEADBEEF is not evidence of an invalid receiver Session header. RFC2326
+section 3.4 defines session identifiers as opaque strings, not decimal numbers.
+That library assumption cannot justify abandoning HappyCast or replacing it.
+https://www.rfc-editor.org/rfc/rfc2326#section-3.4
+
+Historical hypotheses/results below are retained as history and are superseded
+by the direct comparison above wherever they claim that false or key presence
+should succeed.
+
 ## #25 result and next session-metadata experiment
 
 #26 result: the receiver logs confirm et=32 and sourceVersion=670.6.2 arrive,

@@ -14,15 +14,15 @@ pub(super) fn enabled(endpoint: Option<&str>, host: &str, port: u16) -> bool {
 fn session_identity(body: &[u8]) -> Result<Vec<u8>, NtpSessionSetupError> {
     let mut value = Value::from_reader(Cursor::new(body))?;
     let root = value.as_dictionary_mut().ok_or(NtpSessionSetupError::InvalidRoot)?;
-    // Hardware iPhone SETUP reports et=32. The installed HappyCast parser uses
-    // nonzero et plus sourceVersion to classify the session-only first SETUP.
+    // Hardware iPhone SETUP reports et=32; preserve #26's identity metadata.
     // Match our existing AirPlay/670.6.2 agent; do not borrow iPhone identifiers.
     root.insert("et".into(), Value::Integer(32u64.into()));
     root.insert("sourceVersion".into(), Value::String("670.6.2".into()));
-    // Receiver 0x202d4c looks up this key. With no streams and a modern source
-    // version, its presence selects the session-only response path rather than
-    // the stream type check. false describes this audio-only session.
-    root.insert("isScreenMirroringSession".into(), Value::Boolean(false));
+    // Independent live HAP probe: false -> session SETUP 500; true -> session
+    // SETUP 200, RECORD 200 and type-96/ALAC stream SETUP 200. Receiver branch
+    // 0x202e90 tests the boolean VALUE, not merely key presence. Despite the key
+    // name, true is required for this session; only an audio stream is created.
+    root.insert("isScreenMirroringSession".into(), Value::Boolean(true));
     let mut out = Vec::new();
     value.to_writer_binary(&mut out)?;
     Ok(out)
@@ -56,7 +56,7 @@ mod tests {
         }
         assert_eq!(root.get("et").and_then(Value::as_unsigned_integer), Some(32));
         assert_eq!(root.get("sourceVersion").and_then(Value::as_string), Some("670.6.2"));
-        assert_eq!(root.get("isScreenMirroringSession").and_then(Value::as_boolean), Some(false));
+        assert_eq!(root.get("isScreenMirroringSession").and_then(Value::as_boolean), Some(true));
         assert!(!root.contains_key("streams"));
         assert!(!root.contains_key("ekey"));
     }
