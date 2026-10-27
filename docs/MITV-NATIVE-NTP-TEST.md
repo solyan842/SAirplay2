@@ -2,6 +2,19 @@
 
 ## #25 result and next session-metadata experiment
 
+#26 result: the receiver logs confirm et=32 and sourceVersion=670.6.2 arrive,
+but SETUP still returns 500. These two fields alone do not fix classification.
+
+Further static inspection identifies the decisive key at receiver PC 0x202d4c:
+`isScreenMirroringSession`. After finding no streams, the parser looks it up.
+If absent, only source versions in [366.0, 367.0) enter its session-only reply
+path; modern versions fall through to stream/type validation. If present,
+the parser reads the boolean and takes its session reply path. The strings,
+float constants and branch instructions were read from the installed library,
+not guessed from a failed RTSP status. The next adapter adds this one key with
+false for audio-only operation; et/sourceVersion remain unchanged from #26.
+The test checks all original fields and exactly these three added fields.
+
 #25 reaches transient HAP Pair-Setup M3/M4 successfully. HappyCast initializes
 the HAP control cipher, recognizes timingProtocol=NTP, then returns SETUP 500
 with `stream check failed` and `stream type check failed`. No audio is sent.
@@ -25,7 +38,7 @@ clock, pacing, volume or recovery rules are changed.
 
 The immediate gate is whether the session SETUP becomes 200 and the subsequent
 stream SETUP is reached. Audible output and crash behavior are separate gates.
-Adapter tests check endpoint isolation and that only the two documented keys
+Adapter tests check endpoint isolation and that only the documented keys
 are added; existing NTP tests still require exactly four default keys.
 
 Branch: compat/mitv-happycast-raop-diag. This is an alternative session test,
