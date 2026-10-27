@@ -197,6 +197,15 @@ jobs:
           & cmd.exe /d /s /c $cmd 2>&1 | Tee-Object -FilePath build.log -Append
           $code = $LASTEXITCODE
           if ($code -ne 0) { throw "Pinned libraop archive failed ($code)" }
+          $testSource = Join-Path $stageAbs "mitv_ntp_wire_test.c"
+          $testExe = Join-Path $stageAbs "mitv_ntp_wire_test.exe"
+          python scripts/apply_mitv_sync_diag.py --test-source $testSource 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "MiTV wire test generation failed ($code)" }
+          $cmd = "call `"$vcvars64`" && cl.exe /nologo /std:clatest /Fe:`"$testExe`" /Fo:`"$objAbs/mitv_ntp_wire_test.obj`" `"$testSource`" && `"$testExe`""
+          & cmd.exe /d /s /c $cmd 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "MiTV NTP wire regression failed ($code)" }
           New-Item -ItemType Directory -Force -Path "$stage/include" | Out-Null
           Copy-Item "$src/src/raop_client.h" "$stage/include/raop_client.h" -Force
           Copy-Item "$src/src/rtsp_client.h" "$stage/include/rtsp_client.h" -Force
@@ -273,7 +282,7 @@ jobs:
           if (-not $guiText.Contains("MSA RAOP DIAG SYNC first=")) { throw "GUI SYNC telemetry missing" }
           if (-not $dllText.Contains("wire=%s sent=%d first=%u")) { throw "DLL SYNC telemetry missing" }
           "PASS MiTV SYNC binary gates" | Tee-Object -FilePath build.log -Append
-          "Commit: $env:GITHUB_SHA`nSYNC telemetry v1; compare against #22; transport unchanged." | Set-Content "$out/BUILD-INFO.txt"
+          "Commit: $env:GITHUB_SHA`nMiTV NTP wire epoch adapter v1; SYNC/timing only; private clocks unchanged." | Set-Content "$out/BUILD-INFO.txt"
           Get-FileHash "$out/sairplay-gui.exe" -Algorithm SHA256
           Get-FileHash "$out/sairplay-raop.dll" -Algorithm SHA256
 
