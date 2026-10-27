@@ -78,17 +78,31 @@ pub fn setup_ntp_session(
     channel: &mut EncryptedRtspChannel,
     config: &NtpSessionSetupConfig,
 ) -> Result<NtpSessionSetupResult, NtpSessionSetupError> {
-    // Preserve ordering: Session SETUP may only run after live timing readiness.
     if flow.phase() != crate::NativePhase::TimingReady {
         flow.session_setup()?;
         unreachable!("session_setup succeeds only from TimingReady");
     }
-
     let body = build_ntp_session_plist(
         &config.session_uuid,
         config.device_id.as_deref(),
         config.timing_port,
     )?;
+    setup_ntp_session_with_body(flow, channel, config, body)
+}
+
+// Shared envelope/state handling; the MiTV adapter supplies only its session
+// metadata. Ordinary callers retain the exact four-field pinned plist above.
+pub(crate) fn setup_ntp_session_with_body(
+    flow: &mut NativeConnectFlow,
+    channel: &mut EncryptedRtspChannel,
+    config: &NtpSessionSetupConfig,
+    body: Vec<u8>,
+) -> Result<NtpSessionSetupResult, NtpSessionSetupError> {
+    // Preserve ordering: Session SETUP may only run after live timing readiness.
+    if flow.phase() != crate::NativePhase::TimingReady {
+        flow.session_setup()?;
+        unreachable!("session_setup succeeds only from TimingReady");
+    }
 
     let request = RtspRequest {
         method: "SETUP".into(),

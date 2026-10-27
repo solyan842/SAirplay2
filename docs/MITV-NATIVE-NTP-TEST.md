@@ -1,8 +1,37 @@
 # Explicit MiTV native AirPlay / NTP experiment
 
+## #25 result and next session-metadata experiment
+
+#25 reaches transient HAP Pair-Setup M3/M4 successfully. HappyCast initializes
+the HAP control cipher, recognizes timingProtocol=NTP, then returns SETUP 500
+with `stream check failed` and `stream type check failed`. No audio is sent.
+This is distinct from the legacy ALAC decoder crash.
+
+The successful iPhone initial SETUP logs et=32 and sourceVersion=980.77.1.
+The pinned MSA NTP session plist has only deviceID/sessionUUID/timingPort/
+timingProtocol. Static inspection of the installed receiver shows its session
+classification checks nonzero et and a source-version gate before stream
+processing. Its failing stream check tests an absent stream object; this is
+consistent with a session-only SETUP entering the stream handler.
+
+The next build adds only et=32 and sourceVersion=670.6.2 to that first plist,
+through mitv_ntp_session.rs. The source version matches SAirplay2's existing
+AirPlay/670.6.2 User-Agent; no iPhone name, device ID or other identity is copied.
+This is a hardware-evidenced HappyCast session-classification exception, not a
+pinned upstream default. It requires the launcher's exact endpoint opt-in at
+the native control boundary as well as in the GUI selector. Defaults continue
+to use the original four-key plist. No pairing, cipher, stream setup, RTP,
+clock, pacing, volume or recovery rules are changed.
+
+The immediate gate is whether the session SETUP becomes 200 and the subsequent
+stream SETUP is reached. Audible output and crash behavior are separate gates.
+Adapter tests check endpoint isolation and that only the two documented keys
+are added; existing NTP tests still require exactly four default keys.
+
 Branch: compat/mitv-happycast-raop-diag. This is an alternative session test,
-not a confirmed fix. The previously observed native HomePod implementation is
-reused without source changes. No stable or SOtM code is changed.
+not a confirmed fix. The existing native control exchange is reused with a
+separate opt-in MiTV metadata adapter; default requests retain the pinned
+fields. No stable or SOtM code is changed.
 
 ## How to run after this build passes
 

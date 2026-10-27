@@ -16,6 +16,9 @@ use crate::feedback::{SharedCseq, SharedRtspControl};
 use rand::RngCore;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
+
+#[path = "mitv_ntp_session.rs"]
+mod mitv_ntp_session;
 use std::sync::{Arc, Mutex, atomic::AtomicU32};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,7 +249,15 @@ pub fn open_native_control(
 
     let event_port = match timing {
         LiveTiming::Ntp { timing_port } => {
-            setup_ntp_session(
+            let endpoint = std::env::var("SAIRPLAY_MITV_NATIVE_NTP_ENDPOINT").ok();
+            let session_setup = if mitv_ntp_session::enabled(
+                endpoint.as_deref(), &config.host, config.port,
+            ) {
+                mitv_ntp_session::setup
+            } else {
+                setup_ntp_session
+            };
+            session_setup(
                 &mut flow,
                 &mut control,
                 &NtpSessionSetupConfig {
