@@ -266,6 +266,13 @@ jobs:
           $code = $LASTEXITCODE
           if ($code -ne 0) { exit $code }
 
+      - name: Test explicit MiTV native NTP selector
+        shell: pwsh
+        run: |
+          cargo test -p sairplay-gui mitv_native_ntp_override -- --test-threads=1 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { exit $code }
+
       - name: Package MiTV HappyCast test artifact
         shell: pwsh
         run: |
@@ -276,13 +283,16 @@ jobs:
           Copy-Item "target/vendor/sairplay-raop-x64-stage/sairplay-raop.dll" "$out/sairplay-raop.dll" -Force
           Copy-Item "target/vendor/libopenssl-x64-stage/libcrypto-1_1-x64.dll" "$out/libcrypto-1_1-x64.dll" -Force
           Copy-Item "target/vendor/libopenssl-x64-stage/libssl-1_1-x64.dll" "$out/libssl-1_1-x64.dll" -Force
+          Copy-Item "scripts/Test-MiTV-Native-NTP.cmd" "$out/Test-MiTV-Native-NTP.cmd" -Force
+          Copy-Item "docs/MITV-NATIVE-NTP-TEST.md" "$out/MITV-NATIVE-NTP-TEST.md" -Force
           # ASCII strings must survive compilation into the paired GUI/DLL.
           $guiText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes("$out/sairplay-gui.exe"))
           $dllText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes("$out/sairplay-raop.dll"))
           if (-not $guiText.Contains("MSA RAOP DIAG SYNC first=")) { throw "GUI SYNC telemetry missing" }
+          if (-not $guiText.Contains("SAIRPLAY_MITV_NATIVE_NTP_ENDPOINT")) { throw "MiTV native/NTP selector missing" }
           if (-not $dllText.Contains("wire=%s sent=%d first=%u")) { throw "DLL SYNC telemetry missing" }
           "PASS MiTV SYNC binary gates" | Tee-Object -FilePath build.log -Append
-          "Commit: $env:GITHUB_SHA`nMiTV NTP wire epoch adapter v1; SYNC/timing only; private clocks unchanged." | Set-Content "$out/BUILD-INFO.txt"
+          "Commit: $env:GITHUB_SHA`nIncludes explicit Test-MiTV-Native-NTP.cmd; ordinary launch retains #24 RAOP behavior." | Set-Content "$out/BUILD-INFO.txt"
           Get-FileHash "$out/sairplay-gui.exe" -Algorithm SHA256
           Get-FileHash "$out/sairplay-raop.dll" -Algorithm SHA256
 

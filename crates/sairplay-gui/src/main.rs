@@ -5109,6 +5109,12 @@ fn msa_solo_route_txt(service: &DiscoveredService) -> Result<String, String> {
     Ok(parts.join(" "))
 }
 
+// Explicit, process-local diagnostic opt-in. It never follows discovery model
+// names and cannot redirect another receiver or persist an Automatic fallback.
+fn mitv_native_ntp_override(endpoint: Option<&str>, host: &str, port: u16) -> bool {
+    port == 52266 && endpoint.is_some_and(|value| value == format!("{host}:{port}"))
+}
+
 fn msa_solo_config_for_device(
     device: &DeviceRecord,
     credentials: Option<String>,
@@ -5139,11 +5145,16 @@ fn msa_solo_config_for_device(
         None => None,
     };
 
-    // GUI policy: transport is always Automatic. MSA route/fallback remains
-    // inside the engine; there is no user-visible or persisted protocol override.
-    let protocol = MsaProtocolPreference::Auto;
-    let ptp_override = None;
-    let effective_hires = hires_enabled;
+    // The separate MiTV test launcher requests the existing native/NTP route
+    // for one exact endpoint. Normal launches and all other receivers stay Auto.
+    let requested_endpoint = std::env::var("SAIRPLAY_MITV_NATIVE_NTP_ENDPOINT").ok();
+    let native_ntp_test = mitv_native_ntp_override(
+        requested_endpoint.as_deref(), &native_host, native_service.port,
+    );
+    let protocol = if native_ntp_test { MsaProtocolPreference::AirPlay2 }
+        else { MsaProtocolPreference::Auto };
+    let ptp_override = if native_ntp_test { Some(false) } else { None };
+    let effective_hires = hires_enabled && !native_ntp_test;
     let (sample_rate, bit_depth) = if effective_hires {
         (48_000, 24)
     } else {
@@ -5161,6 +5172,10 @@ fn msa_solo_config_for_device(
     config.raop.host = raop_host.clone();
     config.protocol = protocol;
     config.ptp_override = ptp_override;
+    if native_ntp_test {
+        config.force_native = true;
+        config.buffered_forced = false;
+    }
     config.txt = txt.clone();
     // Match pinned Music Assistant stream.py exactly: RAOP transport
     // properties (et/md/am/pk/pw/cn) come from the _raop._tcp service.
@@ -5221,11 +5236,12 @@ fn msa_solo_config_for_device(
         format!("raop_endpoint={}:{}", raop_host, raop_service.port)
     };
     let summary = format!(
-        "MSA SOLO CONNECT target={} {} requested={}/{} streaming_mode=auto protocol={:?} features={:#018x} flags={:#x} pairing_required={}; credentials are never printed.",
+        "MSA SOLO CONNECT target={} {} requested={}/{} streaming_mode={} protocol={:?} features={:#018x} flags={:#x} pairing_required={}; credentials are never printed.",
         device.display_name,
         endpoint_summary,
         sample_rate,
         bit_depth,
+        if native_ntp_test { "mitv-native-ntp-test" } else { "auto" },
         config.protocol,
         features,
         flags,
@@ -5470,6 +5486,23 @@ fn address_rank(ip: IpAddr) -> u8 {
 mod gui_tests {
     use super::*;
     use sairplay_engine::AirPlayTxt;
+
+    #[test]
+    fn mitv_native_ntp_override_is_explicit_and_endpoint_scoped() {
+        let endpoint = Some("192.168.88.15:52266");
+        assert!(mitv_native_ntp_override(endpoint, "192.168.88.15", 52266));
+        assert!(!mitv_native_ntp_override(None, "192.168.88.15", 52266));
+        assert!(!mitv_native_ntp_override(endpoint, "192.168.88.16", 52266));
+        assert!(!mitv_native_ntp_override(endpoint, "192.168.88.15", 7000));
+        assert!(!mitv_native_ntp_override(Some("*"), "192.168.88.15", 52266));
+        assert!(!mitv_native_ntp_override(Some("192.168.88.15:7000"), "192.168.88.15", 7000));
+        let route = sairplay_msa_solo::route::resolve_route(
+            MsaProtocolPreference::AirPlay2, 0x0000001e527ffff7, 4,
+            false, false, false, true, Some(false),
+        );
+        assert_eq!(route.flow, MsaFlow::AirPlay2Native);
+        assert_eq!(route.timing, sairplay_msa_solo::route::Timing::Ntp);
+    }
 
     #[test]
     fn all_device_artwork_assets_are_independent_valid_pngs() {
