@@ -33,6 +33,9 @@ jobs:
           python scripts/apply_mitv_record_refresh_diag.py --repo . 2>&1 | Tee-Object -FilePath build.log -Append
           $code = $LASTEXITCODE
           if ($code -ne 0) { throw "MiTV RECORD refresh diagnostic patch failed ($code)" }
+          python scripts/apply_mitv_sync_diag.py --repo . 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "MiTV SYNC repository patch failed ($code)" }
           git diff --check
           $code = $LASTEXITCODE
           if ($code -ne 0) { throw "MiTV repository patch produced an invalid diff ($code)" }
@@ -156,6 +159,12 @@ jobs:
           python scripts/apply_mitv_active_feedback.py --libraop $src 2>&1 | Tee-Object -FilePath build.log -Append
           $code = $LASTEXITCODE
           if ($code -ne 0) { throw "Pinned libraop MiTV patch failed ($code)" }
+          python scripts/apply_mitv_sync_diag.py --libraop $src 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "MiTV SYNC vendor patch failed ($code)" }
+          python scripts/apply_mitv_sync_diag.py --verify --repo . --libraop $src 2>&1 | Tee-Object -FilePath build.log -Append
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "MiTV SYNC source gates failed ($code)" }
           $dmapHead = (git -C "$src/dmap-parser" rev-parse HEAD).Trim()
           if ($dmapHead -ne $dmapPin) { throw "Pinned dmap-parser mismatch: $dmapHead" }
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -258,6 +267,13 @@ jobs:
           Copy-Item "target/vendor/sairplay-raop-x64-stage/sairplay-raop.dll" "$out/sairplay-raop.dll" -Force
           Copy-Item "target/vendor/libopenssl-x64-stage/libcrypto-1_1-x64.dll" "$out/libcrypto-1_1-x64.dll" -Force
           Copy-Item "target/vendor/libopenssl-x64-stage/libssl-1_1-x64.dll" "$out/libssl-1_1-x64.dll" -Force
+          # ASCII strings must survive compilation into the paired GUI/DLL.
+          $guiText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes("$out/sairplay-gui.exe"))
+          $dllText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes("$out/sairplay-raop.dll"))
+          if (-not $guiText.Contains("MSA RAOP DIAG SYNC first=")) { throw "GUI SYNC telemetry missing" }
+          if (-not $dllText.Contains("wire=%s sent=%d first=%u")) { throw "DLL SYNC telemetry missing" }
+          "PASS MiTV SYNC binary gates" | Tee-Object -FilePath build.log -Append
+          "Commit: $env:GITHUB_SHA`nSYNC telemetry v1; compare against #22; transport unchanged." | Set-Content "$out/BUILD-INFO.txt"
           Get-FileHash "$out/sairplay-gui.exe" -Algorithm SHA256
           Get-FileHash "$out/sairplay-raop.dll" -Algorithm SHA256
 
