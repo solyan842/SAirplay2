@@ -10,6 +10,10 @@ use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, UdpSocket};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[path = "mitv_media_pacing.rs"]
+mod mitv_media_pacing;
+use mitv_media_pacing::MiTvMediaPacer;
+
 pub const UDP_SEND_TIMEOUT: Duration = Duration::from_millis(20);
 pub const BUFFERED_WRITE_TIMEOUT: Duration = Duration::from_millis(2000);
 pub const BUFFERED_SEND_BUFFER_BYTES: usize = 64 << 10;
@@ -27,6 +31,7 @@ pub struct NativeMediaIo {
     remote_data: Option<SocketAddr>,
     remote_control: Option<SocketAddr>,
     buffered: Option<TcpStream>,
+    mitv_pacer: Option<MiTvMediaPacer>,
 }
 
 impl NativeMediaIo {
@@ -42,6 +47,7 @@ impl NativeMediaIo {
             remote_data: None,
             remote_control: None,
             buffered: None,
+            mitv_pacer: None,
         })
     }
 
@@ -50,6 +56,10 @@ impl NativeMediaIo {
             data: self.data_socket.local_addr()?.port(),
             control: self.control_socket.local_addr()?.port(),
         })
+    }
+
+    pub(crate) fn enable_mitv_realtime_pacing(&mut self) {
+        self.mitv_pacer = Some(MiTvMediaPacer::default());
     }
 
     pub fn attach_data_remote(&mut self, receiver_ip: IpAddr, data_port: u16) {
@@ -175,7 +185,10 @@ pub(crate) fn send_datagram_deadline(
 
 impl MediaIo for NativeMediaIo {
     fn send_realtime(&mut self, packet: &[u8]) -> SendResult {
-        self.send_data_deadline(packet)
+        if let Some(pacer) = &self.mitv_pacer { pacer.wait(); }
+        let result = self.send_data_deadline(packet);
+        if let Some(pacer) = &mut self.mitv_pacer { pacer.committed(Instant::now()); }
+        result
     }
 
     fn send_buffered(&mut self, bytes: &[u8]) -> StreamWrite {
@@ -231,6 +244,7 @@ mod tests {
     #[test]
     fn binds_real_distinct_media_ports() {
         let io = NativeMediaIo::bind(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
+        assert!(io.mitv_pacer.is_none());
         let p = io.local_ports().unwrap();
         assert_ne!(p.data, 0);
         assert_ne!(p.control, 0);

@@ -323,6 +323,20 @@ pub fn open_native_control(
         &pairing,
     ).map_err(|e| NativeControlError::Media(format!("{e:?}")))?;
 
+    // Hardware differential probes: HappyCast rejects closely spaced encrypted
+    // packets but accepts evenly released 352-frame packets. Preserve pinned
+    // MSA defaults everywhere outside the explicit 44.1/16 MiTV NTP test.
+    if matches!(timing, LiveTiming::Ntp { .. })
+        && config.audio_format.sample_rate == 44100
+        && config.audio_format.bit_depth == 16
+        && mitv_ntp_session::enabled(
+            std::env::var("SAIRPLAY_MITV_NATIVE_NTP_ENDPOINT").ok().as_deref(),
+            &config.host, config.port,
+        )
+    {
+        media.io.enable_mitv_realtime_pacing();
+    }
+
     let mut latency_min = None;
     let mut latency_max = None;
     let mut arrival_to_render_latency_ms = None;
