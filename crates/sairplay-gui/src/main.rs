@@ -1,5 +1,7 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
+mod receiver_compatibility;
+
 use eframe::egui;
 use sairplay_engine::{
     Ap2PreflightClient, DeviceCatalog, DeviceRecord, DiscoveredService, DiscoveryEvent,
@@ -5145,10 +5147,16 @@ fn msa_solo_config_for_device(
         None => None,
     };
 
-    // The separate MiTV test launcher requests the existing native/NTP route
-    // for one exact endpoint. Normal launches and all other receivers stay Auto.
+    // Classify the measured protocol capability profile, without device names,
+    // hostname patterns, IPs or port assumptions. Normal connect still verifies HAP/SETUP.
+    let receiver_class = receiver_compatibility::classify(
+        device.airplay.is_some(), device.raop.is_some(),
+        sairplay_msa_solo::route::txt_features(txt.as_deref()),
+        sairplay_msa_solo::route::txt_flags(txt.as_deref()),
+    );
+    let ntp_compat_profile = receiver_class == receiver_compatibility::ReceiverCompatibility::LegacyAp2Ntp;
     let requested_endpoint = std::env::var("SAIRPLAY_MITV_NATIVE_NTP_ENDPOINT").ok();
-    let native_ntp_test = mitv_native_ntp_override(
+    let native_ntp_test = ntp_compat_profile || mitv_native_ntp_override(
         requested_endpoint.as_deref(), &native_host, native_service.port,
     );
     let protocol = if native_ntp_test { MsaProtocolPreference::AirPlay2 }
@@ -5170,6 +5178,7 @@ fn msa_solo_config_for_device(
     // RAOP lane must always use the RAOP endpoint rather than inheriting the
     // native endpoint merely because both services belong to one DeviceRecord.
     config.raop.host = raop_host.clone();
+    config.native.control.ntp_session_compat = native_ntp_test;
     config.protocol = protocol;
     config.ptp_override = ptp_override;
     if native_ntp_test {
@@ -5236,12 +5245,13 @@ fn msa_solo_config_for_device(
         format!("raop_endpoint={}:{}", raop_host, raop_service.port)
     };
     let summary = format!(
-        "MSA SOLO CONNECT target={} {} requested={}/{} streaming_mode={} protocol={:?} features={:#018x} flags={:#x} pairing_required={}; credentials are never printed.",
+        "MSA SOLO CONNECT target={} {} requested={}/{} streaming_mode={} receiver_class={} protocol={:?} features={:#018x} flags={:#x} pairing_required={}; credentials are never printed.",
         device.display_name,
         endpoint_summary,
         sample_rate,
         bit_depth,
-        if native_ntp_test { "mitv-native-ntp-test" } else { "auto" },
+        if ntp_compat_profile { "native-ntp-compat" } else if native_ntp_test { "mitv-native-ntp-test" } else { "auto" },
+        if ntp_compat_profile { "legacy-native-ntp" } else { "standard" },
         config.protocol,
         features,
         flags,
@@ -5926,6 +5936,29 @@ mod gui_tests {
         assert!(txt.contains("features=0x0001c340445d0a00"));
         assert!(txt.contains("flags=0x4"));
         assert!(!txt.contains("model="));
+    }
+
+    #[test]
+    fn mitv_happycast_config_selects_isolated_native_ntp_without_launcher() {
+        let airplay = DiscoveredService {
+            kind: ServiceKind::AirPlay,
+            fullname: "Mi._airplay._tcp.local.".into(),
+            display_name: "Renamed TV".into(), host: "another-vendor.local.".into(),
+            port: 5030, addresses: vec!["192.168.1.99".into()],
+            txt: AirPlayTxt::parse([("features","0x1e527ffff7"),("flags","0x4")]).unwrap(),
+        };
+        let mut raop = airplay.clone();
+        raop.kind = ServiceKind::Raop;
+        raop.fullname = "Mi._raop._tcp.local.".into();
+        let device = DeviceRecord { display_name: "Renamed TV".into(), airplay: Some(airplay), raop: Some(raop) };
+        let (config, format, summary) = msa_solo_config_for_device(&device, None, None, true).unwrap();
+        assert_eq!(config.protocol, MsaProtocolPreference::AirPlay2);
+        assert_eq!(config.ptp_override, Some(false));
+        assert!(config.force_native);
+        assert!(config.native.control.ntp_session_compat);
+        assert!(!config.buffered_forced);
+        assert_eq!((format.sample_rate,format.bit_depth),(44100,16));
+        assert!(summary.contains("receiver_class=legacy-native-ntp"));
     }
 
     #[test]

@@ -1,3 +1,7 @@
+## Current behavior: classified HappyCast lane
+
+Ordinary launch now recognizes the measured dual-service protocol capability profile, independent of device name, host, IP and port and selects the isolated Native AP2 / NTP / realtime96 / 16-44.1 compatibility profile. The endpoint launcher remains available for diagnostics. See MITV-RECEIVER-CLASSIFICATION.md. Historical test-only/default-RAOP statements below describe earlier builds and are superseded for this exact fingerprint. Stability and initial-volume issues remain open.
+
 # Explicit MiTV native AirPlay / NTP experiment
 
 ## Broad source review and directly reproduced fix after #27

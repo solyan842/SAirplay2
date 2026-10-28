@@ -42,6 +42,8 @@ pub struct NativeControlConfig {
     pub follow_receiver_clock: bool,
     pub bind_ip: Option<IpAddr>,
     pub publish_ip: Option<IpAddr>,
+    /// Caller-selected native-NTP compatibility profile; never inferred from device identity.
+    pub ntp_session_compat: bool,
 }
 
 impl NativeControlConfig {
@@ -60,6 +62,7 @@ impl NativeControlConfig {
             follow_receiver_clock: false,
             bind_ip: None,
             publish_ip: None,
+            ntp_session_compat: false,
         }
     }
 }
@@ -246,13 +249,13 @@ pub fn open_native_control(
     let session_uri = format_session_uri(local_addr.ip(), session_id);
     let device_id = dacp_device_id(&config.dacp_id).ok_or(NativeControlError::Identity)?;
     let buffered = config.buffered_requested && matches!(timing, LiveTiming::Ptp { .. });
+    let endpoint = std::env::var("SAIRPLAY_MITV_NATIVE_NTP_ENDPOINT").ok();
+    let mitv_compat = config.ntp_session_compat
+        || mitv_ntp_session::enabled(endpoint.as_deref(), &config.host, config.port);
 
     let event_port = match timing {
         LiveTiming::Ntp { timing_port } => {
-            let endpoint = std::env::var("SAIRPLAY_MITV_NATIVE_NTP_ENDPOINT").ok();
-            let session_setup = if mitv_ntp_session::enabled(
-                endpoint.as_deref(), &config.host, config.port,
-            ) {
+            let session_setup = if mitv_compat {
                 mitv_ntp_session::setup
             } else {
                 setup_ntp_session
@@ -325,14 +328,11 @@ pub fn open_native_control(
 
     // Hardware differential probes: HappyCast rejects closely spaced encrypted
     // packets but accepts evenly released 352-frame packets. Preserve pinned
-    // MSA defaults everywhere outside the explicit 44.1/16 MiTV NTP test.
+    // MSA defaults outside the selected 44.1/16 native-NTP compatibility profile.
     if matches!(timing, LiveTiming::Ntp { .. })
         && config.audio_format.sample_rate == 44100
         && config.audio_format.bit_depth == 16
-        && mitv_ntp_session::enabled(
-            std::env::var("SAIRPLAY_MITV_NATIVE_NTP_ENDPOINT").ok().as_deref(),
-            &config.host, config.port,
-        )
+        && mitv_compat
     {
         media.io.enable_mitv_realtime_pacing();
     }

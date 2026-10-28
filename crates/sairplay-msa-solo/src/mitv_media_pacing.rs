@@ -1,4 +1,4 @@
-//! HappyCast-only wire release adapter; enabled by the explicit NTP test endpoint.
+//! Measured native-NTP compatibility release adapter; enabled per receiver profile.
 use std::time::{Duration, Instant};
 
 const MIN_GAP: Duration = Duration::from_millis(7);
