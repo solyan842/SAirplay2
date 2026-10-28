@@ -30,10 +30,19 @@ Raw ADB logs and packet captures stay local because logs contain unrelated priva
 
 ## Adapter
 
-Enable a separate socket-release pacer only when the existing explicit MiTV endpoint guard matches, timing is NTP, and format is 44100/16. Nominal absolute deadlines remain 352/44100 seconds per packet; a 7-ms minimum prevents catch-up bursts. A late wake does not accumulate ordinary relative-sleep drift. No packet bytes, crypto keys, ALAC framing, sequence/timestamp advancement, source clocks, START anchors, or pacing window constants change. The capture producer remains independent of the media worker.
+Enable a separate socket-release pacer only when the existing explicit MiTV endpoint guard matches, timing is NTP, and format is 44100/16. A 7-ms minimum separates wire releases. The existing MSA pacing window remains the only average-rate governor, so delivery can catch up at up to approximately 143 packets/s when recovery padding exists. An overdue release may proceed immediately; the following release still observes the minimum gap. No packet bytes, crypto keys, ALAC framing, sequence/timestamp advancement, source clocks, START anchors, or pacing window constants change. The capture producer remains independent of the media worker.
 
-The pacer is absent by default. Buffered TCP, synchronization and retransmission sockets keep their existing behavior. Existing endpoint isolation tests remain required. A pure deadline test covers cadence, normal wake jitter and a long stall without a burst; Windows CI must compile and run the full existing suite.
+The pacer is absent by default. Buffered TCP, synchronization and retransmission sockets keep their existing behavior. Existing endpoint isolation tests remain required. A pure deadline test covers the minimum gap, a long stall, and sufficient spare delivery capacity to drain recovery padding; Windows CI must compile and run the full existing suite.
 
 ## Remaining hardware gates
 
 This is a measured mitigation candidate, not audible stability PASS. The packaged Windows GUI must still be retested for sustained playback and Stop/Start. Volume is separate: GUI reports RTSP 200 for 100% while initial TV system volume is 32/100; code already sends volume after stream SETUP. A reset-order defect is not established and no volume change is included.
+
+
+## 7e11298 hardware regression and correction
+
+The next user log contains 9408 bounded PCM-ring overflow messages, after source-present and with no normal source-consumption diagnostics. Actual sender capture confirms evenly spaced ~8-ms releases (2477 packets over 19.762718 s, minimum gap 7.267 ms). Audibility is therefore NOT PASS on 7e11298.
+
+Code evidence: windows_audio_worker calls recover_delivery_gap before each packet, then pcm_chunker::pop_packet_with_silence_prefix. If pad_frames is 352, the latter consumes zero real PCM bytes. NativeRuntime::recover_delivery_gap adds silence when the delivery head falls behind. The first adapter incorrectly capped all releases at the exact media rate, leaving no headroom to repay a deficit: padding can consume the entire sustained delivery budget while real PCM fills the ring. This is an adapter regression, not evidence for changing MSA recovery or dropping source PCM.
+
+Correction removes the absolute nominal-rate schedule entirely and retains only the measured 7-ms minimum gap. MSA keeps its original window, clock and recovery calculations. Default endpoints remain unchanged. The deadline test now requires spare catch-up capacity as well as minimum spacing. Windows CI and sustained audible hardware validation are still required. Quiet volume remains an independent unresolved gate.

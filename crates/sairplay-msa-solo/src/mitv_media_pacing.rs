@@ -1,19 +1,16 @@
 //! HappyCast-only wire release adapter; enabled by the explicit NTP test endpoint.
 use std::time::{Duration, Instant};
 
-const PERIOD: Duration = Duration::from_nanos(352 * 1_000_000_000 / 44_100);
 const MIN_GAP: Duration = Duration::from_millis(7);
 
 #[derive(Default)]
 pub(super) struct MiTvMediaPacer {
-    next: Option<Instant>,
     last: Option<Instant>,
 }
 
 impl MiTvMediaPacer {
     fn deadline(&self, now: Instant) -> Instant {
-        let nominal = self.next.unwrap_or(now);
-        self.last.map_or(nominal, |last| nominal.max(last + MIN_GAP))
+        self.last.map_or(now, |last| now.max(last + MIN_GAP))
     }
 
     pub(super) fn wait(&self) {
@@ -25,9 +22,8 @@ impl MiTvMediaPacer {
     }
 
     pub(super) fn committed(&mut self, now: Instant) {
-        // Absolute deadlines retain the stream rate despite ordinary wake jitter.
-        // After a stall, the minimum gap prevents a back-to-back catch-up burst.
-        self.next = Some((self.next.unwrap_or(now) + PERIOD).max(now));
+        // Only bound close releases. MSA's existing window owns average rate
+        // and must retain enough catch-up capacity to consume recovery padding.
         self.last = Some(now);
     }
 }
@@ -37,15 +33,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deadlines_preserve_rate_and_bound_catch_up() {
+    fn minimum_gap_retains_capacity_to_drain_recovery_padding() {
         let start = Instant::now();
         let mut p = MiTvMediaPacer::default();
         assert_eq!(p.deadline(start), start);
         p.committed(start);
-        let jittered = start + PERIOD + Duration::from_micros(500);
-        p.committed(jittered);
-        assert_eq!(p.deadline(jittered), start + PERIOD * 2);
+        assert_eq!(p.deadline(start), start + MIN_GAP);
+        let mut now = start;
+        for _ in 0..100 {
+            now = p.deadline(now);
+            p.committed(now);
+        }
+        // A fixed 352/44100 cadence cannot repay a timeline deficit: each
+        // silence packet only replaces the wall time spent sending it.
+        let produced = Duration::from_nanos(100 * 352 * 1_000_000_000 / 44_100);
+        assert!(now.duration_since(start) < produced);
         let stalled = start + Duration::from_secs(1);
+        assert_eq!(p.deadline(stalled), stalled);
         p.committed(stalled);
         assert_eq!(p.deadline(stalled), stalled + MIN_GAP);
     }
