@@ -28,3 +28,10 @@ another device with this same capability profile.
 This is classification, not stability certification. Intermittent stutter and
 initial volume application remain open hardware issues. No packet, clock,
 volume or lifecycle fix is included in this classification change.
+
+## Acceptance / stop decision
+
+The user accepts this as a secondary compatibility lane with known limitations,
+and requests no further optimization at present. See
+[MITV-COMPATIBILITY-DECISION-2026-10-28.md](MITV-COMPATIBILITY-DECISION-2026-10-28.md).
+This does not certify that the outstanding stutter or initial-volume defects are fixed.

@@ -1,5 +1,14 @@
 # SAirplay2 — Project State
 
+## Current MiTV compatibility decision (2026-10-28)
+
+MiTV/native-NTP is accepted by the user as a secondary compatibility lane with
+known intermittent stutter and initial-volume limitations. Stop its optimization
+unless requested again. Classification is capability-based, independent of device
+identity. See [MITV-COMPATIBILITY-DECISION-2026-10-28.md](MITV-COMPATIBILITY-DECISION-2026-10-28.md).
+MSA-CORE-SOURCE-LOCK.md takes precedence over conflicting historical SOLO state below.
+
+
 Last updated: 2026-10-01  
 Working branch: `dev/msa-solo-rebuild`
 

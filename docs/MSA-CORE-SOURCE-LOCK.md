@@ -316,7 +316,7 @@ Order of work:
 3. **complete and hardware locked:** Apple TV5,3 `Phòng ngủ` 16/44.1 Realtime Type-96 Single-receiver lifecycle baseline;
 4. **complete and hardware locked:** AirPort Express AirPort10,115 16/44.1 Native AP2 / PTP / Buffered Type-103 Single-receiver lifecycle baseline;
 5. **complete and hardware locked:** SOtM/Eunhasu RAOP-only / NTP / ALAC 16/44.1 Single-receiver baseline;
-6. **current compatibility work:** diagnose MiTV RAOP interoperability without changing any locked lane unless evidence identifies a shared-Core regression;
+6. **accepted secondary compatibility lane (2026-10-28):** MiTV uses Native AP2 / NTP / realtime96 with known limitations; stop optimization per user decision, preserve all locked lanes, and follow [MITV-COMPATIBILITY-DECISION-2026-10-28.md](MITV-COMPATIBILITY-DECISION-2026-10-28.md);
 7. only then return to 24-bit work;
 8. only after Single/Core gates are sound, continue Stereo Pair and MultiRoom migration;
 9. GUI/productization remains above the transport core and must not drive protocol changes.
